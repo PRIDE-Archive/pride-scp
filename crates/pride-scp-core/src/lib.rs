@@ -240,3 +240,49 @@ pub fn read_candidate_tsv(path: &Path) -> Result<Vec<CandidateRecord>> {
     }
     Ok(rows)
 }
+
+pub fn make_progress_bar(len: u64, label: &str, enabled: bool) -> indicatif::ProgressBar {
+    if !enabled {
+        return indicatif::ProgressBar::hidden();
+    }
+    let bar = indicatif::ProgressBar::new(len);
+    let style = indicatif::ProgressStyle::with_template(
+        "{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({percent}%) ETA {eta_precise} {msg}",
+    )
+    .unwrap_or_else(|_| indicatif::ProgressStyle::default_bar())
+    .progress_chars("=>-");
+    bar.set_style(style);
+    bar.set_message(label.to_string());
+    bar
+}
+
+pub fn make_spinner(label: &str, enabled: bool) -> indicatif::ProgressBar {
+    if !enabled {
+        return indicatif::ProgressBar::hidden();
+    }
+    let spinner = indicatif::ProgressBar::new_spinner();
+    let style =
+        indicatif::ProgressStyle::with_template("{spinner:.green} [{elapsed_precise}] {msg}")
+            .unwrap_or_else(|_| indicatif::ProgressStyle::default_spinner());
+    spinner.set_style(style);
+    spinner.set_message(label.to_string());
+    spinner.enable_steady_tick(std::time::Duration::from_millis(120));
+    spinner
+}
+
+pub fn format_duration(duration: std::time::Duration) -> String {
+    let total = duration.as_secs();
+    let hours = total / 3600;
+    let minutes = (total % 3600) / 60;
+    let seconds = total % 60;
+    let millis = duration.subsec_millis();
+    if hours > 0 {
+        format!("{hours}h {minutes:02}m {seconds:02}s")
+    } else if minutes > 0 {
+        format!("{minutes}m {seconds:02}s")
+    } else if total > 0 {
+        format!("{seconds}.{millis:03}s")
+    } else {
+        format!("0.{millis:03}s")
+    }
+}

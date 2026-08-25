@@ -358,3 +358,45 @@ recall-first front end. Before using it to replace the old catalogue, validate:
 3. recall against the earlier manual positive set;
 4. candidate count and missed-positive report;
 5. only then run the expensive publication/Qwen stages.
+
+## Progress, timing, and logs (v0.1.2)
+
+Long-running Rust commands show terminal progress by default. Progress is sent
+to stderr, while the final JSON summary remains on stdout.
+
+A full snapshot will look approximately like:
+
+```text
+⠋ [00:00:12] enumerating PRIDE projects | page 18 | 1800 accessions
+⠙ [00:03:41] [=========>------------------------------] 942/4217 (22%) ETA 00:12:51 completed PXD012345
+```
+
+Discovery similarly reports the parallel local scan and output-writing phase.
+The progress format includes elapsed time and ETA.
+
+Logging defaults to `info` and is also written to stderr:
+
+```bash
+target/release/pride-scp --log-level info snapshot ...
+target/release/pride-scp --log-level debug snapshot ...
+RUST_LOG=debug target/release/pride-scp snapshot ...
+```
+
+Disable interactive progress without changing final summaries:
+
+```bash
+target/release/pride-scp --no-progress snapshot ...
+```
+
+To retain a human-readable run log while still seeing it in the terminal:
+
+```bash
+mkdir -p logs
+target/release/pride-scp snapshot ... 2>&1 | tee logs/snapshot.log
+```
+
+If you need a clean machine-readable JSON file, redirect stdout only:
+
+```bash
+target/release/pride-scp snapshot ... > snapshot_result.json
+```

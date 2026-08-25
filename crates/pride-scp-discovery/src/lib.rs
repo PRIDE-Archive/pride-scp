@@ -1,8 +1,9 @@
 use anyhow::{anyhow, Context, Result};
 use pride_scp_core::{
-    first_string_for_keys, flatten_json_strings, read_candidate_tsv, read_json, semicolon_join,
-    write_candidate_tsv, write_json, write_jsonl, CandidateRecord, DiscoveryConfig,
-    DiscoverySummary, LaneHit, RecallAuditRow, RecallSummary, WeightedTerm,
+    first_string_for_keys, flatten_json_strings, make_progress_bar, make_spinner,
+    read_candidate_tsv, read_json, semicolon_join, write_candidate_tsv, write_json, write_jsonl,
+    CandidateRecord, DiscoveryConfig, DiscoverySummary, LaneHit, RecallAuditRow, RecallSummary,
+    WeightedTerm,
 };
 use rayon::prelude::*;
 use regex::Regex;
@@ -11,6 +12,7 @@ use std::collections::{BTreeSet, HashMap};
 use std::fs::File;
 use std::io::{BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 
 #[derive(Debug, Clone)]
 pub struct DiscoverOptions {
@@ -19,6 +21,7 @@ pub struct DiscoverOptions {
     pub config_path: PathBuf,
     pub min_score: i32,
     pub expected_positive_count: usize,
+    pub progress: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -26,6 +29,7 @@ pub struct RecallAuditOptions {
     pub candidates_tsv: PathBuf,
     pub benchmark_csv: PathBuf,
     pub output_dir: PathBuf,
+    pub progress: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -33,6 +37,7 @@ pub struct ExportPythonOptions {
     pub candidates_tsv: PathBuf,
     pub output_dir: PathBuf,
     pub min_tier: String,
+    pub progress: bool,
 }
 
 fn excerpt(text: &str, needle: &str) -> String {
@@ -317,6 +322,13 @@ fn discover_project(
 }
 
 pub fn discover(opts: DiscoverOptions) -> Result<DiscoverySummary> {
+    let started = Instant::now();
+    log::info!(
+        "discovery start: snapshot={} output={} min_score={}",
+        opts.snapshot_dir.display(),
+        opts.output_dir.display(),
+        opts.min_score
+    );
     let cfg: DiscoveryConfig = read_json(&opts.config_path)?;
     let project_dir = opts.snapshot_dir.join("projects");
     let mut project_paths = std::fs::read_dir(&project_dir)
@@ -326,20 +338,35 @@ pub fn discover(opts: DiscoverOptions) -> Result<DiscoverySummary> {
         .collect::<Vec<_>>();
     project_paths.sort();
 
+    log::info!(
+        "discovery scan: {} cached project records",
+        project_paths.len()
+    );
+    let progress = make_progress_bar(
+        project_paths.len() as u64,
+        "scanning repository/file/SDRF discovery signals",
+        opts.progress,
+    );
     let mut rows = project_paths
         .par_iter()
-        .filter_map(|path| match discover_project(path, &opts, &cfg) {
-            Ok(row) => Some(row),
-            Err(error) => {
-                eprintln!("warning: {}: {error:#}", path.display());
-                None
-            }
+        .filter_map(|path| {
+            let result = match discover_project(path, &opts, &cfg) {
+                Ok(row) => Some(row),
+                Err(error) => {
+                    log::warn!("discovery read failed: {}: {error:#}", path.display());
+                    None
+                }
+            };
+            progress.inc(1);
+            result
         })
         .collect::<Vec<_>>();
+    progress.finish_with_message("discovery scan complete");
     rows.sort_by(|a, b| a.accession.cmp(&b.accession));
 
     let positive_count = rows.iter().filter(|row| row.score > 0).count();
     std::fs::create_dir_all(&opts.output_dir)?;
+    let output_progress = make_spinner("writing discovery outputs", opts.progress);
     // Keep a complete scored audit table, including score=0 projects, so a
     // missed known positive can be traced without repeating the snapshot.
     write_candidate_tsv(&opts.output_dir.join("project_discovery_audit.tsv"), &rows)?;
@@ -370,6 +397,19 @@ pub fn discover(opts: DiscoverOptions) -> Result<DiscoverySummary> {
             && emitted.len() < opts.expected_positive_count,
     };
     write_json(&opts.output_dir.join("discovery_summary.json"), &summary)?;
+    output_progress.finish_with_message(format!(
+        "discovery outputs complete | {} candidates",
+        summary.candidates_emitted
+    ));
+    log::info!(
+        "discovery complete in {:.1}s: scanned={} candidates={} strong={} possible={} weak={}",
+        started.elapsed().as_secs_f64(),
+        summary.projects_scanned,
+        summary.candidates_emitted,
+        summary.strong_candidates,
+        summary.possible_candidates,
+        summary.weak_candidates
+    );
     Ok(summary)
 }
 
@@ -381,6 +421,12 @@ fn truthy(value: &str) -> bool {
 }
 
 pub fn recall_audit(opts: RecallAuditOptions) -> Result<RecallSummary> {
+    let started = Instant::now();
+    log::info!(
+        "recall audit start: candidates={} benchmark={}",
+        opts.candidates_tsv.display(),
+        opts.benchmark_csv.display()
+    );
     let candidates = read_candidate_tsv(&opts.candidates_tsv)?;
     let candidate_map: HashMap<String, CandidateRecord> = candidates
         .into_iter()
@@ -403,9 +449,17 @@ pub fn recall_audit(opts: RecallAuditOptions) -> Result<RecallSummary> {
         .position(|x| x == "dataset_title")
         .or_else(|| headers.iter().position(|x| x == "benchmark_label"));
 
+    let records = reader
+        .records()
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    let progress = make_progress_bar(
+        records.len() as u64,
+        "checking known-positive recovery",
+        opts.progress,
+    );
     let mut rows = Vec::new();
-    for record in reader.records() {
-        let record = record?;
+    for record in records {
+        progress.inc(1);
         if let Some(index) = positive_col {
             if !truthy(record.get(index).unwrap_or_default()) {
                 continue;
@@ -435,6 +489,7 @@ pub fn recall_audit(opts: RecallAuditOptions) -> Result<RecallSummary> {
                 .to_string(),
         });
     }
+    progress.finish_with_message("known-positive recall scan complete");
     rows.sort_by(|a, b| a.accession.cmp(&b.accession));
 
     std::fs::create_dir_all(&opts.output_dir)?;
@@ -490,6 +545,13 @@ pub fn recall_audit(opts: RecallAuditOptions) -> Result<RecallSummary> {
         },
     };
     write_json(&opts.output_dir.join("recall_summary.json"), &summary)?;
+    log::info!(
+        "recall audit complete in {:.1}s: recovered={}/{} ({:.2}%)",
+        started.elapsed().as_secs_f64(),
+        summary.recovered_positives,
+        summary.expected_positives,
+        summary.recall * 100.0
+    );
     Ok(summary)
 }
 
@@ -503,6 +565,12 @@ fn tier_rank(tier: &str) -> i32 {
 }
 
 pub fn export_python(opts: ExportPythonOptions) -> Result<usize> {
+    let started = Instant::now();
+    log::info!(
+        "python bridge export start: candidates={} min_tier={}",
+        opts.candidates_tsv.display(),
+        opts.min_tier
+    );
     let min_rank = tier_rank(&opts.min_tier);
     if min_rank == 0 {
         return Err(anyhow!("--min-tier must be strong, possible, or weak"));
@@ -514,6 +582,7 @@ pub fn export_python(opts: ExportPythonOptions) -> Result<usize> {
     rows.sort_by(|a, b| a.accession.cmp(&b.accession));
     std::fs::create_dir_all(&opts.output_dir)?;
 
+    let progress = make_progress_bar(rows.len() as u64, "exporting Python bridge", opts.progress);
     let mut accessions = BufWriter::new(File::create(
         opts.output_dir.join("candidate_accessions.txt"),
     )?);
@@ -549,8 +618,18 @@ pub fn export_python(opts: ExportPythonOptions) -> Result<usize> {
             row.dataset_title.as_str(),
             row.dataset_description.as_str(),
         ])?;
+        progress.inc(1);
     }
     writer.flush()?;
+    progress.finish_with_message(format!(
+        "Python bridge complete | {} candidates",
+        rows.len()
+    ));
+    log::info!(
+        "python bridge export complete in {:.1}s: {} candidates",
+        started.elapsed().as_secs_f64(),
+        rows.len()
+    );
     Ok(rows.len())
 }
 
@@ -587,6 +666,7 @@ mod tests {
             config_path: config,
             min_score: 1,
             expected_positive_count: 0,
+            progress: false,
         })
         .expect("fixture discovery should succeed");
         assert!(summary.candidates_emitted >= 3);
@@ -601,6 +681,7 @@ mod tests {
             candidates_tsv: discovery_out.join("candidates.tsv"),
             benchmark_csv: benchmark,
             output_dir: recall_out,
+            progress: false,
         })
         .expect("fixture recall audit should succeed");
         assert_eq!(recall.expected_positives, 2);

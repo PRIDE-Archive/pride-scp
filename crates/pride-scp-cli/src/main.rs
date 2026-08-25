@@ -1,10 +1,12 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
+use pride_scp_core::format_duration;
 use pride_scp_discovery::{
     discover, export_python, recall_audit, DiscoverOptions, ExportPythonOptions, RecallAuditOptions,
 };
 use pride_scp_index::{snapshot, SnapshotOptions, DEFAULT_PRIDE_API, DEFAULT_PROJECT_PAGE_SIZE};
 use std::path::PathBuf;
+use std::time::Instant;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -13,6 +15,15 @@ use std::path::PathBuf;
     about = "Recall-first PRIDE single-cell proteomics discovery and audit tooling"
 )]
 struct Cli {
+    /// Disable interactive progress bars/spinners. Final summaries still print to stdout.
+    #[arg(long, global = true)]
+    no_progress: bool,
+
+    /// Log level for stderr diagnostics (error, warn, info, debug, trace).
+    /// RUST_LOG overrides this when set.
+    #[arg(long, global = true, default_value = "info")]
+    log_level: String,
+
     #[command(subcommand)]
     command: Command,
 }
@@ -36,7 +47,7 @@ enum Command {
         /// Page size used while enumerating PRIDE projects.
         #[arg(long, default_value_t = DEFAULT_PROJECT_PAGE_SIZE)]
         project_page_size: usize,
-        #[arg(long, default_value = "PRIDE-SCP-recall-index/0.1.1")]
+        #[arg(long, default_value = "PRIDE-SCP-recall-index/0.1.2")]
         user_agent: String,
         /// Skip per-project file-manifest retrieval.
         #[arg(long)]
@@ -86,10 +97,28 @@ enum Command {
     },
 }
 
+fn init_logging(default_level: &str) {
+    let mut builder = env_logger::Builder::new();
+    if let Ok(filter) = std::env::var("RUST_LOG") {
+        builder.parse_filters(&filter);
+    } else {
+        builder.parse_filters(default_level);
+    }
+    let _ = builder.format_timestamp_secs().try_init();
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
-    let cli = Cli::parse();
-    match cli.command {
+    let Cli {
+        no_progress,
+        log_level,
+        command,
+    } = Cli::parse();
+    init_logging(&log_level);
+    let progress = !no_progress;
+    let started = Instant::now();
+
+    match command {
         Command::Snapshot {
             output,
             api_base,
@@ -104,6 +133,7 @@ async fn main() -> Result<()> {
             limit,
             accessions_file,
         } => {
+            log::info!("command=snapshot output={}", output.display());
             let summary = snapshot(SnapshotOptions {
                 output_dir: output,
                 api_base,
@@ -117,6 +147,7 @@ async fn main() -> Result<()> {
                 force,
                 limit,
                 accessions_file,
+                progress,
             })
             .await?;
             println!("{}", serde_json::to_string_pretty(&summary)?);
@@ -128,12 +159,18 @@ async fn main() -> Result<()> {
             min_score,
             expected_positive_count,
         } => {
+            log::info!(
+                "command=discover snapshot={} output={}",
+                snapshot.display(),
+                output.display()
+            );
             let summary = discover(DiscoverOptions {
                 snapshot_dir: snapshot,
                 output_dir: output,
                 config_path: config,
                 min_score,
                 expected_positive_count,
+                progress,
             })?;
             println!("{}", serde_json::to_string_pretty(&summary)?);
         }
@@ -142,10 +179,16 @@ async fn main() -> Result<()> {
             known_positives,
             output,
         } => {
+            log::info!(
+                "command=recall-audit candidates={} benchmark={}",
+                candidates.display(),
+                known_positives.display()
+            );
             let summary = recall_audit(RecallAuditOptions {
                 candidates_tsv: candidates,
                 benchmark_csv: known_positives,
                 output_dir: output,
+                progress,
             })?;
             println!("{}", serde_json::to_string_pretty(&summary)?);
         }
@@ -154,13 +197,21 @@ async fn main() -> Result<()> {
             output,
             min_tier,
         } => {
+            log::info!(
+                "command=export-python candidates={} output={}",
+                candidates.display(),
+                output.display()
+            );
             let count = export_python(ExportPythonOptions {
                 candidates_tsv: candidates,
                 output_dir: output,
                 min_tier,
+                progress,
             })?;
             println!("exported_candidates\t{count}");
         }
     }
+
+    log::info!("command finished in {}", format_duration(started.elapsed()));
     Ok(())
 }

@@ -1,12 +1,12 @@
 use anyhow::{anyhow, Context, Result};
-use pride_scp_core::{read_nonempty_lines, write_json};
+use pride_scp_core::{make_progress_bar, make_spinner, read_nonempty_lines, write_json};
 use reqwest::{header::RETRY_AFTER, Client, StatusCode};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 use tokio::time::sleep;
@@ -28,6 +28,7 @@ pub struct SnapshotOptions {
     pub limit: usize,
     pub project_page_size: usize,
     pub accessions_file: Option<PathBuf>,
+    pub progress: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -215,6 +216,14 @@ async fn fetch_cached(
 
         if attempt + 1 < attempts {
             let seconds = retry_after.unwrap_or_else(|| exponential_backoff_seconds(attempt));
+            log::warn!(
+                "HTTP retry {}/{} in {}s: {} ({})",
+                attempt + 1,
+                attempts - 1,
+                seconds,
+                url,
+                last_error
+            );
             sleep(Duration::from_secs(seconds)).await;
         }
     }
@@ -237,6 +246,7 @@ async fn enumerate_project_accessions(
 
     let mut accessions = BTreeSet::new();
     let mut page = 0usize;
+    let spinner = make_spinner("enumerating PRIDE project catalogue", opts.progress);
 
     loop {
         let url = format!(
@@ -260,6 +270,12 @@ async fn enumerate_project_accessions(
         for accession in page_accessions {
             accessions.insert(accession);
         }
+        spinner.inc(1);
+        spinner.set_message(format!(
+            "enumerating PRIDE projects | page {} | {} accessions",
+            page + 1,
+            accessions.len()
+        ));
 
         // A bounded pilot should never download the complete PRIDE project catalogue first.
         // Stop enumeration as soon as we have enough accessions to satisfy --limit.
@@ -277,6 +293,11 @@ async fn enumerate_project_accessions(
             ));
         }
     }
+
+    spinner.finish_with_message(format!(
+        "catalogue enumeration complete | {} accessions",
+        accessions.len()
+    ));
 
     let mut accessions = accessions.into_iter().collect::<Vec<_>>();
     if opts.limit > 0 && accessions.len() > opts.limit {
@@ -364,6 +385,14 @@ async fn snapshot_one(
 }
 
 pub async fn snapshot(opts: SnapshotOptions) -> Result<SnapshotSummary> {
+    let started = Instant::now();
+    log::info!(
+        "snapshot start: output={} concurrency={} files={} sdrf={}",
+        opts.output_dir.display(),
+        opts.concurrency.max(1),
+        opts.include_files,
+        opts.include_sdrf
+    );
     tokio::fs::create_dir_all(&opts.output_dir)
         .await
         .with_context(|| format!("create {}", opts.output_dir.display()))?;
@@ -391,6 +420,14 @@ pub async fn snapshot(opts: SnapshotOptions) -> Result<SnapshotSummary> {
     if opts.limit > 0 && accessions.len() > opts.limit {
         accessions.truncate(opts.limit);
     }
+    log::info!("snapshot plan: {} accessions", accessions.len());
+
+    summary.accessions_planned = accessions.len();
+    let progress = make_progress_bar(
+        summary.accessions_planned as u64,
+        "snapshotting project metadata/files/SDRF",
+        opts.progress,
+    );
 
     let semaphore = Arc::new(Semaphore::new(opts.concurrency.max(1)));
     let mut join_set = JoinSet::new();
@@ -398,13 +435,16 @@ pub async fn snapshot(opts: SnapshotOptions) -> Result<SnapshotSummary> {
         let permit = semaphore.clone().acquire_owned().await?;
         let client = client.clone();
         let opts = opts.clone();
+        let worker_progress = progress.clone();
         join_set.spawn(async move {
             let _permit = permit;
-            snapshot_one(client, opts, accession).await
+            let result = snapshot_one(client, opts, accession).await;
+            worker_progress.inc(1);
+            worker_progress.set_message(format!("completed {}", result.0));
+            result
         });
     }
 
-    summary.accessions_planned = accessions.len();
     let mut completed = 0usize;
 
     while let Some(joined) = join_set.join_next().await {
@@ -457,12 +497,31 @@ pub async fn snapshot(opts: SnapshotOptions) -> Result<SnapshotSummary> {
                 _ => {}
             }
         }
-        if completed % 100 == 0 || completed == summary.accessions_planned {
-            eprintln!("snapshot {completed}/{}", summary.accessions_planned);
-        }
+        progress.set_message(format!(
+            "processed={} | last={} | fetched p/f/s={}/{}/{} | cached={}/{}/{} | errors={}",
+            completed,
+            accession,
+            summary.projects_fetched,
+            summary.files_fetched,
+            summary.sdrf_fetched,
+            summary.projects_cached,
+            summary.files_cached,
+            summary.sdrf_cached,
+            summary.project_errors + summary.file_errors + summary.sdrf_errors
+        ));
     }
 
+    progress.finish_with_message(format!(
+        "snapshot complete | {} projects",
+        summary.accessions_planned
+    ));
     write_json(&opts.output_dir.join("snapshot_summary.json"), &summary)?;
+    log::info!(
+        "snapshot complete in {:.1}s: {} projects, {} total errors",
+        started.elapsed().as_secs_f64(),
+        summary.accessions_planned,
+        summary.project_errors + summary.file_errors + summary.sdrf_errors
+    );
     Ok(summary)
 }
 

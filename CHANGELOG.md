@@ -25,3 +25,14 @@
 - Added migration helper to copy the exact current Stage 01–06 Python scripts from the old working tree and hash them.
 - Changed architecture so the old Stage 03 publication screen is diagnostic, not a hard gate.
 - Added synthetic fixtures testing repository-text and file-manifest discovery recall.
+
+## 0.1.2 - 2026-08-25
+
+- Add `indicatif` progress bars/spinners to snapshot, discovery, recall audit,
+  and Python bridge export.
+- Show elapsed time, percentage, ETA, and current stage on long-running work.
+- Add timestamped stderr logging with `--log-level` / `RUST_LOG` control.
+- Add global `--no-progress` for CI/non-interactive runs.
+- Keep final JSON/stdout contracts separate from progress/logging on stderr.
+- Move snapshot progress updates into the network workers so progress reflects
+  live PRIDE download completion.
