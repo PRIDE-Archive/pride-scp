@@ -1,0 +1,334 @@
+{
+  "explicit_terms": [
+    {
+      "label": "single_cell_proteomics",
+      "term": "single-cell proteomics",
+      "weight": 14
+    },
+    {
+      "label": "single_cell_proteomics",
+      "term": "single cell proteomics",
+      "weight": 14
+    },
+    {
+      "label": "single_cell_proteome",
+      "term": "single-cell proteome",
+      "weight": 12
+    },
+    {
+      "label": "single_cell_proteome",
+      "term": "single cell proteome",
+      "weight": 12
+    },
+    {
+      "label": "single_cell_proteomic",
+      "term": "single-cell proteomic",
+      "weight": 12
+    },
+    {
+      "label": "single_cell_mass_spectrometry",
+      "term": "single-cell mass spectrometry",
+      "weight": 12
+    },
+    {
+      "label": "single_cell_mass_spectrometry",
+      "term": "single cell mass spectrometry",
+      "weight": 12
+    },
+    {
+      "label": "single_cell_ms",
+      "term": "single-cell ms",
+      "weight": 10
+    },
+    {
+      "label": "individual_cell_proteomics",
+      "term": "individual cell proteomics",
+      "weight": 13
+    },
+    {
+      "label": "individual_cell_proteome",
+      "term": "individual cell proteome",
+      "weight": 12
+    },
+    {
+      "label": "proteins_per_cell",
+      "term": "proteins per cell",
+      "weight": 8
+    },
+    {
+      "label": "protein_groups_per_cell",
+      "term": "protein groups per cell",
+      "weight": 8
+    }
+  ],
+  "method_terms": [
+    {
+      "label": "scope_ms",
+      "term": "scope-ms",
+      "weight": 9
+    },
+    {
+      "label": "scope2",
+      "term": "scope2",
+      "weight": 9
+    },
+    {
+      "label": "pscope",
+      "term": "pscope",
+      "weight": 8
+    },
+    {
+      "label": "npop",
+      "term": "npop",
+      "weight": 9
+    },
+    {
+      "label": "nanopots",
+      "term": "nanopots",
+      "weight": 8
+    },
+    {
+      "label": "autopots",
+      "term": "autopots",
+      "weight": 8
+    },
+    {
+      "label": "proteochip",
+      "term": "proteochip",
+      "weight": 8
+    },
+    {
+      "label": "chip_tip",
+      "term": "chip-tip",
+      "weight": 8
+    },
+    {
+      "label": "microhold",
+      "term": "microhold",
+      "weight": 8
+    },
+    {
+      "label": "one_tip",
+      "term": "one-tip",
+      "weight": 7
+    },
+    {
+      "label": "sc_psilac",
+      "term": "sc-psilac",
+      "weight": 8
+    },
+    {
+      "label": "plexdia",
+      "term": "plexdia",
+      "weight": 7
+    },
+    {
+      "label": "single_cell_dvp",
+      "term": "single-cell dvp",
+      "weight": 8
+    },
+    {
+      "label": "cellenone",
+      "term": "cellenone",
+      "weight": 4
+    },
+    {
+      "label": "single_cell_tmt",
+      "term": "single-cell tmt",
+      "weight": 7
+    },
+    {
+      "label": "dia_me",
+      "term": "dia-me",
+      "weight": 8
+    },
+    {
+      "label": "scproteomics",
+      "term": "scproteomics",
+      "weight": 7
+    },
+    {
+      "label": "single_cell_ce_ms",
+      "term": "single-cell ce-ms",
+      "weight": 8
+    },
+    {
+      "label": "single_cell_ce_ms",
+      "term": "single cell ce-ms",
+      "weight": 8
+    },
+    {
+      "label": "nanop3",
+      "term": "nanop3",
+      "weight": 7
+    },
+    {
+      "label": "micropots",
+      "term": "micropots",
+      "weight": 7
+    },
+    {
+      "label": "sceptre",
+      "term": "sceptre",
+      "weight": 5
+    },
+    {
+      "label": "tmtpro_single_cell",
+      "term": "tmtpro single-cell",
+      "weight": 7
+    }
+  ],
+  "biological_terms": [
+    {
+      "label": "individual_cells",
+      "term": "individual cells",
+      "weight": 5
+    },
+    {
+      "label": "single_cells",
+      "term": "single cells",
+      "weight": 5
+    },
+    {
+      "label": "single_oocyte",
+      "term": "single oocyte",
+      "weight": 6
+    },
+    {
+      "label": "single_oocytes",
+      "term": "single oocytes",
+      "weight": 6
+    },
+    {
+      "label": "single_blastomere",
+      "term": "single blastomere",
+      "weight": 6
+    },
+    {
+      "label": "single_blastomeres",
+      "term": "single blastomeres",
+      "weight": 6
+    },
+    {
+      "label": "single_neuron",
+      "term": "single neuron",
+      "weight": 6
+    },
+    {
+      "label": "single_neurons",
+      "term": "single neurons",
+      "weight": 6
+    },
+    {
+      "label": "single_bacterium",
+      "term": "single bacterium",
+      "weight": 7
+    },
+    {
+      "label": "single_bacteria",
+      "term": "single bacteria",
+      "weight": 7
+    },
+    {
+      "label": "single_hepatocyte",
+      "term": "single hepatocyte",
+      "weight": 6
+    },
+    {
+      "label": "single_zygote",
+      "term": "single zygote",
+      "weight": 6
+    },
+    {
+      "label": "single_zygotes",
+      "term": "single zygotes",
+      "weight": 6
+    }
+  ],
+  "adjacent_terms": [
+    {
+      "label": "single_cell_equivalent",
+      "term": "single-cell equivalent",
+      "weight": 3
+    },
+    {
+      "label": "single_cell_equivalent",
+      "term": "single cell equivalent",
+      "weight": 3
+    },
+    {
+      "label": "ultra_low_input_proteomics",
+      "term": "ultra-low-input proteomics",
+      "weight": 3
+    },
+    {
+      "label": "low_input_proteomics",
+      "term": "low-input proteomics",
+      "weight": 2
+    },
+    {
+      "label": "picogram_proteomics",
+      "term": "picogram proteomics",
+      "weight": 2
+    },
+    {
+      "label": "single_cell_resolution_proteomics",
+      "term": "single-cell resolution proteomics",
+      "weight": 2
+    },
+    {
+      "label": "single_organelle",
+      "term": "single organelle",
+      "weight": 3
+    },
+    {
+      "label": "facs_single_cell",
+      "term": "facs-isolated individual",
+      "weight": 5
+    }
+  ],
+  "negative_context_terms": [
+    {
+      "label": "single_cell_transcriptomics",
+      "term": "single-cell transcriptomics",
+      "weight": 0
+    },
+    {
+      "label": "single_cell_rna_seq",
+      "term": "single-cell rna-seq",
+      "weight": 0
+    },
+    {
+      "label": "single_cell_rnaseq",
+      "term": "single cell rna-seq",
+      "weight": 0
+    },
+    {
+      "label": "single_cell_atac",
+      "term": "single-cell atac",
+      "weight": 0
+    },
+    {
+      "label": "spatial_single_cell_resolution",
+      "term": "single-cell resolution",
+      "weight": 0
+    },
+    {
+      "label": "diluted_bulk",
+      "term": "diluted bulk",
+      "weight": 0
+    },
+    {
+      "label": "bulk_digest",
+      "term": "bulk digest",
+      "weight": 0
+    },
+    {
+      "label": "pooled_cells",
+      "term": "pooled cells",
+      "weight": 0
+    }
+  ],
+  "strong_score": 36,
+  "possible_score": 14
+}

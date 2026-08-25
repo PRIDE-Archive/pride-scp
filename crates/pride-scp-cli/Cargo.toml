@@ -1,0 +1,19 @@
+[package]
+name = "pride-scp-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "pride-scp"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+pride-scp-core = { path = "../pride-scp-core" }
+pride-scp-discovery = { path = "../pride-scp-discovery" }
+pride-scp-index = { path = "../pride-scp-index" }
+tokio.workspace = true
+serde_json.workspace = true

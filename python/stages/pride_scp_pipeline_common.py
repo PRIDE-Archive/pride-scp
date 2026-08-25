@@ -1,0 +1,461 @@
+#!/usr/bin/env python3
+"""Shared helpers for the PRIDE SCP catalogue pipeline."""
+
+from __future__ import annotations
+
+import csv
+import hashlib
+import json
+import re
+import time
+from pathlib import Path
+from typing import Any, Iterable, Optional
+from urllib.parse import quote
+
+import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+
+
+DOI_RE = re.compile(r"10\.\d{4,9}/[-._;()/:A-Z0-9]+", re.I)
+PXD_RE = re.compile(r"\bPXD\d{6,}\b", re.I)
+PMID_RE = re.compile(r"\bPMID\s*:?\s*(\d{5,10})\b", re.I)
+
+DEFAULT_UA = (
+    "PRIDE-SCP-catalogue/1.0 "
+    "(academic metadata curation; https://www.ebi.ac.uk/pride/)"
+)
+
+
+def build_session(
+    user_agent: str = DEFAULT_UA,
+    retries: int = 5,
+    backoff: float = 0.8,
+) -> requests.Session:
+    session = requests.Session()
+    retry = Retry(
+        total=retries,
+        connect=retries,
+        read=retries,
+        status=retries,
+        backoff_factor=backoff,
+        status_forcelist=(429, 500, 502, 503, 504),
+        allowed_methods=frozenset({"GET", "HEAD"}),
+        respect_retry_after_header=True,
+    )
+    adapter = HTTPAdapter(max_retries=retry, pool_connections=32, pool_maxsize=32)
+    session.mount("https://", adapter)
+    session.mount("http://", adapter)
+    session.headers.update(
+        {
+            "User-Agent": user_agent,
+            "Accept": "application/json",
+        }
+    )
+    return session
+
+
+def get_json(
+    session: requests.Session,
+    url: str,
+    *,
+    params: Optional[dict[str, Any]] = None,
+    timeout: float = 45.0,
+    delay: float = 0.0,
+) -> Any:
+    if delay > 0:
+        time.sleep(delay)
+    response = session.get(url, params=params, timeout=timeout)
+    response.raise_for_status()
+    return response.json()
+
+
+def text_value(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return re.sub(r"\s+", " ", value).strip()
+    return str(value).strip()
+
+
+def normalize_doi(value: Any) -> str:
+    text = text_value(value)
+    if not text:
+        return ""
+    text = re.sub(r"^https?://(?:dx\.)?doi\.org/", "", text, flags=re.I)
+    match = DOI_RE.search(text)
+    if not match:
+        return ""
+    return match.group(0).rstrip(".,;)]}").lower()
+
+
+def doi_from_text(value: Any) -> str:
+    return normalize_doi(value)
+
+
+def pmid_from_text(value: Any) -> str:
+    text = text_value(value)
+    match = PMID_RE.search(text)
+    return match.group(1) if match else ""
+
+
+def unique_nonempty(values: Iterable[Any]) -> list[str]:
+    seen = set()
+    out = []
+    for value in values:
+        value = text_value(value)
+        if not value or value in seen:
+            continue
+        seen.add(value)
+        out.append(value)
+    return out
+
+
+def join_unique(values: Iterable[Any], sep: str = "; ") -> str:
+    return sep.join(unique_nonempty(values))
+
+
+def flatten_named_values(value: Any) -> list[str]:
+    """Extract human-readable names from common PRIDE metadata shapes."""
+    out: list[str] = []
+
+    if value is None:
+        return out
+
+    if isinstance(value, str):
+        if value.strip():
+            out.append(value.strip())
+        return out
+
+    if isinstance(value, list):
+        for item in value:
+            out.extend(flatten_named_values(item))
+        return unique_nonempty(out)
+
+    if isinstance(value, dict):
+        preferred = (
+            "name",
+            "value",
+            "label",
+            "title",
+            "accession",
+        )
+        for key in preferred:
+            if key in value and value[key] not in (None, "", [], {}):
+                out.extend(flatten_named_values(value[key]))
+                if out:
+                    return unique_nonempty(out)
+
+        for item in value.values():
+            if isinstance(item, (dict, list)):
+                out.extend(flatten_named_values(item))
+
+    return unique_nonempty(out)
+
+
+def first_value(mapping: dict[str, Any], *keys: str) -> Any:
+    for key in keys:
+        if key in mapping and mapping[key] not in (None, "", [], {}):
+            return mapping[key]
+    return None
+
+
+def recursive_find_values(obj: Any, key_names: set[str]) -> list[Any]:
+    found: list[Any] = []
+    lowered = {x.lower() for x in key_names}
+
+    if isinstance(obj, dict):
+        for key, value in obj.items():
+            if key.lower() in lowered:
+                found.append(value)
+            if isinstance(value, (dict, list)):
+                found.extend(recursive_find_values(value, key_names))
+
+    elif isinstance(obj, list):
+        for value in obj:
+            found.extend(recursive_find_values(value, key_names))
+
+    return found
+
+
+def read_tsv(path: Path) -> list[dict[str, str]]:
+    with path.open("r", encoding="utf-8", newline="") as handle:
+        return list(csv.DictReader(handle, delimiter="\t"))
+
+
+def write_tsv(path: Path, rows: list[dict[str, Any]], fieldnames: list[str]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(
+            handle,
+            fieldnames=fieldnames,
+            delimiter="\t",
+            extrasaction="ignore",
+            lineterminator="\n",
+        )
+        writer.writeheader()
+        for row in rows:
+            writer.writerow({k: _csv_value(row.get(k)) for k in fieldnames})
+
+
+def write_csv(path: Path, rows: list[dict[str, Any]], fieldnames: list[str]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(
+            handle,
+            fieldnames=fieldnames,
+            extrasaction="ignore",
+            lineterminator="\n",
+        )
+        writer.writeheader()
+        for row in rows:
+            writer.writerow({k: _csv_value(row.get(k)) for k in fieldnames})
+
+
+def _csv_value(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, (dict, list)):
+        return json.dumps(value, ensure_ascii=False, sort_keys=True)
+    return str(value)
+
+
+def safe_slug(value: str, max_len: int = 120) -> str:
+    value = value.strip()
+    value = re.sub(r"^https?://", "", value, flags=re.I)
+    value = re.sub(r"[^A-Za-z0-9._+-]+", "_", value)
+    value = value.strip("._")
+    if not value:
+        value = "unknown"
+    if len(value) > max_len:
+        digest = hashlib.sha1(value.encode("utf-8")).hexdigest()[:12]
+        value = f"{value[:max_len-13]}_{digest}"
+    return value
+
+
+def publication_key(row: dict[str, Any]) -> str:
+    doi = normalize_doi(row.get("publication_doi"))
+    if doi:
+        return f"doi:{doi}"
+    pmid = text_value(row.get("publication_pmid"))
+    if pmid:
+        return f"pmid:{pmid}"
+    title = text_value(row.get("publication_title")).lower()
+    if title:
+        digest = hashlib.sha1(title.encode("utf-8")).hexdigest()[:16]
+        return f"title:{digest}"
+    accession = text_value(row.get("accession"))
+    index = text_value(row.get("publication_index"))
+    return f"row:{accession}:{index}"
+
+
+def publication_filename(row: dict[str, Any]) -> str:
+    doi = normalize_doi(row.get("publication_doi"))
+    if doi:
+        return safe_slug(doi) + ".pdf"
+    pmid = text_value(row.get("publication_pmid"))
+    if pmid:
+        return f"PMID_{safe_slug(pmid)}.pdf"
+    title = text_value(row.get("publication_title"))
+    if title:
+        digest = hashlib.sha1(title.encode("utf-8")).hexdigest()[:12]
+        return f"title_{digest}.pdf"
+    return safe_slug(publication_key(row)) + ".pdf"
+
+
+def looks_like_pdf_bytes(data: bytes) -> bool:
+    return data.lstrip().startswith(b"%PDF-")
+
+
+def validate_pdf_path(path: Path) -> bool:
+    if not path.is_file() or path.stat().st_size < 512:
+        return False
+    with path.open("rb") as handle:
+        head = handle.read(1024)
+    return looks_like_pdf_bytes(head)
+
+
+def europe_pmc_lookup(
+    session: requests.Session,
+    *,
+    doi: str = "",
+    pmid: str = "",
+    timeout: float = 45.0,
+) -> Optional[dict[str, Any]]:
+    base = "https://www.ebi.ac.uk/europepmc/webservices/rest/search"
+
+    if doi:
+        query = f'DOI:"{normalize_doi(doi)}"'
+    elif pmid:
+        query = f"EXT_ID:{pmid} AND SRC:MED"
+    else:
+        return None
+
+    data = get_json(
+        session,
+        base,
+        params={
+            "query": query,
+            "format": "json",
+            "resultType": "core",
+            "pageSize": 5,
+        },
+        timeout=timeout,
+    )
+
+    results = data.get("resultList", {}).get("result", []) or []
+
+    if not results:
+        return None
+
+    norm_doi = normalize_doi(doi)
+
+    for result in results:
+        if norm_doi and normalize_doi(result.get("doi")) == norm_doi:
+            return result
+        if pmid and text_value(result.get("pmid")) == text_value(pmid):
+            return result
+
+    return results[0]
+
+
+def europe_pmc_pdf_urls(record: Optional[dict[str, Any]]) -> list[tuple[str, str]]:
+    if not record:
+        return []
+
+    candidates: list[tuple[str, str]] = []
+    ft = record.get("fullTextUrlList", {}).get("fullTextUrl", []) or []
+
+    if isinstance(ft, dict):
+        ft = [ft]
+
+    for item in ft:
+        if not isinstance(item, dict):
+            continue
+        style = text_value(item.get("documentStyle")).lower()
+        url = text_value(item.get("url"))
+        if style == "pdf" and url:
+            candidates.append(("europe_pmc_fullTextUrl", url))
+
+    pmcid = text_value(record.get("pmcid"))
+    has_pdf = text_value(record.get("hasPDF")).upper() == "Y"
+
+    if pmcid and has_pdf:
+        if not pmcid.upper().startswith("PMC"):
+            pmcid = "PMC" + pmcid
+        candidates.extend(
+            [
+                (
+                    "pmc_pdf",
+                    f"https://www.ncbi.nlm.nih.gov/pmc/articles/{pmcid}/pdf/",
+                ),
+                (
+                    "europe_pmc_render",
+                    f"https://europepmc.org/articles/{pmcid}?pdf=render",
+                ),
+            ]
+        )
+
+    # De-duplicate while preserving order.
+    seen = set()
+    out = []
+    for source, url in candidates:
+        if url not in seen:
+            out.append((source, url))
+            seen.add(url)
+    return out
+
+
+def crossref_lookup(
+    session: requests.Session,
+    doi: str,
+    *,
+    mailto: str = "",
+    timeout: float = 45.0,
+) -> Optional[dict[str, Any]]:
+    doi = normalize_doi(doi)
+    if not doi:
+        return None
+
+    url = "https://api.crossref.org/works/" + quote(doi, safe="")
+    params = {"mailto": mailto} if mailto else None
+
+    try:
+        data = get_json(session, url, params=params, timeout=timeout)
+    except requests.RequestException:
+        return None
+
+    return data.get("message") if isinstance(data, dict) else None
+
+
+def choose_crossref_date(record: Optional[dict[str, Any]]) -> str:
+    if not record:
+        return ""
+
+    for key in ("published-print", "published-online", "published", "created"):
+        value = record.get(key)
+        if not isinstance(value, dict):
+            continue
+        parts = value.get("date-parts")
+        if (
+            isinstance(parts, list)
+            and parts
+            and isinstance(parts[0], list)
+            and parts[0]
+        ):
+            nums = parts[0]
+            if len(nums) >= 3:
+                return f"{nums[0]:04d}-{nums[1]:02d}-{nums[2]:02d}"
+            if len(nums) == 2:
+                return f"{nums[0]:04d}-{nums[1]:02d}"
+            return str(nums[0])
+
+    return ""
+
+
+def unpaywall_lookup(
+    session: requests.Session,
+    doi: str,
+    email: str,
+    *,
+    timeout: float = 45.0,
+) -> Optional[dict[str, Any]]:
+    doi = normalize_doi(doi)
+    if not doi or not email:
+        return None
+
+    url = "https://api.unpaywall.org/v2/" + quote(doi, safe="")
+    try:
+        return get_json(
+            session,
+            url,
+            params={"email": email},
+            timeout=timeout,
+        )
+    except requests.RequestException:
+        return None
+
+
+def unpaywall_pdf_urls(record: Optional[dict[str, Any]]) -> list[tuple[str, str]]:
+    if not record:
+        return []
+
+    candidates: list[tuple[str, str]] = []
+
+    best = record.get("best_oa_location")
+    locations = []
+    if isinstance(best, dict):
+        locations.append(best)
+
+    for item in record.get("oa_locations", []) or []:
+        if isinstance(item, dict):
+            locations.append(item)
+
+    seen = set()
+    for location in locations:
+        url = text_value(location.get("url_for_pdf"))
+        if url and url not in seen:
+            candidates.append(("unpaywall", url))
+            seen.add(url)
+
+    return candidates

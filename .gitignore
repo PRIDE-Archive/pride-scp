@@ -1,0 +1,12 @@
+/target/
+/.venv/
+__pycache__/
+*.pyc
+/data/
+/work/
+/publication_pdfs/
+/pride_scp_annotations/
+/pride_scp_catalogue/
+/pride_scp_qc_review*/
+.env
+.DS_Store
