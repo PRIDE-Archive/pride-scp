@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.1.1 — paginated/resilient PRIDE snapshot hotfix
+
+- Fixed bounded pilots so `--limit` stops project enumeration early instead of first downloading the complete `/projects/all` response.
+- Switched project-universe enumeration to PRIDE's documented `page`/`pageSize` pagination and cached each page for resume.
+- Added `--project-page-size` (default 100), raised the default request timeout to 120 s, and raised default retries to 4.
+- Fixed response-body timeouts/truncated JSON so they participate in retry/backoff instead of aborting immediately after headers were received.
+- Added `Retry-After` handling for numeric server retry hints.
+- Added `accessions.txt` to snapshot output for transparent/resumable project-universe inspection.
+- Removed the unused `ProjectSnapshotResult` type that generated the v0.1.0 dead-code warning.
+- Added pagination unit regressions and configurable network settings to `run_recall_discovery.sh`.
+
 ## 0.1.0 — recall-first repository bootstrap
 
 - Added Rust workspace with `pride-scp` CLI.

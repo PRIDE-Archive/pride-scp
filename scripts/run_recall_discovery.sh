@@ -8,6 +8,9 @@ SNAPSHOT_DIR="${SNAPSHOT_DIR:-$ROOT/data/snapshot}"
 DISCOVERY_DIR="${DISCOVERY_DIR:-$ROOT/data/discovery}"
 BRIDGE_DIR="${BRIDGE_DIR:-$ROOT/data/python_bridge}"
 CONCURRENCY="${PRIDE_CONCURRENCY:-8}"
+TIMEOUT="${PRIDE_TIMEOUT:-120}"
+RETRIES="${PRIDE_RETRIES:-4}"
+PROJECT_PAGE_SIZE="${PRIDE_PROJECT_PAGE_SIZE:-100}"
 
 if [[ ! -x "$BIN" ]]; then
   echo "ERROR: build the Rust CLI first: cargo build --release --locked" >&2
@@ -16,7 +19,10 @@ fi
 
 "$BIN" snapshot \
   --output "$SNAPSHOT_DIR" \
-  --concurrency "$CONCURRENCY"
+  --concurrency "$CONCURRENCY" \
+  --timeout "$TIMEOUT" \
+  --retries "$RETRIES" \
+  --project-page-size "$PROJECT_PAGE_SIZE"
 
 "$BIN" discover \
   --snapshot "$SNAPSHOT_DIR" \

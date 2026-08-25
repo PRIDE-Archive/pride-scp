@@ -636,7 +636,7 @@ dependencies = [
 
 [[package]]
 name = "pride-scp-cli"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "clap",
@@ -649,7 +649,7 @@ dependencies = [
 
 [[package]]
 name = "pride-scp-core"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "csv",
@@ -659,7 +659,7 @@ dependencies = [
 
 [[package]]
 name = "pride-scp-discovery"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "csv",
@@ -672,7 +672,7 @@ dependencies = [
 
 [[package]]
 name = "pride-scp-index"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "pride-scp-core",

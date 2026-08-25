@@ -3,7 +3,7 @@ use clap::{Parser, Subcommand};
 use pride_scp_discovery::{
     discover, export_python, recall_audit, DiscoverOptions, ExportPythonOptions, RecallAuditOptions,
 };
-use pride_scp_index::{snapshot, SnapshotOptions, DEFAULT_PRIDE_API};
+use pride_scp_index::{snapshot, SnapshotOptions, DEFAULT_PRIDE_API, DEFAULT_PROJECT_PAGE_SIZE};
 use std::path::PathBuf;
 
 #[derive(Debug, Parser)]
@@ -27,11 +27,16 @@ enum Command {
         api_base: String,
         #[arg(long, default_value_t = 8)]
         concurrency: usize,
-        #[arg(long, default_value_t = 60)]
+        /// Per-request timeout, including response-body transfer.
+        #[arg(long, default_value_t = 120)]
         timeout: u64,
-        #[arg(long, default_value_t = 2)]
+        /// Number of retries after the initial HTTP attempt.
+        #[arg(long, default_value_t = 4)]
         retries: usize,
-        #[arg(long, default_value = "PRIDE-SCP-recall-index/0.1")]
+        /// Page size used while enumerating PRIDE projects.
+        #[arg(long, default_value_t = DEFAULT_PROJECT_PAGE_SIZE)]
+        project_page_size: usize,
+        #[arg(long, default_value = "PRIDE-SCP-recall-index/0.1.1")]
         user_agent: String,
         /// Skip per-project file-manifest retrieval.
         #[arg(long)]
@@ -91,6 +96,7 @@ async fn main() -> Result<()> {
             concurrency,
             timeout,
             retries,
+            project_page_size,
             user_agent,
             no_files,
             no_sdrf,
@@ -104,6 +110,7 @@ async fn main() -> Result<()> {
                 concurrency,
                 timeout_seconds: timeout,
                 retries,
+                project_page_size,
                 user_agent,
                 include_files: !no_files,
                 include_sdrf: !no_sdrf,

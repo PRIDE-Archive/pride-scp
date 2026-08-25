@@ -1,6 +1,6 @@
 use anyhow::{anyhow, Context, Result};
 use pride_scp_core::{read_nonempty_lines, write_json};
-use reqwest::{Client, StatusCode};
+use reqwest::{header::RETRY_AFTER, Client, StatusCode};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeSet;
@@ -12,6 +12,7 @@ use tokio::task::JoinSet;
 use tokio::time::sleep;
 
 pub const DEFAULT_PRIDE_API: &str = "https://www.ebi.ac.uk/pride/ws/archive/v3";
+pub const DEFAULT_PROJECT_PAGE_SIZE: usize = 100;
 
 #[derive(Debug, Clone)]
 pub struct SnapshotOptions {
@@ -25,12 +26,15 @@ pub struct SnapshotOptions {
     pub include_sdrf: bool,
     pub force: bool,
     pub limit: usize,
+    pub project_page_size: usize,
     pub accessions_file: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct SnapshotSummary {
     pub accessions_planned: usize,
+    pub project_pages_fetched: usize,
+    pub project_pages_cached: usize,
     pub projects_fetched: usize,
     pub projects_cached: usize,
     pub files_fetched: usize,
@@ -58,20 +62,13 @@ enum FetchState {
     NotFound,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-struct ProjectSnapshotResult {
-    project: Option<String>,
-    files: Option<String>,
-    sdrf: Option<String>,
-}
-
 fn is_pxd(accession: &str) -> bool {
     let upper = accession.trim().to_ascii_uppercase();
     upper.len() >= 9 && upper.starts_with("PXD") && upper[3..].chars().all(|c| c.is_ascii_digit())
 }
 
-fn extract_accessions(value: &Value) -> Vec<String> {
-    let entries: Vec<&Value> = if let Some(items) = value.as_array() {
+fn project_entries(value: &Value) -> Vec<&Value> {
+    if let Some(items) = value.as_array() {
         items.iter().collect()
     } else if let Some(items) = value.get("projects").and_then(Value::as_array) {
         items.iter().collect()
@@ -85,10 +82,12 @@ fn extract_accessions(value: &Value) -> Vec<String> {
         items.iter().collect()
     } else {
         Vec::new()
-    };
+    }
+}
 
+fn extract_accessions(value: &Value) -> Vec<String> {
     let mut out = BTreeSet::new();
-    for item in entries {
+    for item in project_entries(value) {
         if let Some(accession) = item.get("accession").and_then(Value::as_str) {
             let accession = accession.trim().to_ascii_uppercase();
             if is_pxd(&accession) {
@@ -97,6 +96,45 @@ fn extract_accessions(value: &Value) -> Vec<String> {
         }
     }
     out.into_iter().collect()
+}
+
+fn nested_usize(value: &Value, keys: &[&str]) -> Option<usize> {
+    let mut current = value;
+    for key in keys {
+        current = current.get(*key)?;
+    }
+    current.as_u64().and_then(|x| usize::try_from(x).ok())
+}
+
+fn page_is_last(value: &Value, page: usize, page_size: usize) -> bool {
+    if let Some(last) = value.get("last").and_then(Value::as_bool) {
+        if last {
+            return true;
+        }
+    }
+
+    let total_pages = value
+        .get("totalPages")
+        .and_then(Value::as_u64)
+        .and_then(|x| usize::try_from(x).ok())
+        .or_else(|| nested_usize(value, &["page", "totalPages"]));
+    if let Some(total_pages) = total_pages {
+        return page.saturating_add(1) >= total_pages;
+    }
+
+    project_entries(value).len() < page_size
+}
+
+fn retry_after_seconds(response: &reqwest::Response) -> Option<u64> {
+    response
+        .headers()
+        .get(RETRY_AFTER)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.trim().parse::<u64>().ok())
+}
+
+fn exponential_backoff_seconds(attempt: usize) -> u64 {
+    1_u64 << attempt.min(5)
 }
 
 async fn fetch_cached(
@@ -122,40 +160,61 @@ async fn fetch_cached(
     let mut last_error = String::new();
 
     for attempt in 0..attempts {
+        let mut retry_after = None;
         match client.get(url).send().await {
             Ok(response) => {
                 let status = response.status();
+                retry_after = retry_after_seconds(&response);
                 if allow_not_found && status == StatusCode::NOT_FOUND {
                     return Ok(FetchState::NotFound);
                 }
                 if !status.is_success() {
                     last_error = format!("HTTP {status}");
                 } else {
-                    let bytes = response.bytes().await.context("read response body")?;
-                    if validate_json {
-                        serde_json::from_slice::<Value>(&bytes)
-                            .with_context(|| format!("validate JSON from {url}"))?;
+                    match response.bytes().await {
+                        Ok(bytes) => {
+                            if validate_json {
+                                match serde_json::from_slice::<Value>(&bytes) {
+                                    Ok(_) => {}
+                                    Err(error) => {
+                                        last_error = format!("invalid JSON response: {error}");
+                                        if attempt + 1 < attempts {
+                                            let seconds = exponential_backoff_seconds(attempt);
+                                            sleep(Duration::from_secs(seconds)).await;
+                                            continue;
+                                        }
+                                        break;
+                                    }
+                                }
+                            }
+
+                            let tmp = path.with_extension(format!(
+                                "{}.part",
+                                path.extension().and_then(|x| x.to_str()).unwrap_or("tmp")
+                            ));
+                            tokio::fs::write(&tmp, &bytes)
+                                .await
+                                .with_context(|| format!("write {}", tmp.display()))?;
+                            tokio::fs::rename(&tmp, path).await.with_context(|| {
+                                format!("rename {} -> {}", tmp.display(), path.display())
+                            })?;
+                            return Ok(FetchState::Fetched);
+                        }
+                        Err(error) => {
+                            // A response body can time out after the headers were received. This is
+                            // transient and must participate in the same retry policy as send().
+                            last_error = format!("read response body: {error:#}");
+                        }
                     }
-                    let tmp = path.with_extension(format!(
-                        "{}.part",
-                        path.extension().and_then(|x| x.to_str()).unwrap_or("tmp")
-                    ));
-                    tokio::fs::write(&tmp, &bytes)
-                        .await
-                        .with_context(|| format!("write {}", tmp.display()))?;
-                    tokio::fs::rename(&tmp, path).await.with_context(|| {
-                        format!("rename {} -> {}", tmp.display(), path.display())
-                    })?;
-                    return Ok(FetchState::Fetched);
                 }
             }
             Err(error) => {
-                last_error = format!("{error:#}");
+                last_error = format!("send request: {error:#}");
             }
         }
 
         if attempt + 1 < attempts {
-            let seconds = 1_u64 << attempt.min(5);
+            let seconds = retry_after.unwrap_or_else(|| exponential_backoff_seconds(attempt));
             sleep(Duration::from_secs(seconds)).await;
         }
     }
@@ -163,6 +222,77 @@ async fn fetch_cached(
     Err(anyhow!(
         "request failed after {attempts} attempt(s): {last_error}"
     ))
+}
+
+async fn enumerate_project_accessions(
+    client: &Client,
+    opts: &SnapshotOptions,
+    summary: &mut SnapshotSummary,
+) -> Result<Vec<String>> {
+    let page_size = opts.project_page_size.max(1);
+    let pages_dir = opts.output_dir.join("project_pages");
+    tokio::fs::create_dir_all(&pages_dir)
+        .await
+        .with_context(|| format!("create {}", pages_dir.display()))?;
+
+    let mut accessions = BTreeSet::new();
+    let mut page = 0usize;
+
+    loop {
+        let url = format!(
+            "{}/projects/all?page={page}&pageSize={page_size}",
+            opts.api_base.trim_end_matches('/')
+        );
+        let path = pages_dir.join(format!("page_{page:06}.json"));
+        let state = fetch_cached(client, &url, &path, opts.force, opts.retries, false, true)
+            .await
+            .with_context(|| format!("enumerate PRIDE projects page {page} from {url}"))?;
+
+        match state {
+            FetchState::Fetched => summary.project_pages_fetched += 1,
+            FetchState::Cached => summary.project_pages_cached += 1,
+            FetchState::NotFound => {}
+        }
+
+        let value: Value = pride_scp_core::read_json(&path)
+            .with_context(|| format!("read project page {}", path.display()))?;
+        let page_accessions = extract_accessions(&value);
+        for accession in page_accessions {
+            accessions.insert(accession);
+        }
+
+        // A bounded pilot should never download the complete PRIDE project catalogue first.
+        // Stop enumeration as soon as we have enough accessions to satisfy --limit.
+        if opts.limit > 0 && accessions.len() >= opts.limit {
+            break;
+        }
+        if page_is_last(&value, page, page_size) {
+            break;
+        }
+
+        page = page.saturating_add(1);
+        if page > 1_000_000 {
+            return Err(anyhow!(
+                "aborting project enumeration after implausibly many pages"
+            ));
+        }
+    }
+
+    let mut accessions = accessions.into_iter().collect::<Vec<_>>();
+    if opts.limit > 0 && accessions.len() > opts.limit {
+        accessions.truncate(opts.limit);
+    }
+
+    let accession_text = if accessions.is_empty() {
+        String::new()
+    } else {
+        format!("{}\n", accessions.join("\n"))
+    };
+    tokio::fs::write(opts.output_dir.join("accessions.txt"), accession_text)
+        .await
+        .context("write accessions.txt")?;
+
+    Ok(accessions)
 }
 
 async fn write_error(output_dir: &Path, record: &ErrorRecord) -> Result<()> {
@@ -239,11 +369,13 @@ pub async fn snapshot(opts: SnapshotOptions) -> Result<SnapshotSummary> {
         .with_context(|| format!("create {}", opts.output_dir.display()))?;
 
     let client = Client::builder()
-        .timeout(Duration::from_secs(opts.timeout_seconds))
+        .connect_timeout(Duration::from_secs(20))
+        .timeout(Duration::from_secs(opts.timeout_seconds.max(1)))
         .user_agent(&opts.user_agent)
         .build()
         .context("build HTTP client")?;
 
+    let mut summary = SnapshotSummary::default();
     let mut accessions = if let Some(path) = &opts.accessions_file {
         read_nonempty_lines(path)?
             .into_iter()
@@ -251,20 +383,7 @@ pub async fn snapshot(opts: SnapshotOptions) -> Result<SnapshotSummary> {
             .filter(|x| is_pxd(x))
             .collect::<Vec<_>>()
     } else {
-        let all_url = format!("{}/projects/all", opts.api_base.trim_end_matches('/'));
-        let all_path = opts.output_dir.join("projects_all.json");
-        fetch_cached(
-            &client,
-            &all_url,
-            &all_path,
-            opts.force,
-            opts.retries,
-            false,
-            true,
-        )
-        .await?;
-        let value: Value = pride_scp_core::read_json(&all_path)?;
-        extract_accessions(&value)
+        enumerate_project_accessions(&client, &opts, &mut summary).await?
     };
 
     accessions.sort();
@@ -285,10 +404,7 @@ pub async fn snapshot(opts: SnapshotOptions) -> Result<SnapshotSummary> {
         });
     }
 
-    let mut summary = SnapshotSummary {
-        accessions_planned: accessions.len(),
-        ..SnapshotSummary::default()
-    };
+    summary.accessions_planned = accessions.len();
     let mut completed = 0usize;
 
     while let Some(joined) = join_set.join_next().await {
@@ -348,4 +464,48 @@ pub async fn snapshot(opts: SnapshotOptions) -> Result<SnapshotSummary> {
 
     write_json(&opts.output_dir.join("snapshot_summary.json"), &summary)?;
     Ok(summary)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn extracts_projects_from_content_wrapper() {
+        let value = json!({
+            "content": [
+                {"accession": "PXD000001"},
+                {"accession": "PXD000002"},
+                {"accession": "NOT_A_PXD"}
+            ],
+            "totalPages": 4,
+            "last": false
+        });
+        assert_eq!(
+            extract_accessions(&value),
+            vec!["PXD000001".to_string(), "PXD000002".to_string()]
+        );
+        assert!(!page_is_last(&value, 0, 200));
+    }
+
+    #[test]
+    fn detects_last_page_from_spring_metadata() {
+        let value = json!({
+            "content": [{"accession": "PXD000001"}],
+            "totalPages": 3,
+            "last": true
+        });
+        assert!(page_is_last(&value, 2, 200));
+    }
+
+    #[test]
+    fn detects_last_page_from_short_page_fallback() {
+        let value = json!([
+            {"accession": "PXD000001"},
+            {"accession": "PXD000002"}
+        ]);
+        assert!(page_is_last(&value, 0, 200));
+        assert!(!page_is_last(&value, 0, 2));
+    }
 }

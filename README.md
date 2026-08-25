@@ -139,7 +139,10 @@ Start with a bounded test:
 ```bash
 target/release/pride-scp snapshot \
   --output data/snapshot_pilot \
-  --concurrency 8 \
+  --concurrency 4 \
+  --timeout 120 \
+  --retries 4 \
+  --project-page-size 100 \
   --limit 100
 
 target/release/pride-scp discover \
@@ -149,6 +152,13 @@ target/release/pride-scp discover \
   --min-score 1 \
   --expected-positive-count 0
 ```
+
+The project catalogue is enumerated page-by-page and cached under
+`project_pages/`. With `--limit 100`, enumeration stops as soon as 100 unique
+PXD accessions have been collected; it does **not** download the complete PRIDE
+project catalogue first. Request-body timeouts and truncated JSON responses
+participate in the retry policy. Re-running the same command reuses successful
+page/project/file/SDRF cache entries.
 
 Inspect:
 
@@ -176,7 +186,10 @@ Equivalent explicit commands:
 ```bash
 target/release/pride-scp snapshot \
   --output data/snapshot \
-  --concurrency 8
+  --concurrency 8 \
+  --timeout 120 \
+  --retries 4 \
+  --project-page-size 100
 
 target/release/pride-scp discover \
   --snapshot data/snapshot \
@@ -189,6 +202,24 @@ target/release/pride-scp export-python \
   --output data/python_bridge \
   --min-tier weak
 ```
+
+### Snapshot network resilience
+
+PRIDE's all-projects endpoint is paginated. The snapshotter caches each page in
+`project_pages/page_XXXXXX.json`, then snapshots per-project metadata/files/SDRF
+with bounded concurrency. The key options are:
+
+```text
+--project-page-size 100   project-enumeration page size
+--timeout 120            per-request timeout including body transfer
+--retries 4              retries after the initial attempt
+--concurrency 8          concurrent per-project workers
+```
+
+HTTP/body-transfer failures are retried. Individual project/file/SDRF failures
+are written under `errors/` and do not abort the rest of the crawl. A failure to
+enumerate a project-catalogue page is fatal because proceeding would silently
+truncate the universe, but successful earlier pages remain cached for resume.
 
 ### Important recall rule
 

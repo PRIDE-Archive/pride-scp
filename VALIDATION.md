@@ -22,3 +22,11 @@ cargo build --release
 ```
 
 Do not start the full PRIDE crawl until these commands pass.
+
+
+## v0.1.1 live-snapshot regression
+
+The v0.1.1 hotfix adds unit coverage for PRIDE project-page extraction and
+last-page detection. A live pilot should also confirm that `--limit 100` fetches
+only enough paginated catalogue pages to obtain 100 accessions, then snapshots
+those projects with no fatal catalogue-body timeout.
