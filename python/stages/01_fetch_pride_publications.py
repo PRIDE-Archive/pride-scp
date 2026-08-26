@@ -366,6 +366,7 @@ def enrich_publication(
     out = dict(pub)
     doi = normalize_doi(out.get("publication_doi"))
     pmid = text_value(out.get("publication_pmid"))
+    title = text_value(out.get("publication_title"))
 
     epmc = None
     try:
@@ -373,6 +374,7 @@ def enrich_publication(
             session,
             doi=doi,
             pmid=pmid,
+            title=title,
             timeout=timeout,
         )
     except requests.RequestException:

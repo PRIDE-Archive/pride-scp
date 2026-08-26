@@ -584,3 +584,42 @@ Do **not** use that second mode yet if you may retune discovery vocabulary and
 want to rescan all 40,364 projects using the original file/SDRF evidence. The
 ~4 GB full file/SDRF cache is modest compared with the redundant catalogue-page
 cache and is worth retaining for now.
+
+## v0.1.5 publication/PDF recovery
+
+The publication resolver now treats PDFs as an evidence enrichment layer, not a
+candidate gate.  It retries the previously broken OA cache and resolves in this
+order:
+
+1. current validated PDF;
+2. `manual_pdfs/` / manual manifest;
+3. legacy PDF reuse directories;
+4. Europe PMC DOI/PMID/title lookup and PMCID render fallbacks;
+5. manifest PDF candidate;
+6. Unpaywall when `UNPAYWALL_EMAIL` is configured.
+
+Run the normal enrichment helper:
+
+```bash
+scripts/run_python_publication_enrichment.sh
+```
+
+To reuse PDFs from another workspace:
+
+```bash
+LEGACY_PDF_DIRS=/path/to/old/publication_pdfs:/another/pdf/cache \
+  scripts/run_python_publication_enrichment.sh
+```
+
+Unresolved publications are written to:
+
+```text
+work/python/manual_pdf_queue.tsv
+```
+
+Manually downloaded PDFs can be placed in `manual_pdfs/` as `PXDxxxxxx.pdf`
+or using the queue's `suggested_filename`.  For shared publications, use
+`manual_pdfs/manual_pdf_manifest.tsv`; see `manual_pdfs/README.md`.
+
+PDF files under `manual_pdfs/` are ignored by Git.  The resolver validates PDF
+magic bytes before accepting any automatic, reused, or manual file.

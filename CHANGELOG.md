@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.1.5 - 2026-08-26
+
+- Harden Europe PMC DOI/PMID/title resolution and force JSON metadata responses even when the PDF downloader session prefers PDF content.
+- Recover PMID/PMCID metadata during Stage 01/02 and try official PMC/Europe-PMC render URLs whenever a PMCID is known; `hasPDF == Y` is no longer required.
+- Bump the Stage-02 resolution cache schema so the broken v0.1.4 `no_open_access_pdf` cache is retried automatically.
+- Add validated PDF reuse from legacy directories and a Git-ignored `manual_pdfs/` fallback with optional TSV mapping.
+- Add `manual_pdf_queue.tsv` with article URLs, suggested filenames, resolver diagnostics, and recovered identifiers for genuinely unresolved publications.
+- Add structured `pdf_resolution_trace` and non-empty diagnostic errors for unresolved rows.
+- Preserve repository-only candidates; manual/PDF recovery changes evidence mode but never drops a candidate.
+- Protect the repository-owned v0.1.5 resolver files from accidental overwrite by later `import_current_python.sh` runs.
+- Add offline PDF-resolver regression tests.
+
 ## 0.1.4 - 2026-08-26
 
 - Add `candidate-audit` to separate specific SCP, method, broad-context, adjacent, and negative discovery signals without filtering candidates.

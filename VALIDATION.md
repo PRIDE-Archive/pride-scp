@@ -164,3 +164,38 @@ The dry-run must report `validation_ok=true`, 40,364 indexed accessions, at
 least 40,364 materialized project records, and a very large number of redundant
 project-page bytes eligible for deletion. Then run the same command without
 `--dry-run` and confirm that `projects/`, `files/`, and `sdrf/` remain present.
+
+## v0.1.5 publication resolver
+
+Offline regression:
+
+```bash
+python python/recall/pdf_resolver_regression_smoke.py
+```
+
+Expected:
+
+```text
+All v0.1.5 PDF resolver regression tests passed.
+PMCID fallback no longer requires hasPDF=Y.
+Manual/reused PDFs override unresolved cache paths.
+Old no_open_access_pdf cache schema is invalidated.
+Unresolved rows now retain structured diagnostics.
+```
+
+After applying the patch, rerun `scripts/run_python_publication_enrichment.sh`.
+The old Stage-02 `.resolution_cache` is safe to retain: schema-v1 unresolved
+records are ignored automatically.  Compare the resulting
+`publication_backed` count with the previous broken 0/321 partition before
+starting Ollama annotation.
+
+Optional live network smoke against three known SCP publication DOIs:
+
+```bash
+python python/recall/pdf_resolver_live_smoke.py \
+  --keep-output work/python/pdf_resolver_live_smoke
+```
+
+Expected final line: `Live known-OA smoke: 3/3 usable PDFs`. If a publisher or
+PMC endpoint changes, inspect the retained `pdf_error` and
+`pdf_resolution_trace` fields before running the full 201-publication batch.

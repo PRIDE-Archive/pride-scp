@@ -62,10 +62,16 @@ def get_json(
     params: Optional[dict[str, Any]] = None,
     timeout: float = 45.0,
     delay: float = 0.0,
+    headers: Optional[dict[str, str]] = None,
 ) -> Any:
     if delay > 0:
         time.sleep(delay)
-    response = session.get(url, params=params, timeout=timeout)
+    response = session.get(
+        url,
+        params=params,
+        timeout=timeout,
+        headers=headers,
+    )
     response.raise_for_status()
     return response.json()
 
@@ -275,22 +281,15 @@ def validate_pdf_path(path: Path) -> bool:
     return looks_like_pdf_bytes(head)
 
 
-def europe_pmc_lookup(
+def _europe_pmc_search(
     session: requests.Session,
+    query: str,
     *,
-    doi: str = "",
-    pmid: str = "",
     timeout: float = 45.0,
-) -> Optional[dict[str, Any]]:
+    page_size: int = 10,
+) -> list[dict[str, Any]]:
+    """Run a Europe PMC JSON search regardless of the session Accept header."""
     base = "https://www.ebi.ac.uk/europepmc/webservices/rest/search"
-
-    if doi:
-        query = f'DOI:"{normalize_doi(doi)}"'
-    elif pmid:
-        query = f"EXT_ID:{pmid} AND SRC:MED"
-    else:
-        return None
-
     data = get_json(
         session,
         base,
@@ -298,25 +297,94 @@ def europe_pmc_lookup(
             "query": query,
             "format": "json",
             "resultType": "core",
-            "pageSize": 5,
+            "pageSize": page_size,
         },
         timeout=timeout,
+        headers={"Accept": "application/json"},
     )
-
+    if not isinstance(data, dict):
+        return []
     results = data.get("resultList", {}).get("result", []) or []
+    if isinstance(results, dict):
+        results = [results]
+    return [item for item in results if isinstance(item, dict)]
 
-    if not results:
+
+def europe_pmc_lookup(
+    session: requests.Session,
+    *,
+    doi: str = "",
+    pmid: str = "",
+    title: str = "",
+    timeout: float = 45.0,
+) -> Optional[dict[str, Any]]:
+    """Resolve a publication in Europe PMC using progressively broader keys.
+
+    The legacy pipeline used one quoted DOI query.  In practice Europe PMC
+    records can be recovered more reliably by trying DOI, PMID and title forms
+    independently, then selecting an exact identifier match when possible.
+    """
+    norm_doi = normalize_doi(doi)
+    norm_pmid = text_value(pmid)
+    norm_title = text_value(title)
+
+    queries: list[str] = []
+    if norm_doi:
+        queries.extend(
+            [
+                f"DOI:{norm_doi}",
+                f'DOI:"{norm_doi}"',
+            ]
+        )
+    if norm_pmid:
+        queries.extend(
+            [
+                f"EXT_ID:{norm_pmid} AND SRC:MED",
+                f"EXT_ID:{norm_pmid}",
+            ]
+        )
+    if norm_title:
+        escaped = norm_title.replace('"', " ")
+        queries.append(f'TITLE:"{escaped}"')
+
+    if not queries:
         return None
 
-    norm_doi = normalize_doi(doi)
+    seen_queries: set[str] = set()
+    fallback: Optional[dict[str, Any]] = None
 
-    for result in results:
-        if norm_doi and normalize_doi(result.get("doi")) == norm_doi:
-            return result
-        if pmid and text_value(result.get("pmid")) == text_value(pmid):
-            return result
+    def normalized_title(value: Any) -> str:
+        text = text_value(value).lower()
+        return re.sub(r"[^a-z0-9]+", " ", text).strip()
 
-    return results[0]
+    wanted_title = normalized_title(norm_title)
+
+    for query in queries:
+        if query in seen_queries:
+            continue
+        seen_queries.add(query)
+        results = _europe_pmc_search(
+            session,
+            query,
+            timeout=timeout,
+            page_size=10,
+        )
+        for result in results:
+            if norm_doi and normalize_doi(result.get("doi")) == norm_doi:
+                return result
+            if norm_pmid and text_value(result.get("pmid")) == norm_pmid:
+                return result
+            if norm_title:
+                candidate_title = normalized_title(result.get("title"))
+                if candidate_title and candidate_title == wanted_title:
+                    return result
+            # A non-exact fallback is acceptable only when an identifier was
+            # supplied.  Title-only lookup must never silently attach a
+            # different paper to an identifier-less PRIDE record.
+            if (norm_doi or norm_pmid) and fallback is None:
+                fallback = result
+
+    return fallback
 
 
 def europe_pmc_pdf_urls(record: Optional[dict[str, Any]]) -> list[tuple[str, str]]:
@@ -337,34 +405,37 @@ def europe_pmc_pdf_urls(record: Optional[dict[str, Any]]) -> list[tuple[str, str
         if style == "pdf" and url:
             candidates.append(("europe_pmc_fullTextUrl", url))
 
+    # Do not require the historically brittle hasPDF == Y field.  A known
+    # PMCID is enough to try the official PMC/Europe-PMC render endpoints; the
+    # downloader still validates the PDF magic bytes before accepting a file.
     pmcid = text_value(record.get("pmcid"))
-    has_pdf = text_value(record.get("hasPDF")).upper() == "Y"
-
-    if pmcid and has_pdf:
+    if pmcid:
         if not pmcid.upper().startswith("PMC"):
             pmcid = "PMC" + pmcid
         candidates.extend(
             [
                 (
-                    "pmc_pdf",
-                    f"https://www.ncbi.nlm.nih.gov/pmc/articles/{pmcid}/pdf/",
-                ),
-                (
                     "europe_pmc_render",
                     f"https://europepmc.org/articles/{pmcid}?pdf=render",
+                ),
+                (
+                    "pmc_pdf",
+                    f"https://pmc.ncbi.nlm.nih.gov/articles/{pmcid}/pdf/",
+                ),
+                (
+                    "pmc_pdf_legacy",
+                    f"https://www.ncbi.nlm.nih.gov/pmc/articles/{pmcid}/pdf/",
                 ),
             ]
         )
 
-    # De-duplicate while preserving order.
     seen = set()
     out = []
     for source, url in candidates:
-        if url not in seen:
+        if url and url not in seen:
             out.append((source, url))
             seen.add(url)
     return out
-
 
 def crossref_lookup(
     session: requests.Session,

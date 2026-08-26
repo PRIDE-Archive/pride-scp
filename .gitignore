@@ -10,3 +10,5 @@ __pycache__/
 /pride_scp_qc_review*/
 .env
 .DS_Store
+/manual_pdfs/*.pdf
+/manual_pdfs/**/*.pdf
