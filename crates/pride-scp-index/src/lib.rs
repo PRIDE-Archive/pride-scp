@@ -27,6 +27,14 @@ pub struct SnapshotOptions {
     pub force: bool,
     pub limit: usize,
     pub project_page_size: usize,
+    /// Stop catalogue enumeration after this many consecutive pages add no new accessions.
+    pub max_stagnant_pages: usize,
+    /// Maximum number of concurrent HTTP requests across project/files/SDRF stages.
+    pub request_concurrency: usize,
+    /// Seed per-project metadata from the catalogue payload when possible.
+    pub seed_projects_from_catalogue: bool,
+    /// Refresh the catalogue payload even when project-page cache files exist.
+    pub refresh_catalogue: bool,
     pub accessions_file: Option<PathBuf>,
     pub progress: bool,
 }
@@ -36,6 +44,10 @@ pub struct SnapshotSummary {
     pub accessions_planned: usize,
     pub project_pages_fetched: usize,
     pub project_pages_cached: usize,
+    pub project_pages_duplicate_only: usize,
+    pub unique_accessions_enumerated: usize,
+    pub catalogue_projects_seeded: usize,
+    pub enumeration_termination: String,
     pub projects_fetched: usize,
     pub projects_cached: usize,
     pub files_fetched: usize,
@@ -97,6 +109,79 @@ fn extract_accessions(value: &Value) -> Vec<String> {
         }
     }
     out.into_iter().collect()
+}
+
+fn has_pagination_metadata(value: &Value) -> bool {
+    value.get("last").is_some()
+        || value.get("totalPages").is_some()
+        || value.get("totalElements").is_some()
+        || value
+            .get("page")
+            .and_then(Value::as_object)
+            .map(|page| {
+                page.contains_key("totalPages")
+                    || page.contains_key("totalElements")
+                    || page.contains_key("number")
+            })
+            .unwrap_or(false)
+        || value
+            .get("_links")
+            .and_then(Value::as_object)
+            .map(|links| links.contains_key("next") || links.contains_key("last"))
+            .unwrap_or(false)
+}
+
+fn catalogue_response_is_monolithic(value: &Value, requested_page_size: usize) -> bool {
+    let entries = project_entries(value).len();
+    // Live PRIDE v3 currently returns the complete project catalogue from /projects/all
+    // even when page/pageSize are supplied. Detect that shape explicitly so a full crawl
+    // does not request the same ~40k-project payload hundreds or thousands of times.
+    entries
+        > requested_page_size
+            .saturating_mul(2)
+            .max(requested_page_size + 1)
+        && !has_pagination_metadata(value)
+}
+
+fn seed_catalogue_projects(value: &Value, output_dir: &Path, force: bool) -> Result<usize> {
+    let projects_dir = output_dir.join("projects");
+    std::fs::create_dir_all(&projects_dir)
+        .with_context(|| format!("create {}", projects_dir.display()))?;
+    let mut seeded = 0usize;
+    for item in project_entries(value) {
+        let Some(accession) = item.get("accession").and_then(Value::as_str) else {
+            continue;
+        };
+        let accession = accession.trim().to_ascii_uppercase();
+        if !is_pxd(&accession) {
+            continue;
+        }
+        let path = projects_dir.join(format!("{accession}.json"));
+        if path.is_file() && !force {
+            continue;
+        }
+        write_json(&path, item)
+            .with_context(|| format!("seed catalogue project {}", path.display()))?;
+        seeded += 1;
+    }
+    Ok(seeded)
+}
+
+fn latest_cached_project_page(pages_dir: &Path) -> Option<PathBuf> {
+    let entries = std::fs::read_dir(pages_dir).ok()?;
+    entries
+        .filter_map(|entry| entry.ok())
+        .filter_map(|entry| {
+            let path = entry.path();
+            if path.extension().and_then(|x| x.to_str()) != Some("json") {
+                return None;
+            }
+            let stem = path.file_stem()?.to_str()?;
+            let page = stem.strip_prefix("page_")?.parse::<usize>().ok()?;
+            Some((page, path))
+        })
+        .max_by_key(|(page, _)| *page)
+        .map(|(_, path)| path)
 }
 
 fn nested_usize(value: &Value, keys: &[&str]) -> Option<usize> {
@@ -233,6 +318,36 @@ async fn fetch_cached(
     ))
 }
 
+async fn fetch_cached_bounded(
+    request_semaphore: &Arc<Semaphore>,
+    client: &Client,
+    url: &str,
+    path: &Path,
+    force: bool,
+    retries: usize,
+    allow_not_found: bool,
+    validate_json: bool,
+) -> Result<FetchState> {
+    // Cache hits do not consume an HTTP slot.
+    if path.is_file() && !force {
+        return Ok(FetchState::Cached);
+    }
+    let _permit = request_semaphore
+        .acquire()
+        .await
+        .map_err(|_| anyhow!("HTTP request semaphore closed"))?;
+    fetch_cached(
+        client,
+        url,
+        path,
+        force,
+        retries,
+        allow_not_found,
+        validate_json,
+    )
+    .await
+}
+
 async fn enumerate_project_accessions(
     client: &Client,
     opts: &SnapshotOptions,
@@ -246,7 +361,53 @@ async fn enumerate_project_accessions(
 
     let mut accessions = BTreeSet::new();
     let mut page = 0usize;
+    let mut stagnant_pages = 0usize;
+    let max_stagnant_pages = opts.max_stagnant_pages.max(1);
     let spinner = make_spinner("enumerating PRIDE project catalogue", opts.progress);
+
+    // Recover efficiently from a previously interrupted v0.1.2 runaway enumeration.
+    // The highest completed cached page is also the newest live catalogue snapshot. If
+    // it already contains the complete monolithic catalogue, use it directly instead of
+    // replaying page_000000, page_000001, ... from the beginning.
+    if !opts.force && !opts.refresh_catalogue {
+        if let Some(latest_path) = latest_cached_project_page(&pages_dir) {
+            let latest_value: Value = pride_scp_core::read_json(&latest_path)
+                .with_context(|| format!("read cached project page {}", latest_path.display()))?;
+            if catalogue_response_is_monolithic(&latest_value, page_size) {
+                let mut accessions = extract_accessions(&latest_value);
+                summary.project_pages_cached += 1;
+                summary.unique_accessions_enumerated = accessions.len();
+                summary.enumeration_termination = "latest_cached_monolithic_catalogue".to_string();
+                if opts.seed_projects_from_catalogue {
+                    spinner.set_message(format!(
+                        "seeding {} project records from newest cached catalogue",
+                        accessions.len()
+                    ));
+                    let seeded =
+                        seed_catalogue_projects(&latest_value, &opts.output_dir, opts.force)?;
+                    summary.catalogue_projects_seeded += seeded;
+                    log::info!("seeded {} project records from cached catalogue", seeded);
+                }
+                spinner.finish_with_message(format!(
+                    "catalogue enumeration complete | {} accessions | latest cached monolithic catalogue",
+                    accessions.len()
+                ));
+                accessions.sort();
+                if opts.limit > 0 && accessions.len() > opts.limit {
+                    accessions.truncate(opts.limit);
+                }
+                let accession_text = if accessions.is_empty() {
+                    String::new()
+                } else {
+                    format!("{}\n", accessions.join("\n"))
+                };
+                tokio::fs::write(opts.output_dir.join("accessions.txt"), accession_text)
+                    .await
+                    .context("write accessions.txt")?;
+                return Ok(accessions);
+            }
+        }
+    }
 
     loop {
         let url = format!(
@@ -254,9 +415,17 @@ async fn enumerate_project_accessions(
             opts.api_base.trim_end_matches('/')
         );
         let path = pages_dir.join(format!("page_{page:06}.json"));
-        let state = fetch_cached(client, &url, &path, opts.force, opts.retries, false, true)
-            .await
-            .with_context(|| format!("enumerate PRIDE projects page {page} from {url}"))?;
+        let state = fetch_cached(
+            client,
+            &url,
+            &path,
+            opts.force || opts.refresh_catalogue,
+            opts.retries,
+            false,
+            true,
+        )
+        .await
+        .with_context(|| format!("enumerate PRIDE projects page {page} from {url}"))?;
 
         match state {
             FetchState::Fetched => summary.project_pages_fetched += 1,
@@ -267,22 +436,73 @@ async fn enumerate_project_accessions(
         let value: Value = pride_scp_core::read_json(&path)
             .with_context(|| format!("read project page {}", path.display()))?;
         let page_accessions = extract_accessions(&value);
-        for accession in page_accessions {
-            accessions.insert(accession);
+        let before = accessions.len();
+        for accession in &page_accessions {
+            accessions.insert(accession.clone());
         }
+        let added = accessions.len().saturating_sub(before);
+
+        if opts.seed_projects_from_catalogue {
+            let seeded = seed_catalogue_projects(&value, &opts.output_dir, opts.force)?;
+            summary.catalogue_projects_seeded += seeded;
+            if seeded > 0 {
+                log::info!(
+                    "seeded {} project records from catalogue page {}",
+                    seeded,
+                    page
+                );
+            }
+        }
+
+        if added == 0 {
+            stagnant_pages += 1;
+            summary.project_pages_duplicate_only += 1;
+        } else {
+            stagnant_pages = 0;
+        }
+
         spinner.inc(1);
         spinner.set_message(format!(
-            "enumerating PRIDE projects | page {} | {} accessions",
+            "enumerating PRIDE projects | page {} | {} unique | +{} new | stagnant {}/{}",
             page + 1,
-            accessions.len()
+            accessions.len(),
+            added,
+            stagnant_pages,
+            max_stagnant_pages
         ));
 
         // A bounded pilot should never download the complete PRIDE project catalogue first.
-        // Stop enumeration as soon as we have enough accessions to satisfy --limit.
         if opts.limit > 0 && accessions.len() >= opts.limit {
+            summary.enumeration_termination = "limit_reached".to_string();
             break;
         }
+
+        // The live v3 /projects/all endpoint has been observed returning the entire catalogue
+        // (~40k projects) even when page/pageSize are supplied. In that case the first response
+        // is authoritative enough for enumeration and requesting page 1, 2, ... merely repeats
+        // the same huge payload.
+        if catalogue_response_is_monolithic(&value, page_size) {
+            summary.enumeration_termination = "monolithic_catalogue_response".to_string();
+            log::info!(
+                "catalogue endpoint returned {} projects for requested pageSize={}; treating response as complete",
+                page_accessions.len(),
+                page_size
+            );
+            break;
+        }
+
         if page_is_last(&value, page, page_size) {
+            summary.enumeration_termination = "api_last_page".to_string();
+            break;
+        }
+
+        if stagnant_pages >= max_stagnant_pages {
+            summary.enumeration_termination = format!("stagnant_after_{max_stagnant_pages}_pages");
+            log::warn!(
+                "stopping PRIDE project enumeration after {} consecutive duplicate-only pages ({} unique accessions)",
+                stagnant_pages,
+                accessions.len()
+            );
             break;
         }
 
@@ -294,9 +514,15 @@ async fn enumerate_project_accessions(
         }
     }
 
+    if summary.enumeration_termination.is_empty() {
+        summary.enumeration_termination = "unknown".to_string();
+    }
+    summary.unique_accessions_enumerated = accessions.len();
+
     spinner.finish_with_message(format!(
-        "catalogue enumeration complete | {} accessions",
-        accessions.len()
+        "catalogue enumeration complete | {} accessions | {}",
+        accessions.len(),
+        summary.enumeration_termination
     ));
 
     let mut accessions = accessions.into_iter().collect::<Vec<_>>();
@@ -326,11 +552,10 @@ async fn write_error(output_dir: &Path, record: &ErrorRecord) -> Result<()> {
 
 async fn snapshot_one(
     client: Client,
+    request_semaphore: Arc<Semaphore>,
     opts: SnapshotOptions,
     accession: String,
 ) -> (String, Vec<(String, Result<FetchState>)>) {
-    let mut outcomes = Vec::new();
-
     let project_url = format!(
         "{}/projects/{}",
         opts.api_base.trim_end_matches('/'),
@@ -340,7 +565,31 @@ async fn snapshot_one(
         .output_dir
         .join("projects")
         .join(format!("{accession}.json"));
-    let project = fetch_cached(
+
+    let files_url = format!(
+        "{}/projects/{}/files/all",
+        opts.api_base.trim_end_matches('/'),
+        accession
+    );
+    let files_path = opts
+        .output_dir
+        .join("files")
+        .join(format!("{accession}.json"));
+
+    let sdrf_url = format!(
+        "{}/files/sdrf/{}",
+        opts.api_base.trim_end_matches('/'),
+        accession
+    );
+    let sdrf_path = opts
+        .output_dir
+        .join("sdrf")
+        .join(format!("{accession}.sdrf.tsv"));
+
+    // These resources are independent. Fetch them concurrently, while a separate global
+    // request semaphore keeps aggregate pressure on PRIDE bounded.
+    let project_future = fetch_cached_bounded(
+        &request_semaphore,
         &client,
         &project_url,
         &project_path,
@@ -348,48 +597,60 @@ async fn snapshot_one(
         opts.retries,
         false,
         true,
-    )
-    .await;
-    outcomes.push(("project".to_string(), project));
+    );
+    let files_future = async {
+        if opts.include_files {
+            fetch_cached_bounded(
+                &request_semaphore,
+                &client,
+                &files_url,
+                &files_path,
+                opts.force,
+                opts.retries,
+                true,
+                true,
+            )
+            .await
+        } else {
+            Ok(FetchState::NotFound)
+        }
+    };
+    let sdrf_future = async {
+        if opts.include_sdrf {
+            fetch_cached_bounded(
+                &request_semaphore,
+                &client,
+                &sdrf_url,
+                &sdrf_path,
+                opts.force,
+                opts.retries,
+                true,
+                false,
+            )
+            .await
+        } else {
+            Ok(FetchState::NotFound)
+        }
+    };
 
+    let (project, files, sdrf) = tokio::join!(project_future, files_future, sdrf_future);
+    let mut outcomes = vec![("project".to_string(), project)];
     if opts.include_files {
-        let url = format!(
-            "{}/projects/{}/files/all",
-            opts.api_base.trim_end_matches('/'),
-            accession
-        );
-        let path = opts
-            .output_dir
-            .join("files")
-            .join(format!("{accession}.json"));
-        let result = fetch_cached(&client, &url, &path, opts.force, opts.retries, true, true).await;
-        outcomes.push(("files".to_string(), result));
+        outcomes.push(("files".to_string(), files));
     }
-
     if opts.include_sdrf {
-        let url = format!(
-            "{}/files/sdrf/{}",
-            opts.api_base.trim_end_matches('/'),
-            accession
-        );
-        let path = opts
-            .output_dir
-            .join("sdrf")
-            .join(format!("{accession}.sdrf.tsv"));
-        let result =
-            fetch_cached(&client, &url, &path, opts.force, opts.retries, true, false).await;
-        outcomes.push(("sdrf".to_string(), result));
+        outcomes.push(("sdrf".to_string(), sdrf));
     }
-
     (accession, outcomes)
 }
 
 pub async fn snapshot(opts: SnapshotOptions) -> Result<SnapshotSummary> {
     let started = Instant::now();
     log::info!(
-        "snapshot start: output={} concurrency={} files={} sdrf={}",
+        "snapshot start: output={} project_concurrency={} request_concurrency={} files={} sdrf={}",
         opts.output_dir.display(),
         opts.concurrency.max(1),
+        opts.request_concurrency.max(1),
         opts.include_files,
         opts.include_sdrf
     );
@@ -417,6 +678,10 @@ pub async fn snapshot(opts: SnapshotOptions) -> Result<SnapshotSummary> {
 
     accessions.sort();
     accessions.dedup();
+    if opts.accessions_file.is_some() {
+        summary.unique_accessions_enumerated = accessions.len();
+        summary.enumeration_termination = "accessions_file".to_string();
+    }
     if opts.limit > 0 && accessions.len() > opts.limit {
         accessions.truncate(opts.limit);
     }
@@ -429,16 +694,27 @@ pub async fn snapshot(opts: SnapshotOptions) -> Result<SnapshotSummary> {
         opts.progress,
     );
 
-    let semaphore = Arc::new(Semaphore::new(opts.concurrency.max(1)));
+    let project_concurrency = opts.concurrency.max(1);
+    let request_semaphore = Arc::new(Semaphore::new(opts.request_concurrency.max(1)));
     let mut join_set = JoinSet::new();
-    for accession in accessions.iter().cloned() {
-        let permit = semaphore.clone().acquire_owned().await?;
-        let client = client.clone();
-        let opts = opts.clone();
+    let mut accession_iter = accessions.into_iter();
+
+    for _ in 0..project_concurrency {
+        let Some(accession) = accession_iter.next() else {
+            break;
+        };
+        let worker_client = client.clone();
+        let worker_opts = opts.clone();
         let worker_progress = progress.clone();
+        let worker_request_semaphore = request_semaphore.clone();
         join_set.spawn(async move {
-            let _permit = permit;
-            let result = snapshot_one(client, opts, accession).await;
+            let result = snapshot_one(
+                worker_client,
+                worker_request_semaphore,
+                worker_opts,
+                accession,
+            )
+            .await;
             worker_progress.inc(1);
             worker_progress.set_message(format!("completed {}", result.0));
             result
@@ -509,6 +785,25 @@ pub async fn snapshot(opts: SnapshotOptions) -> Result<SnapshotSummary> {
             summary.sdrf_cached,
             summary.project_errors + summary.file_errors + summary.sdrf_errors
         ));
+
+        if let Some(next_accession) = accession_iter.next() {
+            let worker_client = client.clone();
+            let worker_opts = opts.clone();
+            let worker_progress = progress.clone();
+            let worker_request_semaphore = request_semaphore.clone();
+            join_set.spawn(async move {
+                let result = snapshot_one(
+                    worker_client,
+                    worker_request_semaphore,
+                    worker_opts,
+                    next_accession,
+                )
+                .await;
+                worker_progress.inc(1);
+                worker_progress.set_message(format!("completed {}", result.0));
+                result
+            });
+        }
     }
 
     progress.finish_with_message(format!(
@@ -566,5 +861,27 @@ mod tests {
         ]);
         assert!(page_is_last(&value, 0, 200));
         assert!(!page_is_last(&value, 0, 2));
+    }
+
+    #[test]
+    fn detects_monolithic_catalogue_response_without_pagination_metadata() {
+        let projects = (0..250)
+            .map(|i| json!({"accession": format!("PXD{i:06}"), "title": "example"}))
+            .collect::<Vec<_>>();
+        let value = Value::Array(projects);
+        assert!(catalogue_response_is_monolithic(&value, 100));
+    }
+
+    #[test]
+    fn does_not_call_normal_paginated_response_monolithic() {
+        let projects = (0..100)
+            .map(|i| json!({"accession": format!("PXD{i:06}")}))
+            .collect::<Vec<_>>();
+        let value = json!({
+            "content": projects,
+            "totalPages": 400,
+            "last": false
+        });
+        assert!(!catalogue_response_is_monolithic(&value, 100));
     }
 }

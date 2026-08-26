@@ -400,3 +400,67 @@ If you need a clean machine-readable JSON file, redirect stdout only:
 ```bash
 target/release/pride-scp snapshot ... > snapshot_result.json
 ```
+
+
+## Full-catalogue snapshot behavior (v0.1.3)
+
+The live PRIDE v3 `/projects/all` endpoint has been observed returning the
+complete public project catalogue even when `page` and `pageSize` query
+parameters are supplied. v0.1.3 detects this response shape and stops after the
+first complete catalogue payload rather than repeatedly downloading the same
+~40k-project response.
+
+A second safety condition stops enumeration after three consecutive pages add
+no new accessions (configurable with `--max-stagnant-pages`). The final
+`snapshot_summary.json` records the termination reason.
+
+For full snapshots, catalogue project records are also materialized directly
+under `projects/`. This removes a redundant per-project metadata request for
+most accessions. File manifests and SDRF remain independently cached.
+
+Snapshot concurrency now has two controls:
+
+```text
+--concurrency          concurrent accession workers (default 8)
+--request-concurrency  global concurrent HTTP requests (default 16)
+```
+
+Project/file/SDRF requests for an accession are independent and may run in
+parallel, but the global request semaphore prevents unbounded load on PRIDE.
+
+A conservative full run is:
+
+```bash
+target/release/pride-scp snapshot \
+  --output data/snapshot \
+  --concurrency 8 \
+  --request-concurrency 16 \
+  --timeout 120 \
+  --retries 4 \
+  --project-page-size 100
+```
+
+It is safe to interrupt with Ctrl+C. Rerunning the same command reuses complete
+cached catalogue/project/file/SDRF outputs. Existing `page_000001.json` and
+later files from a v0.1.2 runaway enumeration can be left in place; v0.1.3
+normally terminates from cached page 0 before reading them.
+
+For a fast metadata-only first pass, use:
+
+```bash
+target/release/pride-scp snapshot \
+  --output data/snapshot_metadata \
+  --no-files \
+  --no-sdrf \
+  --concurrency 8 \
+  --request-concurrency 16
+```
+
+This can be followed by discovery and targeted file/SDRF enrichment for the
+candidate accession list if desired.
+
+If resuming the interrupted v0.1.2 run, v0.1.3 first inspects the highest
+completed cached `project_pages/page_*.json`. If it is a complete monolithic
+catalogue response, that newest cache is used directly. To request one current
+catalogue snapshot instead, add `--refresh-catalogue`; unlike `--force`, this
+does not invalidate project/file/SDRF caches.

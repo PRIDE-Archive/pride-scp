@@ -36,18 +36,34 @@ enum Command {
         output: PathBuf,
         #[arg(long, default_value = DEFAULT_PRIDE_API)]
         api_base: String,
+        /// Maximum number of accessions being processed concurrently.
         #[arg(long, default_value_t = 8)]
         concurrency: usize,
+        /// Global cap on concurrent HTTP requests across project/files/SDRF retrieval.
+        #[arg(long, default_value_t = 16)]
+        request_concurrency: usize,
         /// Per-request timeout, including response-body transfer.
         #[arg(long, default_value_t = 120)]
         timeout: u64,
         /// Number of retries after the initial HTTP attempt.
         #[arg(long, default_value_t = 4)]
         retries: usize,
-        /// Page size used while enumerating PRIDE projects.
+        /// Page size requested while enumerating PRIDE projects. The live v3 endpoint
+        /// may return a monolithic catalogue; v0.1.3 detects and stops on that shape.
         #[arg(long, default_value_t = DEFAULT_PROJECT_PAGE_SIZE)]
         project_page_size: usize,
-        #[arg(long, default_value = "PRIDE-SCP-recall-index/0.1.2")]
+        /// Safety stop if consecutive catalogue pages contribute no new PXD accessions.
+        #[arg(long, default_value_t = 3)]
+        max_stagnant_pages: usize,
+        /// Do not seed project metadata from the /projects/all catalogue payload.
+        /// Seeding avoids tens of thousands of redundant per-project detail requests.
+        #[arg(long)]
+        no_catalogue_project_seed: bool,
+        /// Refresh the PRIDE catalogue response instead of reusing cached project pages.
+        /// This does not force re-download of per-project files/SDRF.
+        #[arg(long)]
+        refresh_catalogue: bool,
+        #[arg(long, default_value = "PRIDE-SCP-recall-index/0.1.3")]
         user_agent: String,
         /// Skip per-project file-manifest retrieval.
         #[arg(long)]
@@ -123,9 +139,13 @@ async fn main() -> Result<()> {
             output,
             api_base,
             concurrency,
+            request_concurrency,
             timeout,
             retries,
             project_page_size,
+            max_stagnant_pages,
+            no_catalogue_project_seed,
+            refresh_catalogue,
             user_agent,
             no_files,
             no_sdrf,
@@ -138,9 +158,13 @@ async fn main() -> Result<()> {
                 output_dir: output,
                 api_base,
                 concurrency,
+                request_concurrency,
                 timeout_seconds: timeout,
                 retries,
                 project_page_size,
+                max_stagnant_pages,
+                seed_projects_from_catalogue: !no_catalogue_project_seed,
+                refresh_catalogue,
                 user_agent,
                 include_files: !no_files,
                 include_sdrf: !no_sdrf,

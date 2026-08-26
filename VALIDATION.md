@@ -62,3 +62,56 @@ target/release/pride-scp --no-progress discover \
 ```
 
 Both runs should preserve 20/20 known-positive candidate recovery.
+
+
+## v0.1.3 full-catalogue enumeration regression
+
+After applying the patch, run:
+
+```bash
+cargo fmt --all
+cargo check --workspace --locked
+cargo test --workspace --locked
+cargo build --release --locked
+./scripts/smoke_fixture.sh
+```
+
+The unit suite now includes synthetic regressions for:
+
+- a normal paginated response;
+- a short final page;
+- a monolithic response containing more than twice the requested page size.
+
+For the interrupted live snapshot, rerun the same output directory:
+
+```bash
+target/release/pride-scp snapshot \
+  --output data/snapshot \
+  --concurrency 8 \
+  --request-concurrency 16 \
+  --timeout 120 \
+  --retries 4 \
+  --project-page-size 100
+```
+
+Expected enumeration behavior is that cached page 0 yields roughly the full
+40k-accession universe and terminates with:
+
+```text
+enumeration_termination = monolithic_catalogue_response
+```
+
+or, if the server response shape changes, no more than the configured number
+of duplicate-only stagnant pages are traversed.
+
+To force a current catalogue snapshot without invalidating downstream caches:
+
+```bash
+target/release/pride-scp snapshot \
+  --output data/snapshot \
+  --refresh-catalogue \
+  --concurrency 8 \
+  --request-concurrency 16 \
+  --timeout 120 \
+  --retries 4
+```

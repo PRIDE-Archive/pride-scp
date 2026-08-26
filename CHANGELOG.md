@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.1.3 - 2026-08-26
+
+- Fix full-catalogue enumeration against the live PRIDE v3 `/projects/all` behavior, which can return the complete ~40k-project catalogue despite `page`/`pageSize` parameters.
+- Detect monolithic catalogue responses and terminate after the first complete payload.
+- Add `--max-stagnant-pages` as an independent duplicate-only pagination safety stop.
+- Seed per-project repository metadata directly from the catalogue response, avoiding tens of thousands of redundant project-detail requests.
+- Add bounded parallel project/file/SDRF fetching with independent `--concurrency` and `--request-concurrency` controls.
+- Bound the number of in-flight accession tasks instead of accumulating the whole catalogue in `JoinSet`.
+- Add enumeration termination/duplicate/seed diagnostics to `snapshot_summary.json`.
+- Preserve v0.1.2 cache/resume semantics; interrupted full snapshots can reuse all completed cache files.
+- Prefer the newest completed monolithic catalogue cache when recovering an interrupted runaway enumeration, and add `--refresh-catalogue` for a fresh catalogue-only request without invalidating project/file/SDRF caches.
+
 ## 0.1.1 — paginated/resilient PRIDE snapshot hotfix
 
 - Fixed bounded pilots so `--limit` stops project enumeration early instead of first downloading the complete `/projects/all` response.
