@@ -1,19 +1,20 @@
 #!/usr/bin/env python3
 """Stage 2: resolve, reuse, or manually supply publication PDFs.
 
-v0.1.5 resolution order
+v0.1.6 resolution order
 -----------------------
 1. Existing validated PDF in the current work directory.
 2. Manual PDF manifest / manual PDF directory.
 3. Validated PDFs from one or more legacy/reuse directories.
-4. Europe PMC lookup (DOI, PMID, then title) and PMC render fallbacks.
-5. Manifest-provided PDF candidate URL.
-6. Unpaywall when an email is supplied.
+4. NCBI PMC ID Converter (DOI/PMID/PMCID -> PMCID) + PMC PDF fallbacks.
+5. Europe PMC lookup (DOI, PMID, then exact title) as secondary metadata lookup.
+6. Manifest-provided PDF candidate URL.
+7. Unpaywall when an email is supplied.
 
 Every downloaded/reused file is validated by PDF magic bytes.  Resolution is
-cached per unique publication, but the v0.1.5 cache schema intentionally
-invalidates the previous `no_open_access_pdf` cache produced by the broken
-resolver.  Adding a manual/reuse PDF also overrides a cached unresolved result.
+cached per unique publication, but the v0.1.6 cache schema intentionally
+invalidates the previous `no_open_access_pdf` caches produced before the NCBI
+identifier-conversion fallback.  Adding a manual/reuse PDF also overrides a cached unresolved result.
 """
 
 from __future__ import annotations
@@ -36,6 +37,7 @@ from pride_scp_pipeline_common import (
     build_session,
     europe_pmc_lookup,
     europe_pmc_pdf_urls,
+    pmc_idconv_lookup,
     normalize_doi,
     publication_filename,
     publication_key,
@@ -49,8 +51,8 @@ from pride_scp_pipeline_common import (
 )
 
 
-RESOLVER_PATCH_VERSION = "pride-scp-v0.1.5"
-CACHE_SCHEMA_VERSION = 2
+RESOLVER_PATCH_VERSION = "pride-scp-v0.1.6"
+CACHE_SCHEMA_VERSION = 3
 _thread_local = threading.local()
 
 TERMINAL_CACHE_STATUSES = {
@@ -99,8 +101,18 @@ def parse_args() -> argparse.Namespace:
         default=os.environ.get("UNPAYWALL_EMAIL", ""),
     )
     parser.add_argument(
+        "--contact-email",
+        default=os.environ.get(
+            "NCBI_EMAIL", os.environ.get("CONTACT_EMAIL", "")
+        ),
+        help=(
+            "Optional contact email sent to NCBI PMC ID Converter requests. "
+            "Defaults to NCBI_EMAIL or CONTACT_EMAIL."
+        ),
+    )
+    parser.add_argument(
         "--user-agent",
-        default="PRIDE-SCP-pdf-downloader/1.5",
+        default="PRIDE-SCP-pdf-downloader/1.6",
     )
     parser.add_argument(
         "--reuse-pdf-dir",
@@ -499,6 +511,7 @@ def resolve_uncached(
     reuse_index: dict[str, Path],
     reuse_mode: str,
     unpaywall_email: str,
+    contact_email: str,
     user_agent: str,
     timeout: float,
 ) -> dict[str, Any]:
@@ -524,8 +537,59 @@ def resolve_uncached(
     candidates: list[tuple[str, str]] = []
     errors: list[str] = []
 
+    idconv = None
+    if doi or pmid or supplied_pmcid:
+        try:
+            idconv = pmc_idconv_lookup(
+                session,
+                doi=doi,
+                pmid=pmid,
+                pmcid=supplied_pmcid,
+                timeout=timeout,
+                tool="pride_scp_pdf_resolver",
+                email=contact_email,
+            )
+            if idconv:
+                resolved_doi = normalize_doi(idconv.get("doi")) or doi
+                resolved_pmid = text_value(idconv.get("pmid")) or pmid
+                resolved_pmcid = text_value(idconv.get("pmcid")) or supplied_pmcid
+                result["resolved_doi"] = resolved_doi
+                result["resolved_pmid"] = resolved_pmid
+                result["resolved_pmcid"] = resolved_pmcid
+                trace.append(
+                    {
+                        "source": "NCBI_PMC_IDConverter",
+                        "status": "matched",
+                        "doi": resolved_doi,
+                        "pmid": resolved_pmid,
+                        "pmcid": resolved_pmcid,
+                        "live": idconv.get("live"),
+                        "release_date": text_value(idconv.get("releaseDate")),
+                    }
+                )
+                candidates.extend(europe_pmc_pdf_urls({"pmcid": resolved_pmcid}))
+            else:
+                trace.append(
+                    {"source": "NCBI_PMC_IDConverter", "status": "no_match"}
+                )
+        except Exception as exc:
+            trace.append(
+                {
+                    "source": "NCBI_PMC_IDConverter",
+                    "status": "error",
+                    "error": f"{type(exc).__name__}: {exc}",
+                }
+            )
+            errors.append(
+                f"NCBI PMC ID Converter: {type(exc).__name__}: {exc}"
+            )
+    else:
+        trace.append(
+            {"source": "NCBI_PMC_IDConverter", "status": "skipped_no_identifier"}
+        )
+
     epmc = None
-    if doi or pmid or title:
+    if not idconv and (doi or pmid or title):
         try:
             epmc = europe_pmc_lookup(
                 session,
@@ -567,6 +631,13 @@ def resolve_uncached(
                 }
             )
             errors.append(f"EuropePMC lookup: {type(exc).__name__}: {exc}")
+    elif idconv:
+        trace.append(
+            {
+                "source": "EuropePMC",
+                "status": "skipped_idconv_already_resolved",
+            }
+        )
     else:
         trace.append({"source": "EuropePMC", "status": "skipped_no_metadata"})
         errors.append("EuropePMC: no DOI, PMID, or publication title")
@@ -574,7 +645,7 @@ def resolve_uncached(
     # Even if the lookup failed or hasPDF is absent, a supplied PMCID is enough
     # to try the official render endpoints.
     effective_pmcid = text_value(result.get("resolved_pmcid")) or supplied_pmcid
-    if effective_pmcid and not epmc:
+    if effective_pmcid and not epmc and not idconv:
         candidates.extend(europe_pmc_pdf_urls({"pmcid": effective_pmcid}))
         trace.append(
             {
@@ -694,6 +765,7 @@ def resolve_and_cache(
     reuse_index: dict[str, Path],
     reuse_mode: str,
     unpaywall_email: str,
+    contact_email: str,
     user_agent: str,
     timeout: float,
 ) -> tuple[str, dict[str, Any]]:
@@ -706,6 +778,7 @@ def resolve_and_cache(
             reuse_index=reuse_index,
             reuse_mode=reuse_mode,
             unpaywall_email=unpaywall_email,
+            contact_email=contact_email,
             user_agent=user_agent,
             timeout=timeout,
         )
@@ -888,6 +961,7 @@ def main() -> None:
                     reuse_index=reuse_index,
                     reuse_mode=args.reuse_mode,
                     unpaywall_email=args.unpaywall_email,
+                    contact_email=args.contact_email,
                     user_agent=args.user_agent,
                     timeout=args.timeout,
                 ): key

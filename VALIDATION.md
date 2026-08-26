@@ -199,3 +199,17 @@ python python/recall/pdf_resolver_live_smoke.py \
 Expected final line: `Live known-OA smoke: 3/3 usable PDFs`. If a publisher or
 PMC endpoint changes, inspect the retained `pdf_error` and
 `pdf_resolution_trace` fields before running the full 201-publication batch.
+
+
+## v0.1.6 NCBI PMC ID Converter fallback
+
+Offline regression coverage now verifies normalization of a PMC ID Converter
+record, cache-v2 invalidation, PMCID URL generation, manual/reuse override, and
+structured unresolved traces. The authoritative live test remains:
+
+```bash
+python python/recall/pdf_resolver_live_smoke.py \
+  --keep-output work/python/pdf_resolver_live_smoke_v016
+```
+
+Expected result for the three known-PMC SCP publications is `3/3 usable PDFs`.

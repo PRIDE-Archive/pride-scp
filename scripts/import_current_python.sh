@@ -12,7 +12,7 @@ fi
 
 mkdir -p "$DEST"
 
-# v0.1.5 owns these resolver/enrichment files locally.  Preserve them on
+# v0.1.6 owns these resolver/enrichment files locally.  Preserve them on
 # subsequent imports so an older source tree cannot silently undo the new PDF
 # resolver.  They are still imported during initial bootstrap if absent.
 protected=(
@@ -95,8 +95,8 @@ if ! grep -q 'stage6-qc-v3.2' "$DEST/06_review_pride_scp_catalogue.py"; then
   echo "WARNING: imported Stage 06 does not advertise stage6-qc-v3.2; verify that the source tree is your latest one." >&2
 fi
 
-if ! grep -q 'pride-scp-v0.1.5' "$DEST/02_download_publication_pdfs.py"; then
-  echo "WARNING: Stage 02 does not advertise the v0.1.5 resolver patch." >&2
+if ! grep -q 'pride-scp-v0.1.6' "$DEST/02_download_publication_pdfs.py"; then
+  echo "WARNING: Stage 02 does not advertise the v0.1.6 resolver patch." >&2
 fi
 
 echo "Imported current Python pipeline from: $SOURCE_DIR"

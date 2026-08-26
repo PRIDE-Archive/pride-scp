@@ -33,6 +33,7 @@ from pride_scp_pipeline_common import (
     get_json,
     join_unique,
     normalize_doi,
+    pmc_idconv_lookup,
     pmid_from_text,
     recursive_find_values,
     text_value,
@@ -367,6 +368,25 @@ def enrich_publication(
     doi = normalize_doi(out.get("publication_doi"))
     pmid = text_value(out.get("publication_pmid"))
     title = text_value(out.get("publication_title"))
+
+    idconv = None
+    if doi or pmid:
+        try:
+            idconv = pmc_idconv_lookup(
+                session,
+                doi=doi,
+                pmid=pmid,
+                timeout=timeout,
+                email=contact_email,
+            )
+        except requests.RequestException:
+            idconv = None
+    if idconv:
+        out["publication_doi"] = normalize_doi(idconv.get("doi")) or doi
+        out["publication_pmid"] = text_value(idconv.get("pmid")) or pmid
+        out["publication_pmcid"] = text_value(idconv.get("pmcid"))
+        doi = normalize_doi(out.get("publication_doi"))
+        pmid = text_value(out.get("publication_pmid"))
 
     epmc = None
     try:

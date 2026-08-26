@@ -281,6 +281,79 @@ def validate_pdf_path(path: Path) -> bool:
     return looks_like_pdf_bytes(head)
 
 
+
+def pmc_idconv_lookup(
+    session: requests.Session,
+    *,
+    doi: str = "",
+    pmid: str = "",
+    pmcid: str = "",
+    timeout: float = 45.0,
+    tool: str = "pride_scp",
+    email: str = "",
+) -> Optional[dict[str, Any]]:
+    """Resolve DOI/PMID/PMCID with NCBI's PMC ID Converter API.
+
+    Unlike Europe PMC's free-text search endpoint, this service accepts article
+    identifiers directly and is therefore a robust primary DOI -> PMID/PMCID
+    resolver for articles represented in PubMed Central.  It only returns
+    related IDs for articles that exist in PMC; callers should retain Europe
+    PMC / Crossref / Unpaywall fallbacks for publications outside PMC.
+    """
+    identifiers: list[str] = []
+    norm_doi = normalize_doi(doi)
+    norm_pmid = text_value(pmid)
+    norm_pmcid = text_value(pmcid)
+    if norm_doi:
+        identifiers.append(norm_doi)
+    if norm_pmcid:
+        if not norm_pmcid.upper().startswith("PMC"):
+            norm_pmcid = "PMC" + norm_pmcid
+        identifiers.append(norm_pmcid)
+    if norm_pmid:
+        identifiers.append(norm_pmid)
+    if not identifiers:
+        return None
+
+    base = "https://pmc.ncbi.nlm.nih.gov/tools/idconv/api/v1/articles/"
+    for identifier in identifiers:
+        params: dict[str, Any] = {
+            "ids": identifier,
+            "format": "json",
+            "tool": re.sub(r"\s+", "_", tool.strip()) or "pride_scp",
+        }
+        if email:
+            params["email"] = email
+        data = get_json(
+            session,
+            base,
+            params=params,
+            timeout=timeout,
+            headers={"Accept": "application/json"},
+        )
+        if not isinstance(data, dict) or data.get("status") not in {None, "ok"}:
+            continue
+        records = data.get("records", []) or []
+        if isinstance(records, dict):
+            records = [records]
+        for record in records:
+            if not isinstance(record, dict) or record.get("error"):
+                continue
+            resolved = {
+                "doi": normalize_doi(record.get("doi")) or norm_doi,
+                "pmid": text_value(record.get("pmid")) or norm_pmid,
+                "pmcid": text_value(record.get("pmcid")) or norm_pmcid,
+                "live": record.get("live"),
+                "releaseDate": text_value(
+                    record.get("release-date") or record.get("releaseDate")
+                ),
+                "requestedId": text_value(
+                    record.get("requested-id") or record.get("requestedId")
+                ),
+            }
+            return resolved
+    return None
+
 def _europe_pmc_search(
     session: requests.Session,
     query: str,

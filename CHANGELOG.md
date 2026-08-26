@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.1.6 - 2026-08-26
+
+- Add NCBI PMC ID Converter as the primary DOI/PMID/PMCID resolver for publications represented in PMC.
+- Bypass the environment-specific Europe PMC DOI-search failure seen in the v0.1.5 live smoke test.
+- Populate PMCID/PMID from DOI before attempting PMC PDF render URLs.
+- Keep Europe PMC as a secondary metadata/title resolver for publications outside the ID-converter path.
+- Bump PDF resolution cache schema to v3 so v0.1.5 unresolved results are retried automatically.
+- Preserve manual/legacy PDF override semantics and structured unresolved diagnostics.
+
+
 ## 0.1.5 - 2026-08-26
 
 - Harden Europe PMC DOI/PMID/title resolution and force JSON metadata responses even when the PDF downloader session prefers PDF content.

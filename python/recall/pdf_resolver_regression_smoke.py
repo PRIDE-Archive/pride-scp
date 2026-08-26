@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Offline regressions for the v0.1.5 publication/PDF resolver."""
+"""Offline regressions for the v0.1.6 publication/PDF resolver."""
 
 from __future__ import annotations
 
@@ -28,6 +28,34 @@ def fake_pdf(path: Path) -> None:
     path.write_bytes(b"%PDF-1.7\n" + b"0" * 2048)
 
 
+
+def test_pmc_idconv_normalizes_record() -> None:
+    class DummySession:
+        pass
+
+    original = common.get_json
+    try:
+        common.get_json = lambda *a, **k: {
+            "status": "ok",
+            "records": [
+                {
+                    "doi": "10.1002/anie.202303415",
+                    "pmid": 37380610,
+                    "pmcid": "PMC10529037",
+                    "requested-id": "10.1002/anie.202303415",
+                }
+            ],
+        }
+        result = common.pmc_idconv_lookup(
+            DummySession(), doi="https://doi.org/10.1002/anie.202303415"
+        )
+        assert result
+        assert result["doi"] == "10.1002/anie.202303415"
+        assert result["pmid"] == "37380610"
+        assert result["pmcid"] == "PMC10529037"
+    finally:
+        common.get_json = original
+
 def test_pmcid_does_not_require_haspdf() -> None:
     urls = common.europe_pmc_pdf_urls({"pmcid": "PMC10557376"})
     assert urls, "PMCID should produce fallback PDF URLs even without hasPDF"
@@ -49,6 +77,62 @@ def test_title_only_lookup_requires_exact_title() -> None:
     finally:
         common._europe_pmc_search = original
 
+
+
+def test_stage2_prefers_idconv_before_europepmc() -> None:
+    with tempfile.TemporaryDirectory() as tmp_text:
+        tmp = Path(tmp_text)
+        row = {
+            "accession": "PXD037527",
+            "publication_doi": "10.1002/anie.202303415",
+            "publication_title": "Known PMC paper",
+        }
+        original_idconv = pdf_stage.pmc_idconv_lookup
+        original_epmc = pdf_stage.europe_pmc_lookup
+        original_session = pdf_stage.session_for_thread
+        original_download = pdf_stage.download_candidate
+        epmc_called = {"value": False}
+        try:
+            pdf_stage.pmc_idconv_lookup = lambda *a, **k: {
+                "doi": "10.1002/anie.202303415",
+                "pmid": "37380610",
+                "pmcid": "PMC10529037",
+            }
+            def forbidden_epmc(*a, **k):
+                epmc_called["value"] = True
+                return None
+            pdf_stage.europe_pmc_lookup = forbidden_epmc
+            pdf_stage.session_for_thread = lambda *a, **k: object()
+            def fake_download(session, url, path, timeout):
+                fake_pdf(path)
+                return True, ""
+            pdf_stage.download_candidate = fake_download
+            result = pdf_stage.resolve_uncached(
+                row,
+                pdf_dir=tmp / "pdfs",
+                manual_manifest={},
+                manual_index={},
+                reuse_index={},
+                reuse_mode="symlink",
+                unpaywall_email="",
+                contact_email="",
+                user_agent="test",
+                timeout=1,
+            )
+        finally:
+            pdf_stage.pmc_idconv_lookup = original_idconv
+            pdf_stage.europe_pmc_lookup = original_epmc
+            pdf_stage.session_for_thread = original_session
+            pdf_stage.download_candidate = original_download
+        assert result["pdf_status"] == "downloaded"
+        assert result["resolved_pmcid"] == "PMC10529037"
+        assert not epmc_called["value"], "Europe PMC search should be skipped after ID conversion"
+        trace = json.loads(result["pdf_resolution_trace"])
+        assert any(
+            item.get("source") == "NCBI_PMC_IDConverter"
+            and item.get("status") == "matched"
+            for item in trace
+        )
 
 def test_manual_accession_pdf_is_reused() -> None:
     with tempfile.TemporaryDirectory() as tmp_text:
@@ -88,7 +172,7 @@ def test_old_cache_schema_is_invalidated() -> None:
         path.write_text(
             json.dumps(
                 {
-                    "cache_schema_version": 1,
+                    "cache_schema_version": 2,
                     "publication_identity": pdf_stage.publication_identity(row),
                     "result": {"pdf_status": "no_open_access_pdf"},
                 }
@@ -108,9 +192,11 @@ def test_unresolved_has_diagnostics() -> None:
             "publication_pmid": "",
             "publication_pmcid": "",
         }
+        original_idconv = pdf_stage.pmc_idconv_lookup
         original_lookup = pdf_stage.europe_pmc_lookup
         original_session = pdf_stage.session_for_thread
         try:
+            pdf_stage.pmc_idconv_lookup = lambda *a, **k: None
             pdf_stage.europe_pmc_lookup = lambda *a, **k: None
             pdf_stage.session_for_thread = lambda *a, **k: object()
             result = pdf_stage.resolve_uncached(
@@ -121,27 +207,32 @@ def test_unresolved_has_diagnostics() -> None:
                 reuse_index={},
                 reuse_mode="symlink",
                 unpaywall_email="",
+                contact_email="",
                 user_agent="test",
                 timeout=1,
             )
         finally:
+            pdf_stage.pmc_idconv_lookup = original_idconv
             pdf_stage.europe_pmc_lookup = original_lookup
             pdf_stage.session_for_thread = original_session
         assert result["pdf_status"] == "no_open_access_pdf"
         assert result["pdf_error"], "unresolved results must explain why"
         trace = json.loads(result["pdf_resolution_trace"])
+        assert any(item.get("source") == "NCBI_PMC_IDConverter" for item in trace)
         assert any(item.get("source") == "EuropePMC" for item in trace)
         assert any(item.get("source") == "Unpaywall" for item in trace)
 
 
 def main() -> None:
+    test_pmc_idconv_normalizes_record()
     test_pmcid_does_not_require_haspdf()
+    test_stage2_prefers_idconv_before_europepmc()
     test_title_only_lookup_requires_exact_title()
     test_manual_accession_pdf_is_reused()
     test_old_cache_schema_is_invalidated()
     test_unresolved_has_diagnostics()
-    print("All v0.1.5 PDF resolver regression tests passed.")
-    print("PMCID fallback no longer requires hasPDF=Y.")
+    print("All v0.1.6 PDF resolver regression tests passed.")
+    print("NCBI PMC ID Converter DOI/PMID/PMCID fallback is available.\nPMCID fallback no longer requires hasPDF=Y.")
     print("Manual/reused PDFs override unresolved cache paths.")
     print("Old no_open_access_pdf cache schema is invalidated.")
     print("Unresolved rows now retain structured diagnostics.")

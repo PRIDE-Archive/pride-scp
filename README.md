@@ -623,3 +623,25 @@ or using the queue's `suggested_filename`.  For shared publications, use
 
 PDF files under `manual_pdfs/` are ignored by Git.  The resolver validates PDF
 magic bytes before accepting any automatic, reused, or manual file.
+
+
+## v0.1.6 NCBI PMC identifier fallback
+
+The v0.1.5 live smoke test showed that Europe PMC free-text DOI searches can
+return no matches in some environments even for papers that are definitely in
+PubMed Central. v0.1.6 therefore resolves DOI/PMID/PMCID first through the
+NCBI PMC ID Converter API. A recovered PMCID is immediately converted into
+validated PMC PDF candidate URLs. Europe PMC remains a secondary metadata/title
+resolver.
+
+The resolver cache schema is now 3, so v0.1.5 `no_open_access_pdf` results are
+retried automatically. Optional NCBI contact metadata can be supplied via
+`NCBI_EMAIL` or `CONTACT_EMAIL`.
+
+Validate with:
+
+```bash
+python python/recall/pdf_resolver_regression_smoke.py
+python python/recall/pdf_resolver_live_smoke.py \
+  --keep-output work/python/pdf_resolver_live_smoke_v016
+```
