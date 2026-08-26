@@ -3,7 +3,7 @@ use pride_scp_core::{make_progress_bar, make_spinner, read_nonempty_lines, write
 use reqwest::{header::RETRY_AFTER, Client, StatusCode};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -58,6 +58,36 @@ pub struct SnapshotSummary {
     pub project_errors: usize,
     pub file_errors: usize,
     pub sdrf_errors: usize,
+}
+
+#[derive(Debug, Clone)]
+pub struct CompactSnapshotOptions {
+    pub snapshot_dir: PathBuf,
+    /// Keep the newest completed catalogue page as a compact provenance copy.
+    pub keep_latest_project_page: bool,
+    /// Optional accession list used only when pruning non-candidate file/SDRF evidence.
+    pub retain_accessions_file: Option<PathBuf>,
+    /// Remove file-manifest and SDRF payloads for accessions outside retain_accessions_file.
+    pub prune_noncandidate_evidence: bool,
+    pub dry_run: bool,
+    pub progress: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct CompactSnapshotSummary {
+    pub snapshot_dir: String,
+    pub accessions_indexed: usize,
+    pub project_records: usize,
+    pub project_pages_found: usize,
+    pub project_pages_removed: usize,
+    pub project_pages_kept: usize,
+    pub project_page_bytes_removed: u64,
+    pub file_manifests_removed: usize,
+    pub sdrf_payloads_removed: usize,
+    pub evidence_bytes_removed: u64,
+    pub dry_run: bool,
+    pub validation_ok: bool,
+    pub note: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -820,10 +850,223 @@ pub async fn snapshot(opts: SnapshotOptions) -> Result<SnapshotSummary> {
     Ok(summary)
 }
 
+fn file_size(path: &Path) -> u64 {
+    std::fs::metadata(path).map(|meta| meta.len()).unwrap_or(0)
+}
+
+fn accession_from_named_file(path: &Path) -> Option<String> {
+    let name = path.file_name()?.to_str()?;
+    let accession = name.split('.').next()?.trim().to_ascii_uppercase();
+    is_pxd(&accession).then_some(accession)
+}
+
+pub fn compact_snapshot(opts: CompactSnapshotOptions) -> Result<CompactSnapshotSummary> {
+    let started = Instant::now();
+    let snapshot_dir = opts.snapshot_dir.clone();
+    let accessions_path = snapshot_dir.join("accessions.txt");
+    let projects_dir = snapshot_dir.join("projects");
+    let pages_dir = snapshot_dir.join("project_pages");
+    let files_dir = snapshot_dir.join("files");
+    let sdrf_dir = snapshot_dir.join("sdrf");
+
+    let accessions = read_nonempty_lines(&accessions_path)
+        .with_context(|| {
+            format!(
+                "validate snapshot accession index {}",
+                accessions_path.display()
+            )
+        })?
+        .into_iter()
+        .map(|x| x.to_ascii_uppercase())
+        .collect::<BTreeSet<_>>();
+    let project_records = if projects_dir.is_dir() {
+        std::fs::read_dir(&projects_dir)?
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| entry.path().extension().and_then(|x| x.to_str()) == Some("json"))
+            .count()
+    } else {
+        0
+    };
+
+    if project_records < accessions.len() {
+        return Err(anyhow!(
+            "snapshot compaction refused: only {} materialized project records for {} indexed accessions",
+            project_records,
+            accessions.len()
+        ));
+    }
+
+    let mut page_files = if pages_dir.is_dir() {
+        std::fs::read_dir(&pages_dir)?
+            .filter_map(|entry| entry.ok().map(|x| x.path()))
+            .filter(|path| path.is_file())
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
+    page_files.sort();
+    let latest_page = page_files
+        .iter()
+        .filter(|path| path.extension().and_then(|x| x.to_str()) == Some("json"))
+        .max()
+        .cloned();
+
+    let retain_accessions: HashSet<String> = if opts.prune_noncandidate_evidence {
+        let path = opts.retain_accessions_file.as_ref().ok_or_else(|| {
+            anyhow!("--prune-noncandidate-evidence requires --retain-accessions-file")
+        })?;
+        read_nonempty_lines(path)?
+            .into_iter()
+            .map(|x| x.to_ascii_uppercase())
+            .collect()
+    } else {
+        HashSet::new()
+    };
+
+    let total_items = page_files.len()
+        + if opts.prune_noncandidate_evidence && files_dir.is_dir() {
+            std::fs::read_dir(&files_dir)?.count()
+        } else {
+            0
+        }
+        + if opts.prune_noncandidate_evidence && sdrf_dir.is_dir() {
+            std::fs::read_dir(&sdrf_dir)?.count()
+        } else {
+            0
+        };
+    let progress = make_progress_bar(
+        total_items as u64,
+        "compacting snapshot cache",
+        opts.progress,
+    );
+
+    let mut summary = CompactSnapshotSummary {
+        snapshot_dir: snapshot_dir.display().to_string(),
+        accessions_indexed: accessions.len(),
+        project_records,
+        project_pages_found: page_files.len(),
+        dry_run: opts.dry_run,
+        validation_ok: true,
+        note: if opts.keep_latest_project_page {
+            "Materialized projects/accessions retained; newest catalogue page retained for provenance.".to_string()
+        } else {
+            "Materialized projects/accessions retained; redundant catalogue pages removed."
+                .to_string()
+        },
+        ..Default::default()
+    };
+
+    for path in &page_files {
+        let keep = opts.keep_latest_project_page
+            && latest_page
+                .as_ref()
+                .map(|latest| latest == path)
+                .unwrap_or(false);
+        if keep {
+            summary.project_pages_kept += 1;
+        } else {
+            summary.project_pages_removed += 1;
+            summary.project_page_bytes_removed += file_size(path);
+            if !opts.dry_run {
+                std::fs::remove_file(path).with_context(|| {
+                    format!("remove redundant catalogue page {}", path.display())
+                })?;
+            }
+        }
+        progress.inc(1);
+    }
+
+    if opts.prune_noncandidate_evidence {
+        for (dir, is_sdrf) in [(&files_dir, false), (&sdrf_dir, true)] {
+            if !dir.is_dir() {
+                continue;
+            }
+            for entry in std::fs::read_dir(dir)? {
+                let path = entry?.path();
+                if !path.is_file() {
+                    continue;
+                }
+                let keep = accession_from_named_file(&path)
+                    .map(|accession| retain_accessions.contains(&accession))
+                    .unwrap_or(true);
+                if !keep {
+                    let bytes = file_size(&path);
+                    summary.evidence_bytes_removed += bytes;
+                    if is_sdrf {
+                        summary.sdrf_payloads_removed += 1;
+                    } else {
+                        summary.file_manifests_removed += 1;
+                    }
+                    if !opts.dry_run {
+                        std::fs::remove_file(&path).with_context(|| {
+                            format!("remove non-candidate evidence {}", path.display())
+                        })?;
+                    }
+                }
+                progress.inc(1);
+            }
+        }
+    }
+
+    progress.finish_with_message("snapshot compaction complete");
+    if !opts.dry_run {
+        write_json(
+            &snapshot_dir.join("snapshot_compaction_summary.json"),
+            &summary,
+        )?;
+    }
+    log::info!(
+        "snapshot compaction complete in {:.1}s: pages_removed={} page_bytes_removed={} evidence_bytes_removed={}",
+        started.elapsed().as_secs_f64(),
+        summary.project_pages_removed,
+        summary.project_page_bytes_removed,
+        summary.evidence_bytes_removed,
+    );
+    Ok(summary)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn compact_snapshot_removes_redundant_pages_but_keeps_materialized_projects() {
+        let root = std::env::temp_dir().join(format!(
+            "pride_scp_compact_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(root.join("projects")).unwrap();
+        std::fs::create_dir_all(root.join("project_pages")).unwrap();
+        std::fs::write(root.join("accessions.txt"), "PXD000001\nPXD000002\n").unwrap();
+        std::fs::write(root.join("projects/PXD000001.json"), "{}").unwrap();
+        std::fs::write(root.join("projects/PXD000002.json"), "{}").unwrap();
+        std::fs::write(root.join("project_pages/page_000000.json"), "[1]").unwrap();
+        std::fs::write(root.join("project_pages/page_000001.json"), "[2]").unwrap();
+
+        let summary = compact_snapshot(CompactSnapshotOptions {
+            snapshot_dir: root.clone(),
+            keep_latest_project_page: true,
+            retain_accessions_file: None,
+            prune_noncandidate_evidence: false,
+            dry_run: false,
+            progress: false,
+        })
+        .expect("snapshot compaction should succeed");
+        assert_eq!(summary.project_pages_found, 2);
+        assert_eq!(summary.project_pages_removed, 1);
+        assert_eq!(summary.project_pages_kept, 1);
+        assert!(root.join("project_pages/page_000001.json").is_file());
+        assert!(!root.join("project_pages/page_000000.json").exists());
+        assert!(root.join("projects/PXD000001.json").is_file());
+        assert!(root.join("projects/PXD000002.json").is_file());
+
+        let _ = std::fs::remove_dir_all(root);
+    }
 
     #[test]
     fn extracts_projects_from_content_wrapper() {

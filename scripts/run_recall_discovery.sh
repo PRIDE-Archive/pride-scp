@@ -30,8 +30,15 @@ fi
   --output "$DISCOVERY_DIR" \
   --min-score 1
 
+"$BIN" candidate-audit \
+  --candidates "$DISCOVERY_DIR/candidates.jsonl" \
+  --config "$ROOT/config/discovery_terms.json" \
+  --output "$ROOT/data/candidate_audit"
+
 "$BIN" export-python \
   --candidates "$DISCOVERY_DIR/candidates.tsv" \
+  --candidates-jsonl "$DISCOVERY_DIR/candidates.jsonl" \
+  --config "$ROOT/config/discovery_terms.json" \
   --output "$BRIDGE_DIR" \
   --min-tier weak
 

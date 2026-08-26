@@ -49,6 +49,56 @@ pub struct CandidateRecord {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct CandidateDiagnosticRecord {
+    pub accession: String,
+    pub dataset_title: String,
+    pub dataset_description: String,
+    pub discovery_score: i32,
+    pub discovery_tier: String,
+    pub positive_lanes: Vec<String>,
+    pub specific_scp_labels: Vec<String>,
+    pub method_labels: Vec<String>,
+    pub biological_specific_labels: Vec<String>,
+    pub broad_context_labels: Vec<String>,
+    pub adjacent_labels: Vec<String>,
+    pub uncategorized_positive_labels: Vec<String>,
+    pub negative_context_labels: Vec<String>,
+    pub evidence_profile: String,
+    pub semantic_priority: String,
+    pub broad_only: bool,
+    pub has_negative_context: bool,
+    pub project_json_path: String,
+    pub files_json_path: String,
+    pub sdrf_path: String,
+    pub hits: Vec<LaneHit>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct CandidateAuditSummary {
+    pub candidates: usize,
+    pub priority_a_specific: usize,
+    pub priority_b_method: usize,
+    pub priority_c_broad: usize,
+    pub priority_d_adjacent: usize,
+    pub broad_only_candidates: usize,
+    pub candidates_with_negative_context: usize,
+    pub candidates_with_specific_signal: usize,
+    pub candidates_with_method_signal: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct PythonBridgeSummary {
+    pub candidates_exported: usize,
+    pub strong_candidates: usize,
+    pub possible_candidates: usize,
+    pub weak_candidates: usize,
+    pub priority_a_specific: usize,
+    pub priority_b_method: usize,
+    pub priority_c_broad: usize,
+    pub priority_d_adjacent: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct DiscoverySummary {
     pub projects_scanned: usize,
     pub projects_with_positive_signal: usize,
@@ -94,6 +144,24 @@ pub fn write_json<T: Serialize>(path: &Path, value: &T) -> Result<()> {
     serde_json::to_writer_pretty(BufWriter::new(file), value)
         .with_context(|| format!("write JSON {}", path.display()))?;
     Ok(())
+}
+
+pub fn read_jsonl<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<Vec<T>> {
+    let file = File::open(path).with_context(|| format!("open {}", path.display()))?;
+    let reader = BufReader::new(file);
+    let mut out = Vec::new();
+    for (index, line) in reader.lines().enumerate() {
+        let line =
+            line.with_context(|| format!("read line {} from {}", index + 1, path.display()))?;
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let row = serde_json::from_str::<T>(line)
+            .with_context(|| format!("parse JSONL line {} from {}", index + 1, path.display()))?;
+        out.push(row);
+    }
+    Ok(out)
 }
 
 pub fn write_jsonl<T: Serialize>(path: &Path, rows: &[T]) -> Result<()> {

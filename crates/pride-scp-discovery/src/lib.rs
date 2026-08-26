@@ -1,14 +1,15 @@
 use anyhow::{anyhow, Context, Result};
 use pride_scp_core::{
     first_string_for_keys, flatten_json_strings, make_progress_bar, make_spinner,
-    read_candidate_tsv, read_json, semicolon_join, write_candidate_tsv, write_json, write_jsonl,
-    CandidateRecord, DiscoveryConfig, DiscoverySummary, LaneHit, RecallAuditRow, RecallSummary,
+    read_candidate_tsv, read_json, read_jsonl, semicolon_join, write_candidate_tsv, write_json,
+    write_jsonl, CandidateAuditSummary, CandidateDiagnosticRecord, CandidateRecord,
+    DiscoveryConfig, DiscoverySummary, LaneHit, PythonBridgeSummary, RecallAuditRow, RecallSummary,
     WeightedTerm,
 };
 use rayon::prelude::*;
 use regex::Regex;
 use serde_json::Value;
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs::File;
 use std::io::{BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
@@ -25,6 +26,14 @@ pub struct DiscoverOptions {
 }
 
 #[derive(Debug, Clone)]
+pub struct CandidateAuditOptions {
+    pub candidates_jsonl: PathBuf,
+    pub config_path: PathBuf,
+    pub output_dir: PathBuf,
+    pub progress: bool,
+}
+
+#[derive(Debug, Clone)]
 pub struct RecallAuditOptions {
     pub candidates_tsv: PathBuf,
     pub benchmark_csv: PathBuf,
@@ -35,6 +44,8 @@ pub struct RecallAuditOptions {
 #[derive(Debug, Clone)]
 pub struct ExportPythonOptions {
     pub candidates_tsv: PathBuf,
+    pub candidates_jsonl: Option<PathBuf>,
+    pub config_path: PathBuf,
     pub output_dir: PathBuf,
     pub min_tier: String,
     pub progress: bool,
@@ -413,6 +424,268 @@ pub fn discover(opts: DiscoverOptions) -> Result<DiscoverySummary> {
     Ok(summary)
 }
 
+fn label_set(terms: &[WeightedTerm]) -> HashSet<String> {
+    terms.iter().map(|item| item.label.clone()).collect()
+}
+
+fn sorted_unique(values: impl IntoIterator<Item = String>) -> Vec<String> {
+    values
+        .into_iter()
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
+fn categorize_candidate(row: &CandidateRecord, cfg: &DiscoveryConfig) -> CandidateDiagnosticRecord {
+    let explicit = label_set(&cfg.explicit_terms);
+    let methods = label_set(&cfg.method_terms);
+    let biological = label_set(&cfg.biological_terms);
+    let adjacent = label_set(&cfg.adjacent_terms);
+
+    // These labels are deliberately retained for recall but are broad enough to
+    // match studies that mention a cell type or nearby single-cell context without
+    // measuring an individual biological cell by MS.
+    let broad_overrides: HashSet<&'static str> = HashSet::from([
+        "single_cells",
+        "individual_cells",
+        "single_bacteria",
+        "proteins_per_cell",
+        "protein_groups_per_cell",
+        "individual_biological_cell_proteomics",
+        "proteomics_individual_biological_cell",
+    ]);
+    let regex_specific: HashSet<&'static str> = HashSet::from(["one_cell_sample"]);
+
+    let mut specific_scp_labels = Vec::new();
+    let mut method_labels = Vec::new();
+    let mut biological_specific_labels = Vec::new();
+    let mut broad_context_labels = Vec::new();
+    let mut adjacent_labels = Vec::new();
+    let mut uncategorized_positive_labels = Vec::new();
+
+    for label in &row.positive_labels {
+        if broad_overrides.contains(label.as_str()) {
+            broad_context_labels.push(label.clone());
+        } else if methods.contains(label) {
+            method_labels.push(label.clone());
+        } else if explicit.contains(label) || regex_specific.contains(label.as_str()) {
+            specific_scp_labels.push(label.clone());
+        } else if biological.contains(label) {
+            biological_specific_labels.push(label.clone());
+            specific_scp_labels.push(label.clone());
+        } else if adjacent.contains(label) {
+            adjacent_labels.push(label.clone());
+        } else {
+            uncategorized_positive_labels.push(label.clone());
+        }
+    }
+
+    specific_scp_labels = sorted_unique(specific_scp_labels);
+    method_labels = sorted_unique(method_labels);
+    biological_specific_labels = sorted_unique(biological_specific_labels);
+    broad_context_labels = sorted_unique(broad_context_labels);
+    adjacent_labels = sorted_unique(adjacent_labels);
+    uncategorized_positive_labels = sorted_unique(uncategorized_positive_labels);
+
+    let evidence_profile = if !specific_scp_labels.is_empty() && !method_labels.is_empty() {
+        "specific_plus_method"
+    } else if !specific_scp_labels.is_empty() {
+        "specific"
+    } else if !method_labels.is_empty() && !broad_context_labels.is_empty() {
+        "method_plus_context"
+    } else if !method_labels.is_empty() {
+        "method_only"
+    } else if !broad_context_labels.is_empty() {
+        "broad_only"
+    } else if !adjacent_labels.is_empty() {
+        "adjacent_only"
+    } else {
+        "other"
+    }
+    .to_string();
+
+    let semantic_priority = if !specific_scp_labels.is_empty() {
+        "A_specific"
+    } else if !method_labels.is_empty() {
+        "B_method"
+    } else if !broad_context_labels.is_empty() {
+        "C_broad"
+    } else {
+        "D_adjacent"
+    }
+    .to_string();
+
+    CandidateDiagnosticRecord {
+        accession: row.accession.clone(),
+        dataset_title: row.dataset_title.clone(),
+        dataset_description: row.dataset_description.clone(),
+        discovery_score: row.score,
+        discovery_tier: row.tier.clone(),
+        positive_lanes: row.positive_lanes.clone(),
+        specific_scp_labels,
+        method_labels,
+        biological_specific_labels,
+        broad_context_labels,
+        adjacent_labels,
+        uncategorized_positive_labels,
+        negative_context_labels: row.negative_context_labels.clone(),
+        evidence_profile: evidence_profile.clone(),
+        semantic_priority,
+        broad_only: evidence_profile == "broad_only",
+        has_negative_context: !row.negative_context_labels.is_empty(),
+        project_json_path: row.project_json_path.clone(),
+        files_json_path: row.files_json_path.clone(),
+        sdrf_path: row.sdrf_path.clone(),
+        hits: row.hits.clone(),
+    }
+}
+
+fn candidate_audit_summary(rows: &[CandidateDiagnosticRecord]) -> CandidateAuditSummary {
+    CandidateAuditSummary {
+        candidates: rows.len(),
+        priority_a_specific: rows
+            .iter()
+            .filter(|x| x.semantic_priority == "A_specific")
+            .count(),
+        priority_b_method: rows
+            .iter()
+            .filter(|x| x.semantic_priority == "B_method")
+            .count(),
+        priority_c_broad: rows
+            .iter()
+            .filter(|x| x.semantic_priority == "C_broad")
+            .count(),
+        priority_d_adjacent: rows
+            .iter()
+            .filter(|x| x.semantic_priority == "D_adjacent")
+            .count(),
+        broad_only_candidates: rows.iter().filter(|x| x.broad_only).count(),
+        candidates_with_negative_context: rows.iter().filter(|x| x.has_negative_context).count(),
+        candidates_with_specific_signal: rows
+            .iter()
+            .filter(|x| !x.specific_scp_labels.is_empty())
+            .count(),
+        candidates_with_method_signal: rows.iter().filter(|x| !x.method_labels.is_empty()).count(),
+    }
+}
+
+fn write_candidate_diagnostics_tsv(path: &Path, rows: &[CandidateDiagnosticRecord]) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let mut writer = csv::WriterBuilder::new().delimiter(b'\t').from_path(path)?;
+    writer.write_record([
+        "accession",
+        "dataset_title",
+        "dataset_description",
+        "discovery_score",
+        "discovery_tier",
+        "semantic_priority",
+        "evidence_profile",
+        "broad_only",
+        "has_negative_context",
+        "positive_lanes",
+        "specific_scp_labels",
+        "method_labels",
+        "biological_specific_labels",
+        "broad_context_labels",
+        "adjacent_labels",
+        "uncategorized_positive_labels",
+        "negative_context_labels",
+        "project_json_path",
+        "files_json_path",
+        "sdrf_path",
+    ])?;
+    for row in rows {
+        let score = row.discovery_score.to_string();
+        let broad_only = row.broad_only.to_string();
+        let has_negative = row.has_negative_context.to_string();
+        let positive_lanes = semicolon_join(&row.positive_lanes);
+        let specific = semicolon_join(&row.specific_scp_labels);
+        let methods = semicolon_join(&row.method_labels);
+        let biological = semicolon_join(&row.biological_specific_labels);
+        let broad = semicolon_join(&row.broad_context_labels);
+        let adjacent = semicolon_join(&row.adjacent_labels);
+        let uncategorized = semicolon_join(&row.uncategorized_positive_labels);
+        let negative = semicolon_join(&row.negative_context_labels);
+        writer.write_record([
+            row.accession.as_str(),
+            row.dataset_title.as_str(),
+            row.dataset_description.as_str(),
+            score.as_str(),
+            row.discovery_tier.as_str(),
+            row.semantic_priority.as_str(),
+            row.evidence_profile.as_str(),
+            broad_only.as_str(),
+            has_negative.as_str(),
+            positive_lanes.as_str(),
+            specific.as_str(),
+            methods.as_str(),
+            biological.as_str(),
+            broad.as_str(),
+            adjacent.as_str(),
+            uncategorized.as_str(),
+            negative.as_str(),
+            row.project_json_path.as_str(),
+            row.files_json_path.as_str(),
+            row.sdrf_path.as_str(),
+        ])?;
+    }
+    writer.flush()?;
+    Ok(())
+}
+
+pub fn candidate_audit(opts: CandidateAuditOptions) -> Result<CandidateAuditSummary> {
+    let started = Instant::now();
+    let cfg: DiscoveryConfig = read_json(&opts.config_path)?;
+    let mut candidates: Vec<CandidateRecord> = read_jsonl(&opts.candidates_jsonl)?;
+    candidates.sort_by(|a, b| a.accession.cmp(&b.accession));
+    log::info!(
+        "candidate audit start: candidates={} input={}",
+        candidates.len(),
+        opts.candidates_jsonl.display()
+    );
+    let progress = make_progress_bar(
+        candidates.len() as u64,
+        "classifying discovery evidence profiles",
+        opts.progress,
+    );
+    let mut rows = Vec::with_capacity(candidates.len());
+    for candidate in &candidates {
+        rows.push(categorize_candidate(candidate, &cfg));
+        progress.inc(1);
+    }
+    progress.finish_with_message("candidate evidence profiles complete");
+
+    std::fs::create_dir_all(&opts.output_dir)?;
+    write_candidate_diagnostics_tsv(&opts.output_dir.join("candidate_diagnostics.tsv"), &rows)?;
+    write_jsonl(&opts.output_dir.join("candidate_diagnostics.jsonl"), &rows)?;
+    let broad_only = rows
+        .iter()
+        .filter(|x| x.broad_only)
+        .cloned()
+        .collect::<Vec<_>>();
+    write_candidate_diagnostics_tsv(
+        &opts.output_dir.join("broad_only_candidates.tsv"),
+        &broad_only,
+    )?;
+    let summary = candidate_audit_summary(&rows);
+    write_json(
+        &opts.output_dir.join("candidate_audit_summary.json"),
+        &summary,
+    )?;
+    log::info!(
+        "candidate audit complete in {:.1}s: A={} B={} C={} D={} broad_only={}",
+        started.elapsed().as_secs_f64(),
+        summary.priority_a_specific,
+        summary.priority_b_method,
+        summary.priority_c_broad,
+        summary.priority_d_adjacent,
+        summary.broad_only_candidates,
+    );
+    Ok(summary)
+}
+
 fn truthy(value: &str) -> bool {
     matches!(
         value.trim().to_ascii_lowercase().as_str(),
@@ -564,7 +837,7 @@ fn tier_rank(tier: &str) -> i32 {
     }
 }
 
-pub fn export_python(opts: ExportPythonOptions) -> Result<usize> {
+pub fn export_python(opts: ExportPythonOptions) -> Result<PythonBridgeSummary> {
     let started = Instant::now();
     log::info!(
         "python bridge export start: candidates={} min_tier={}",
@@ -575,62 +848,84 @@ pub fn export_python(opts: ExportPythonOptions) -> Result<usize> {
     if min_rank == 0 {
         return Err(anyhow!("--min-tier must be strong, possible, or weak"));
     }
-    let mut rows = read_candidate_tsv(&opts.candidates_tsv)?
+    let cfg: DiscoveryConfig = read_json(&opts.config_path)?;
+
+    let jsonl_path = opts.candidates_jsonl.clone().unwrap_or_else(|| {
+        opts.candidates_tsv
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join("candidates.jsonl")
+    });
+    let source_rows: Vec<CandidateRecord> = if jsonl_path.is_file() {
+        read_jsonl(&jsonl_path)?
+    } else {
+        log::warn!(
+            "candidate JSONL not found at {}; bridge will omit hit excerpts",
+            jsonl_path.display()
+        );
+        read_candidate_tsv(&opts.candidates_tsv)?
+    };
+
+    let mut rows = source_rows
         .into_iter()
         .filter(|row| tier_rank(&row.tier) >= min_rank)
         .collect::<Vec<_>>();
     rows.sort_by(|a, b| a.accession.cmp(&b.accession));
     std::fs::create_dir_all(&opts.output_dir)?;
 
-    let progress = make_progress_bar(rows.len() as u64, "exporting Python bridge", opts.progress);
+    let progress = make_progress_bar(
+        rows.len() as u64,
+        "exporting semantic Python bridge",
+        opts.progress,
+    );
     let mut accessions = BufWriter::new(File::create(
         opts.output_dir.join("candidate_accessions.txt"),
     )?);
+    let mut diagnostics = Vec::with_capacity(rows.len());
     for row in &rows {
         writeln!(accessions, "{}", row.accession)?;
-    }
-
-    let mut writer = csv::WriterBuilder::new()
-        .delimiter(b'\t')
-        .from_path(opts.output_dir.join("candidate_manifest.tsv"))?;
-    writer.write_record([
-        "accession",
-        "discovery_score",
-        "discovery_tier",
-        "discovery_positive_lanes",
-        "discovery_positive_labels",
-        "discovery_negative_context_labels",
-        "dataset_title",
-        "dataset_description",
-    ])?;
-    for row in &rows {
-        let score = row.score.to_string();
-        let positive_lanes = semicolon_join(&row.positive_lanes);
-        let positive_labels = semicolon_join(&row.positive_labels);
-        let negative_labels = semicolon_join(&row.negative_context_labels);
-        writer.write_record([
-            row.accession.as_str(),
-            score.as_str(),
-            row.tier.as_str(),
-            positive_lanes.as_str(),
-            positive_labels.as_str(),
-            negative_labels.as_str(),
-            row.dataset_title.as_str(),
-            row.dataset_description.as_str(),
-        ])?;
+        diagnostics.push(categorize_candidate(row, &cfg));
         progress.inc(1);
     }
-    writer.flush()?;
+
+    write_candidate_diagnostics_tsv(
+        &opts.output_dir.join("candidate_manifest.tsv"),
+        &diagnostics,
+    )?;
+    write_jsonl(
+        &opts.output_dir.join("semantic_candidates.jsonl"),
+        &diagnostics,
+    )?;
+
+    let audit = candidate_audit_summary(&diagnostics);
+    let summary = PythonBridgeSummary {
+        candidates_exported: rows.len(),
+        strong_candidates: rows.iter().filter(|x| x.tier == "strong").count(),
+        possible_candidates: rows.iter().filter(|x| x.tier == "possible").count(),
+        weak_candidates: rows.iter().filter(|x| x.tier == "weak").count(),
+        priority_a_specific: audit.priority_a_specific,
+        priority_b_method: audit.priority_b_method,
+        priority_c_broad: audit.priority_c_broad,
+        priority_d_adjacent: audit.priority_d_adjacent,
+    };
+    write_json(
+        &opts.output_dir.join("python_bridge_summary.json"),
+        &summary,
+    )?;
     progress.finish_with_message(format!(
-        "Python bridge complete | {} candidates",
+        "semantic Python bridge complete | {} candidates",
         rows.len()
     ));
     log::info!(
-        "python bridge export complete in {:.1}s: {} candidates",
+        "python bridge export complete in {:.1}s: {} candidates A={} B={} C={} D={}",
         started.elapsed().as_secs_f64(),
-        rows.len()
+        rows.len(),
+        summary.priority_a_specific,
+        summary.priority_b_method,
+        summary.priority_c_broad,
+        summary.priority_d_adjacent,
     );
-    Ok(rows.len())
+    Ok(summary)
 }
 
 #[cfg(test)]
@@ -641,6 +936,56 @@ mod tests {
     fn tier_order_is_monotonic() {
         assert!(tier_rank("strong") > tier_rank("possible"));
         assert!(tier_rank("possible") > tier_rank("weak"));
+    }
+
+    #[test]
+    fn candidate_profiles_keep_broad_and_specific_signals_distinct() {
+        let cfg = DiscoveryConfig {
+            explicit_terms: vec![WeightedTerm {
+                label: "single_cell_proteomics".into(),
+                term: "single-cell proteomics".into(),
+                weight: 14,
+            }],
+            method_terms: vec![WeightedTerm {
+                label: "nanopots".into(),
+                term: "nanopots".into(),
+                weight: 8,
+            }],
+            biological_terms: vec![WeightedTerm {
+                label: "single_cells".into(),
+                term: "single cells".into(),
+                weight: 5,
+            }],
+            adjacent_terms: vec![],
+            negative_context_terms: vec![],
+            strong_score: 36,
+            possible_score: 14,
+        };
+        let row = CandidateRecord {
+            accession: "PXD999999".into(),
+            dataset_title: "test".into(),
+            dataset_description: String::new(),
+            score: 40,
+            tier: "strong".into(),
+            positive_lanes: vec!["repository_title".into()],
+            positive_labels: vec![
+                "single_cell_proteomics".into(),
+                "single_cells".into(),
+                "nanopots".into(),
+            ],
+            ..Default::default()
+        };
+        let diag = categorize_candidate(&row, &cfg);
+        assert!(diag
+            .specific_scp_labels
+            .contains(&"single_cell_proteomics".to_string()));
+        assert!(diag.method_labels.contains(&"nanopots".to_string()));
+        assert!(diag
+            .broad_context_labels
+            .contains(&"single_cells".to_string()));
+        assert_eq!(diag.semantic_priority, "A_specific");
+        assert_eq!(diag.evidence_profile, "specific_plus_method");
+        assert!(!diag.broad_only);
     }
 
     #[test]

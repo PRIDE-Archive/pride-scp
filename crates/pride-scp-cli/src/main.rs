@@ -2,9 +2,13 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 use pride_scp_core::format_duration;
 use pride_scp_discovery::{
-    discover, export_python, recall_audit, DiscoverOptions, ExportPythonOptions, RecallAuditOptions,
+    candidate_audit, discover, export_python, recall_audit, CandidateAuditOptions, DiscoverOptions,
+    ExportPythonOptions, RecallAuditOptions,
 };
-use pride_scp_index::{snapshot, SnapshotOptions, DEFAULT_PRIDE_API, DEFAULT_PROJECT_PAGE_SIZE};
+use pride_scp_index::{
+    compact_snapshot, snapshot, CompactSnapshotOptions, SnapshotOptions, DEFAULT_PRIDE_API,
+    DEFAULT_PROJECT_PAGE_SIZE,
+};
 use std::path::PathBuf;
 use std::time::Instant;
 
@@ -63,7 +67,7 @@ enum Command {
         /// This does not force re-download of per-project files/SDRF.
         #[arg(long)]
         refresh_catalogue: bool,
-        #[arg(long, default_value = "PRIDE-SCP-recall-index/0.1.3")]
+        #[arg(long, default_value = "PRIDE-SCP-recall-index/0.1.4")]
         user_agent: String,
         /// Skip per-project file-manifest retrieval.
         #[arg(long)]
@@ -93,6 +97,32 @@ enum Command {
         #[arg(long, default_value_t = 208)]
         expected_positive_count: usize,
     },
+    /// Categorize high-recall discovery evidence into semantic-review profiles.
+    CandidateAudit {
+        #[arg(long, default_value = "data/discovery/candidates.jsonl")]
+        candidates: PathBuf,
+        #[arg(long, default_value = "config/discovery_terms.json")]
+        config: PathBuf,
+        #[arg(long, default_value = "data/candidate_audit")]
+        output: PathBuf,
+    },
+    /// Reclaim redundant snapshot cache after projects have been materialized.
+    CompactSnapshot {
+        #[arg(long, default_value = "data/snapshot")]
+        snapshot: PathBuf,
+        /// Remove every project-page cache. By default the newest page is retained.
+        #[arg(long)]
+        delete_all_project_pages: bool,
+        /// Optional accession list to retain when pruning file/SDRF evidence.
+        #[arg(long)]
+        retain_accessions_file: Option<PathBuf>,
+        /// Also remove file/SDRF payloads for accessions not in --retain-accessions-file.
+        #[arg(long)]
+        prune_noncandidate_evidence: bool,
+        /// Report what would be removed without deleting anything.
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// Measure candidate recall against a known-positive CSV benchmark.
     RecallAudit {
         #[arg(long, default_value = "data/discovery/candidates.tsv")]
@@ -106,6 +136,11 @@ enum Command {
     ExportPython {
         #[arg(long, default_value = "data/discovery/candidates.tsv")]
         candidates: PathBuf,
+        /// Optional full JSONL candidate records. Defaults to candidates.jsonl beside the TSV.
+        #[arg(long)]
+        candidates_jsonl: Option<PathBuf>,
+        #[arg(long, default_value = "config/discovery_terms.json")]
+        config: PathBuf,
         #[arg(long, default_value = "data/python_bridge")]
         output: PathBuf,
         #[arg(long, default_value = "weak")]
@@ -198,6 +233,42 @@ async fn main() -> Result<()> {
             })?;
             println!("{}", serde_json::to_string_pretty(&summary)?);
         }
+        Command::CandidateAudit {
+            candidates,
+            config,
+            output,
+        } => {
+            log::info!(
+                "command=candidate-audit candidates={} output={}",
+                candidates.display(),
+                output.display()
+            );
+            let summary = candidate_audit(CandidateAuditOptions {
+                candidates_jsonl: candidates,
+                config_path: config,
+                output_dir: output,
+                progress,
+            })?;
+            println!("{}", serde_json::to_string_pretty(&summary)?);
+        }
+        Command::CompactSnapshot {
+            snapshot,
+            delete_all_project_pages,
+            retain_accessions_file,
+            prune_noncandidate_evidence,
+            dry_run,
+        } => {
+            log::info!("command=compact-snapshot snapshot={}", snapshot.display());
+            let summary = compact_snapshot(CompactSnapshotOptions {
+                snapshot_dir: snapshot,
+                keep_latest_project_page: !delete_all_project_pages,
+                retain_accessions_file,
+                prune_noncandidate_evidence,
+                dry_run,
+                progress,
+            })?;
+            println!("{}", serde_json::to_string_pretty(&summary)?);
+        }
         Command::RecallAudit {
             candidates,
             known_positives,
@@ -218,6 +289,8 @@ async fn main() -> Result<()> {
         }
         Command::ExportPython {
             candidates,
+            candidates_jsonl,
+            config,
             output,
             min_tier,
         } => {
@@ -226,13 +299,15 @@ async fn main() -> Result<()> {
                 candidates.display(),
                 output.display()
             );
-            let count = export_python(ExportPythonOptions {
+            let summary = export_python(ExportPythonOptions {
                 candidates_tsv: candidates,
+                candidates_jsonl,
+                config_path: config,
                 output_dir: output,
                 min_tier,
                 progress,
             })?;
-            println!("exported_candidates\t{count}");
+            println!("{}", serde_json::to_string_pretty(&summary)?);
         }
     }
 

@@ -464,3 +464,123 @@ completed cached `project_pages/page_*.json`. If it is a complete monolithic
 catalogue response, that newest cache is used directly. To request one current
 catalogue snapshot instead, add `--refresh-catalogue`; unlike `--force`, this
 does not invalidate project/file/SDRF caches.
+
+## v0.1.4 candidate diagnostics and semantic bridge
+
+The discovery tier remains a recall score, not a probability of true SCP. Before
+Ollama annotation, classify discovery features into semantic-review profiles:
+
+```bash
+target/release/pride-scp candidate-audit \
+  --candidates data/discovery/candidates.jsonl \
+  --config config/discovery_terms.json \
+  --output data/candidate_audit
+```
+
+Outputs:
+
+```text
+candidate_diagnostics.tsv
+candidate_diagnostics.jsonl
+broad_only_candidates.tsv
+candidate_audit_summary.json
+```
+
+The audit separates:
+
+```text
+specific_scp_labels
+method_labels
+biological_specific_labels
+broad_context_labels
+adjacent_labels
+negative_context_labels
+```
+
+and assigns a non-destructive semantic priority:
+
+```text
+A_specific
+B_method
+C_broad
+D_adjacent
+```
+
+All candidates are retained regardless of priority.
+
+Prepare the Python bridge with full hit excerpts:
+
+```bash
+target/release/pride-scp export-python \
+  --candidates data/discovery/candidates.tsv \
+  --candidates-jsonl data/discovery/candidates.jsonl \
+  --config config/discovery_terms.json \
+  --output data/python_bridge \
+  --min-tier weak
+```
+
+or run both commands with:
+
+```bash
+scripts/prepare_semantic_bridge.sh
+```
+
+The richer bridge writes:
+
+```text
+candidate_accessions.txt
+candidate_manifest.tsv
+semantic_candidates.jsonl
+python_bridge_summary.json
+```
+
+After Stage-01/02 publication enrichment, `run_python_publication_enrichment.sh`
+partitions the 321-candidate universe into publication-backed and repository-only
+evidence modes. Every candidate is assigned exactly one mode; absence of a PDF
+never removes a candidate.
+
+## Snapshot compaction
+
+Once a full snapshot has successfully materialized `projects/` and discovery has
+completed, the historical `project_pages/` cache is redundant. In particular,
+the v0.1.2 runaway pagination cache can contain hundreds of gigabytes of repeated
+monolithic catalogue responses.
+
+Preview safe compaction first:
+
+```bash
+target/release/pride-scp compact-snapshot \
+  --snapshot data/snapshot \
+  --dry-run
+```
+
+Then compact:
+
+```bash
+target/release/pride-scp compact-snapshot \
+  --snapshot data/snapshot
+```
+
+By default this validates that all indexed accessions have materialized project
+records, deletes redundant catalogue pages, and keeps only the newest completed
+catalogue page for provenance. `projects/`, `files/`, `sdrf/`, `accessions.txt`,
+and discovery outputs are untouched.
+
+For the current ~414 GB `project_pages/` cache this should reclaim almost all of
+that space while preserving the complete materialized snapshot needed to rerun
+discovery.
+
+An optional later mode can also retain file/SDRF evidence only for a supplied
+candidate accession list:
+
+```bash
+target/release/pride-scp compact-snapshot \
+  --snapshot data/snapshot \
+  --retain-accessions-file data/python_bridge/candidate_accessions.txt \
+  --prune-noncandidate-evidence
+```
+
+Do **not** use that second mode yet if you may retune discovery vocabulary and
+want to rescan all 40,364 projects using the original file/SDRF evidence. The
+~4 GB full file/SDRF cache is modest compared with the redundant catalogue-page
+cache and is worth retaining for now.

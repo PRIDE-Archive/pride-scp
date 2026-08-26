@@ -35,6 +35,11 @@ done
   --workers "${PDF_WORKERS:-4}" \
   --output "$WORK/pride_candidate_publications_with_pdfs.tsv"
 
+"$PYTHON" "$ROOT/python/recall/partition_semantic_candidates.py" \
+  "$BRIDGE/semantic_candidates.jsonl" \
+  --pdf-manifest "$WORK/pride_candidate_publications_with_pdfs.tsv" \
+  --output-dir "$WORK/semantic_partition"
+
 cat <<MSG
 Publication enrichment complete.
 
@@ -42,14 +47,26 @@ The old deterministic publication screen is intentionally NOT a hard gate.
 You may run it separately for diagnostics, but Stage 04 should consume the
 unfiltered PDF manifest using --all-valid-pdfs.
 
-Next (long Ollama step):
+Semantic partition:
+  publication-backed: $WORK/semantic_partition/publication_backed_candidates.jsonl
+  repository-only:    $WORK/semantic_partition/repository_only_candidates.jsonl
 
-  $PYTHON $STAGES/04_run_pride_scp_annotations.py \\
-    $WORK/pride_candidate_publications_with_pdfs.tsv \\
-    --targeted-script $STAGES/pride_scp_targeted_ollama.py \\
-    --output-dir $WORK/pride_scp_annotations \\
-    --model qwen2.5:3b \\
-    --cpu-threads 4 \\
-    --workers 1 \\
+Next (long Ollama steps):
+
+Publication-backed:
+  $PYTHON $STAGES/04_run_pride_scp_annotations.py \
+    $WORK/pride_candidate_publications_with_pdfs.tsv \
+    --targeted-script $STAGES/pride_scp_targeted_ollama.py \
+    --output-dir $WORK/pride_scp_annotations \
+    --model qwen2.5:3b \
+    --cpu-threads 4 \
+    --workers 1 \
     --all-valid-pdfs
+
+Repository-only (non-destructive triage):
+  $PYTHON $ROOT/python/recall/triage_repository_candidates.py \
+    $WORK/semantic_partition/repository_only_candidates.jsonl \
+    --output-dir $WORK/repository_triage \
+    --model qwen2.5:3b \
+    --cpu-threads 4
 MSG

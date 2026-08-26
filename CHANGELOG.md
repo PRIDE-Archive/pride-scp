@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.1.4 - 2026-08-26
+
+- Add `candidate-audit` to separate specific SCP, method, broad-context, adjacent, and negative discovery signals without filtering candidates.
+- Add semantic priorities (`A_specific`, `B_method`, `C_broad`, `D_adjacent`) and broad-only diagnostics.
+- Expand `export-python` to preserve full discovery hit excerpts and emit `semantic_candidates.jsonl` plus a richer candidate manifest.
+- Add publication-backed vs repository-only semantic partitioning; candidates without usable PDFs are retained rather than lost.
+- Add `compact-snapshot` with validation and dry-run support to remove redundant `project_pages/` cache while retaining the materialized 40,364-project snapshot.
+- Add optional candidate-only file/SDRF pruning for later use; full evidence retention remains recommended during discovery development.
+
 ## 0.1.3 - 2026-08-26
 
 - Fix full-catalogue enumeration against the live PRIDE v3 `/projects/all` behavior, which can return the complete ~40k-project catalogue despite `page`/`pageSize` parameters.

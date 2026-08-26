@@ -87,7 +87,14 @@ def evidence_text(candidate: dict[str, Any], max_chars: int) -> str:
         f"PRIDE accession: {candidate.get('accession', '')}",
         f"Dataset title: {candidate.get('dataset_title', '')}",
         f"Dataset description: {candidate.get('dataset_description', '')}",
-        f"Discovery tier: {candidate.get('tier', '')}",
+        f"Discovery tier: {candidate.get('discovery_tier', candidate.get('tier', ''))}",
+        f"Semantic priority: {candidate.get('semantic_priority', '')}",
+        f"Evidence profile: {candidate.get('evidence_profile', '')}",
+        f"Specific SCP labels: {candidate.get('specific_scp_labels', [])}",
+        f"Method labels: {candidate.get('method_labels', [])}",
+        f"Broad context labels: {candidate.get('broad_context_labels', [])}",
+        f"Adjacent labels: {candidate.get('adjacent_labels', [])}",
+        f"Negative context labels: {candidate.get('negative_context_labels', [])}",
         "Discovery evidence:",
     ]
     for hit in candidate.get("hits", []) or []:

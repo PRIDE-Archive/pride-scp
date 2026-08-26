@@ -115,3 +115,52 @@ target/release/pride-scp snapshot \
   --timeout 120 \
   --retries 4
 ```
+
+## v0.1.4 semantic bridge and snapshot compaction
+
+Validate locally:
+
+```bash
+cargo fmt --all
+cargo check --workspace --locked
+cargo test --workspace --locked
+cargo build --release --locked
+./scripts/smoke_fixture.sh
+python -m py_compile python/recall/*.py
+bash -n scripts/*.sh
+```
+
+The Rust unit suite now additionally checks that broad-context labels are kept
+separate from specific SCP/method labels and that snapshot compaction removes
+redundant catalogue pages while preserving materialized project records.
+
+On the completed full discovery, run:
+
+```bash
+target/release/pride-scp candidate-audit \
+  --candidates data/discovery/candidates.jsonl \
+  --config config/discovery_terms.json \
+  --output data/candidate_audit
+
+target/release/pride-scp export-python \
+  --candidates data/discovery/candidates.tsv \
+  --candidates-jsonl data/discovery/candidates.jsonl \
+  --config config/discovery_terms.json \
+  --output data/python_bridge \
+  --min-tier weak
+```
+
+The bridge must retain all 321 candidates.
+
+Before reclaiming storage, preview:
+
+```bash
+target/release/pride-scp compact-snapshot \
+  --snapshot data/snapshot \
+  --dry-run
+```
+
+The dry-run must report `validation_ok=true`, 40,364 indexed accessions, at
+least 40,364 materialized project records, and a very large number of redundant
+project-page bytes eligible for deletion. Then run the same command without
+`--dry-run` and confirm that `projects/`, `files/`, and `sdrf/` remain present.
