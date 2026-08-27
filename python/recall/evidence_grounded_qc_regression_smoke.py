@@ -5,6 +5,7 @@ import importlib.util
 import json
 import tempfile
 from pathlib import Path
+from types import SimpleNamespace
 
 HERE = Path(__file__).resolve().parent
 
@@ -20,32 +21,54 @@ def load(name: str, filename: str):
 b = load("packet_builder", "build_semantic_qc_packets.py")
 q = load("qc", "adjudicate_semantic_qc.py")
 
-# Deterministic factual-axis normalization must resolve a cautious top-level
-# `uncertain` when the axes themselves are decisive.
-genuine = {
-    "decision": "uncertain",
-    "sample_unit": "individual_cell",
-    "same_unit_ms_proteomics": "yes",
-    "target_dataset_scope": "supports_target",
-    "premeasurement_pooling": "absent",
-    "benchmark_only": "no",
-    "evidence_quote_cell": "Each egg was thawed and homogenized",
-    "evidence_quote_ms": "until mass spectrometry analysis",
-    "reason": "individual eggs were separately processed",
-}
+
+def payload(**overrides):
+    base = {
+        "decision": "uncertain",
+        "individual_cell_samples_present": "yes",
+        "individual_identity_preserved": "yes",
+        "ms_on_individual_cell_samples": "yes",
+        "destructive_pooling_before_identity": "absent",
+        "population_or_bulk_only": "no",
+        "benchmark_only": "no",
+        "mixed_controls_or_libraries_present": "no",
+        "evidence_quote_cell": "individual cells were sorted into individual wells",
+        "evidence_quote_chain": "digested cells were analyzed by LC-MS/MS",
+        "evidence_quote_ms": "data were recorded in DIA mode on an Orbitrap Astral",
+        "reason": "identity is preserved from an individual cell to its MS-derived sample",
+    }
+    base.update(overrides)
+    return base
+
+
+# Positive normalization must accept a complete chain even when the model's raw
+# decision is cautious.
+genuine = payload()
 assert q.normalized_decision(genuine)[0] == "include"
 
-population = {
-    "decision": "include",
-    "sample_unit": "population_or_pool",
-    "same_unit_ms_proteomics": "yes",
-    "target_dataset_scope": "supports_target",
-    "premeasurement_pooling": "present",
-    "benchmark_only": "no",
-    "evidence_quote_cell": "10^6 root hair cells",
-    "evidence_quote_ms": "peptides were analyzed by LC-MS/MS",
-    "reason": "many cells contributed to one proteomic sample",
-}
+# Separate multi-cell libraries/controls do not negate direct single-cell data.
+mixed_controls = payload(mixed_controls_or_libraries_present="yes")
+assert q.normalized_decision(mixed_controls)[0] == "include"
+
+# Identity-preserving multiplexing is allowed: the exclusion axis is destructive
+# pooling BEFORE identity is established, not physical combination after labels.
+identity_preserving_multiplex = payload(
+    evidence_quote_chain="each cell received a unique isobaric label before channels were combined",
+)
+assert q.normalized_decision(identity_preserving_multiplex)[0] == "include"
+
+population = payload(
+    decision="include",
+    individual_cell_samples_present="no",
+    individual_identity_preserved="no",
+    ms_on_individual_cell_samples="no",
+    destructive_pooling_before_identity="present",
+    population_or_bulk_only="yes",
+    evidence_quote_cell="10^6 root hair cells",
+    evidence_quote_chain="proteins from each population sample were extracted",
+    evidence_quote_ms="peptides were analyzed by LC-MS/MS",
+    reason="many cells contributed to one proteomic sample",
+)
 assert q.normalized_decision(population)[0] == "exclude"
 
 # Risk pattern should surface a many-cell preparation passage.
@@ -78,18 +101,20 @@ with tempfile.TemporaryDirectory() as td:
     assert raw and raw[0]["is_single_cell_proteomics"] == "yes"
     assert sources == ["/tmp/test.pdf"]
 
-# v0.1.8 cache records must not be reusable in v0.1.9.
+# Older cache records must not be reusable in v0.1.10.
 row = {"qc_packet_hash": "abc"}
 old_cache = {
+    "qc_version": "v0.1.9-evidence-grounded-qc-1",
+    "packet_hash": "abc",
     "accession": "PXDTEST",
     "model": "phi4-mini:3.8b",
     **genuine,
 }
 assert not q.cache_payload_valid(old_cache, row=row, model="phi4-mini:3.8b")
-new_cache = dict(old_cache, qc_version=q.QC_VERSION, packet_hash="abc")
+new_cache = dict(old_cache, qc_version=q.QC_VERSION)
 assert q.cache_payload_valid(new_cache, row=row, model="phi4-mini:3.8b")
 
-# Jury is no longer called for every uncertain record merely because it is uncertain.
+# Jury is not called for every uncertain record merely because it is uncertain.
 medium_sparse = {
     "unified_route": "review_medium",
     "review_flags": [],
@@ -97,18 +122,80 @@ medium_sparse = {
     "qc_primary_evidence": [],
     "qc_stage04_raw_samples": [],
 }
-unclear = dict(genuine)
-unclear.update({
-    "sample_unit":"unclear",
-    "same_unit_ms_proteomics":"unclear",
-    "premeasurement_pooling":"unclear",
-    "benchmark_only":"unclear",
-})
+unclear = payload(
+    individual_cell_samples_present="unclear",
+    individual_identity_preserved="unclear",
+    ms_on_individual_cell_samples="unclear",
+    destructive_pooling_before_identity="unclear",
+    population_or_bulk_only="unclear",
+    benchmark_only="unclear",
+)
 assert q.normalized_decision(unclear)[0] == "uncertain"
 assert q.jury_required(medium_sparse, unclear)[0] is False
 
-print("All v0.1.9 evidence-grounded QC regression tests passed.")
-print("Direct Stage-04 passages are rehydrated before independent QC.")
-print("Structured factual axes override over-cautious/optimistic top-level decisions.")
-print("v0.1.8 QC caches are invalidated automatically.")
-print("Jury selection no longer expands to every critic-uncertain candidate.")
+# Wrapped JSON is accepted, while a truncated object is rejected and therefore
+# eligible for a corrective retry.
+wrapped = "```json\n" + json.dumps(genuine) + "\n```"
+assert q.parse_structured_response(wrapped)["individual_identity_preserved"] == "yes"
+try:
+    q.parse_structured_response('{"decision":"uncertain","individual_cell_samples_present":"yes"')
+except ValueError:
+    pass
+else:
+    raise AssertionError("truncated JSON should not parse")
+
+# Exercise the actual corrective structured retry without network access.
+valid_raw = json.dumps(genuine)
+responses = [
+    {"response": '{"decision":"uncertain","individual_cell_samples_present":"yes"', "eval_count": 520},
+    {"response": valid_raw, "eval_count": 180},
+]
+
+class FakeResponse:
+    status_code = 200
+    text = ""
+    def __init__(self, data):
+        self._data = data
+    def json(self):
+        return self._data
+    def raise_for_status(self):
+        return None
+
+calls = []
+orig_post = q.requests.post
+
+def fake_post(url, json=None, timeout=None):
+    calls.append(json)
+    return FakeResponse(responses.pop(0))
+
+q.requests.post = fake_post
+try:
+    args = SimpleNamespace(
+        structured_retries=1,
+        retries=0,
+        retry_backoff=0.0,
+        timeout=30,
+        num_ctx=8192,
+        cpu_threads=4,
+    )
+    parsed, stats = q.post_generate(
+        url="http://localhost:11434/api/generate",
+        model="gemma3:4b",
+        prompt="test prompt",
+        args=args,
+        keep_alive="0",
+        num_predict=800,
+    )
+    assert parsed["decision"] == "uncertain"
+    assert stats["structured_attempts"] == 2
+    assert len(calls) == 2
+    assert "CORRECTIVE OUTPUT INSTRUCTION" in calls[1]["prompt"]
+finally:
+    q.requests.post = orig_post
+
+print("All v0.1.10 positive-chain QC regression tests passed.")
+print("Complete individual-cell-to-MS chains normalize to include despite cautious raw labels.")
+print("Separate multi-cell controls and identity-preserving multiplexing do not negate SCP samples.")
+print("Population/destructive-pooling evidence remains a deterministic exclusion.")
+print("Older QC caches are invalidated automatically.")
+print("Malformed/truncated structured output receives a corrective JSON retry.")

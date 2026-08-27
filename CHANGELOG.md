@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.1.10 - 2026-08-27
+
+- Fix the v0.1.9 smoke-test positive-calibration failure while preserving correct population/bulk exclusions.
+- Replace the ambiguous `same_unit_ms_proteomics` axis with an explicit individual-cell-to-MS evidence chain: genuine single-cell samples present, individual identity preserved, MS on individual-cell-derived samples, destructive pooling before identity, population/bulk-only status, benchmark-only status, and mixed control/library presence.
+- Explicitly allow identity-preserving multiplexing and separate multi-cell libraries/carriers/controls without treating them as destructive pooling.
+- Clarify that FACS itself is not pooling; one-cell-per-well sorting is compatible with SCP, whereas many cells contributing to one proteomic sample is not.
+- Instruct critic/jury to infer continuity across methods passages instead of demanding one redundant sentence saying the same cell was measured by MS.
+- Add separate critic/jury output-token budgets (520/800 by default).
+- Add structured-output corrective retry with additional output budget after malformed/truncated JSON, plus tolerant parsing of wrappers/code fences.
+- Bump QC cache version so v0.1.9 smoke results are automatically invalidated.
+- Expand regression coverage for genuine egg/single-cell chains, mixed controls, identity-preserving multiplexing, destructive pooling, cache invalidation, and malformed-JSON retry.
+
 ## 0.1.9 - 2026-08-27
 
 - Fix the v0.1.8 independent semantic-QC collapse in which 200/219 critic decisions and 201/219 final decisions were `uncertain`.

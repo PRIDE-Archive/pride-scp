@@ -1,16 +1,18 @@
 #!/usr/bin/env python3
 """Evidence-grounded independent semantic QC for recall-first PRIDE SCP.
 
-v0.1.9 fixes the v0.1.8 failure mode where the critic/jury saw mostly
-post-gating summaries and consequently returned `uncertain` for nearly every
-candidate.  This version consumes `qc_evidence_packets.jsonl`, which contains
-exact Stage-04 task passages (samples/preparation/performance), raw samples-task
-outputs, and repository source excerpts.
+v0.1.10 keeps the v0.1.9 direct-source-evidence architecture but fixes the
+remaining positive-calibration failure seen in the four-accession live smoke.
+The reviewer now evaluates an explicit evidence chain: whether genuine
+individual-cell samples are present, whether their identity is preserved through
+preparation/labeling, whether MS/proteomics is performed on those individual-cell
+derived samples, and whether destructive pooling occurred before identity was
+preserved.  This correctly distinguishes independent eggs/cells and
+identity-preserving multiplexing from population proteomics.
 
-The LLM reports factual axes.  A deterministic normalizer derives the catalogue
-verdict from those axes so an over-cautious top-level `uncertain` cannot hide a
-clear `individual cell + same-unit MS + no pooling` result, and an optimistic
-`include` cannot override explicit population/pooling evidence.
+Structured-output handling is also hardened with separate critic/jury token
+budgets plus corrective JSON retries, so a truncated Gemma response does not
+immediately turn a biologically clear case into an error.
 """
 
 from __future__ import annotations
@@ -27,42 +29,39 @@ from typing import Any
 import requests
 
 DEFAULT_OLLAMA_URL = "http://localhost:11434/api/generate"
-QC_VERSION = "v0.1.9-evidence-grounded-qc-1"
+QC_VERSION = "v0.1.10-positive-chain-qc-1"
 VALID_DECISIONS = {"include", "exclude", "uncertain"}
 
 SCHEMA = {
     "type": "object",
     "properties": {
         "decision": {"type": "string", "enum": ["include", "exclude", "uncertain"]},
-        "sample_unit": {
+        "individual_cell_samples_present": {"type": "string", "enum": ["yes", "no", "unclear"]},
+        "individual_identity_preserved": {"type": "string", "enum": ["yes", "no", "unclear"]},
+        "ms_on_individual_cell_samples": {"type": "string", "enum": ["yes", "no", "unclear"]},
+        "destructive_pooling_before_identity": {
             "type": "string",
-            "enum": [
-                "individual_cell",
-                "population_or_pool",
-                "bulk_or_tissue",
-                "benchmark_or_equivalent",
-                "unclear",
-            ],
+            "enum": ["present", "absent", "unclear"],
         },
-        "same_unit_ms_proteomics": {"type": "string", "enum": ["yes", "no", "unclear"]},
-        "target_dataset_scope": {
-            "type": "string",
-            "enum": ["supports_target", "not_target_specific", "contradicts_target", "unclear"],
-        },
-        "premeasurement_pooling": {"type": "string", "enum": ["present", "absent", "unclear"]},
+        "population_or_bulk_only": {"type": "string", "enum": ["yes", "no", "unclear"]},
         "benchmark_only": {"type": "string", "enum": ["yes", "no", "unclear"]},
-        "evidence_quote_cell": {"type": "string", "maxLength": 500},
-        "evidence_quote_ms": {"type": "string", "maxLength": 500},
-        "reason": {"type": "string", "maxLength": 900},
+        "mixed_controls_or_libraries_present": {"type": "string", "enum": ["yes", "no", "unclear"]},
+        "evidence_quote_cell": {"type": "string", "maxLength": 280},
+        "evidence_quote_chain": {"type": "string", "maxLength": 360},
+        "evidence_quote_ms": {"type": "string", "maxLength": 280},
+        "reason": {"type": "string", "maxLength": 520},
     },
     "required": [
         "decision",
-        "sample_unit",
-        "same_unit_ms_proteomics",
-        "target_dataset_scope",
-        "premeasurement_pooling",
+        "individual_cell_samples_present",
+        "individual_identity_preserved",
+        "ms_on_individual_cell_samples",
+        "destructive_pooling_before_identity",
+        "population_or_bulk_only",
         "benchmark_only",
+        "mixed_controls_or_libraries_present",
         "evidence_quote_cell",
+        "evidence_quote_chain",
         "evidence_quote_ms",
         "reason",
     ],
@@ -88,7 +87,20 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--ollama-url", default=DEFAULT_OLLAMA_URL)
     p.add_argument("--cpu-threads", type=int, default=4)
     p.add_argument("--num-ctx", type=int, default=8192)
-    p.add_argument("--num-predict", type=int, default=420)
+    p.add_argument(
+        "--num-predict",
+        type=int,
+        default=0,
+        help="Legacy override: when >0, use this output-token budget for critic and jury.",
+    )
+    p.add_argument("--critic-num-predict", type=int, default=520)
+    p.add_argument("--jury-num-predict", type=int, default=800)
+    p.add_argument(
+        "--structured-retries",
+        type=int,
+        default=1,
+        help="Corrective retries after a syntactically/structurally invalid model response.",
+    )
     p.add_argument("--timeout", type=int, default=900)
     p.add_argument("--retries", type=int, default=2)
     p.add_argument("--retry-backoff", type=float, default=3.0)
@@ -119,17 +131,22 @@ def system_prompt() -> str:
     return (
         "You are an independent evidence reviewer for a PRIDE single-cell mass-spectrometry "
         "proteomics catalogue. Use ONLY the PRIMARY SOURCE EVIDENCE supplied in the prompt. "
-        "Previous Qwen labels, discovery routes, and titles are claims to verify, not authority. "
-        "A true SCP dataset requires proteomic/mass-spectrometry measurement where the sample unit "
-        "is an individual biological cell (including one egg/oocyte/blastomere/bacterium) or where "
-        "individual identity is preserved by separate preparation/labeling before identity-preserving "
-        "multiplexing. A population of many sorted cells, a cell-line culture, pooled cells before "
-        "measurement, tissue/bulk material, or diluted-bulk/single-cell-equivalent benchmark is not "
-        "true SCP. Do not confuse 'single cell type' with one biological cell. A phrase such as "
-        "'10^6 root hair cells ... proteins from each sample' describes a population sample, not an "
-        "individual cell. Conversely, 'five eggs were used; each egg was homogenized' can describe "
-        "five separate individual-cell biological replicates. Decide the factual axes first, then the "
-        "overall decision. If evidence is genuinely insufficient, use unclear/uncertain."
+        "Previous Qwen labels, discovery routes, titles, and prior decisions are claims to verify, "
+        "not authority. A true SCP dataset contains proteomic/mass-spectrometry measurements derived "
+        "from individual biological cells (including a single egg/oocyte/blastomere/bacterium). "
+        "The evidence chain may be distributed across several passages: individual cell isolation or "
+        "one-cell handling -> separate well/tube or identity-preserving label -> digestion/preparation "
+        "-> LC-MS/MS. You do NOT need one sentence literally saying 'the same cell was measured by MS' "
+        "when the methods establish this continuous chain. Multiple individual cells used as separate "
+        "biological replicates are NOT pooling. Physical combination AFTER unique identity-preserving "
+        "labeling/multiplexing is compatible with SCP because cell identity remains recoverable. "
+        "By contrast, many cells contributing unlabeled material to one proteomic sample, a cell-line "
+        "culture, a sorted population, tissue/bulk material, or diluted-bulk/single-cell-equivalent "
+        "benchmark is not true SCP. FACS itself is NOT evidence of pooling: FACS may deposit one cell "
+        "per well; use the stated number of cells per sample/well. A separate 20/40-cell library, carrier, "
+        "reference, blank, two-proteome mix, or method-control does NOT negate genuine single-cell samples "
+        "when the accession also contains direct single-cell measurements. Decide factual axes first, then "
+        "the overall decision. Use unclear only when the source evidence truly cannot establish the axis."
     )
 
 
@@ -184,20 +201,32 @@ def evidence_text(row: dict[str, Any], max_chars: int) -> str:
 
 def critic_prompt(row: dict[str, Any], max_chars: int) -> str:
     return (
-        "Adjudicate whether THIS PRIDE accession itself contains true individual-biological-cell "
-        "MS proteomics. First classify sample_unit and whether MS/proteomics is performed on that "
-        "same unit. Explicit population/pooling evidence overrides superficial use of the phrase "
-        "'single-cell proteomics'. Copy short exact source phrases into the evidence quote fields.\n\n"
+        "Adjudicate whether THIS PRIDE accession itself contains true individual-biological-cell MS "
+        "proteomics. Evaluate the complete evidence chain across passages, not isolated keywords. "
+        "For a positive chain, identify (1) genuine individual-cell samples, (2) preservation of each "
+        "cell's identity through separate handling or unique labels, and (3) MS/proteomics performed on "
+        "those individual-cell-derived samples. If a passage says individual cells were sorted into "
+        "individual wells and later says those digested cells/samples were analyzed by LC-MS/MS, that is "
+        "sufficient continuity unless an intervening destructive pooling step is stated. Likewise, 'five "
+        "eggs were used; each egg was homogenized ... until mass spectrometry' means separate individual "
+        "egg measurements, not a pool. Do not treat FACS, biological replicates, carrier/reference libraries, "
+        "or multi-cell method controls as pooling by themselves. Explicit many-cell material contributing "
+        "to one sample is an exclusion. Copy short exact source phrases into all applicable evidence fields.\n\n"
         + evidence_text(row, max_chars)
     )
 
 
 def jury_prompt(row: dict[str, Any], critic: dict[str, Any], max_chars: int) -> str:
     return (
-        "Act as an independent second reviewer. Re-evaluate the factual axes from the PRIMARY SOURCE "
-        "EVIDENCE. The critic result is shown only to expose the disputed interpretation. Do not defer "
-        "to it. Explicit many-cell/population/pooling evidence means exclusion unless the text clearly "
-        "states that cells were individually prepared/labeled and identity was preserved.\n\n"
+        "Act as an independent second reviewer. Re-evaluate the evidence chain from the PRIMARY SOURCE "
+        "EVIDENCE. The critic result is shown only to expose the disputed interpretation; do not defer to "
+        "it. Infer continuity across methods passages when individual cells remain in separate wells/tubes "
+        "or receive identity-preserving labels and those derived samples are subsequently digested/analyzed "
+        "by MS. Do not demand a redundant sentence saying 'the same cell was measured'. FACS alone does not "
+        "mean pooling. Separate multi-cell libraries/carriers/controls do not make a dataset benchmark-only "
+        "when direct single-cell samples are also measured. Conversely, many unlabeled cells contributing "
+        "to one proteomic sample is population proteomics and must be excluded. Keep quotes and reason short "
+        "and return only the requested structured object.\n\n"
         f"CRITIC RESULT: {compact_json(critic)}\n\n"
         + evidence_text(row, max_chars)
     )
@@ -212,60 +241,126 @@ def transient(code: int) -> bool:
     return code in {429, 500, 502, 503, 504}
 
 
-def post_generate(*, url: str, model: str, prompt: str, args: argparse.Namespace, keep_alive: str) -> tuple[dict[str, Any], dict[str, Any]]:
-    payload = {
-        "model": model,
-        "system": system_prompt(),
-        "prompt": prompt,
-        "stream": False,
-        "format": SCHEMA,
-        "keep_alive": keep_alive_value(keep_alive),
-        "options": {
-            "temperature": 0,
-            "seed": 42,
-            "num_ctx": args.num_ctx,
-            "num_predict": args.num_predict,
-            "num_thread": args.cpu_threads,
-        },
-    }
-    started = time.perf_counter()
-    last_exc: Exception | None = None
-    for attempt in range(args.retries + 1):
+def parse_structured_response(raw: str) -> dict[str, Any]:
+    """Parse a structured Ollama response, tolerating wrappers/code fences."""
+    value = text(raw)
+    if not value:
+        raise ValueError("empty model response")
+    candidates = [value]
+    if value.startswith("```"):
+        stripped = value.strip("`").strip()
+        if stripped.lower().startswith("json"):
+            stripped = stripped[4:].lstrip()
+        candidates.append(stripped)
+    start, end = value.find("{"), value.rfind("}")
+    if 0 <= start < end:
+        candidates.append(value[start : end + 1])
+    last: Exception | None = None
+    for candidate in candidates:
         try:
-            response = requests.post(url, json=payload, timeout=args.timeout)
-            if response.status_code >= 400:
-                body = response.text[:800]
-                if response.status_code == 404:
-                    raise RuntimeError(f"Ollama model {model!r} unavailable. Try: ollama pull {model}. {body}")
-                if transient(response.status_code) and attempt < args.retries:
+            obj = json.loads(candidate)
+            if not isinstance(obj, dict):
+                raise ValueError("structured response was not a JSON object")
+            validate_model_payload(obj)
+            return obj
+        except (json.JSONDecodeError, ValueError, KeyError) as exc:
+            last = exc
+    raise ValueError(str(last or "invalid structured response"))
+
+
+def corrective_prompt(prompt: str) -> str:
+    return (
+        prompt
+        + "\n\nCORRECTIVE OUTPUT INSTRUCTION: Your previous response could not be parsed or did not "
+        "match the required schema. Re-evaluate the same evidence and return ONLY one complete valid "
+        "JSON object matching the requested schema. No markdown and no prose outside JSON. Keep each "
+        "evidence quote under 180 characters and the reason under 300 characters so the JSON completes."
+    )
+
+
+def post_generate(
+    *,
+    url: str,
+    model: str,
+    prompt: str,
+    args: argparse.Namespace,
+    keep_alive: str,
+    num_predict: int,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    started = time.perf_counter()
+    total_http_attempts = 0
+    last_exc: Exception | None = None
+    last_raw = ""
+
+    for structured_attempt in range(args.structured_retries + 1):
+        this_prompt = prompt if structured_attempt == 0 else corrective_prompt(prompt)
+        # Corrective retries get additional room, particularly for Gemma jury output.
+        this_num_predict = num_predict if structured_attempt == 0 else max(num_predict, 900)
+        payload = {
+            "model": model,
+            "system": system_prompt(),
+            "prompt": this_prompt,
+            "stream": False,
+            "format": SCHEMA,
+            "keep_alive": keep_alive_value(keep_alive),
+            "options": {
+                "temperature": 0,
+                "seed": 42,
+                "num_ctx": args.num_ctx,
+                "num_predict": this_num_predict,
+                "num_thread": args.cpu_threads,
+            },
+        }
+
+        for attempt in range(args.retries + 1):
+            total_http_attempts += 1
+            try:
+                response = requests.post(url, json=payload, timeout=args.timeout)
+                if response.status_code >= 400:
+                    body = response.text[:800]
+                    if response.status_code == 404:
+                        raise RuntimeError(
+                            f"Ollama model {model!r} unavailable. Try: ollama pull {model}. {body}"
+                        )
+                    if transient(response.status_code) and attempt < args.retries:
+                        time.sleep(args.retry_backoff * (2**attempt))
+                        continue
+                    response.raise_for_status()
+                data = response.json()
+                last_raw = text(data.get("response"))
+                try:
+                    parsed = parse_structured_response(last_raw)
+                except (ValueError, KeyError) as exc:
+                    last_exc = exc
+                    break  # corrective structured retry, not another identical HTTP retry
+                stats = {
+                    "wall_seconds": round(time.perf_counter() - started, 3),
+                    "request_attempts": total_http_attempts,
+                    "structured_attempts": structured_attempt + 1,
+                    "prompt_tokens": data.get("prompt_eval_count", 0),
+                    "output_tokens": data.get("eval_count", 0),
+                    "prompt_seconds": round(data.get("prompt_eval_duration", 0) / 1e9, 3),
+                    "generation_seconds": round(data.get("eval_duration", 0) / 1e9, 3),
+                    "num_predict": this_num_predict,
+                }
+                return parsed, stats
+            except (requests.ConnectionError, requests.Timeout) as exc:
+                last_exc = exc
+                if attempt < args.retries:
                     time.sleep(args.retry_backoff * (2**attempt))
                     continue
-                response.raise_for_status()
-            data = response.json()
-            parsed = json.loads(text(data.get("response")) or "{}")
-            validate_model_payload(parsed)
-            stats = {
-                "wall_seconds": round(time.perf_counter() - started, 3),
-                "request_attempts": attempt + 1,
-                "prompt_tokens": data.get("prompt_eval_count", 0),
-                "output_tokens": data.get("eval_count", 0),
-                "prompt_seconds": round(data.get("prompt_eval_duration", 0) / 1e9, 3),
-                "generation_seconds": round(data.get("eval_duration", 0) / 1e9, 3),
-            }
-            return parsed, stats
-        except (requests.ConnectionError, requests.Timeout) as exc:
-            last_exc = exc
-            if attempt < args.retries:
-                time.sleep(args.retry_backoff * (2**attempt))
-                continue
-            raise OllamaUnavailableError(f"Ollama unavailable for {model}: {type(exc).__name__}: {exc}") from exc
-        except (json.JSONDecodeError, ValueError, KeyError) as exc:
-            last_exc = exc
-            if attempt < args.retries:
-                time.sleep(args.retry_backoff * (2**attempt))
-                continue
-            raise RuntimeError(f"Invalid structured response from {model}: {exc}") from exc
-    raise RuntimeError(f"Ollama request failed for {model}: {last_exc}")
+                raise OllamaUnavailableError(
+                    f"Ollama unavailable for {model}: {type(exc).__name__}: {exc}"
+                ) from exc
+            except (json.JSONDecodeError, ValueError, KeyError) as exc:
+                last_exc = exc
+                break
+
+    snippet = last_raw[:500].replace("\n", " ")
+    raise RuntimeError(
+        f"Invalid structured response from {model} after "
+        f"{args.structured_retries + 1} structured attempt(s): {last_exc}; raw={snippet!r}"
+    )
 
 
 def unload_model(args: argparse.Namespace, model: str) -> None:
@@ -280,11 +375,13 @@ def validate_model_payload(payload: dict[str, Any]) -> None:
     if text(payload.get("decision")).lower() not in VALID_DECISIONS:
         raise ValueError("missing/invalid decision")
     required = [
-        "sample_unit",
-        "same_unit_ms_proteomics",
-        "target_dataset_scope",
-        "premeasurement_pooling",
+        "individual_cell_samples_present",
+        "individual_identity_preserved",
+        "ms_on_individual_cell_samples",
+        "destructive_pooling_before_identity",
+        "population_or_bulk_only",
         "benchmark_only",
+        "mixed_controls_or_libraries_present",
         "reason",
     ]
     missing = [k for k in required if not text(payload.get(k))]
@@ -293,39 +390,50 @@ def validate_model_payload(payload: dict[str, Any]) -> None:
 
 
 def normalized_decision(payload: dict[str, Any]) -> tuple[str, str]:
-    """Derive verdict from factual axes, using top-level decision only when coherent."""
-    sample = text(payload.get("sample_unit")).lower()
-    ms = text(payload.get("same_unit_ms_proteomics")).lower()
-    scope = text(payload.get("target_dataset_scope")).lower()
-    pooling = text(payload.get("premeasurement_pooling")).lower()
+    """Derive verdict from the explicit individual-cell-to-MS evidence chain."""
+    sc = text(payload.get("individual_cell_samples_present")).lower()
+    identity = text(payload.get("individual_identity_preserved")).lower()
+    ms = text(payload.get("ms_on_individual_cell_samples")).lower()
+    destructive_pooling = text(payload.get("destructive_pooling_before_identity")).lower()
+    population_only = text(payload.get("population_or_bulk_only")).lower()
     benchmark = text(payload.get("benchmark_only")).lower()
     raw = text(payload.get("decision")).lower()
 
+    # Exclusion axes describe the target accession's relevant biological samples,
+    # not merely the presence of a separate carrier/library/control.
     explicit_exclude = (
-        sample in {"population_or_pool", "bulk_or_tissue", "benchmark_or_equivalent"}
-        or scope == "contradicts_target"
-        or pooling == "present"
+        sc == "no"
+        or destructive_pooling == "present"
+        or population_only == "yes"
         or benchmark == "yes"
     )
     if explicit_exclude:
         return "exclude", "structured_exclusion_axis"
 
+    # A complete chain is sufficient even when the model's top-level answer is
+    # over-cautious. Identity-preserving multiplexing is compatible with SCP:
+    # destructive_pooling_before_identity must be absent, not physical mixing
+    # after labels were assigned.
     explicit_include = (
-        sample == "individual_cell"
+        sc == "yes"
+        and identity == "yes"
         and ms == "yes"
-        and scope in {"supports_target", "not_target_specific", "unclear"}
-        and pooling == "absent"
+        and destructive_pooling == "absent"
+        and population_only == "no"
         and benchmark == "no"
     )
     if explicit_include:
-        return "include", "structured_individual_cell_plus_ms"
+        return "include", "structured_individual_cell_to_ms_chain"
 
-    # Preserve a coherent explicit model decision only if no factual axis
-    # contradicts it.  Otherwise uncertainty is safer.
-    if raw == "include" and sample == "individual_cell" and ms == "yes":
-        return "include", "model_decision_consistent_with_axes"
-    if raw == "exclude" and sample in {"population_or_pool", "bulk_or_tissue", "benchmark_or_equivalent"}:
-        return "exclude", "model_decision_consistent_with_axes"
+    # Preserve coherent explicit model decisions only when the factual axes do
+    # not contradict them. This is intentionally stricter than the raw label.
+    if raw == "include" and sc == "yes" and identity == "yes" and ms == "yes":
+        if destructive_pooling != "present" and population_only != "yes" and benchmark != "yes":
+            return "include", "model_decision_consistent_with_positive_chain"
+    if raw == "exclude" and (
+        sc == "no" or destructive_pooling == "present" or population_only == "yes" or benchmark == "yes"
+    ):
+        return "exclude", "model_decision_consistent_with_exclusion_axes"
     return "uncertain", "insufficient_or_mixed_axes"
 
 
@@ -420,14 +528,19 @@ def write_tsv(path: Path, rows: list[dict[str, Any]]) -> None:
     fields = [
         "accession", "unified_route", "semantic_evidence_mode", "semantic_priority",
         "critic_raw_decision", "critic_decision", "critic_decision_basis",
-        "critic_sample_unit", "critic_same_unit_ms_proteomics", "critic_target_dataset_scope",
-        "critic_premeasurement_pooling", "critic_benchmark_only", "critic_evidence_quote_cell",
-        "critic_evidence_quote_ms", "critic_reason", "jury_trigger", "jury_raw_decision",
-        "jury_decision", "jury_decision_basis", "jury_sample_unit", "jury_same_unit_ms_proteomics",
-        "jury_target_dataset_scope", "jury_premeasurement_pooling", "jury_benchmark_only",
-        "jury_evidence_quote_cell", "jury_evidence_quote_ms", "jury_reason", "final_decision",
-        "final_basis", "evidence_strength", "qc_evidence_flags", "critic_model", "jury_model",
-        "critic_wall_seconds", "jury_wall_seconds", "error",
+        "critic_individual_cell_samples_present", "critic_individual_identity_preserved",
+        "critic_ms_on_individual_cell_samples", "critic_destructive_pooling_before_identity",
+        "critic_population_or_bulk_only", "critic_benchmark_only",
+        "critic_mixed_controls_or_libraries_present", "critic_evidence_quote_cell",
+        "critic_evidence_quote_chain", "critic_evidence_quote_ms", "critic_reason",
+        "jury_trigger", "jury_raw_decision", "jury_decision", "jury_decision_basis",
+        "jury_individual_cell_samples_present", "jury_individual_identity_preserved",
+        "jury_ms_on_individual_cell_samples", "jury_destructive_pooling_before_identity",
+        "jury_population_or_bulk_only", "jury_benchmark_only",
+        "jury_mixed_controls_or_libraries_present", "jury_evidence_quote_cell",
+        "jury_evidence_quote_chain", "jury_evidence_quote_ms", "jury_reason",
+        "final_decision", "final_basis", "evidence_strength", "qc_evidence_flags",
+        "critic_model", "jury_model", "critic_wall_seconds", "jury_wall_seconds", "error",
     ]
     with path.open("w", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(handle, fieldnames=fields, delimiter="\t", lineterminator="\n")
@@ -445,7 +558,7 @@ def write_review_decisions(path: Path, rows: list[dict[str, Any]]) -> None:
         writer = csv.DictWriter(handle, fieldnames=fields, delimiter="\t", lineterminator="\n")
         writer.writeheader()
         for row in rows:
-            note = f"v0.1.9 evidence-grounded QC ({row.get('final_basis','')}): {row.get('critic_reason','')}"
+            note = f"v0.1.10 positive-chain QC ({row.get('final_basis','')}): {row.get('critic_reason','')}"
             if row.get("jury_reason"):
                 note += f" | jury: {row.get('jury_reason','')}"
             writer.writerow({"accession": row["accession"], "final_decision": row["final_decision"], "review_note": note[:1800]})
@@ -490,6 +603,7 @@ def main() -> None:
             parsed, stats = post_generate(
                 url=args.ollama_url, model=args.critic_model, prompt=critic_prompt(row, args.evidence_chars),
                 args=args, keep_alive=args.critic_keep_alive,
+                num_predict=(args.num_predict if args.num_predict > 0 else args.critic_num_predict),
             )
             payload = {
                 "qc_version": QC_VERSION, "packet_hash": packet_hash(row), "accession": accession,
@@ -540,6 +654,7 @@ def main() -> None:
                 url=args.ollama_url, model=args.jury_model,
                 prompt=jury_prompt(row, critic_results[accession], args.evidence_chars),
                 args=args, keep_alive=args.jury_keep_alive,
+                num_predict=(args.num_predict if args.num_predict > 0 else args.jury_num_predict),
             )
             payload = {
                 "qc_version": QC_VERSION, "packet_hash": packet_hash(row), "accession": accession,
@@ -579,24 +694,30 @@ def main() -> None:
             "critic_raw_decision": critic.get("decision", ""),
             "critic_decision": c_norm,
             "critic_decision_basis": c_basis,
-            "critic_sample_unit": critic.get("sample_unit", ""),
-            "critic_same_unit_ms_proteomics": critic.get("same_unit_ms_proteomics", ""),
-            "critic_target_dataset_scope": critic.get("target_dataset_scope", ""),
-            "critic_premeasurement_pooling": critic.get("premeasurement_pooling", ""),
+            "critic_individual_cell_samples_present": critic.get("individual_cell_samples_present", ""),
+            "critic_individual_identity_preserved": critic.get("individual_identity_preserved", ""),
+            "critic_ms_on_individual_cell_samples": critic.get("ms_on_individual_cell_samples", ""),
+            "critic_destructive_pooling_before_identity": critic.get("destructive_pooling_before_identity", ""),
+            "critic_population_or_bulk_only": critic.get("population_or_bulk_only", ""),
             "critic_benchmark_only": critic.get("benchmark_only", ""),
+            "critic_mixed_controls_or_libraries_present": critic.get("mixed_controls_or_libraries_present", ""),
             "critic_evidence_quote_cell": critic.get("evidence_quote_cell", ""),
+            "critic_evidence_quote_chain": critic.get("evidence_quote_chain", ""),
             "critic_evidence_quote_ms": critic.get("evidence_quote_ms", ""),
             "critic_reason": critic.get("reason", ""),
             "jury_trigger": jury.get("trigger", "") if jury else "",
             "jury_raw_decision": jury.get("decision", "") if jury else "",
             "jury_decision": j_norm,
             "jury_decision_basis": j_basis,
-            "jury_sample_unit": jury.get("sample_unit", "") if jury else "",
-            "jury_same_unit_ms_proteomics": jury.get("same_unit_ms_proteomics", "") if jury else "",
-            "jury_target_dataset_scope": jury.get("target_dataset_scope", "") if jury else "",
-            "jury_premeasurement_pooling": jury.get("premeasurement_pooling", "") if jury else "",
+            "jury_individual_cell_samples_present": jury.get("individual_cell_samples_present", "") if jury else "",
+            "jury_individual_identity_preserved": jury.get("individual_identity_preserved", "") if jury else "",
+            "jury_ms_on_individual_cell_samples": jury.get("ms_on_individual_cell_samples", "") if jury else "",
+            "jury_destructive_pooling_before_identity": jury.get("destructive_pooling_before_identity", "") if jury else "",
+            "jury_population_or_bulk_only": jury.get("population_or_bulk_only", "") if jury else "",
             "jury_benchmark_only": jury.get("benchmark_only", "") if jury else "",
+            "jury_mixed_controls_or_libraries_present": jury.get("mixed_controls_or_libraries_present", "") if jury else "",
             "jury_evidence_quote_cell": jury.get("evidence_quote_cell", "") if jury else "",
+            "jury_evidence_quote_chain": jury.get("evidence_quote_chain", "") if jury else "",
             "jury_evidence_quote_ms": jury.get("evidence_quote_ms", "") if jury else "",
             "jury_reason": jury.get("reason", "") if jury else "",
             "final_decision": final,
@@ -631,9 +752,10 @@ def main() -> None:
         "uncertain_for_manual_review": len(uncertain_rows),
         "errors": sum(bool(r["error"]) for r in final_rows),
         "note": (
-            "v0.1.9 rehydrates direct source evidence and derives verdicts from factual axes. "
-            "v0.1.8 uncertain/blank caches are invalidated automatically. Residual uncertain "
-            "rows still block final Stage-05 bridge generation."
+            "v0.1.10 evaluates an explicit individual-cell-to-MS evidence chain, accepts "
+            "identity-preserving multiplexing, and uses corrective structured-output retries. "
+            "Older QC caches are invalidated automatically. Residual uncertain rows still block "
+            "final Stage-05 bridge generation."
         ),
     }
     (output_dir / "semantic_qc_summary.json").write_text(json.dumps(summary, indent=2, ensure_ascii=False, sort_keys=True), encoding="utf-8")

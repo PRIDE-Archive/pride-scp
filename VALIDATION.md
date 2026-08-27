@@ -331,3 +331,44 @@ The regression verifies direct source-passage rehydration, factual-axis decision
 
 
 Before the full live rerun, use `scripts/run_semantic_qc_smoke.sh`. The four-accession smoke intentionally contrasts individual egg SCP, a many-cell FACS population, a cell-line population study, and a modern genuine SCP dataset. Do not launch the full 219-candidate QC if that qualitative smoke is wrong.
+
+
+## v0.1.10 positive-chain + structured-output validation
+
+Offline regression:
+
+```bash
+python -m py_compile python/recall/*.py
+bash -n scripts/*.sh
+python python/recall/evidence_grounded_qc_regression_smoke.py
+```
+
+Expected:
+
+```text
+All v0.1.10 positive-chain QC regression tests passed.
+Complete individual-cell-to-MS chains normalize to include despite cautious raw labels.
+Separate multi-cell controls and identity-preserving multiplexing do not negate SCP samples.
+Population/destructive-pooling evidence remains a deterministic exclusion.
+Older QC caches are invalidated automatically.
+Malformed/truncated structured output receives a corrective JSON retry.
+```
+
+Then rerun the four-accession live smoke:
+
+```bash
+scripts/run_semantic_qc_smoke.sh \
+  2>&1 | tee work/python/semantic_qc_smoke_v0110.log
+```
+
+Required qualitative result before the full 219-candidate QC:
+
+```text
+PXD000902  include
+PXD028991  exclude
+PXD000441  exclude
+PXD049412  include
+errors      0
+```
+
+Do not run the full semantic QC if either positive control remains uncertain or either negative control becomes included.

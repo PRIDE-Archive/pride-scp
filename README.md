@@ -793,3 +793,8 @@ scripts/run_semantic_qc.sh
 ```
 
 Inspect `work/python/semantic_unification/qc_evidence_packet_summary.json` and `work/python/semantic_qc/semantic_qc_summary.json` before building the Stage-05 bridge.
+
+
+## v0.1.10 semantic-QC calibration
+
+The independent semantic QC now evaluates a complete individual-cell-to-MS evidence chain rather than requiring a literal same-cell/MS sentence. It accepts separate preparation or identity-preserving labels followed by MS, including identity-preserving multiplexing, while continuing to reject population/bulk samples and destructive pooling before cell identity is preserved. Critic and jury use separate output-token budgets and malformed structured responses receive one corrective JSON retry. Run `scripts/run_semantic_qc_smoke.sh` and require the 2-positive/2-negative qualitative controls to pass before launching the full QC batch.

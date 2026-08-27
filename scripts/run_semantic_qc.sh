@@ -11,6 +11,9 @@ OUT="${SEMANTIC_QC_DIR:-$ROOT/work/python/semantic_qc}"
 CRITIC_MODEL="${SEMANTIC_QC_CRITIC_MODEL:-phi4-mini:3.8b}"
 JURY_MODEL="${SEMANTIC_QC_JURY_MODEL:-gemma3:4b}"
 CPU_THREADS="${SEMANTIC_QC_CPU_THREADS:-4}"
+CRITIC_NUM_PREDICT="${SEMANTIC_QC_CRITIC_NUM_PREDICT:-520}"
+JURY_NUM_PREDICT="${SEMANTIC_QC_JURY_NUM_PREDICT:-800}"
+STRUCTURED_RETRIES="${SEMANTIC_QC_STRUCTURED_RETRIES:-1}"
 
 python "$ROOT/python/recall/build_semantic_qc_packets.py" \
   --unified-manifest "$UNIFIED" \
@@ -23,7 +26,10 @@ python "$ROOT/python/recall/adjudicate_semantic_qc.py" \
   --output-dir "$OUT" \
   --critic-model "$CRITIC_MODEL" \
   --jury-model "$JURY_MODEL" \
-  --cpu-threads "$CPU_THREADS"
+  --cpu-threads "$CPU_THREADS" \
+  --critic-num-predict "$CRITIC_NUM_PREDICT" \
+  --jury-num-predict "$JURY_NUM_PREDICT" \
+  --structured-retries "$STRUCTURED_RETRIES"
 
 mkdir -p "$ROOT/work/python/semantic_unification"
 cp "$OUT/review_decisions.tsv" \
@@ -31,7 +37,7 @@ cp "$OUT/review_decisions.tsv" \
 
 cat <<EOF
 
-Evidence-grounded semantic QC complete.
+Positive-chain evidence-grounded semantic QC complete.
 
 Evidence packet summary:
   $PACKET_SUMMARY
@@ -48,7 +54,7 @@ Residual manual cases:
 Bridge decision file updated:
   $ROOT/work/python/semantic_unification/review_decisions.tsv
 
-The v0.1.8 critic/jury cache is version-invalidated automatically; no manual
-cache deletion or --force is required. Final Stage-05 bridge generation should
-still wait until the residual uncertain queue is inspected/resolved.
+v0.1.10 evaluates the explicit individual-cell -> identity-preserved -> MS chain
+and retries malformed structured output. Older QC caches are version-invalidated
+automatically; no manual cache deletion or --force is required.
 EOF
