@@ -645,3 +645,137 @@ python python/recall/pdf_resolver_regression_smoke.py
 python python/recall/pdf_resolver_live_smoke.py \
   --keep-output work/python/pdf_resolver_live_smoke_v016
 ```
+
+
+## v0.1.7 generic publication content and manual manuscript queue
+
+A publication no longer needs a PDF container to become publication-backed.
+After Stage 02, Stage 03 resolves content in this order:
+
+```text
+validated PDF
+    ↓
+Europe PMC full-text JATS XML
+    ↓
+PMC article HTML full text
+    ↓
+repository-only evidence
+```
+
+Run the complete enrichment/content pass with:
+
+```bash
+scripts/run_python_publication_enrichment.sh
+```
+
+The resulting content manifest is:
+
+```text
+work/python/pride_candidate_publications_with_content.tsv
+```
+
+and the semantic partition is based on any validated publication-content
+artifact rather than PDF availability alone.
+
+To list accessions that still lack PDFs/manuscripts:
+
+```bash
+scripts/write_missing_manuscripts.sh
+```
+
+Outputs include:
+
+```text
+work/python/manual_manuscripts/missing_pdf_accessions.txt
+work/python/manual_manuscripts/missing_pdf_publications.tsv
+work/python/manual_manuscripts/missing_manuscript_accessions.txt
+work/python/manual_manuscripts/missing_manuscript_publications.tsv
+work/python/manual_manuscripts/manual_pdf_manifest.template.tsv
+```
+
+`missing_pdf_*` includes every publication-linked PXD that lacks a usable PDF,
+even if XML/HTML full text was recovered. `missing_manuscript_*` is the higher
+priority manual-download set still lacking any usable publication full text.
+
+Save manual PDFs under `manual_pdfs/`. For explicit mapping, copy/edit the
+generated template as `manual_pdfs/manual_pdf_manifest.tsv`; one PDF path may
+be listed for multiple PXD accessions. Rerunning the enrichment script picks up
+and validates manual PDFs automatically.
+
+Publication-backed Stage-04 annotation now uses:
+
+```bash
+python python/stages/04_run_pride_scp_annotations.py \
+  work/python/pride_candidate_publications_with_content.tsv \
+  --targeted-script python/stages/pride_scp_targeted_ollama.py \
+  --output-dir work/python/pride_scp_annotations \
+  --model qwen2.5:3b \
+  --cpu-threads 4 \
+  --workers 1 \
+  --all-valid-content
+```
+
+## 9. Semantic unification before Stage 05 (v0.1.8)
+
+The publication-backed Stage-04 decision and repository-only Qwen triage are
+**not calibrated equivalents**. Do not concatenate them or use
+`possible_true_scp` as an inclusion rule.
+
+After both semantic lanes finish, run:
+
+```bash
+scripts/unify_semantic_results.sh
+```
+
+The unifier validates complete 321-candidate coverage and writes:
+
+```text
+work/python/semantic_unification/
+├── unified_semantic_manifest.tsv
+├── unified_semantic_manifest.jsonl
+├── include_candidate.tsv
+├── review_high.tsv
+├── review_medium.tsv
+├── review_low.tsv
+├── likely_non_scp.tsv
+├── secondary_review_queue.tsv
+├── secondary_review_queue.jsonl
+├── review_decisions.template.tsv
+└── semantic_unification_summary.json
+```
+
+Routing remains recall-preserving. `likely_non_scp` is a retained route, not a
+deletion. `include_candidate` is also provisional and still requires QC.
+
+The recommended next step is an independent small-model QC pass over the
+provisional includes plus all review routes:
+
+```bash
+scripts/run_semantic_qc.sh
+```
+
+By default this runs `phi4-mini:3.8b` as a strict critic, explicitly unloads
+it, then calls `gemma3:4b` only for selected conflicts/uncertainties. The
+resulting `review_decisions.tsv` can override provisional includes as well as
+review candidates. Critic/jury disagreement remains `uncertain` and therefore
+blocks final Stage-05 bridge generation rather than being forced.
+
+A final Stage-05 bridge is deliberately gated. Copy/fill the generated review
+decision template as:
+
+```text
+work/python/semantic_unification/review_decisions.tsv
+```
+
+and set every review candidate to `include` or `exclude`. Then run:
+
+```bash
+scripts/build_stage05_bridge.sh
+```
+
+The bridge generator refuses to create a final bridge while review decisions
+remain unresolved. Once complete, it emits a Stage-05-compatible manifest,
+status directory, and annotations under `work/python/stage05_bridge/`.
+Repository-only annotations are intentionally metadata-sparse; the unified
+semantic manifest remains the classification provenance authority.
+

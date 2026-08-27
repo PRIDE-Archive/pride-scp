@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Stage 2: resolve, reuse, or manually supply publication PDFs.
 
-v0.1.6 resolution order
+v0.1.7 PDF resolution order
 -----------------------
 1. Existing validated PDF in the current work directory.
 2. Manual PDF manifest / manual PDF directory.
@@ -12,7 +12,7 @@ v0.1.6 resolution order
 7. Unpaywall when an email is supplied.
 
 Every downloaded/reused file is validated by PDF magic bytes.  Resolution is
-cached per unique publication, but the v0.1.6 cache schema intentionally
+cached per unique publication, but the v0.1.6+ cache schema intentionally
 invalidates the previous `no_open_access_pdf` caches produced before the NCBI
 identifier-conversion fallback.  Adding a manual/reuse PDF also overrides a cached unresolved result.
 """
@@ -51,7 +51,7 @@ from pride_scp_pipeline_common import (
 )
 
 
-RESOLVER_PATCH_VERSION = "pride-scp-v0.1.6"
+RESOLVER_PATCH_VERSION = "pride-scp-v0.1.7"
 CACHE_SCHEMA_VERSION = 3
 _thread_local = threading.local()
 
@@ -112,7 +112,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--user-agent",
-        default="PRIDE-SCP-pdf-downloader/1.6",
+        default="PRIDE-SCP-pdf-downloader/1.7",
     )
     parser.add_argument(
         "--reuse-pdf-dir",
@@ -136,7 +136,7 @@ def parse_args() -> argparse.Namespace:
         default="",
         help=(
             "Optional TSV mapping manual PDFs. Supported columns: accession, "
-            "publication_doi, publication_pmid, pdf_path, note."
+            "publication_doi, publication_pmid, publication_pmcid, pdf_path, note."
         ),
     )
     parser.add_argument(
@@ -300,12 +300,17 @@ def load_manual_manifest(path: Path | None) -> dict[str, Path]:
         accession = text_value(row.get("accession")).upper()
         doi = normalize_doi(row.get("publication_doi"))
         pmid = text_value(row.get("publication_pmid"))
+        pmcid = text_value(row.get("publication_pmcid")).upper()
+        if pmcid and not pmcid.startswith("PMC"):
+            pmcid = "PMC" + pmcid
         if accession:
             index["accession:" + accession] = pdf
         if doi:
             index["doi:" + doi] = pdf
         if pmid:
             index["pmid:" + pmid] = pdf
+        if pmcid:
+            index["pmcid:" + pmcid] = pdf
     return index
 
 
@@ -318,6 +323,9 @@ def find_external_pdf(
 ) -> tuple[Path | None, str]:
     doi = normalize_doi(row.get("publication_doi"))
     pmid = text_value(row.get("publication_pmid"))
+    pmcid = text_value(row.get("publication_pmcid") or row.get("resolved_pmcid")).upper()
+    if pmcid and not pmcid.startswith("PMC"):
+        pmcid = "PMC" + pmcid
     accessions = candidate_accessions(row)
 
     manifest_keys: list[str] = []
@@ -326,6 +334,8 @@ def find_external_pdf(
         manifest_keys.append("doi:" + doi)
     if pmid:
         manifest_keys.append("pmid:" + pmid)
+    if pmcid:
+        manifest_keys.append("pmcid:" + pmcid)
     for key in manifest_keys:
         path = manual_manifest.get(key)
         if path and validate_pdf_path(path):

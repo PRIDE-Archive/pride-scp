@@ -964,6 +964,44 @@ def extract_blocks(pdf_path: str):
     return blocks
 
 
+def extract_text_blocks(text_path: str):
+    """Create PDF-like evidence blocks from normalized publication text.
+
+    v0.1.7 uses this for Europe-PMC/JATS full text when a direct PDF is not
+    available.  Paragraph boundaries are preserved so the existing section
+    classifier and evidence retrievers operate without a separate LLM path.
+    """
+    raw = Path(text_path).read_text(encoding="utf-8")
+    raw = raw.replace("\r\n", "\n").replace("\r", "\n")
+    paragraphs = re.split(r"\n\s*\n+", raw)
+    blocks = []
+    for paragraph in paragraphs:
+        text = clean_block_text(paragraph)
+        if len(text) < 20:
+            continue
+        blocks.append(
+            {
+                "block_id": f"B{len(blocks) + 1:03d}",
+                "page": 1,
+                "page_block": len(blocks) + 1,
+                "text": text,
+                "bbox": (0.0, float(len(blocks)), 1.0, float(len(blocks) + 1)),
+                "page_width": 1.0,
+                "page_height": max(1.0, float(len(paragraphs))),
+                "section": "other",
+            }
+        )
+    return blocks
+
+
+def infer_text_publication_title(blocks):
+    for item in blocks[:12]:
+        text = normalize_publication_text(item.get("text", "")) or ""
+        if is_plausible_publication_title(text):
+            return text, "source_text_first_block"
+    return None, None
+
+
 
 def normalize_publication_text(text):
     """Normalize publisher/PDF title text without changing scientific meaning."""
@@ -5106,6 +5144,16 @@ def parse_args():
     )
 
     parser.add_argument(
+        "--source-text",
+        default=None,
+        help=(
+            "Normalized publication full text (for example Europe-PMC JATS "
+            "text) used when a direct PDF is unavailable. When supplied, "
+            "this takes precedence over --pdf."
+        ),
+    )
+
+    parser.add_argument(
         "--model",
         default=DEFAULT_MODEL,
         help=f"Ollama model (default: {DEFAULT_MODEL})",
@@ -5288,21 +5336,23 @@ def main():
             "--task-evidence-chars should be at least 1000"
         )
 
-    pdf_path = Path(args.pdf)
+    source_kind = "text" if args.source_text else "pdf"
+    source_path = Path(args.source_text) if args.source_text else Path(args.pdf)
 
-    if not pdf_path.exists():
-        raise FileNotFoundError(f"PDF not found: {pdf_path}")
+    if not source_path.exists():
+        label = "publication text" if source_kind == "text" else "PDF"
+        raise FileNotFoundError(f"{label} not found: {source_path}")
 
     target_accession = (
         args.target_accession.upper()
         if args.target_accession
-        else infer_target_accession(str(pdf_path))
+        else infer_target_accession(str(source_path))
     )
 
     out_path = (
         Path(args.output)
         if args.output
-        else pdf_path.with_suffix(".pride_annotation.json")
+        else source_path.with_suffix(".pride_annotation.json")
     )
 
     work_dir = out_path.parent / (
@@ -5310,11 +5360,15 @@ def main():
     )
     work_dir.mkdir(parents=True, exist_ok=True)
 
-    print(f"PDF: {pdf_path}")
+    print(f"Publication source ({source_kind}): {source_path}")
     print(f"Target accession: {target_accession or 'not inferred'}")
-    print("Extracting PDF blocks...")
+    print(f"Extracting {source_kind} blocks...")
 
-    blocks = extract_blocks(str(pdf_path))
+    blocks = (
+        extract_text_blocks(str(source_path))
+        if source_kind == "text"
+        else extract_blocks(str(source_path))
+    )
 
     full_text_chars = sum(
         len(item["text"])
@@ -5333,9 +5387,13 @@ def main():
     if is_plausible_publication_title(manifest_publication_title):
         publication_title_candidate = manifest_publication_title
         publication_title_source = "manifest"
+    elif source_kind == "text":
+        publication_title_candidate, publication_title_source = (
+            infer_text_publication_title(blocks)
+        )
     else:
         publication_title_candidate, publication_title_source = (
-            infer_publication_title(str(pdf_path), blocks)
+            infer_publication_title(str(source_path), blocks)
         )
 
     print(
@@ -5617,6 +5675,8 @@ def main():
     )
     evidence_bundle = {
         "target_accession": target_accession,
+        "publication_source_kind": source_kind,
+        "publication_source_path": str(source_path.resolve()),
         "target_dataset_label": target_dataset_label,
         "accession_scope_kind": scope_kind,
         "publication_doi": primary_doi,
@@ -6074,6 +6134,8 @@ def main():
 
     result = {
         "target_accession": target_accession,
+        "publication_source_kind": source_kind,
+        "publication_source_path": str(source_path.resolve()),
         "target_accession_mentioned_in_publication": (
             target_accession in publication_pxds
             if target_accession

@@ -63,13 +63,21 @@ def parse_args():
         help=(
             "Comma-separated screening decisions to annotate when the "
             "manifest contains scp_screen_decision. Default: "
-            "candidate,uncertain. Use --all-valid-pdfs to bypass screening."
+            "candidate,uncertain. Use --all-valid-content to bypass screening."
         ),
     )
     parser.add_argument(
         "--all-valid-pdfs",
         action="store_true",
-        help="Ignore scp_screen_decision and annotate every valid PDF.",
+        help="Backward-compatible alias: annotate every valid publication PDF.",
+    )
+    parser.add_argument(
+        "--all-valid-content",
+        action="store_true",
+        help=(
+            "Ignore scp_screen_decision and annotate every valid publication "
+            "content artifact (PDF or normalized full text)."
+        ),
     )
     parser.add_argument(
         "--workers",
@@ -112,33 +120,57 @@ def parse_args():
     return parser.parse_args()
 
 
+def valid_text_path(path: Path) -> bool:
+    if not path.is_file() or path.stat().st_size < 500:
+        return False
+    try:
+        return len(path.read_text(encoding="utf-8").strip()) >= 500
+    except (OSError, UnicodeError):
+        return False
+
+
 def make_jobs(
     rows: list[dict[str, str]],
     *,
     allowed_screen_decisions: set[str],
-    all_valid_pdfs: bool,
+    all_valid_content: bool,
 ) -> list[dict[str, Any]]:
     jobs = []
 
     for row_number, row in enumerate(rows):
-        pdf_status = row.get("pdf_status", "")
-        pdf_path = Path(row.get("pdf_path", ""))
+        content_kind = text_value(row.get("publication_content_kind")).lower()
+        content_path_text = text_value(row.get("publication_content_path"))
+        content_status = text_value(row.get("publication_content_status")).lower()
 
-        if pdf_status not in {"downloaded", "already_exists"}:
+        # Backward-compatible PDF-only manifests remain valid.
+        if not content_kind:
+            pdf_status = text_value(row.get("pdf_status")).lower()
+            pdf_path = Path(text_value(row.get("pdf_path")))
+            if pdf_status in {"downloaded", "already_exists"} and validate_pdf_path(pdf_path):
+                content_kind = "pdf"
+                content_path_text = str(pdf_path)
+                content_status = "available"
+
+        content_path = Path(content_path_text) if content_path_text else Path()
+        if content_status != "available":
             continue
-        if not validate_pdf_path(pdf_path):
+        if content_kind == "pdf":
+            if not content_path_text or not validate_pdf_path(content_path):
+                continue
+        elif content_kind in {"fulltext_xml", "fulltext_html", "text", "fulltext_text"}:
+            if not content_path_text or not valid_text_path(content_path):
+                continue
+        else:
             continue
 
         accession = text_value(row.get("accession")).upper()
         if not accession.startswith("PXD"):
             continue
 
-        screen_decision = text_value(
-            row.get("scp_screen_decision")
-        ).lower()
+        screen_decision = text_value(row.get("scp_screen_decision")).lower()
 
         if (
-            not all_valid_pdfs
+            not all_valid_content
             and "scp_screen_decision" in row
             and screen_decision not in allowed_screen_decisions
         ):
@@ -154,17 +186,15 @@ def make_jobs(
                 "manifest_row_number": row_number,
                 "job_id": job_id,
                 "accession": accession,
-                "pdf_path": str(pdf_path.resolve()),
+                "content_kind": content_kind,
+                "content_path": str(content_path.resolve()),
+                "content_source": text_value(row.get("publication_content_source")),
                 "publication_doi": text_value(row.get("publication_doi")),
                 "publication_title": text_value(row.get("publication_title")),
                 "publication_index": pub_index,
                 "scp_screen_decision": screen_decision,
-                "scp_screen_score": text_value(
-                    row.get("scp_screen_score")
-                ),
-                "scp_screen_reason": text_value(
-                    row.get("scp_screen_reason")
-                ),
+                "scp_screen_score": text_value(row.get("scp_screen_score")),
+                "scp_screen_reason": text_value(row.get("scp_screen_reason")),
             }
         )
 
@@ -202,8 +232,12 @@ def run_job(job: dict[str, Any], args) -> dict[str, Any]:
     cmd = [
         args.python,
         str(Path(args.targeted_script).resolve()),
-        "--pdf",
-        job["pdf_path"],
+    ]
+    if job["content_kind"] == "pdf":
+        cmd.extend(["--pdf", job["content_path"]])
+    else:
+        cmd.extend(["--source-text", job["content_path"]])
+    cmd.extend([
         "--target-accession",
         job["accession"],
         "--publication-title",
@@ -218,7 +252,7 @@ def run_job(job: dict[str, Any], args) -> dict[str, Any]:
         args.ollama_url,
         "--output",
         str(annotation_path.resolve()),
-    ]
+    ])
 
     if not args.no_save_evidence:
         cmd.append("--save-evidence")
@@ -271,15 +305,15 @@ def main():
     jobs = make_jobs(
         rows,
         allowed_screen_decisions=allowed_screen_decisions,
-        all_valid_pdfs=args.all_valid_pdfs,
+        all_valid_content=(args.all_valid_content or args.all_valid_pdfs),
     )
 
     if args.print_job_count:
         print(len(jobs))
         return
 
-    print(f"Valid annotation jobs: {len(jobs):,}")
-    if not args.all_valid_pdfs and rows and "scp_screen_decision" in rows[0]:
+    print(f"Valid publication-content annotation jobs: {len(jobs):,}")
+    if not (args.all_valid_content or args.all_valid_pdfs) and rows and "scp_screen_decision" in rows[0]:
         print(
             "Accepted screen decisions: "
             + ",".join(sorted(allowed_screen_decisions))

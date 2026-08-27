@@ -1,5 +1,29 @@
 # Changelog
 
+## 0.1.8 - 2026-08-27
+
+- Add a lossless semantic-unification layer across the 219 publication-backed and 102 repository-only candidates.
+- Detect repository-Qwen overcalls by comparing `possible_true_scp` against its own structured individual-cell/MS evidence fields.
+- Route candidates into `include_candidate`, `review_high`, `review_medium`, `review_low`, and `likely_non_scp` without deleting any accession.
+- Preserve high-recall conflicts such as `A_specific` discovery evidence versus a negative Stage-04 gate for secondary adjudication rather than silently excluding them.
+- Emit a 321-row unified semantic manifest, route-specific TSVs, a secondary-review JSONL/TSV queue, and an explicit review-decision template.
+- Add a guarded Stage-05 bridge generator. Final bridge generation refuses unresolved review candidates; `--allow-provisional` exists only for structural smoke tests.
+- Synthesize metadata-sparse Stage-05-compatible annotations for repository-only candidates after explicit adjudication, while retaining the unified manifest as provenance authority.
+- Add offline regression coverage for routing, repository overcall detection, review gating, and Stage-05 bridge generation.
+- Add optional independent semantic QC with `phi4-mini:3.8b` critic and selective `gemma3:4b` jury, resumable per accession and explicitly unloaded between model phases.
+- Emit a QC decision file that can override provisional includes/reviews; critic/jury disagreement remains uncertain and blocks the final bridge.
+
+## 0.1.7 - 2026-08-26
+
+- Add generic publication-content resolution after PDF resolution: validated PDF, Europe PMC JATS full-text XML, then PMC article HTML.
+- Normalize XML/HTML full text deterministically into paragraph text for the existing targeted semantic annotator.
+- Extend Stage 04 and the targeted annotator to accept normalized full-text artifacts via `--source-text` / `--all-valid-content`.
+- Partition candidates by usable publication content rather than PDF availability alone; candidate loss remains forbidden.
+- Add `write_missing_manuscript_queue.py` and `scripts/write_missing_manuscripts.sh`.
+- Emit separate missing-PDF and priority-manual-manuscript PXD accession lists, publication queues, and a PXD-to-PDF manifest template.
+- Extend manual PDF mappings to support PMCID and one shared PDF linked to multiple PXD accessions.
+- Preserve the v0.1.7 publication-content front end from accidental overwrite by `import_current_python.sh`.
+
 ## 0.1.6 - 2026-08-26
 
 - Add NCBI PMC ID Converter as the primary DOI/PMID/PMCID resolver for publications represented in PMC.

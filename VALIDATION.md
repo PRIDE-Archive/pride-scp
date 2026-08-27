@@ -213,3 +213,107 @@ python python/recall/pdf_resolver_live_smoke.py \
 ```
 
 Expected result for the three known-PMC SCP publications is `3/3 usable PDFs`.
+
+
+## v0.1.7 publication-content validation
+
+Offline regression:
+
+```bash
+python python/recall/publication_content_regression_smoke.py
+```
+
+Expected:
+
+```text
+All v0.1.7 publication-content regression tests passed.
+JATS XML normalizes into deterministic text blocks.
+Stage 04 accepts normalized full text as publication evidence.
+Manual PDF manifests can link by PMCID/PXD.
+Missing-PDF and priority manual-manuscript queues are distinct.
+```
+
+Live author-manuscript smoke (PXD037527 / PMC10529037):
+
+```bash
+python python/recall/publication_content_live_smoke.py \
+  --keep-output work/python/publication_content_live_smoke_v017
+```
+
+Expected: `publication_content_status=available` using either
+`fulltext_xml` or `fulltext_html`.
+
+## v0.1.8 semantic-unification validation
+
+Offline regression:
+
+```bash
+python python/recall/semantic_unification_regression_smoke.py
+```
+
+Expected:
+
+```text
+All v0.1.8 semantic-unification regression tests passed.
+Stage-04 and repository labels are normalized before routing.
+Repository triage overcalls are detected from its own structured evidence.
+Review candidates cannot enter a final Stage-05 bridge without explicit decisions.
+Repository-only candidates can be synthesized into Stage-05-compatible annotations after adjudication.
+```
+
+On the completed 321-candidate semantic run, execute:
+
+```bash
+scripts/unify_semantic_results.sh
+```
+
+For the v0.1.7 results used to design this release, the expected audit shape is:
+
+```text
+321 candidates, zero loss
+219 publication-backed
+102 repository-only
+
+Stage 04: 42 yes / 177 no
+Repository triage: 96 possible_true_scp / 6 uncertain
+Repository overcalls vs its own structured evidence: 41
+
+include_candidate: 56
+review_high:       77
+review_medium:     66
+review_low:        20
+likely_non_scp:   102
+secondary review: 163
+```
+
+These counts are routing diagnostics, not an expected final catalogue size.
+
+The final Stage-05 bridge must refuse to build until every review row has an
+explicit `include` or `exclude` decision. A structural-only smoke is possible
+with `--allow-provisional`, which encodes unresolved reviews as excluded and
+therefore must never be used as the final catalogue.
+
+Independent QC logic regression:
+
+```bash
+python python/recall/semantic_qc_regression_smoke.py
+```
+
+Expected:
+
+```text
+All v0.1.8 semantic-QC logic regression tests passed.
+Selective jury triggers protect both recall and precision conflicts.
+Critic/jury disagreement remains unresolved rather than being forced.
+Evidence packets preserve source excerpts and prior semantic provenance.
+```
+
+The live Ollama run is intentionally separate because it is CPU-heavy:
+
+```bash
+scripts/run_semantic_qc.sh
+```
+
+Do not run the critic and jury simultaneously. The helper processes all critic
+calls first, unloads that model, then loads the jury only for selected rows.
+
