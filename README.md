@@ -798,3 +798,12 @@ Inspect `work/python/semantic_unification/qc_evidence_packet_summary.json` and `
 ## v0.1.10 semantic-QC calibration
 
 The independent semantic QC now evaluates a complete individual-cell-to-MS evidence chain rather than requiring a literal same-cell/MS sentence. It accepts separate preparation or identity-preserving labels followed by MS, including identity-preserving multiplexing, while continuing to reject population/bulk samples and destructive pooling before cell identity is preserved. Critic and jury use separate output-token budgets and malformed structured responses receive one corrective JSON retry. Run `scripts/run_semantic_qc_smoke.sh` and require the 2-positive/2-negative qualitative controls to pass before launching the full QC batch.
+
+
+### v0.1.11 semantic QC calibration
+
+Independent semantic QC now evaluates the composition of each target MS sample explicitly.
+A many-cell FACS population feeding one proteomic replicate is not single-cell MS, whereas
+one-cell-per-well target samples remain SCP even when separate multi-cell libraries or
+low-input benchmarks are present. Run `scripts/run_semantic_qc_smoke.sh` and require the
+four-control 2-include/2-exclude result before starting the full QC batch.

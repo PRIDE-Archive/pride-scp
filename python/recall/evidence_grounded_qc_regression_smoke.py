@@ -26,50 +26,85 @@ def payload(**overrides):
     base = {
         "decision": "uncertain",
         "individual_cell_samples_present": "yes",
-        "individual_identity_preserved": "yes",
-        "ms_on_individual_cell_samples": "yes",
+        "target_single_cell_ms_samples_present": "yes",
+        "cells_per_target_ms_sample": "one",
+        "individual_identity_preserved_to_ms": "yes",
         "destructive_pooling_before_identity": "absent",
-        "population_or_bulk_only": "no",
+        "population_samples_only": "no",
         "benchmark_only": "no",
-        "mixed_controls_or_libraries_present": "no",
+        "separate_multi_cell_controls_present": "no",
         "evidence_quote_cell": "individual cells were sorted into individual wells",
-        "evidence_quote_chain": "digested cells were analyzed by LC-MS/MS",
+        "evidence_quote_sample_unit": "one cell was deposited per target well",
+        "evidence_quote_chain": "digested cells from those wells were analyzed by LC-MS/MS",
         "evidence_quote_ms": "data were recorded in DIA mode on an Orbitrap Astral",
-        "reason": "identity is preserved from an individual cell to its MS-derived sample",
+        "reason": "one biological cell contributes to each target MS sample",
     }
     base.update(overrides)
     return base
 
 
-# Positive normalization must accept a complete chain even when the model's raw
-# decision is cautious.
+# Complete target one-cell-to-MS chain must include even when raw label is cautious.
 genuine = payload()
 assert q.normalized_decision(genuine)[0] == "include"
 
-# Separate multi-cell libraries/controls do not negate direct single-cell data.
-mixed_controls = payload(mixed_controls_or_libraries_present="yes")
-assert q.normalized_decision(mixed_controls)[0] == "include"
-
-# Identity-preserving multiplexing is allowed: the exclusion axis is destructive
-# pooling BEFORE identity is established, not physical combination after labels.
-identity_preserving_multiplex = payload(
-    evidence_quote_chain="each cell received a unique isobaric label before channels were combined",
+# Mixed design: genuine one-cell target samples plus separate 20/40-cell libraries.
+mixed = payload(
+    cells_per_target_ms_sample="mixed_design",
+    separate_multi_cell_controls_present="yes",
+    benchmark_only="yes",  # internally inconsistent model field
+    reason="one-cell target wells coexist with separate 20/40-cell libraries",
 )
-assert q.normalized_decision(identity_preserving_multiplex)[0] == "include"
+decision, basis = q.normalized_decision(mixed)
+assert decision == "include"
+assert "overrides_inconsistent_benchmark_only" in basis
 
+# PXD028991-style many-cell target sample: individual cells exist upstream but
+# 10^6/106 cells contribute to each proteomic replicate. The sample-unit axis
+# must override an optimistic top-level include / target_single_cell=yes error.
 population = payload(
     decision="include",
-    individual_cell_samples_present="no",
-    individual_identity_preserved="no",
-    ms_on_individual_cell_samples="no",
-    destructive_pooling_before_identity="present",
-    population_or_bulk_only="yes",
-    evidence_quote_cell="10^6 root hair cells",
-    evidence_quote_chain="proteins from each population sample were extracted",
-    evidence_quote_ms="peptides were analyzed by LC-MS/MS",
-    reason="many cells contributed to one proteomic sample",
+    target_single_cell_ms_samples_present="yes",
+    cells_per_target_ms_sample="multiple",
+    individual_identity_preserved_to_ms="yes",
+    destructive_pooling_before_identity="absent",
+    population_samples_only="no",
+    evidence_quote_cell="10^6 root hair cells isolated by FACS",
+    evidence_quote_sample_unit="10^6 root hair cells from each replicate sample",
+    evidence_quote_chain="proteins from each sample were extracted and digested",
+    evidence_quote_ms="peptides from each sample were analyzed by LC-MS/MS",
+    reason="many cells feed each target proteomic sample",
 )
-assert q.normalized_decision(population)[0] == "exclude"
+decision, basis = q.normalized_decision(population)
+assert decision == "exclude"
+assert "target_ms_sample_contains_multiple_cells" in basis
+
+# Explicit destructive pooling remains an exclusion.
+pooled = payload(
+    cells_per_target_ms_sample="multiple",
+    destructive_pooling_before_identity="present",
+    population_samples_only="yes",
+)
+assert q.normalized_decision(pooled)[0] == "exclude"
+
+# Evidence-aware arbitration: a soft benchmark-only critic exclusion must not
+# defeat a complete single-cell target-MS jury chain.
+soft_critic = payload(
+    decision="exclude",
+    benchmark_only="yes",
+    cells_per_target_ms_sample="mixed_design",
+    separate_multi_cell_controls_present="yes",
+)
+jury_positive = payload(decision="include", cells_per_target_ms_sample="mixed_design")
+final, basis, _, _ = q.combine_decisions(soft_critic, jury_positive)
+assert final == "include"
+
+# Conversely, a direct many-cell target-sample finding must defeat an optimistic
+# positive chain from the other reviewer.
+critic_many = population
+jury_optimistic = payload(decision="include")
+final, basis, _, _ = q.combine_decisions(critic_many, jury_optimistic)
+assert final == "exclude"
+assert "hard_sample_unit_exclusion" in basis
 
 # Risk pattern should surface a many-cell preparation passage.
 flags = set(b.flags_for("We isolated 10^6 root hair cells by FACS and analyzed each sample by LC-MS/MS."))
@@ -101,10 +136,10 @@ with tempfile.TemporaryDirectory() as td:
     assert raw and raw[0]["is_single_cell_proteomics"] == "yes"
     assert sources == ["/tmp/test.pdf"]
 
-# Older cache records must not be reusable in v0.1.10.
+# v0.1.10 caches must be invalidated.
 row = {"qc_packet_hash": "abc"}
 old_cache = {
-    "qc_version": "v0.1.9-evidence-grounded-qc-1",
+    "qc_version": "v0.1.10-positive-chain-qc-1",
     "packet_hash": "abc",
     "accession": "PXDTEST",
     "model": "phi4-mini:3.8b",
@@ -114,7 +149,7 @@ assert not q.cache_payload_valid(old_cache, row=row, model="phi4-mini:3.8b")
 new_cache = dict(old_cache, qc_version=q.QC_VERSION)
 assert q.cache_payload_valid(new_cache, row=row, model="phi4-mini:3.8b")
 
-# Jury is not called for every uncertain record merely because it is uncertain.
+# Jury remains selective for sparse medium-review uncertainty.
 medium_sparse = {
     "unified_route": "review_medium",
     "review_flags": [],
@@ -124,19 +159,20 @@ medium_sparse = {
 }
 unclear = payload(
     individual_cell_samples_present="unclear",
-    individual_identity_preserved="unclear",
-    ms_on_individual_cell_samples="unclear",
+    target_single_cell_ms_samples_present="unclear",
+    cells_per_target_ms_sample="unclear",
+    individual_identity_preserved_to_ms="unclear",
     destructive_pooling_before_identity="unclear",
-    population_or_bulk_only="unclear",
+    population_samples_only="unclear",
     benchmark_only="unclear",
+    separate_multi_cell_controls_present="unclear",
 )
 assert q.normalized_decision(unclear)[0] == "uncertain"
 assert q.jury_required(medium_sparse, unclear)[0] is False
 
-# Wrapped JSON is accepted, while a truncated object is rejected and therefore
-# eligible for a corrective retry.
+# Wrapped JSON accepted; truncated JSON gets corrective retry.
 wrapped = "```json\n" + json.dumps(genuine) + "\n```"
-assert q.parse_structured_response(wrapped)["individual_identity_preserved"] == "yes"
+assert q.parse_structured_response(wrapped)["cells_per_target_ms_sample"] == "one"
 try:
     q.parse_structured_response('{"decision":"uncertain","individual_cell_samples_present":"yes"')
 except ValueError:
@@ -144,7 +180,6 @@ except ValueError:
 else:
     raise AssertionError("truncated JSON should not parse")
 
-# Exercise the actual corrective structured retry without network access.
 valid_raw = json.dumps(genuine)
 responses = [
     {"response": '{"decision":"uncertain","individual_cell_samples_present":"yes"', "eval_count": 520},
@@ -193,9 +228,9 @@ try:
 finally:
     q.requests.post = orig_post
 
-print("All v0.1.10 positive-chain QC regression tests passed.")
-print("Complete individual-cell-to-MS chains normalize to include despite cautious raw labels.")
-print("Separate multi-cell controls and identity-preserving multiplexing do not negate SCP samples.")
-print("Population/destructive-pooling evidence remains a deterministic exclusion.")
-print("Older QC caches are invalidated automatically.")
-print("Malformed/truncated structured output receives a corrective JSON retry.")
+print("All v0.1.11 MS-sample-unit QC regression tests passed.")
+print("Many-cell target MS samples override optimistic single-cell labels.")
+print("Complete one-cell target-MS chains override inconsistent benchmark-only flags.")
+print("Evidence-aware critic/jury arbitration preserves hard sample-unit exclusions.")
+print("Separate multi-cell controls remain compatible with genuine single-cell target samples.")
+print("Malformed structured output still receives a corrective JSON retry.")

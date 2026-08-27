@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.1.11 - 2026-08-27
+
+- Make the target MS sample unit explicit: one cell, multiple cells, mixed design, or unclear.
+- Distinguish individual cells being present upstream from one biological cell contributing to each target proteomic/MS sample.
+- Explicitly interpret statements such as `10^6` / extracted `106` cells per replicate followed by protein extraction from each sample as population proteomics.
+- Give many-cell target-sample composition, destructive pooling, and population-only evidence deterministic exclusion precedence over optimistic model labels.
+- Treat `benchmark_only=yes` as internally inconsistent when a complete genuine one-cell target-MS chain is also established; separate multi-cell libraries and low-input benchmarks no longer negate those samples.
+- Add evidence-aware critic/jury arbitration: hard sample-unit exclusions win, while complete one-cell chains can override soft benchmark/control confusion.
+- Preserve v0.1.10 structured-output retry/repair and selective jury behavior.
+- Bump QC cache version so v0.1.10 smoke results are rerun automatically.
+- Add regression coverage for the PXD028991 many-cell-per-replicate failure mode and PXD049412 mixed benchmark + genuine single-cell design.
+
 ## 0.1.10 - 2026-08-27
 
 - Fix the v0.1.9 smoke-test positive-calibration failure while preserving correct population/bulk exclusions.

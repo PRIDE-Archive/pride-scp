@@ -54,7 +54,8 @@ Residual manual cases:
 Bridge decision file updated:
   $ROOT/work/python/semantic_unification/review_decisions.tsv
 
-v0.1.10 evaluates the explicit individual-cell -> identity-preserved -> MS chain
-and retries malformed structured output. Older QC caches are version-invalidated
-automatically; no manual cache deletion or --force is required.
+v0.1.11 evaluates the target MS sample unit explicitly, so many cells feeding one
+proteomic replicate cannot masquerade as single-cell MS, while separate multi-cell
+controls do not negate genuine one-cell target samples. Evidence-aware arbitration
+and structured-output retries remain enabled; older QC caches are invalidated.
 EOF

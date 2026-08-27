@@ -372,3 +372,41 @@ errors      0
 ```
 
 Do not run the full semantic QC if either positive control remains uncertain or either negative control becomes included.
+
+
+## v0.1.11 target-MS-sample-unit QC
+
+Offline regression:
+
+```bash
+python python/recall/evidence_grounded_qc_regression_smoke.py
+```
+
+Expected:
+
+```text
+All v0.1.11 MS-sample-unit QC regression tests passed.
+Many-cell target MS samples override optimistic single-cell labels.
+Complete one-cell target-MS chains override inconsistent benchmark-only flags.
+Evidence-aware critic/jury arbitration preserves hard sample-unit exclusions.
+Separate multi-cell controls remain compatible with genuine single-cell target samples.
+Malformed structured output still receives a corrective JSON retry.
+```
+
+Authoritative live four-accession smoke:
+
+```bash
+scripts/run_semantic_qc_smoke.sh \
+  2>&1 | tee work/python/semantic_qc_smoke_v0111.log
+```
+
+Acceptance criterion before the 219-candidate full run:
+
+```text
+PXD000902  include
+PXD028991  exclude
+PXD000441  exclude
+PXD049412  include
+errors      0
+uncertain   0
+```

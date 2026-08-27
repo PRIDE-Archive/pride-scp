@@ -5,7 +5,7 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
 PACKETS="$ROOT/work/python/semantic_unification/qc_evidence_packets.jsonl"
-SMOKE_OUT="$ROOT/work/python/semantic_qc_smoke_v0110"
+SMOKE_OUT="$ROOT/work/python/semantic_qc_smoke_v0111"
 CRITIC_MODEL="${SEMANTIC_QC_CRITIC_MODEL:-phi4-mini:3.8b}"
 JURY_MODEL="${SEMANTIC_QC_JURY_MODEL:-gemma3:4b}"
 CPU_THREADS="${SEMANTIC_QC_CPU_THREADS:-4}"

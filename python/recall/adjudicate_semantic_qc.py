@@ -1,18 +1,18 @@
 #!/usr/bin/env python3
 """Evidence-grounded independent semantic QC for recall-first PRIDE SCP.
 
-v0.1.10 keeps the v0.1.9 direct-source-evidence architecture but fixes the
-remaining positive-calibration failure seen in the four-accession live smoke.
-The reviewer now evaluates an explicit evidence chain: whether genuine
-individual-cell samples are present, whether their identity is preserved through
-preparation/labeling, whether MS/proteomics is performed on those individual-cell
-derived samples, and whether destructive pooling occurred before identity was
-preserved.  This correctly distinguishes independent eggs/cells and
-identity-preserving multiplexing from population proteomics.
+v0.1.11 keeps the direct-source-evidence architecture and makes the measured
+MS sample unit explicit.  The reviewer must distinguish one biological cell per
+target MS sample from many cells contributing to one population sample, even
+when FACS is used.  It also distinguishes genuine one-cell target samples from
+separate multi-cell libraries/benchmarks.  Deterministic normalization gives
+true target-sample composition and destructive pooling precedence over optimistic
+model labels, while a complete one-cell-to-MS chain takes precedence over an
+internally inconsistent benchmark-only flag.
 
-Structured-output handling is also hardened with separate critic/jury token
-budgets plus corrective JSON retries, so a truncated Gemma response does not
-immediately turn a biologically clear case into an error.
+Critic/jury arbitration is evidence-aware: direct many-cell target-sample facts
+can force exclusion, while a complete single-cell target-MS chain can resolve a
+weaker contradictory label.  Structured-output retry/repair remains enabled.
 """
 
 from __future__ import annotations
@@ -29,7 +29,7 @@ from typing import Any
 import requests
 
 DEFAULT_OLLAMA_URL = "http://localhost:11434/api/generate"
-QC_VERSION = "v0.1.10-positive-chain-qc-1"
+QC_VERSION = "v0.1.11-ms-sample-unit-qc-1"
 VALID_DECISIONS = {"include", "exclude", "uncertain"}
 
 SCHEMA = {
@@ -37,16 +37,21 @@ SCHEMA = {
     "properties": {
         "decision": {"type": "string", "enum": ["include", "exclude", "uncertain"]},
         "individual_cell_samples_present": {"type": "string", "enum": ["yes", "no", "unclear"]},
-        "individual_identity_preserved": {"type": "string", "enum": ["yes", "no", "unclear"]},
-        "ms_on_individual_cell_samples": {"type": "string", "enum": ["yes", "no", "unclear"]},
+        "target_single_cell_ms_samples_present": {"type": "string", "enum": ["yes", "no", "unclear"]},
+        "cells_per_target_ms_sample": {
+            "type": "string",
+            "enum": ["one", "multiple", "mixed_design", "unclear"],
+        },
+        "individual_identity_preserved_to_ms": {"type": "string", "enum": ["yes", "no", "unclear"]},
         "destructive_pooling_before_identity": {
             "type": "string",
             "enum": ["present", "absent", "unclear"],
         },
-        "population_or_bulk_only": {"type": "string", "enum": ["yes", "no", "unclear"]},
+        "population_samples_only": {"type": "string", "enum": ["yes", "no", "unclear"]},
         "benchmark_only": {"type": "string", "enum": ["yes", "no", "unclear"]},
-        "mixed_controls_or_libraries_present": {"type": "string", "enum": ["yes", "no", "unclear"]},
+        "separate_multi_cell_controls_present": {"type": "string", "enum": ["yes", "no", "unclear"]},
         "evidence_quote_cell": {"type": "string", "maxLength": 280},
+        "evidence_quote_sample_unit": {"type": "string", "maxLength": 360},
         "evidence_quote_chain": {"type": "string", "maxLength": 360},
         "evidence_quote_ms": {"type": "string", "maxLength": 280},
         "reason": {"type": "string", "maxLength": 520},
@@ -54,19 +59,22 @@ SCHEMA = {
     "required": [
         "decision",
         "individual_cell_samples_present",
-        "individual_identity_preserved",
-        "ms_on_individual_cell_samples",
+        "target_single_cell_ms_samples_present",
+        "cells_per_target_ms_sample",
+        "individual_identity_preserved_to_ms",
         "destructive_pooling_before_identity",
-        "population_or_bulk_only",
+        "population_samples_only",
         "benchmark_only",
-        "mixed_controls_or_libraries_present",
+        "separate_multi_cell_controls_present",
         "evidence_quote_cell",
+        "evidence_quote_sample_unit",
         "evidence_quote_chain",
         "evidence_quote_ms",
         "reason",
     ],
     "additionalProperties": False,
 }
+
 
 
 class OllamaUnavailableError(RuntimeError):
@@ -132,22 +140,24 @@ def system_prompt() -> str:
         "You are an independent evidence reviewer for a PRIDE single-cell mass-spectrometry "
         "proteomics catalogue. Use ONLY the PRIMARY SOURCE EVIDENCE supplied in the prompt. "
         "Previous Qwen labels, discovery routes, titles, and prior decisions are claims to verify, "
-        "not authority. A true SCP dataset contains proteomic/mass-spectrometry measurements derived "
-        "from individual biological cells (including a single egg/oocyte/blastomere/bacterium). "
-        "The evidence chain may be distributed across several passages: individual cell isolation or "
-        "one-cell handling -> separate well/tube or identity-preserving label -> digestion/preparation "
-        "-> LC-MS/MS. You do NOT need one sentence literally saying 'the same cell was measured by MS' "
-        "when the methods establish this continuous chain. Multiple individual cells used as separate "
-        "biological replicates are NOT pooling. Physical combination AFTER unique identity-preserving "
-        "labeling/multiplexing is compatible with SCP because cell identity remains recoverable. "
-        "By contrast, many cells contributing unlabeled material to one proteomic sample, a cell-line "
-        "culture, a sorted population, tissue/bulk material, or diluted-bulk/single-cell-equivalent "
-        "benchmark is not true SCP. FACS itself is NOT evidence of pooling: FACS may deposit one cell "
-        "per well; use the stated number of cells per sample/well. A separate 20/40-cell library, carrier, "
-        "reference, blank, two-proteome mix, or method-control does NOT negate genuine single-cell samples "
-        "when the accession also contains direct single-cell measurements. Decide factual axes first, then "
-        "the overall decision. Use unclear only when the source evidence truly cannot establish the axis."
+        "not authority. A true SCP dataset contains at least one TARGET MS sample whose proteomic "
+        "material comes from ONE individual biological cell (including one egg/oocyte/blastomere/"
+        "bacterium), or from one cell whose identity is preserved by a unique label through "
+        "identity-preserving multiplexing. The key question is the composition of each TARGET MS "
+        "sample, not whether individual cells appeared anywhere in the workflow. "
+        "If 10^6 cells, 106 cells (a superscript may be lost in extracted text), 100 cells, or another "
+        "stated many-cell count are sorted into each replicate/sample and proteins are extracted from "
+        "that sample, cells_per_target_ms_sample=multiple and this is population proteomics. FACS does "
+        "not imply single-cell MS by itself. By contrast, one-cell-per-well sorting followed by digestion "
+        "and LC-MS/MS of those well-derived samples is true SCP. Multiple individual cells measured as "
+        "separate biological replicates are also true SCP. Separate 20/40-cell libraries, carrier/reference "
+        "channels, blanks, diluted-bulk benchmarks, or method controls do NOT make the accession benchmark-only "
+        "if genuine one-cell target MS samples are also present; mark mixed_design / separate controls instead. "
+        "Physical combination AFTER unique identity-preserving labeling is compatible with SCP. Destructive "
+        "combination of unlabeled cells before identity is established is not. Decide the factual axes first. "
+        "Use unclear only when the source evidence truly cannot establish the axis."
     )
+
 
 
 def compact_json(value: Any) -> str:
@@ -202,34 +212,38 @@ def evidence_text(row: dict[str, Any], max_chars: int) -> str:
 def critic_prompt(row: dict[str, Any], max_chars: int) -> str:
     return (
         "Adjudicate whether THIS PRIDE accession itself contains true individual-biological-cell MS "
-        "proteomics. Evaluate the complete evidence chain across passages, not isolated keywords. "
-        "For a positive chain, identify (1) genuine individual-cell samples, (2) preservation of each "
-        "cell's identity through separate handling or unique labels, and (3) MS/proteomics performed on "
-        "those individual-cell-derived samples. If a passage says individual cells were sorted into "
-        "individual wells and later says those digested cells/samples were analyzed by LC-MS/MS, that is "
-        "sufficient continuity unless an intervening destructive pooling step is stated. Likewise, 'five "
-        "eggs were used; each egg was homogenized ... until mass spectrometry' means separate individual "
-        "egg measurements, not a pool. Do not treat FACS, biological replicates, carrier/reference libraries, "
-        "or multi-cell method controls as pooling by themselves. Explicit many-cell material contributing "
-        "to one sample is an exclusion. Copy short exact source phrases into all applicable evidence fields.\n\n"
+        "proteomics. First determine the TARGET MS sample unit. Do not equate FACS-isolated cells with "
+        "single-cell MS unless one cell contributes to each target proteomic sample (or identity-preserving "
+        "labels preserve individual cells after multiplexing). Explicitly distinguish: "
+        "(A) one cell per target MS sample; (B) many cells contributing to each replicate/sample; and "
+        "(C) mixed designs where genuine one-cell target samples coexist with separate multi-cell libraries, "
+        "carriers, or benchmarks. A phrase such as '10^6 root hair cells' or extracted '106 root hair cells' "
+        "isolated from each replicate and followed by 'proteins from each sample' means MULTIPLE cells per "
+        "target MS sample, not 106 independently measured single cells. Conversely, 'individual cells were "
+        "sorted into individual wells; digested cells were analyzed by LC-MS/MS' establishes one-cell target "
+        "samples even if 20/40-cell libraries or 250-pg benchmarks also exist. If genuine one-cell target MS "
+        "samples exist, benchmark_only must be no. Copy short exact source phrases into the evidence fields.\n\n"
         + evidence_text(row, max_chars)
     )
+
 
 
 def jury_prompt(row: dict[str, Any], critic: dict[str, Any], max_chars: int) -> str:
     return (
-        "Act as an independent second reviewer. Re-evaluate the evidence chain from the PRIMARY SOURCE "
-        "EVIDENCE. The critic result is shown only to expose the disputed interpretation; do not defer to "
-        "it. Infer continuity across methods passages when individual cells remain in separate wells/tubes "
-        "or receive identity-preserving labels and those derived samples are subsequently digested/analyzed "
-        "by MS. Do not demand a redundant sentence saying 'the same cell was measured'. FACS alone does not "
-        "mean pooling. Separate multi-cell libraries/carriers/controls do not make a dataset benchmark-only "
-        "when direct single-cell samples are also measured. Conversely, many unlabeled cells contributing "
-        "to one proteomic sample is population proteomics and must be excluded. Keep quotes and reason short "
-        "and return only the requested structured object.\n\n"
+        "Act as an independent second reviewer. Re-evaluate the PRIMARY SOURCE EVIDENCE with special "
+        "attention to the TARGET MS sample composition. The critic result is shown only to expose the "
+        "disputed interpretation; do not defer to it. FACS can sort either one cell per well or a many-cell "
+        "population. A stated count such as 10^6/106 cells feeding each replicate/sample means multiple "
+        "cells per target MS sample unless the source explicitly says those cells were kept as separate "
+        "single-cell samples. Separate 20/40-cell libraries, carriers, blanks, two-proteome mixes, or low-input "
+        "benchmarks do not negate genuine one-cell samples. If one-cell target MS samples are directly present, "
+        "benchmark_only cannot be yes. If many unlabeled cells contribute to each target proteomic sample, "
+        "that population-sample fact overrides generic single-cell wording. Return only the requested structured "
+        "object with short quotes and reason.\n\n"
         f"CRITIC RESULT: {compact_json(critic)}\n\n"
         + evidence_text(row, max_chars)
     )
+
 
 
 def keep_alive_value(value: str) -> Any:
@@ -376,12 +390,13 @@ def validate_model_payload(payload: dict[str, Any]) -> None:
         raise ValueError("missing/invalid decision")
     required = [
         "individual_cell_samples_present",
-        "individual_identity_preserved",
-        "ms_on_individual_cell_samples",
+        "target_single_cell_ms_samples_present",
+        "cells_per_target_ms_sample",
+        "individual_identity_preserved_to_ms",
         "destructive_pooling_before_identity",
-        "population_or_bulk_only",
+        "population_samples_only",
         "benchmark_only",
-        "mixed_controls_or_libraries_present",
+        "separate_multi_cell_controls_present",
         "reason",
     ]
     missing = [k for k in required if not text(payload.get(k))]
@@ -389,52 +404,80 @@ def validate_model_payload(payload: dict[str, Any]) -> None:
         raise ValueError(f"missing required fields: {missing}")
 
 
-def normalized_decision(payload: dict[str, Any]) -> tuple[str, str]:
-    """Derive verdict from the explicit individual-cell-to-MS evidence chain."""
-    sc = text(payload.get("individual_cell_samples_present")).lower()
-    identity = text(payload.get("individual_identity_preserved")).lower()
-    ms = text(payload.get("ms_on_individual_cell_samples")).lower()
+def sample_unit_hard_exclusion(payload: dict[str, Any]) -> tuple[bool, str]:
+    composition = text(payload.get("cells_per_target_ms_sample")).lower()
     destructive_pooling = text(payload.get("destructive_pooling_before_identity")).lower()
-    population_only = text(payload.get("population_or_bulk_only")).lower()
-    benchmark = text(payload.get("benchmark_only")).lower()
-    raw = text(payload.get("decision")).lower()
+    population_only = text(payload.get("population_samples_only")).lower()
+    if composition == "multiple":
+        return True, "target_ms_sample_contains_multiple_cells"
+    if destructive_pooling == "present":
+        return True, "destructive_pooling_before_identity"
+    if population_only == "yes":
+        return True, "population_samples_only"
+    return False, ""
 
-    # Exclusion axes describe the target accession's relevant biological samples,
-    # not merely the presence of a separate carrier/library/control.
-    explicit_exclude = (
-        sc == "no"
-        or destructive_pooling == "present"
-        or population_only == "yes"
-        or benchmark == "yes"
-    )
-    if explicit_exclude:
-        return "exclude", "structured_exclusion_axis"
 
-    # A complete chain is sufficient even when the model's top-level answer is
-    # over-cautious. Identity-preserving multiplexing is compatible with SCP:
-    # destructive_pooling_before_identity must be absent, not physical mixing
-    # after labels were assigned.
-    explicit_include = (
+def complete_single_cell_ms_chain(payload: dict[str, Any]) -> tuple[bool, str]:
+    sc = text(payload.get("individual_cell_samples_present")).lower()
+    target_sc = text(payload.get("target_single_cell_ms_samples_present")).lower()
+    composition = text(payload.get("cells_per_target_ms_sample")).lower()
+    identity = text(payload.get("individual_identity_preserved_to_ms")).lower()
+    destructive_pooling = text(payload.get("destructive_pooling_before_identity")).lower()
+    population_only = text(payload.get("population_samples_only")).lower()
+
+    if (
         sc == "yes"
+        and target_sc == "yes"
+        and composition in {"one", "mixed_design"}
         and identity == "yes"
-        and ms == "yes"
         and destructive_pooling == "absent"
         and population_only == "no"
-        and benchmark == "no"
-    )
-    if explicit_include:
-        return "include", "structured_individual_cell_to_ms_chain"
-
-    # Preserve coherent explicit model decisions only when the factual axes do
-    # not contradict them. This is intentionally stricter than the raw label.
-    if raw == "include" and sc == "yes" and identity == "yes" and ms == "yes":
-        if destructive_pooling != "present" and population_only != "yes" and benchmark != "yes":
-            return "include", "model_decision_consistent_with_positive_chain"
-    if raw == "exclude" and (
-        sc == "no" or destructive_pooling == "present" or population_only == "yes" or benchmark == "yes"
     ):
+        return True, "complete_target_single_cell_ms_chain"
+    return False, ""
+
+
+def normalized_decision(payload: dict[str, Any]) -> tuple[str, str]:
+    """Derive verdict from the target MS sample unit plus identity-preserved chain."""
+    hard_exclude, exclude_basis = sample_unit_hard_exclusion(payload)
+    positive, positive_basis = complete_single_cell_ms_chain(payload)
+    benchmark = text(payload.get("benchmark_only")).lower()
+    target_sc = text(payload.get("target_single_cell_ms_samples_present")).lower()
+    sc = text(payload.get("individual_cell_samples_present")).lower()
+    raw = text(payload.get("decision")).lower()
+
+    # Direct target-sample composition has highest precedence.  This prevents
+    # '106 cells isolated by FACS' from being converted into an optimistic
+    # single-cell chain merely because individual cells were involved upstream.
+    if hard_exclude:
+        return "exclude", f"structured_exclusion_axis:{exclude_basis}"
+
+    # Absence of individual-cell material is an exclusion, but it is considered
+    # softer than a direct many-cell target-sample statement during critic/jury
+    # arbitration because the second reviewer may recover an explicit one-cell chain.
+    if sc == "no" and target_sc != "yes":
+        return "exclude", "structured_exclusion_axis:no_individual_cell_samples"
+
+    # A complete direct one-cell-to-MS chain is stronger than an internally
+    # inconsistent benchmark_only=yes flag.  Genuine target single-cell samples
+    # plus separate low-input/multi-cell controls make a mixed study, not a
+    # benchmark-only study.
+    if positive:
+        if benchmark == "yes":
+            return "include", "structured_single_cell_chain_overrides_inconsistent_benchmark_only"
+        return "include", "structured_target_single_cell_ms_chain"
+
+    # benchmark_only is a hard exclusion only when no direct target single-cell
+    # MS samples were established.
+    if benchmark == "yes" and target_sc != "yes":
+        return "exclude", "structured_exclusion_axis:benchmark_only_without_single_cell_targets"
+
+    if raw == "include" and positive:
+        return "include", positive_basis
+    if raw == "exclude" and (hard_exclude or (benchmark == "yes" and target_sc != "yes")):
         return "exclude", "model_decision_consistent_with_exclusion_axes"
-    return "uncertain", "insufficient_or_mixed_axes"
+    return "uncertain", "insufficient_or_mixed_target_sample_axes"
+
 
 
 def evidence_strength(row: dict[str, Any]) -> int:
@@ -485,11 +528,37 @@ def combine_decisions(critic: dict[str, Any], jury: dict[str, Any] | None) -> tu
     if jury is None:
         return c, "critic_only", c_basis, ""
     j, j_basis = normalized_decision(jury)
-    if c == "uncertain" and j in {"include", "exclude"}:
-        return j, "jury_resolved_critic_uncertainty", c_basis, j_basis
+
     if c == j and c in {"include", "exclude"}:
         return c, "critic_jury_agree", c_basis, j_basis
+    if c == "uncertain" and j in {"include", "exclude"}:
+        return j, "jury_resolved_critic_uncertainty", c_basis, j_basis
+    if j == "uncertain" and c in {"include", "exclude"}:
+        return c, "critic_resolved_jury_uncertainty", c_basis, j_basis
+
+    # Evidence-aware disagreement resolution.  Direct many-cell target-sample
+    # composition / destructive pooling is stronger than a generic optimistic
+    # chain from the other reviewer.
+    c_hard, c_hard_basis = sample_unit_hard_exclusion(critic)
+    j_hard, j_hard_basis = sample_unit_hard_exclusion(jury)
+    c_pos, _ = complete_single_cell_ms_chain(critic)
+    j_pos, _ = complete_single_cell_ms_chain(jury)
+
+    if c_hard and not j_hard:
+        return "exclude", "critic_hard_sample_unit_exclusion", c_basis, j_basis
+    if j_hard and not c_hard:
+        return "exclude", "jury_hard_sample_unit_exclusion", c_basis, j_basis
+
+    # If one reviewer has a complete target one-cell-to-MS chain and the other
+    # reviewer only excluded because of benchmark-only/mixed-control confusion,
+    # accept the complete chain.  Hard sample-unit exclusions above still win.
+    if c_pos and j == "exclude" and not j_hard:
+        return "include", "critic_complete_chain_overrides_soft_jury_exclusion", c_basis, j_basis
+    if j_pos and c == "exclude" and not c_hard:
+        return "include", "jury_complete_chain_overrides_soft_critic_exclusion", c_basis, j_basis
+
     return "uncertain", "critic_jury_disagree_or_unresolved", c_basis, j_basis
+
 
 
 def packet_hash(row: dict[str, Any]) -> str:
@@ -528,16 +597,18 @@ def write_tsv(path: Path, rows: list[dict[str, Any]]) -> None:
     fields = [
         "accession", "unified_route", "semantic_evidence_mode", "semantic_priority",
         "critic_raw_decision", "critic_decision", "critic_decision_basis",
-        "critic_individual_cell_samples_present", "critic_individual_identity_preserved",
-        "critic_ms_on_individual_cell_samples", "critic_destructive_pooling_before_identity",
-        "critic_population_or_bulk_only", "critic_benchmark_only",
-        "critic_mixed_controls_or_libraries_present", "critic_evidence_quote_cell",
+        "critic_individual_cell_samples_present", "critic_target_single_cell_ms_samples_present",
+        "critic_cells_per_target_ms_sample", "critic_individual_identity_preserved_to_ms",
+        "critic_destructive_pooling_before_identity", "critic_population_samples_only",
+        "critic_benchmark_only", "critic_separate_multi_cell_controls_present",
+        "critic_evidence_quote_cell", "critic_evidence_quote_sample_unit",
         "critic_evidence_quote_chain", "critic_evidence_quote_ms", "critic_reason",
         "jury_trigger", "jury_raw_decision", "jury_decision", "jury_decision_basis",
-        "jury_individual_cell_samples_present", "jury_individual_identity_preserved",
-        "jury_ms_on_individual_cell_samples", "jury_destructive_pooling_before_identity",
-        "jury_population_or_bulk_only", "jury_benchmark_only",
-        "jury_mixed_controls_or_libraries_present", "jury_evidence_quote_cell",
+        "jury_individual_cell_samples_present", "jury_target_single_cell_ms_samples_present",
+        "jury_cells_per_target_ms_sample", "jury_individual_identity_preserved_to_ms",
+        "jury_destructive_pooling_before_identity", "jury_population_samples_only",
+        "jury_benchmark_only", "jury_separate_multi_cell_controls_present",
+        "jury_evidence_quote_cell", "jury_evidence_quote_sample_unit",
         "jury_evidence_quote_chain", "jury_evidence_quote_ms", "jury_reason",
         "final_decision", "final_basis", "evidence_strength", "qc_evidence_flags",
         "critic_model", "jury_model", "critic_wall_seconds", "jury_wall_seconds", "error",
@@ -558,7 +629,7 @@ def write_review_decisions(path: Path, rows: list[dict[str, Any]]) -> None:
         writer = csv.DictWriter(handle, fieldnames=fields, delimiter="\t", lineterminator="\n")
         writer.writeheader()
         for row in rows:
-            note = f"v0.1.10 positive-chain QC ({row.get('final_basis','')}): {row.get('critic_reason','')}"
+            note = f"v0.1.11 MS-sample-unit QC ({row.get('final_basis','')}): {row.get('critic_reason','')}"
             if row.get("jury_reason"):
                 note += f" | jury: {row.get('jury_reason','')}"
             writer.writerow({"accession": row["accession"], "final_decision": row["final_decision"], "review_note": note[:1800]})
@@ -695,13 +766,16 @@ def main() -> None:
             "critic_decision": c_norm,
             "critic_decision_basis": c_basis,
             "critic_individual_cell_samples_present": critic.get("individual_cell_samples_present", ""),
-            "critic_individual_identity_preserved": critic.get("individual_identity_preserved", ""),
-            "critic_ms_on_individual_cell_samples": critic.get("ms_on_individual_cell_samples", ""),
+            "critic_target_single_cell_ms_samples_present": critic.get("target_single_cell_ms_samples_present", ""),
+            "critic_cells_per_target_ms_sample": critic.get("cells_per_target_ms_sample", ""),
+            "critic_individual_identity_preserved_to_ms": critic.get("individual_identity_preserved_to_ms", ""),
+            
             "critic_destructive_pooling_before_identity": critic.get("destructive_pooling_before_identity", ""),
-            "critic_population_or_bulk_only": critic.get("population_or_bulk_only", ""),
+            "critic_population_samples_only": critic.get("population_samples_only", ""),
             "critic_benchmark_only": critic.get("benchmark_only", ""),
-            "critic_mixed_controls_or_libraries_present": critic.get("mixed_controls_or_libraries_present", ""),
+            "critic_separate_multi_cell_controls_present": critic.get("separate_multi_cell_controls_present", ""),
             "critic_evidence_quote_cell": critic.get("evidence_quote_cell", ""),
+            "critic_evidence_quote_sample_unit": critic.get("evidence_quote_sample_unit", ""),
             "critic_evidence_quote_chain": critic.get("evidence_quote_chain", ""),
             "critic_evidence_quote_ms": critic.get("evidence_quote_ms", ""),
             "critic_reason": critic.get("reason", ""),
@@ -710,13 +784,16 @@ def main() -> None:
             "jury_decision": j_norm,
             "jury_decision_basis": j_basis,
             "jury_individual_cell_samples_present": jury.get("individual_cell_samples_present", "") if jury else "",
-            "jury_individual_identity_preserved": jury.get("individual_identity_preserved", "") if jury else "",
-            "jury_ms_on_individual_cell_samples": jury.get("ms_on_individual_cell_samples", "") if jury else "",
+            "jury_target_single_cell_ms_samples_present": jury.get("target_single_cell_ms_samples_present", "") if jury else "",
+            "jury_cells_per_target_ms_sample": jury.get("cells_per_target_ms_sample", "") if jury else "",
+            "jury_individual_identity_preserved_to_ms": jury.get("individual_identity_preserved_to_ms", "") if jury else "",
+            
             "jury_destructive_pooling_before_identity": jury.get("destructive_pooling_before_identity", "") if jury else "",
-            "jury_population_or_bulk_only": jury.get("population_or_bulk_only", "") if jury else "",
+            "jury_population_samples_only": jury.get("population_samples_only", "") if jury else "",
             "jury_benchmark_only": jury.get("benchmark_only", "") if jury else "",
-            "jury_mixed_controls_or_libraries_present": jury.get("mixed_controls_or_libraries_present", "") if jury else "",
+            "jury_separate_multi_cell_controls_present": jury.get("separate_multi_cell_controls_present", "") if jury else "",
             "jury_evidence_quote_cell": jury.get("evidence_quote_cell", "") if jury else "",
+            "jury_evidence_quote_sample_unit": jury.get("evidence_quote_sample_unit", "") if jury else "",
             "jury_evidence_quote_chain": jury.get("evidence_quote_chain", "") if jury else "",
             "jury_evidence_quote_ms": jury.get("evidence_quote_ms", "") if jury else "",
             "jury_reason": jury.get("reason", "") if jury else "",
@@ -752,10 +829,10 @@ def main() -> None:
         "uncertain_for_manual_review": len(uncertain_rows),
         "errors": sum(bool(r["error"]) for r in final_rows),
         "note": (
-            "v0.1.10 evaluates an explicit individual-cell-to-MS evidence chain, accepts "
-            "identity-preserving multiplexing, and uses corrective structured-output retries. "
-            "Older QC caches are invalidated automatically. Residual uncertain rows still block "
-            "final Stage-05 bridge generation."
+            "v0.1.11 makes the target MS sample unit explicit, gives many-cell/destructive-pooling "
+            "facts precedence over optimistic labels, and lets a complete one-cell-to-MS chain override "
+            "an inconsistent benchmark-only flag. Evidence-aware critic/jury arbitration and structured "
+            "output retries remain enabled. Residual uncertain rows still block Stage-05."
         ),
     }
     (output_dir / "semantic_qc_summary.json").write_text(json.dumps(summary, indent=2, ensure_ascii=False, sort_keys=True), encoding="utf-8")
