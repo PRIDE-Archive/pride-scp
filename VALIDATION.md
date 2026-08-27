@@ -317,3 +317,17 @@ scripts/run_semantic_qc.sh
 Do not run the critic and jury simultaneously. The helper processes all critic
 calls first, unloads that model, then loads the jury only for selected rows.
 
+
+
+## v0.1.9 evidence-grounded QC
+
+```bash
+python -m py_compile python/recall/*.py
+bash -n scripts/*.sh
+python python/recall/evidence_grounded_qc_regression_smoke.py
+```
+
+The regression verifies direct source-passage rehydration, factual-axis decision normalization, automatic v0.1.8 cache invalidation, and selective-jury behavior. A live Ollama rerun is authoritative for the final uncertainty count.
+
+
+Before the full live rerun, use `scripts/run_semantic_qc_smoke.sh`. The four-accession smoke intentionally contrasts individual egg SCP, a many-cell FACS population, a cell-line population study, and a modern genuine SCP dataset. Do not launch the full 219-candidate QC if that qualitative smoke is wrong.

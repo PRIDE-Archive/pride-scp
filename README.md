@@ -779,3 +779,17 @@ status directory, and annotations under `work/python/stage05_bridge/`.
 Repository-only annotations are intentionally metadata-sparse; the unified
 semantic manifest remains the classification provenance authority.
 
+
+
+## v0.1.9 evidence-grounded semantic QC
+
+If the v0.1.8 QC produced a near-universal `uncertain` result, do not manually adjudicate hundreds of accessions. v0.1.9 rebuilds QC packets from the exact Stage-04 source passages and repository excerpts, automatically invalidates the old QC cache, and reruns only the evidence-grounded critic/jury workflow.
+
+```bash
+python python/recall/evidence_grounded_qc_regression_smoke.py
+scripts/run_semantic_qc_smoke.sh
+# Only after the four-accession smoke is qualitatively correct:
+scripts/run_semantic_qc.sh
+```
+
+Inspect `work/python/semantic_unification/qc_evidence_packet_summary.json` and `work/python/semantic_qc/semantic_qc_summary.json` before building the Stage-05 bridge.

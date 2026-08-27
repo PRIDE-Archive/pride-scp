@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.1.9 - 2026-08-27
+
+- Fix the v0.1.8 independent semantic-QC collapse in which 200/219 critic decisions and 201/219 final decisions were `uncertain`.
+- Rehydrate exact Stage-04 `samples`, `preparation`, and performance evidence passages plus raw samples-task output before independent QC.
+- Preserve repository title/description/discovery excerpts as primary source evidence for repository-only cases.
+- Replace one opaque decision with factual axes: sample unit, same-unit MS/proteomics, target-dataset scope, pre-measurement pooling, and benchmark-only status.
+- Derive normalized include/exclude/uncertain decisions deterministically from those factual axes, preventing over-cautious or optimistic top-level labels from dominating.
+- Add population/pooling/benchmark risk flags, including many-cell count contexts such as `10^6 ... cells`, as retrieval hints rather than hard exclusions.
+- Version evidence packets and critic/jury caches; v0.1.8 uncertain/blank cache records are invalidated automatically and rerun without `--force`.
+- Stop sending every critic-uncertain candidate to Gemma; jury selection is now conflict/evidence driven.
+- Add regression coverage for direct individual-cell evidence, many-cell population evidence, cache invalidation, and selective-jury behavior.
+
 ## 0.1.8 - 2026-08-27
 
 - Add a lossless semantic-unification layer across the 219 publication-backed and 102 repository-only candidates.
