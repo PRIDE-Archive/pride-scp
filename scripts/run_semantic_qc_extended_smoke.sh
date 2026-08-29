@@ -5,7 +5,7 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
 PACKETS="$ROOT/work/python/semantic_unification/qc_evidence_packets.jsonl"
-SMOKE_OUT="$ROOT/work/python/semantic_qc_smoke_v0112"
+SMOKE_OUT="$ROOT/work/python/semantic_qc_extended_smoke_v0112"
 CRITIC_MODEL="${SEMANTIC_QC_CRITIC_MODEL:-phi4-mini:3.8b}"
 JURY_MODEL="${SEMANTIC_QC_JURY_MODEL:-gemma3:4b}"
 CPU_THREADS="${SEMANTIC_QC_CPU_THREADS:-4}"
@@ -30,14 +30,22 @@ python "$ROOT/python/recall/adjudicate_semantic_qc.py" \
   --jury-num-predict "$JURY_NUM_PREDICT" \
   --structured-retries "$STRUCTURED_RETRIES" \
   --accession PXD000902 \
-  --accession PXD028991 \
+  --accession PXD004174 \
+  --accession PXD035339 \
+  --accession PXD049412 \
   --accession PXD000441 \
-  --accession PXD049412
+  --accession PXD004931 \
+  --accession PXD012307 \
+  --accession PXD028991
 
-printf '\nExpected qualitative smoke behavior:\n'
+printf '\nExtended qualitative controls:\n'
 printf '  PXD000902  include  (individual Xenopus egg proteomics)\n'
-printf '  PXD028991  exclude  (many FACS-sorted root-hair cells per proteomic sample)\n'
+printf '  PXD004174  include  (individual embryonic blastomere proteomics)\n'
+printf '  PXD035339  include  (genuine single-cell proteomics)\n'
+printf '  PXD049412  include  (modern genuine SCP with separate controls)\n'
 printf '  PXD000441  exclude  (AML cell-line population proteomics)\n'
-printf '  PXD049412  include  (modern genuine SCP; separate multi-cell controls do not negate it)\n'
+printf '  PXD004931  exclude  (bulk secretion from a single cell type)\n'
+printf '  PXD012307  exclude  (single-cell transcriptomics + tissue/bulk proteomics)\n'
+printf '  PXD028991  exclude  (many FACS-sorted root-hair cells per MS sample)\n'
 printf '\nResults:\n  %s\n' "$SMOKE_OUT/semantic_qc_results.tsv"
 printf 'Summary:\n  %s\n' "$SMOKE_OUT/semantic_qc_summary.json"

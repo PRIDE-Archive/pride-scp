@@ -410,3 +410,51 @@ PXD049412  include
 errors      0
 uncertain   0
 ```
+
+
+## v0.1.12 passage-scoped sample-unit QC
+
+Offline regression:
+
+```bash
+python python/recall/evidence_grounded_qc_regression_smoke.py
+bash -n scripts/*.sh
+```
+
+Expected:
+
+```text
+All v0.1.12 passage-scoped sample-unit QC regression tests passed.
+Many-cell population anchors remain hard exclusions when no one-cell target anchor exists.
+One-cell target anchors prevent library/control counts from being misapplied to target samples.
+Separate multi-cell controls remain compatible with genuine single-cell target samples.
+250-pg input amounts are not misread as 250-cell population anchors.
+Malformed structured output still receives a corrective JSON retry.
+```
+
+First rerun the original four-control live smoke:
+
+```bash
+scripts/run_semantic_qc_smoke.sh \
+  2>&1 | tee work/python/semantic_qc_smoke_v0112.log
+```
+
+Required result:
+
+```text
+PXD000902 include
+PXD028991 exclude
+PXD000441 exclude
+PXD049412 include
+errors 0
+uncertain 0
+```
+
+If and only if that passes, run the broader eight-control smoke before the full 219-candidate QC:
+
+```bash
+scripts/run_semantic_qc_extended_smoke.sh \
+  2>&1 | tee work/python/semantic_qc_extended_smoke_v0112.log
+```
+
+The extended set adds genuine PXD004174/PXD035339 and negative PXD004931/PXD012307 controls to reduce four-case overfitting.

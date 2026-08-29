@@ -54,8 +54,9 @@ Residual manual cases:
 Bridge decision file updated:
   $ROOT/work/python/semantic_unification/review_decisions.tsv
 
-v0.1.11 evaluates the target MS sample unit explicitly, so many cells feeding one
-proteomic replicate cannot masquerade as single-cell MS, while separate multi-cell
-controls do not negate genuine one-cell target samples. Evidence-aware arbitration
-and structured-output retries remain enabled; older QC caches are invalidated.
+v0.1.12 scopes cell-count evidence to exact source passages. A many-cell count tied
+to a target replicate/sample remains an exclusion signal, while counts from separate
+libraries, controls, or benchmarks cannot overwrite an explicit one-cell target chain.
+Evidence-aware arbitration and structured-output retries remain enabled; older QC
+caches are invalidated.
 EOF

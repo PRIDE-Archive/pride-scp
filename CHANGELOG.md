@@ -1,3 +1,14 @@
+## 0.1.12 - 2026-08-28
+
+- Scope many-cell counts to the exact source passage/sample role rather than applying any count anywhere in a study to every target MS sample.
+- Add deterministic passage anchors for explicit one-cell targets, many-cell population target samples, and separate multi-cell libraries/controls.
+- Prevent library/control/benchmark counts from overwriting an explicit one-cell-to-MS chain.
+- Keep a many-cell target-sample passage as a hard exclusion when no explicit one-cell target passage exists.
+- Avoid misreading low-input quantities such as `250 pg of HeLa cell peptides` as cell-count population evidence.
+- Add passage-anchor counts to semantic-QC diagnostic TSV output.
+- Add an eight-accession extended smoke set to reduce overfitting to the original four controls before the full 219-candidate run.
+- Bump evidence-packet and semantic-QC cache versions so v0.1.11 results are automatically invalidated.
+
 # Changelog
 
 ## 0.1.11 - 2026-08-27

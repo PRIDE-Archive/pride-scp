@@ -807,3 +807,8 @@ A many-cell FACS population feeding one proteomic replicate is not single-cell M
 one-cell-per-well target samples remain SCP even when separate multi-cell libraries or
 low-input benchmarks are present. Run `scripts/run_semantic_qc_smoke.sh` and require the
 four-control 2-include/2-exclude result before starting the full QC batch.
+
+
+### v0.1.12 semantic-QC sample-unit scoping
+
+Semantic QC now uses passage-scoped lexical anchors so a many-cell count from a library, carrier, benchmark, or other control cannot be transferred to an explicit one-cell target MS sample. A many-cell count tied directly to a replicate/sample and downstream proteomic handling remains a strong population-sample exclusion signal. Run the four-control smoke and then the eight-control extended smoke before launching the full QC batch.

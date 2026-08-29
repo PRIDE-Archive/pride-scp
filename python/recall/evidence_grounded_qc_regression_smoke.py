@@ -43,6 +43,16 @@ def payload(**overrides):
     return base
 
 
+def anchor_row(*, single=False, population=False, controls=False):
+    return {
+        "qc_sample_unit_anchors": {
+            "single_cell_target_anchor": ([{"text": "one cell target"}] if single else []),
+            "population_target_anchor": ([{"text": "many-cell target"}] if population else []),
+            "multi_cell_control_anchor": ([{"text": "multi-cell library"}] if controls else []),
+        }
+    }
+
+
 # Complete target one-cell-to-MS chain must include even when raw label is cautious.
 genuine = payload()
 assert q.normalized_decision(genuine)[0] == "include"
@@ -78,6 +88,38 @@ decision, basis = q.normalized_decision(population)
 assert decision == "exclude"
 assert "target_ms_sample_contains_multiple_cells" in basis
 
+# PXD028991-style passage-scoped population anchor must defeat an optimistic
+# single-cell chain even if the model misreads FACS as single-cell MS.
+pop_anchor_row = anchor_row(population=True)
+decision, basis = q.normalized_decision(population, pop_anchor_row)
+assert decision == "exclude"
+assert "passage_scoped_population_target_anchor" in basis
+
+# PXD000902-style exact one-cell passage must prevent an unrelated count from
+# turning cells_per_target_ms_sample=multiple into a hard exclusion.
+single_anchor_row = anchor_row(single=True)
+count_spillover = payload(
+    decision="include",
+    cells_per_target_ms_sample="multiple",
+    reason="model accidentally transferred a replicate/library count",
+)
+decision, basis = q.normalized_decision(count_spillover, single_anchor_row)
+assert decision == "include"
+assert "passage_scope" in basis
+
+# PXD049412-style one-cell target plus separate multi-cell controls remains SCP
+# even if the reviewer also sets multiple / benchmark_only from the controls.
+mixed_control_row = anchor_row(single=True, controls=True)
+control_spillover = payload(
+    decision="exclude",
+    cells_per_target_ms_sample="multiple",
+    benchmark_only="yes",
+    separate_multi_cell_controls_present="yes",
+)
+decision, basis = q.normalized_decision(control_spillover, mixed_control_row)
+assert decision == "include"
+assert "benchmark_only" in basis or "passage_scope" in basis
+
 # Explicit destructive pooling remains an exclusion.
 pooled = payload(
     cells_per_target_ms_sample="multiple",
@@ -111,6 +153,24 @@ flags = set(b.flags_for("We isolated 10^6 root hair cells by FACS and analyzed e
 assert "multi_cell_count_language" in flags
 assert "ms_proteomics_language" in flags
 
+# Passage-scoped anchors distinguish target populations from libraries/controls.
+assert "population_target_anchor" in b.sample_unit_hints_for(
+    "We isolated 10^6 root hair cells by FACS from three independent replicate samples. "
+    "The extracted proteins from each sample were digested and analyzed by LC-MS/MS."
+)
+assert "single_cell_target_anchor" in b.sample_unit_hints_for(
+    "Each egg was thawed and homogenized separately and stored until mass spectrometry analysis."
+)
+hints = set(b.sample_unit_hints_for(
+    "Individual cells were analyzed by LC-MS/MS. A tailored library used three replicates of 100 cells each."
+))
+assert "single_cell_target_anchor" in hints
+assert "multi_cell_control_anchor" in hints
+assert "population_target_anchor" not in hints
+assert "population_target_anchor" not in b.sample_unit_hints_for(
+    "250 pg of HeLa cell peptides from diluted bulk digest were analyzed by LC-MS/MS."
+)
+
 # Rehydrate exact Stage-04 evidence and raw samples response.
 with tempfile.TemporaryDirectory() as td:
     root = Path(td) / "annotations"
@@ -139,7 +199,7 @@ with tempfile.TemporaryDirectory() as td:
 # v0.1.10 caches must be invalidated.
 row = {"qc_packet_hash": "abc"}
 old_cache = {
-    "qc_version": "v0.1.10-positive-chain-qc-1",
+    "qc_version": "v0.1.11-ms-sample-unit-qc-1",
     "packet_hash": "abc",
     "accession": "PXDTEST",
     "model": "phi4-mini:3.8b",
@@ -228,9 +288,9 @@ try:
 finally:
     q.requests.post = orig_post
 
-print("All v0.1.11 MS-sample-unit QC regression tests passed.")
-print("Many-cell target MS samples override optimistic single-cell labels.")
-print("Complete one-cell target-MS chains override inconsistent benchmark-only flags.")
-print("Evidence-aware critic/jury arbitration preserves hard sample-unit exclusions.")
+print("All v0.1.12 passage-scoped sample-unit QC regression tests passed.")
+print("Many-cell population anchors remain hard exclusions when no one-cell target anchor exists.")
+print("One-cell target anchors prevent library/control counts from being misapplied to target samples.")
 print("Separate multi-cell controls remain compatible with genuine single-cell target samples.")
+print("250-pg input amounts are not misread as 250-cell population anchors.")
 print("Malformed structured output still receives a corrective JSON retry.")

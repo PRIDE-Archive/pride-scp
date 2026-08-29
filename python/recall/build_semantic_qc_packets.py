@@ -7,8 +7,11 @@ ambiguous and it also hid population-size contradictions present in preparation
 passages.  This helper rehydrates the exact Stage-04 task evidence selected from
 the manuscript and the raw samples-task response before independent QC.
 
-No candidate is classified or deleted here.  The output is only a richer,
-versioned evidence packet for the critic/jury stage.
+No candidate is classified or deleted here.  v0.1.12 also adds conservative
+passage-scoped sample-unit anchors that distinguish explicit one-cell target
+passages, many-cell target population passages, and separate multi-cell
+controls/libraries. The output remains a versioned evidence packet for the
+critic/jury stage.
 """
 
 from __future__ import annotations
@@ -20,7 +23,7 @@ import re
 from pathlib import Path
 from typing import Any
 
-PACKET_VERSION = "v0.1.9-evidence-packet-1"
+PACKET_VERSION = "v0.1.12-evidence-packet-2"
 
 INDIVIDUAL_RE = re.compile(
     r"\b(?:individual|single)[- ](?:cell|cells|egg|eggs|oocyte|oocytes|"
@@ -58,6 +61,68 @@ BENCHMARK_RE = re.compile(
     r"low[- ]input benchmark|single[- ]cell[- ]level input|single cell level input)\b",
     re.I,
 )
+
+
+ANCHOR_CELL_COUNT_RE = re.compile(
+    r"\b(?:10\s*\^\s*\d+|10[⁰¹²³⁴⁵⁶⁷⁸⁹]+|\d{2,}|hundreds?|thousands?|millions?)"
+    r"(?!\s*(?:pg|ng|[µμu]g|mg)\b)\s+"
+    r"(?:sorted\s+|isolated\s+|FACS[- ]?sorted\s+)?"
+    r"(?:[A-Za-z][A-Za-z-]*\s+){0,3}(?:cells?|protoplasts?)\b",
+    re.I,
+)
+MULTICELL_CONTROL_RE = re.compile(
+    r"\b(?:\d{2,}[- ]?cell|\d+\s*(?:/|or)\s*\d+[- ]?cell).{0,80}"
+    r"\b(?:librar(?:y|ies)|control|carrier|reference|benchmark)\b",
+    re.I | re.S,
+)
+
+CONTROL_NEAR_COUNT_RE = re.compile(
+    r"\b(?:librar(?:y|ies)|control|carrier|reference|benchmark|blank|bulk digest|diluted bulk)\b",
+    re.I,
+)
+SAMPLE_LINK_RE = re.compile(
+    r"\b(?:replicate|sample|well)s?\b",
+    re.I,
+)
+PROTEOMIC_LINK_RE = re.compile(
+    r"\b(?:protein(?:s)?|peptide(?:s)?|extract(?:ed|ion)?|digest(?:ed|ion)?|"
+    r"LC[-– ]?MS(?:/MS)?|mass spectrometr(?:y|ic))\b",
+    re.I,
+)
+SINGLE_TARGET_PATTERNS = [
+    re.compile(r"\bfor single[- ]cell samples?.{0,220}\bindividual wells?\b", re.I | re.S),
+    re.compile(r"\bindividual cells?.{0,220}\b(?:digested|analy[sz]ed|LC[-– ]?MS|mass spectrometr)", re.I | re.S),
+    re.compile(r"\b(?:one|1)\s+cell\s+(?:per|into)\s+(?:well|sample)\b", re.I),
+    re.compile(r"\beach\s+(?:egg|embryo|oocyte|blastomere|cell|bacterium).{0,760}\bmass spectrometr", re.I | re.S),
+    re.compile(r"\bproteome\s+of\s+individual\s+.{0,80}?(?:eggs?|oocytes?|blastomeres?|cells?|bacteria)\b", re.I | re.S),
+]
+
+def _context(text_value: str, start: int, end: int, flank: int = 320) -> str:
+    return text_value[max(0, start - flank): min(len(text_value), end + flank)]
+
+def sample_unit_hints_for(text_value: str) -> list[str]:
+    """Return conservative passage-scoped sample-unit hints.
+
+    These are lexical anchors used to stop a many-cell count from a separate
+    library/control from being misapplied to genuine one-cell target samples.
+    They are evidence hints, not catalogue decisions.
+    """
+    value = text_value or ""
+    hints: set[str] = set()
+    if any(p.search(value) for p in SINGLE_TARGET_PATTERNS):
+        hints.add("single_cell_target_anchor")
+
+    if MULTICELL_CONTROL_RE.search(value):
+        hints.add("multi_cell_control_anchor")
+
+    for match in ANCHOR_CELL_COUNT_RE.finditer(value):
+        ctx = _context(value, match.start(), match.end())
+        if CONTROL_NEAR_COUNT_RE.search(ctx):
+            hints.add("multi_cell_control_anchor")
+            continue
+        if SAMPLE_LINK_RE.search(ctx) and PROTEOMIC_LINK_RE.search(ctx):
+            hints.add("population_target_anchor")
+    return sorted(hints)
 
 
 def parse_args() -> argparse.Namespace:
@@ -203,6 +268,7 @@ def stage04_source_evidence(
                         "section": text(item.get("section")),
                         "text": passage,
                         "flags": flags_for(passage),
+                        "sample_unit_hints": sample_unit_hints_for(passage),
                     }
                 )
                 if len(blocks) >= max_blocks:
@@ -234,7 +300,7 @@ def repository_source_evidence(row: dict[str, Any], max_blocks: int) -> list[dic
     description = text(row.get("dataset_description"))
     for source, passage in (("repository_title", title), ("repository_description", description)):
         if passage:
-            blocks.append({"source": source, "text": passage, "flags": flags_for(passage)})
+            blocks.append({"source": source, "text": passage, "flags": flags_for(passage), "sample_unit_hints": sample_unit_hints_for(passage)})
     for hit in row.get("discovery_hits") or []:
         if not isinstance(hit, dict):
             continue
@@ -249,6 +315,7 @@ def repository_source_evidence(row: dict[str, Any], max_blocks: int) -> list[dic
                 "term": text(hit.get("term")),
                 "text": passage,
                 "flags": flags_for(passage),
+                "sample_unit_hints": sample_unit_hints_for(passage),
             }
         )
         if len(blocks) >= max_blocks:
@@ -279,6 +346,7 @@ def main() -> None:
     packets = []
     mode_counts: dict[str, int] = {}
     flag_counts: dict[str, int] = {}
+    anchor_counts: dict[str, int] = {}
     with_primary = 0
     with_raw_samples = 0
 
@@ -320,6 +388,28 @@ def main() -> None:
         packet["qc_evidence_flags"] = all_flags
         for flag in all_flags:
             flag_counts[flag] = flag_counts.get(flag, 0) + 1
+
+        sample_unit_anchors = {
+            "single_cell_target_anchor": [],
+            "population_target_anchor": [],
+            "multi_cell_control_anchor": [],
+        }
+        for block in packet["qc_primary_evidence"]:
+            if not isinstance(block, dict):
+                continue
+            for hint in block.get("sample_unit_hints") or []:
+                if hint not in sample_unit_anchors:
+                    continue
+                sample_unit_anchors[hint].append({
+                    "source": block.get("source", ""),
+                    "task": block.get("task", ""),
+                    "page": block.get("page"),
+                    "text": text(block.get("text"))[:700],
+                })
+        packet["qc_sample_unit_anchors"] = sample_unit_anchors
+        for anchor, items in sample_unit_anchors.items():
+            if items:
+                anchor_counts[anchor] = anchor_counts.get(anchor, 0) + 1
         packet["qc_packet_hash"] = packet_hash(packet)
         packets.append(packet)
 
@@ -334,6 +424,7 @@ def main() -> None:
         "candidates_with_primary_source_evidence": with_primary,
         "publication_candidates_with_raw_samples_response": with_raw_samples,
         "evidence_flag_candidate_counts": dict(sorted(flag_counts.items())),
+        "sample_unit_anchor_candidate_counts": dict(sorted(anchor_counts.items())),
         "output": str(output),
     }
     summary_path.write_text(json.dumps(summary, indent=2, sort_keys=True), encoding="utf-8")

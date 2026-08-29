@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Evidence-grounded independent semantic QC for recall-first PRIDE SCP.
 
-v0.1.11 keeps the direct-source-evidence architecture and makes the measured
-MS sample unit explicit.  The reviewer must distinguish one biological cell per
+v0.1.12 keeps the direct-source-evidence architecture and scopes measured
+MS sample-unit claims to passage-level target/control anchors.  The reviewer must distinguish one biological cell per
 target MS sample from many cells contributing to one population sample, even
 when FACS is used.  It also distinguishes genuine one-cell target samples from
 separate multi-cell libraries/benchmarks.  Deterministic normalization gives
@@ -29,7 +29,7 @@ from typing import Any
 import requests
 
 DEFAULT_OLLAMA_URL = "http://localhost:11434/api/generate"
-QC_VERSION = "v0.1.11-ms-sample-unit-qc-1"
+QC_VERSION = "v0.1.12-passage-scoped-sample-unit-qc-1"
 VALID_DECISIONS = {"include", "exclude", "uncertain"}
 
 SCHEMA = {
@@ -154,14 +154,36 @@ def system_prompt() -> str:
         "channels, blanks, diluted-bulk benchmarks, or method controls do NOT make the accession benchmark-only "
         "if genuine one-cell target MS samples are also present; mark mixed_design / separate controls instead. "
         "Physical combination AFTER unique identity-preserving labeling is compatible with SCP. Destructive "
-        "combination of unlabeled cells before identity is established is not. Decide the factual axes first. "
-        "Use unclear only when the source evidence truly cannot establish the axis."
+        "combination of unlabeled cells before identity is established is not. The prompt may include PASSAGE-SCOPED "
+        "SAMPLE-UNIT ANCHORS extracted deterministically from the exact source text. Treat them as lexical hints to "
+        "verify, not as final decisions: single_cell_target_anchor marks an explicit one-cell-to-MS passage; "
+        "population_target_anchor marks a many-cell count tied to a replicate/sample and downstream proteomic handling; "
+        "multi_cell_control_anchor marks many-cell library/control/benchmark wording. Do not transfer a cell count from "
+        "one passage/sample role onto a different target sample. Decide the factual axes first. Use unclear only when "
+        "the source evidence truly cannot establish the axis."
     )
 
 
 
 def compact_json(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, sort_keys=True)
+
+
+def compact_sample_unit_anchors(row: dict[str, Any]) -> dict[str, list[str]]:
+    anchors = row.get("qc_sample_unit_anchors") or {}
+    out: dict[str, list[str]] = {}
+    for key in ("single_cell_target_anchor", "population_target_anchor", "multi_cell_control_anchor"):
+        vals = []
+        for item in (anchors.get(key) or [])[:2]:
+            if isinstance(item, dict):
+                snippet = text(item.get("text"))[:220].replace("\n", " ")
+            else:
+                snippet = text(item)[:220].replace("\n", " ")
+            if snippet:
+                vals.append(snippet)
+        if vals:
+            out[key] = vals
+    return out
 
 
 def evidence_text(row: dict[str, Any], max_chars: int) -> str:
@@ -171,6 +193,7 @@ def evidence_text(row: dict[str, Any], max_chars: int) -> str:
         f"Evidence mode: {text(row.get('semantic_evidence_mode'))}",
         f"Discovery priority: {text(row.get('semantic_priority'))}",
         f"Evidence packet flags: {compact_json(row.get('qc_evidence_flags') or [])}",
+        f"Passage-scoped sample-unit anchors: {compact_json(compact_sample_unit_anchors(row))}",
         "",
         "PRIMARY SOURCE EVIDENCE:",
     ]
@@ -404,80 +427,100 @@ def validate_model_payload(payload: dict[str, Any]) -> None:
         raise ValueError(f"missing required fields: {missing}")
 
 
-def sample_unit_hard_exclusion(payload: dict[str, Any]) -> tuple[bool, str]:
+def sample_unit_anchor_state(row: dict[str, Any] | None) -> tuple[bool, bool, bool]:
+    anchors = (row or {}).get("qc_sample_unit_anchors") or {}
+    single = bool(anchors.get("single_cell_target_anchor"))
+    population = bool(anchors.get("population_target_anchor"))
+    controls = bool(anchors.get("multi_cell_control_anchor"))
+    return single, population, controls
+
+
+def sample_unit_anchor_counts(row: dict[str, Any] | None) -> dict[str, int]:
+    anchors = (row or {}).get("qc_sample_unit_anchors") or {}
+    return {
+        "single_cell_target_anchor": len(anchors.get("single_cell_target_anchor") or []),
+        "population_target_anchor": len(anchors.get("population_target_anchor") or []),
+        "multi_cell_control_anchor": len(anchors.get("multi_cell_control_anchor") or []),
+    }
+
+
+def sample_unit_hard_exclusion(payload: dict[str, Any], row: dict[str, Any] | None = None) -> tuple[bool, str]:
     composition = text(payload.get("cells_per_target_ms_sample")).lower()
     destructive_pooling = text(payload.get("destructive_pooling_before_identity")).lower()
     population_only = text(payload.get("population_samples_only")).lower()
-    if composition == "multiple":
+    target_sc = text(payload.get("target_single_cell_ms_samples_present")).lower()
+    single_anchor, population_anchor, _ = sample_unit_anchor_state(row)
+
+    if population_anchor and not single_anchor:
+        return True, "passage_scoped_population_target_anchor"
+    if composition == "multiple" and (row is None or (population_anchor and not single_anchor)):
         return True, "target_ms_sample_contains_multiple_cells"
-    if destructive_pooling == "present":
+    if destructive_pooling == "present" and not (single_anchor and not population_anchor):
         return True, "destructive_pooling_before_identity"
-    if population_only == "yes":
+    if population_only == "yes" and not (single_anchor and target_sc == "yes" and not population_anchor):
         return True, "population_samples_only"
     return False, ""
 
 
-def complete_single_cell_ms_chain(payload: dict[str, Any]) -> tuple[bool, str]:
+def complete_single_cell_ms_chain(payload: dict[str, Any], row: dict[str, Any] | None = None) -> tuple[bool, str]:
     sc = text(payload.get("individual_cell_samples_present")).lower()
     target_sc = text(payload.get("target_single_cell_ms_samples_present")).lower()
     composition = text(payload.get("cells_per_target_ms_sample")).lower()
     identity = text(payload.get("individual_identity_preserved_to_ms")).lower()
     destructive_pooling = text(payload.get("destructive_pooling_before_identity")).lower()
     population_only = text(payload.get("population_samples_only")).lower()
+    single_anchor, population_anchor, controls_anchor = sample_unit_anchor_state(row)
+
+    composition_ok = composition in {"one", "mixed_design"}
+    if composition == "multiple" and single_anchor and not population_anchor:
+        composition_ok = True
+    pooling_ok = destructive_pooling == "absent" or (
+        destructive_pooling == "present" and single_anchor and not population_anchor
+    )
+    population_ok = population_only == "no" or (
+        population_only == "yes" and single_anchor and target_sc == "yes" and not population_anchor
+    )
 
     if (
         sc == "yes"
         and target_sc == "yes"
-        and composition in {"one", "mixed_design"}
+        and composition_ok
         and identity == "yes"
-        and destructive_pooling == "absent"
-        and population_only == "no"
+        and pooling_ok
+        and population_ok
     ):
+        if composition == "multiple" or destructive_pooling == "present" or population_only == "yes":
+            return True, "complete_target_single_cell_ms_chain_corrected_by_passage_scope"
+        if controls_anchor:
+            return True, "complete_target_single_cell_ms_chain_with_separate_controls"
         return True, "complete_target_single_cell_ms_chain"
     return False, ""
 
 
-def normalized_decision(payload: dict[str, Any]) -> tuple[str, str]:
-    """Derive verdict from the target MS sample unit plus identity-preserved chain."""
-    hard_exclude, exclude_basis = sample_unit_hard_exclusion(payload)
-    positive, positive_basis = complete_single_cell_ms_chain(payload)
+def normalized_decision(payload: dict[str, Any], row: dict[str, Any] | None = None) -> tuple[str, str]:
+    """Derive verdict using model axes plus passage-scoped source anchors."""
+    hard_exclude, exclude_basis = sample_unit_hard_exclusion(payload, row)
+    positive, positive_basis = complete_single_cell_ms_chain(payload, row)
     benchmark = text(payload.get("benchmark_only")).lower()
     target_sc = text(payload.get("target_single_cell_ms_samples_present")).lower()
     sc = text(payload.get("individual_cell_samples_present")).lower()
     raw = text(payload.get("decision")).lower()
 
-    # Direct target-sample composition has highest precedence.  This prevents
-    # '106 cells isolated by FACS' from being converted into an optimistic
-    # single-cell chain merely because individual cells were involved upstream.
     if hard_exclude:
         return "exclude", f"structured_exclusion_axis:{exclude_basis}"
-
-    # Absence of individual-cell material is an exclusion, but it is considered
-    # softer than a direct many-cell target-sample statement during critic/jury
-    # arbitration because the second reviewer may recover an explicit one-cell chain.
     if sc == "no" and target_sc != "yes":
         return "exclude", "structured_exclusion_axis:no_individual_cell_samples"
-
-    # A complete direct one-cell-to-MS chain is stronger than an internally
-    # inconsistent benchmark_only=yes flag.  Genuine target single-cell samples
-    # plus separate low-input/multi-cell controls make a mixed study, not a
-    # benchmark-only study.
     if positive:
         if benchmark == "yes":
             return "include", "structured_single_cell_chain_overrides_inconsistent_benchmark_only"
-        return "include", "structured_target_single_cell_ms_chain"
-
-    # benchmark_only is a hard exclusion only when no direct target single-cell
-    # MS samples were established.
+        return "include", positive_basis
     if benchmark == "yes" and target_sc != "yes":
         return "exclude", "structured_exclusion_axis:benchmark_only_without_single_cell_targets"
-
     if raw == "include" and positive:
         return "include", positive_basis
     if raw == "exclude" and (hard_exclude or (benchmark == "yes" and target_sc != "yes")):
         return "exclude", "model_decision_consistent_with_exclusion_axes"
     return "uncertain", "insufficient_or_mixed_target_sample_axes"
-
 
 
 def evidence_strength(row: dict[str, Any]) -> int:
@@ -497,7 +540,7 @@ def evidence_strength(row: dict[str, Any]) -> int:
 
 
 def jury_required(row: dict[str, Any], critic: dict[str, Any]) -> tuple[bool, str]:
-    c, _ = normalized_decision(critic)
+    c, _ = normalized_decision(critic, row)
     route = text(row.get("unified_route"))
     flags = set(row.get("review_flags") or [])
     evidence_flags = set(row.get("qc_evidence_flags") or [])
@@ -523,11 +566,11 @@ def jury_required(row: dict[str, Any], critic: dict[str, Any]) -> tuple[bool, st
     return False, ""
 
 
-def combine_decisions(critic: dict[str, Any], jury: dict[str, Any] | None) -> tuple[str, str, str, str]:
-    c, c_basis = normalized_decision(critic)
+def combine_decisions(critic: dict[str, Any], jury: dict[str, Any] | None, row: dict[str, Any] | None = None) -> tuple[str, str, str, str]:
+    c, c_basis = normalized_decision(critic, row)
     if jury is None:
         return c, "critic_only", c_basis, ""
-    j, j_basis = normalized_decision(jury)
+    j, j_basis = normalized_decision(jury, row)
 
     if c == j and c in {"include", "exclude"}:
         return c, "critic_jury_agree", c_basis, j_basis
@@ -539,10 +582,10 @@ def combine_decisions(critic: dict[str, Any], jury: dict[str, Any] | None) -> tu
     # Evidence-aware disagreement resolution.  Direct many-cell target-sample
     # composition / destructive pooling is stronger than a generic optimistic
     # chain from the other reviewer.
-    c_hard, c_hard_basis = sample_unit_hard_exclusion(critic)
-    j_hard, j_hard_basis = sample_unit_hard_exclusion(jury)
-    c_pos, _ = complete_single_cell_ms_chain(critic)
-    j_pos, _ = complete_single_cell_ms_chain(jury)
+    c_hard, c_hard_basis = sample_unit_hard_exclusion(critic, row)
+    j_hard, j_hard_basis = sample_unit_hard_exclusion(jury, row)
+    c_pos, _ = complete_single_cell_ms_chain(critic, row)
+    j_pos, _ = complete_single_cell_ms_chain(jury, row)
 
     if c_hard and not j_hard:
         return "exclude", "critic_hard_sample_unit_exclusion", c_basis, j_basis
@@ -611,6 +654,7 @@ def write_tsv(path: Path, rows: list[dict[str, Any]]) -> None:
         "jury_evidence_quote_cell", "jury_evidence_quote_sample_unit",
         "jury_evidence_quote_chain", "jury_evidence_quote_ms", "jury_reason",
         "final_decision", "final_basis", "evidence_strength", "qc_evidence_flags",
+        "qc_single_cell_target_anchor_count", "qc_population_target_anchor_count", "qc_multi_cell_control_anchor_count",
         "critic_model", "jury_model", "critic_wall_seconds", "jury_wall_seconds", "error",
     ]
     with path.open("w", newline="", encoding="utf-8") as handle:
@@ -629,7 +673,7 @@ def write_review_decisions(path: Path, rows: list[dict[str, Any]]) -> None:
         writer = csv.DictWriter(handle, fieldnames=fields, delimiter="\t", lineterminator="\n")
         writer.writeheader()
         for row in rows:
-            note = f"v0.1.11 MS-sample-unit QC ({row.get('final_basis','')}): {row.get('critic_reason','')}"
+            note = f"v0.1.12 passage-scoped sample-unit QC ({row.get('final_basis','')}): {row.get('critic_reason','')}"
             if row.get("jury_reason"):
                 note += f" | jury: {row.get('jury_reason','')}"
             writer.writerow({"accession": row["accession"], "final_decision": row["final_decision"], "review_note": note[:1800]})
@@ -667,7 +711,7 @@ def main() -> None:
             invalidated_critic += 1
         if cached is not None:
             critic_results[accession] = cached
-            norm, _ = normalized_decision(cached)
+            norm, _ = normalized_decision(cached, row)
             print(f"[critic {i}/{len(rows)}] {accession} -> cached/{norm}")
             continue
         try:
@@ -682,7 +726,7 @@ def main() -> None:
             }
             path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
             critic_results[accession] = payload
-            norm, basis = normalized_decision(payload)
+            norm, basis = normalized_decision(payload, row)
             print(f"[critic {i}/{len(rows)}] {accession} -> {norm} ({basis})")
         except Exception as exc:
             error = f"{type(exc).__name__}: {exc}"
@@ -717,7 +761,7 @@ def main() -> None:
             cached = dict(cached)
             cached["trigger"] = trigger
             jury_results[accession] = cached
-            norm, _ = normalized_decision(cached)
+            norm, _ = normalized_decision(cached, row)
             print(f"[jury {i}/{len(jury_targets)}] {accession} -> cached/{norm}")
             continue
         try:
@@ -733,7 +777,7 @@ def main() -> None:
             }
             path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
             jury_results[accession] = payload
-            norm, basis = normalized_decision(payload)
+            norm, basis = normalized_decision(payload, row)
             print(f"[jury {i}/{len(jury_targets)}] {accession} -> {norm} ({basis})")
         except Exception as exc:
             error = f"{type(exc).__name__}: {exc}"
@@ -754,9 +798,9 @@ def main() -> None:
         elif jury is not None and jury.get("error"):
             final, final_basis, c_basis, j_basis = "uncertain", "jury_error", "", ""
         else:
-            final, final_basis, c_basis, j_basis = combine_decisions(critic, jury)
-        c_norm, _ = normalized_decision(critic) if critic and not critic.get("error") else ("uncertain", "")
-        j_norm, _ = normalized_decision(jury) if jury and not jury.get("error") else ("", "")
+            final, final_basis, c_basis, j_basis = combine_decisions(critic, jury, row)
+        c_norm, _ = normalized_decision(critic, row) if critic and not critic.get("error") else ("uncertain", "")
+        j_norm, _ = normalized_decision(jury, row) if jury and not jury.get("error") else ("", "")
         final_rows.append({
             "accession": accession,
             "unified_route": row.get("unified_route", ""),
@@ -801,6 +845,9 @@ def main() -> None:
             "final_basis": final_basis,
             "evidence_strength": evidence_strength(row),
             "qc_evidence_flags": row.get("qc_evidence_flags") or [],
+            "qc_single_cell_target_anchor_count": sample_unit_anchor_counts(row)["single_cell_target_anchor"],
+            "qc_population_target_anchor_count": sample_unit_anchor_counts(row)["population_target_anchor"],
+            "qc_multi_cell_control_anchor_count": sample_unit_anchor_counts(row)["multi_cell_control_anchor"],
             "critic_model": args.critic_model,
             "jury_model": args.jury_model if jury else "",
             "critic_wall_seconds": (critic.get("stats") or {}).get("wall_seconds", ""),
@@ -829,9 +876,9 @@ def main() -> None:
         "uncertain_for_manual_review": len(uncertain_rows),
         "errors": sum(bool(r["error"]) for r in final_rows),
         "note": (
-            "v0.1.11 makes the target MS sample unit explicit, gives many-cell/destructive-pooling "
-            "facts precedence over optimistic labels, and lets a complete one-cell-to-MS chain override "
-            "an inconsistent benchmark-only flag. Evidence-aware critic/jury arbitration and structured "
+            "v0.1.12 scopes many-cell counts to exact source passages so library/control counts cannot "
+            "overwrite genuine one-cell targets. Passage-scoped population anchors remain hard exclusions "
+            "when no one-cell target anchor exists. Evidence-aware critic/jury arbitration and structured "
             "output retries remain enabled. Residual uncertain rows still block Stage-05."
         ),
     }
