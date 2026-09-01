@@ -129,6 +129,11 @@ enum Command {
         candidates: PathBuf,
         #[arg(long)]
         known_positives: PathBuf,
+        /// Optional case-insensitive hosting_repository filter for benchmark CSVs.
+        /// This allows the frozen multi-repository GT master to be evaluated directly
+        /// without copying PRIDE rows into a production lookup list.
+        #[arg(long)]
+        repository_filter: Option<String>,
         #[arg(long, default_value = "data/recall_audit")]
         output: PathBuf,
     },
@@ -272,6 +277,7 @@ async fn main() -> Result<()> {
         Command::RecallAudit {
             candidates,
             known_positives,
+            repository_filter,
             output,
         } => {
             log::info!(
@@ -283,6 +289,7 @@ async fn main() -> Result<()> {
                 candidates_tsv: candidates,
                 benchmark_csv: known_positives,
                 output_dir: output,
+                repository_filter,
                 progress,
             })?;
             println!("{}", serde_json::to_string_pretty(&summary)?);

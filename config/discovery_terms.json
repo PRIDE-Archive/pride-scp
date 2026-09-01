@@ -176,6 +176,16 @@
       "label": "tmtpro_single_cell",
       "term": "tmtpro single-cell",
       "weight": 7
+    },
+    {
+      "label": "single_fiber_proteomics",
+      "term": "single fiber proteomics",
+      "weight": 8
+    },
+    {
+      "label": "single_fibre_proteomics",
+      "term": "single fibre proteomics",
+      "weight": 8
     }
   ],
   "biological_terms": [
@@ -243,6 +253,26 @@
       "label": "single_zygotes",
       "term": "single zygotes",
       "weight": 6
+    },
+    {
+      "label": "single_muscle_fiber",
+      "term": "single muscle fiber",
+      "weight": 7
+    },
+    {
+      "label": "single_muscle_fibre",
+      "term": "single muscle fibre",
+      "weight": 7
+    },
+    {
+      "label": "single_myofiber",
+      "term": "single myofiber",
+      "weight": 7
+    },
+    {
+      "label": "single_myofibre",
+      "term": "single myofibre",
+      "weight": 7
     }
   ],
   "adjacent_terms": [

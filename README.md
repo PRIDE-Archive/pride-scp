@@ -245,6 +245,35 @@ target/release/pride-scp recall-audit \
   --output data/recall_audit
 ```
 
+For the frozen GT196 evaluation master, use it directly as a benchmark and
+filter to the repository lane being measured. The benchmark is evaluation-only:
+it is never consulted by `discover`, `snapshot`, or any production lookup path.
+
+```bash
+target/release/pride-scp recall-audit \
+  --candidates data/discovery/candidates.tsv \
+  --known-positives gpt/final_curation_20260831/PRIDE_SCP_GT_REFERENCE_MASTER_2026-08-31_FINAL_v196.csv \
+  --repository-filter PRIDE \
+  --output data/recall_audit_gt196_pride
+```
+
+`recall-audit` accepts the frozen master's `reference_decision=include` rows as
+positives. Do not copy GT accessions into discovery terms, runtime allow-lists,
+or production tests. Keep the frozen GT directory immutable and out of Git
+staging.
+
+To rerun the same frozen discovery benchmark after a vocabulary/logic change
+without refreshing the repository snapshot, use:
+
+```bash
+OUT_ROOT=data/gt196_discovery_iter1 \
+  ./scripts/run_gt196_discovery_benchmark.sh
+```
+
+The script runs `discover`, `candidate-audit`, and the PRIDE-filtered recall
+audit against the existing snapshot. Set `SNAPSHOT_DIR`, `GT_MASTER`, or
+`OUT_ROOT` to override the defaults.
+
 Outputs:
 
 ```text

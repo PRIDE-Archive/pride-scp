@@ -1,3 +1,15 @@
+# Unreleased — GT196 optimization
+
+- Freeze the pre-change Rust321 discovery baseline at 97/106 PRIDE-labelled GT196 positives (91.51% recall) before changing discovery logic.
+- Expand recall-first discovery vocabulary for single muscle fibre/fiber and myofibre/myofiber proteomics, a measured dominant false-negative class.
+- Add a bounded MALDI/MSI + single-cell-context regex signal so single-cell MALDI imaging datasets can enter review without making generic spatial or MALDI studies positive.
+- Add regression tests for fibre vocabulary and for joint MALDI/single-cell evidence.
+- Extend `recall-audit` to read frozen GT-style `reference_decision=include` labels and optionally filter by `hosting_repository`, keeping GT use strictly in evaluation rather than runtime discovery.
+- Add an evaluation-only `run_gt196_discovery_benchmark.sh` runner so every discovery iteration is scored against the same frozen snapshot/GT contract without using GT accessions during discovery.
+- Preserve negative/pooled fibre studies as recall candidates for downstream adjudication; discovery remains intentionally non-destructive.
+- Record cross-repository/native-accession normalization as a separate next discovery problem after source review showed PXD047101 is MassIVE-hosted as MSV000093434 despite its PXD secondary accession.
+- Keep the v0.1.8-v0.1.12 affirmative Phi/Gemma QC decisions quarantined; this iteration changes discovery only.
+
 ## 0.1.12 - 2026-08-28
 
 - Scope many-cell counts to the exact source passage/sample role rather than applying any count anywhere in a study to every target MS sample.

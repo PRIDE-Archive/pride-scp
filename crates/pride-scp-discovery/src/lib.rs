@@ -38,6 +38,7 @@ pub struct RecallAuditOptions {
     pub candidates_tsv: PathBuf,
     pub benchmark_csv: PathBuf,
     pub output_dir: PathBuf,
+    pub repository_filter: Option<String>,
     pub progress: bool,
 }
 
@@ -149,6 +150,34 @@ fn scan_regex_signal(
             "one_cell_sample",
             r"(?i)\b(?:1|one)[- ]cell\s+(?:sample|well|proteom\w*)s?\b",
             9,
+        ),
+        // A skeletal muscle fibre/myofibre is a single multinucleated biological cell.
+        // This vocabulary is common in muscle proteomics and was a dominant measured
+        // false-negative class in the frozen recall baseline. Keep the signal specific
+        // by requiring nearby proteomics/MS language rather than matching "fiber" alone.
+        (
+            "single_muscle_fibre_proteomics",
+            r"(?i)\b(?:single|individual)\s+(?:(?:skeletal|cardiac)\s+)?(?:(?:muscle|myo)\s*)?(?:fibers?|fibres?|myofibers?|myofibres?)\b.{0,120}\b(?:proteom\w*|mass\s+spectrom\w*|LC[- ]?MS|MS/MS)\b",
+            12,
+        ),
+        (
+            "single_muscle_fibre_proteomics",
+            r"(?i)\b(?:proteom\w*|mass\s+spectrom\w*|LC[- ]?MS|MS/MS)\b.{0,120}\b(?:single|individual)\s+(?:(?:skeletal|cardiac)\s+)?(?:(?:muscle|myo)\s*)?(?:fibers?|fibres?|myofibers?|myofibres?)\b",
+            12,
+        ),
+        // MALDI/MSI studies often describe the biological resolution separately from
+        // the acquisition modality. Requiring both concepts in the same evidence lane
+        // avoids turning generic MALDI imaging or generic "single-cell resolution"
+        // spatial studies into positive discovery signals.
+        (
+            "single_cell_maldi_msi",
+            r"(?is)\b(?:MALDI(?:[- ]?MSI)?|mass\s+spectrom(?:etry|etric)\s+imaging)\b.{0,300}\bsingle[- ]cell(?:ular)?(?:\s+resolution)?\b",
+            10,
+        ),
+        (
+            "single_cell_maldi_msi",
+            r"(?is)\bsingle[- ]cell(?:ular)?(?:\s+resolution)?\b.{0,300}\b(?:MALDI(?:[- ]?MSI)?|mass\s+spectrom(?:etry|etric)\s+imaging)\b",
+            10,
         ),
     ];
     let mut score = 0;
@@ -454,7 +483,13 @@ fn categorize_candidate(row: &CandidateRecord, cfg: &DiscoveryConfig) -> Candida
         "individual_biological_cell_proteomics",
         "proteomics_individual_biological_cell",
     ]);
-    let regex_specific: HashSet<&'static str> = HashSet::from(["one_cell_sample"]);
+    let regex_specific: HashSet<&'static str> =
+        HashSet::from(["one_cell_sample", "single_muscle_fibre_proteomics"]);
+    // MALDI/MSI plus single-cell-resolution wording is a useful acquisition signal
+    // but is not, by itself, proof that one biological cell is the target MS sample.
+    // Keep it in the method-priority lane so downstream evidence adjudication still
+    // has to establish the biological unit and identity-preservation chain.
+    let regex_methods: HashSet<&'static str> = HashSet::from(["single_cell_maldi_msi"]);
 
     let mut specific_scp_labels = Vec::new();
     let mut method_labels = Vec::new();
@@ -466,7 +501,7 @@ fn categorize_candidate(row: &CandidateRecord, cfg: &DiscoveryConfig) -> Candida
     for label in &row.positive_labels {
         if broad_overrides.contains(label.as_str()) {
             broad_context_labels.push(label.clone());
-        } else if methods.contains(label) {
+        } else if methods.contains(label) || regex_methods.contains(label.as_str()) {
             method_labels.push(label.clone());
         } else if explicit.contains(label) || regex_specific.contains(label.as_str()) {
             specific_scp_labels.push(label.clone());
@@ -689,7 +724,7 @@ pub fn candidate_audit(opts: CandidateAuditOptions) -> Result<CandidateAuditSumm
 fn truthy(value: &str) -> bool {
     matches!(
         value.trim().to_ascii_lowercase().as_str(),
-        "yes" | "true" | "1" | "y" | "positive"
+        "yes" | "true" | "1" | "y" | "positive" | "include" | "included"
     )
 }
 
@@ -716,7 +751,14 @@ pub fn recall_audit(opts: RecallAuditOptions) -> Result<RecallSummary> {
     let positive_col = headers
         .iter()
         .position(|x| x == "contains_true_single_cell_ms")
-        .or_else(|| headers.iter().position(|x| x == "expected_positive"));
+        .or_else(|| headers.iter().position(|x| x == "expected_positive"))
+        .or_else(|| headers.iter().position(|x| x == "reference_decision"));
+    let repository_col = headers.iter().position(|x| x == "hosting_repository");
+    if opts.repository_filter.is_some() && repository_col.is_none() {
+        return Err(anyhow!(
+            "--repository-filter requires hosting_repository in the benchmark"
+        ));
+    }
     let label_col = headers
         .iter()
         .position(|x| x == "dataset_title")
@@ -733,6 +775,12 @@ pub fn recall_audit(opts: RecallAuditOptions) -> Result<RecallSummary> {
     let mut rows = Vec::new();
     for record in records {
         progress.inc(1);
+        if let (Some(filter), Some(index)) = (&opts.repository_filter, repository_col) {
+            let repository = record.get(index).unwrap_or_default().trim();
+            if !repository.eq_ignore_ascii_case(filter.trim()) {
+                continue;
+            }
+        }
         if let Some(index) = positive_col {
             if !truthy(record.get(index).unwrap_or_default()) {
                 continue;
@@ -989,6 +1037,34 @@ mod tests {
     }
 
     #[test]
+    fn maldi_single_cell_resolution_signal_is_method_priority_not_cell_proof() {
+        let cfg = DiscoveryConfig {
+            explicit_terms: vec![],
+            method_terms: vec![],
+            biological_terms: vec![],
+            adjacent_terms: vec![],
+            negative_context_terms: vec![],
+            strong_score: 36,
+            possible_score: 14,
+        };
+        let row = CandidateRecord {
+            accession: "PXD999998".into(),
+            dataset_title: "test".into(),
+            score: 10,
+            tier: "weak".into(),
+            positive_labels: vec!["single_cell_maldi_msi".into()],
+            ..Default::default()
+        };
+        let diag = categorize_candidate(&row, &cfg);
+        assert!(diag
+            .method_labels
+            .contains(&"single_cell_maldi_msi".to_string()));
+        assert!(diag.specific_scp_labels.is_empty());
+        assert_eq!(diag.semantic_priority, "B_method");
+        assert_eq!(diag.evidence_profile, "method_only");
+    }
+
+    #[test]
     fn fixture_union_recovers_known_positives() {
         let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
         let snapshot = root.join("tests/fixtures/snapshot");
@@ -1026,6 +1102,7 @@ mod tests {
             candidates_tsv: discovery_out.join("candidates.tsv"),
             benchmark_csv: benchmark,
             output_dir: recall_out,
+            repository_filter: None,
             progress: false,
         })
         .expect("fixture recall audit should succeed");
@@ -1076,5 +1153,124 @@ mod tests {
         );
         assert!(negatives.contains("bulk"));
         assert_eq!(score, 10);
+    }
+
+    #[test]
+    fn regex_signal_recognizes_single_muscle_fibre_proteomics() {
+        let mut seen = BTreeSet::new();
+        let mut hits = Vec::new();
+        let score = scan_regex_signal(
+            "repository_description",
+            "We performed paired proteomic analysis on individual skeletal muscle fibres from each mouse.",
+            1,
+            &mut seen,
+            &mut hits,
+        );
+        assert!(score >= 12);
+        assert!(hits
+            .iter()
+            .any(|hit| hit.label == "single_muscle_fibre_proteomics"));
+
+        let mut seen = BTreeSet::new();
+        let mut hits = Vec::new();
+        let score = scan_regex_signal(
+            "repository_title",
+            "Single skeletal muscle fibers profiled by LC-MS/MS",
+            1,
+            &mut seen,
+            &mut hits,
+        );
+        assert!(score >= 12);
+        assert!(hits
+            .iter()
+            .any(|hit| hit.label == "single_muscle_fibre_proteomics"));
+    }
+
+    #[test]
+    fn regex_signal_requires_joint_maldi_and_single_cell_context() {
+        let mut seen = BTreeSet::new();
+        let mut hits = Vec::new();
+        let score = scan_regex_signal(
+            "repository_metadata",
+            "Bottom-up spatial proteomics MALDI MSI.\nNew workflow for spatial bottom-up proteomics at single-cell resolution.",
+            1,
+            &mut seen,
+            &mut hits,
+        );
+        assert!(score >= 10);
+        assert!(hits.iter().any(|hit| hit.label == "single_cell_maldi_msi"));
+
+        let mut seen = BTreeSet::new();
+        let mut hits = Vec::new();
+        let maldi_only = scan_regex_signal(
+            "repository_title",
+            "MALDI MSI atlas of tissue sections",
+            1,
+            &mut seen,
+            &mut hits,
+        );
+        assert_eq!(maldi_only, 0);
+
+        let mut seen = BTreeSet::new();
+        let mut hits = Vec::new();
+        let resolution_only = scan_regex_signal(
+            "repository_description",
+            "Spatial transcriptomics at single-cell resolution",
+            1,
+            &mut seen,
+            &mut hits,
+        );
+        assert_eq!(resolution_only, 0);
+    }
+
+    #[test]
+    fn recall_audit_accepts_frozen_gt_style_decision_and_repository_filter() {
+        let output = std::env::temp_dir().join(format!(
+            "pride_scp_gt_recall_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&output).unwrap();
+        let candidates = output.join("candidates.tsv");
+        write_candidate_tsv(
+            &candidates,
+            &[CandidateRecord {
+                accession: "PXD900001".into(),
+                score: 12,
+                tier: "possible".into(),
+                positive_lanes: vec!["repository_title".into()],
+                ..Default::default()
+            }],
+        )
+        .unwrap();
+
+        let benchmark = output.join("gt.csv");
+        std::fs::write(
+            &benchmark,
+            concat!(
+                "accession,reference_decision,hosting_repository,dataset_title\n",
+                "PXD900001,include,PRIDE,recovered\n",
+                "PXD900002,include,MassIVE,other repository\n",
+                "PXD900003,exclude,PRIDE,strict negative\n"
+            ),
+        )
+        .unwrap();
+
+        let summary = recall_audit(RecallAuditOptions {
+            candidates_tsv: candidates,
+            benchmark_csv: benchmark,
+            output_dir: output.join("recall"),
+            repository_filter: Some("pride".into()),
+            progress: false,
+        })
+        .unwrap();
+        assert_eq!(summary.expected_positives, 1);
+        assert_eq!(summary.recovered_positives, 1);
+        assert_eq!(summary.missed_positives, 0);
+
+        let _ = std::fs::remove_dir_all(output);
     }
 }
