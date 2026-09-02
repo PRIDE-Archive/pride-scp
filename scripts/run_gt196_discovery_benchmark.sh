@@ -2,8 +2,10 @@
 set -euo pipefail
 
 # Evaluation-only benchmark runner for the frozen GT196 reference.
-# This script never feeds GT accessions into discovery; it scores discovery output
-# after the candidate universe has been produced independently from repository data.
+# The frozen GT is consulted only after independent candidate generation.
+# Iteration 2 first ensures a cached ProteomeCentral/PROXI registry supplement so
+# cross-repository PXD aliases absent from the primary PRIDE snapshot can enter
+# discovery without hard-coded accession knowledge.
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
@@ -15,6 +17,10 @@ OUT_ROOT="${OUT_ROOT:-$ROOT/data/gt196_discovery_benchmark}"
 DISCOVERY_DIR="$OUT_ROOT/discovery"
 AUDIT_DIR="$OUT_ROOT/candidate_audit"
 RECALL_DIR="$OUT_ROOT/recall_pride"
+REGISTRY_API_BASE="${REGISTRY_API_BASE:-https://proteomecentral.proteomexchange.org/api/proxi/v0.1}"
+REGISTRY_PAGE_SIZE="${REGISTRY_PAGE_SIZE:-100}"
+SKIP_REGISTRY_SNAPSHOT="${SKIP_REGISTRY_SNAPSHOT:-0}"
+REGISTRY_FORCE="${REGISTRY_FORCE:-0}"
 
 if [[ ! -x "$BIN" ]]; then
   echo "ERROR: build the Rust CLI first: cargo build --release --locked" >&2
@@ -30,6 +36,19 @@ if [[ ! -f "$GT_MASTER" ]]; then
 fi
 
 mkdir -p "$OUT_ROOT"
+
+if [[ "$SKIP_REGISTRY_SNAPSHOT" != "1" ]]; then
+  registry_args=(
+    registry-snapshot
+    --snapshot "$SNAPSHOT_DIR"
+    --api-base "$REGISTRY_API_BASE"
+    --page-size "$REGISTRY_PAGE_SIZE"
+  )
+  if [[ "$REGISTRY_FORCE" == "1" ]]; then
+    registry_args+=(--force)
+  fi
+  "$BIN" "${registry_args[@]}"
+fi
 
 "$BIN" discover \
   --snapshot "$SNAPSHOT_DIR" \
@@ -49,6 +68,7 @@ mkdir -p "$OUT_ROOT"
   --output "$RECALL_DIR"
 
 printf 'GT196 discovery benchmark complete\n'
+printf '  registry: %s\n' "$SNAPSHOT_DIR/registry"
 printf '  discovery: %s\n' "$DISCOVERY_DIR"
 printf '  candidate audit: %s\n' "$AUDIT_DIR"
 printf '  PRIDE recall: %s\n' "$RECALL_DIR"

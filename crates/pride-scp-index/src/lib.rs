@@ -1,5 +1,8 @@
 use anyhow::{anyhow, Context, Result};
-use pride_scp_core::{make_progress_bar, make_spinner, read_nonempty_lines, write_json};
+use pride_scp_core::{
+    first_string_for_keys, flatten_json_strings, make_progress_bar, make_spinner,
+    read_nonempty_lines, write_json,
+};
 use reqwest::{header::RETRY_AFTER, Client, StatusCode};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -13,6 +16,9 @@ use tokio::time::sleep;
 
 pub const DEFAULT_PRIDE_API: &str = "https://www.ebi.ac.uk/pride/ws/archive/v3";
 pub const DEFAULT_PROJECT_PAGE_SIZE: usize = 100;
+pub const DEFAULT_PROTEOMECENTRAL_PROXI_API: &str =
+    "https://proteomecentral.proteomexchange.org/api/proxi/v0.1";
+pub const DEFAULT_REGISTRY_PAGE_SIZE: usize = 100;
 
 #[derive(Debug, Clone)]
 pub struct SnapshotOptions {
@@ -58,6 +64,40 @@ pub struct SnapshotSummary {
     pub project_errors: usize,
     pub file_errors: usize,
     pub sdrf_errors: usize,
+}
+
+#[derive(Debug, Clone)]
+pub struct RegistrySnapshotOptions {
+    /// Existing PRIDE snapshot that will receive a supplemental ProteomeCentral index.
+    pub snapshot_dir: PathBuf,
+    pub api_base: String,
+    pub timeout_seconds: u64,
+    pub retries: usize,
+    pub user_agent: String,
+    /// PROXI datasets page size. The public API currently documents a maximum of 100.
+    pub page_size: usize,
+    /// Safety cap. Zero means no user cap beyond the internal implausibility guard.
+    pub max_pages: usize,
+    /// Refresh cached registry pages and normalized records.
+    pub force: bool,
+    pub progress: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct RegistrySnapshotSummary {
+    pub api_base: String,
+    pub page_size: usize,
+    pub pages_fetched: usize,
+    pub pages_cached: usize,
+    pub datasets_seen: usize,
+    pub datasets_with_pxd_alias: usize,
+    pub unique_pxd_accessions: usize,
+    pub primary_snapshot_overlaps: usize,
+    pub supplemental_pxd_accessions: usize,
+    pub normalized_records_written: usize,
+    pub stale_normalized_records_removed: usize,
+    pub native_aliases_observed: usize,
+    pub enumeration_termination: String,
 }
 
 #[derive(Debug, Clone)]
@@ -139,6 +179,130 @@ fn extract_accessions(value: &Value) -> Vec<String> {
         }
     }
     out.into_iter().collect()
+}
+
+fn registry_dataset_entries(value: &Value) -> Vec<&Value> {
+    if let Some(items) = value.as_array() {
+        return items.iter().collect();
+    }
+    for key in ["datasets", "results", "data", "content"] {
+        if let Some(items) = value.get(key).and_then(Value::as_array) {
+            return items.iter().collect();
+        }
+    }
+    if let Some(data) = value.get("data") {
+        for key in ["datasets", "results", "content"] {
+            if let Some(items) = data.get(key).and_then(Value::as_array) {
+                return items.iter().collect();
+            }
+        }
+    }
+    Vec::new()
+}
+
+fn accession_tokens(text: &str) -> impl Iterator<Item = String> + '_ {
+    text.split(|c: char| !c.is_ascii_alphanumeric())
+        .map(str::trim)
+        .filter(|token| !token.is_empty())
+        .map(str::to_ascii_uppercase)
+}
+
+fn registry_identifier_strings(dataset: &Value) -> Vec<String> {
+    let mut strings = Vec::new();
+    if let Some(value) = dataset.get("identifiers") {
+        flatten_json_strings(value, &mut strings);
+    }
+    if let Some(value) = dataset.get("accession") {
+        flatten_json_strings(value, &mut strings);
+    }
+    // Some registry providers expose the PX accession only in a dataset link
+    // rather than the identifiers array. Restrict this fallback to structured
+    // links so PXD mentions in free-text descriptions are not mistaken for aliases.
+    if let Some(value) = dataset.get("fullDatasetLinks") {
+        flatten_json_strings(value, &mut strings);
+    }
+    strings
+}
+
+fn registry_pxd_accessions(dataset: &Value) -> Vec<String> {
+    registry_identifier_strings(dataset)
+        .iter()
+        .flat_map(|text| accession_tokens(text))
+        .filter(|token| is_pxd(token))
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
+fn registry_native_accessions(dataset: &Value) -> Vec<String> {
+    let mut strings = Vec::new();
+    flatten_json_strings(dataset, &mut strings);
+    strings
+        .iter()
+        .flat_map(|text| accession_tokens(text))
+        .filter(|token| {
+            ["MSV", "IPX", "JPST", "PASS", "PXL"].iter().any(|prefix| {
+                token
+                    .strip_prefix(prefix)
+                    .map(|rest| !rest.is_empty() && rest.chars().all(|c| c.is_ascii_digit()))
+                    .unwrap_or(false)
+            })
+        })
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
+fn infer_registry_repository(dataset: &Value, native_accessions: &[String]) -> String {
+    if native_accessions.iter().any(|x| x.starts_with("MSV")) {
+        return "MassIVE".to_string();
+    }
+    if native_accessions.iter().any(|x| x.starts_with("IPX")) {
+        return "iProX".to_string();
+    }
+    if native_accessions.iter().any(|x| x.starts_with("JPST")) {
+        return "jPOST".to_string();
+    }
+    if native_accessions.iter().any(|x| x.starts_with("PASS")) {
+        return "PeptideAtlas/PASSEL".to_string();
+    }
+
+    let mut strings = Vec::new();
+    flatten_json_strings(dataset, &mut strings);
+    let joined = strings.join("\n").to_ascii_lowercase();
+    for (needle, label) in [
+        ("massive", "MassIVE"),
+        ("iprox", "iProX"),
+        ("jpost", "jPOST"),
+        ("panorama public", "Panorama Public"),
+        ("panorama", "Panorama Public"),
+        ("pride", "PRIDE"),
+    ] {
+        if joined.contains(needle) {
+            return label.to_string();
+        }
+    }
+    "unknown".to_string()
+}
+
+fn normalized_registry_dataset(accession: &str, dataset: &Value) -> Value {
+    let native_accessions = registry_native_accessions(dataset);
+    let hosting_repository = infer_registry_repository(dataset, &native_accessions);
+    let title = first_string_for_keys(dataset, &["title", "datasetTitle", "name"]);
+    let description = first_string_for_keys(
+        dataset,
+        &["description", "projectDescription", "datasetDescription"],
+    );
+    serde_json::json!({
+        "accession": accession,
+        "projectAccession": accession,
+        "title": title,
+        "description": description,
+        "registrySource": "ProteomeCentral PROXI",
+        "registryHostingRepository": hosting_repository,
+        "registryNativeAccessions": native_accessions,
+        "registryDataset": dataset,
+    })
 }
 
 fn has_pagination_metadata(value: &Value) -> bool {
@@ -850,6 +1014,228 @@ pub async fn snapshot(opts: SnapshotOptions) -> Result<SnapshotSummary> {
     Ok(summary)
 }
 
+pub async fn registry_snapshot(opts: RegistrySnapshotOptions) -> Result<RegistrySnapshotSummary> {
+    let started = Instant::now();
+    let registry_dir = opts.snapshot_dir.join("registry");
+    let pages_dir = registry_dir.join("pages");
+    let projects_dir = registry_dir.join("projects");
+    tokio::fs::create_dir_all(&pages_dir)
+        .await
+        .with_context(|| format!("create {}", pages_dir.display()))?;
+    tokio::fs::create_dir_all(&projects_dir)
+        .await
+        .with_context(|| format!("create {}", projects_dir.display()))?;
+
+    let client = Client::builder()
+        .connect_timeout(Duration::from_secs(20))
+        .timeout(Duration::from_secs(opts.timeout_seconds.max(1)))
+        .user_agent(&opts.user_agent)
+        .build()
+        .context("build ProteomeCentral HTTP client")?;
+
+    let primary_projects_dir = opts.snapshot_dir.join("projects");
+    let primary_accessions = if primary_projects_dir.is_dir() {
+        std::fs::read_dir(&primary_projects_dir)?
+            .filter_map(|entry| entry.ok().map(|x| x.path()))
+            .filter_map(|path| accession_from_named_file(&path))
+            .collect::<HashSet<_>>()
+    } else {
+        HashSet::new()
+    };
+
+    let page_size = opts.page_size.clamp(1, DEFAULT_REGISTRY_PAGE_SIZE);
+    let mut summary = RegistrySnapshotSummary {
+        api_base: opts.api_base.clone(),
+        page_size,
+        ..Default::default()
+    };
+    let mut seen_pxd = BTreeSet::new();
+    let mut supplemental_pxd = BTreeSet::new();
+    let mut native_aliases = BTreeSet::new();
+    let mut alias_rows = vec![
+        "pxd_accession\thosting_repository\tnative_accessions\tpresent_in_primary_snapshot\tregistry_json_path\tdataset_title".to_string(),
+    ];
+    let spinner = make_spinner("enumerating ProteomeCentral PROXI datasets", opts.progress);
+    let mut page_number = 1usize;
+
+    loop {
+        if opts.max_pages > 0 && page_number > opts.max_pages {
+            return Err(anyhow!(
+                "ProteomeCentral enumeration incomplete: reached --max-pages {} before an end-of-list response",
+                opts.max_pages
+            ));
+        }
+        if page_number > 1_000_000 {
+            return Err(anyhow!(
+                "aborting ProteomeCentral enumeration after implausibly many pages"
+            ));
+        }
+
+        let url = format!(
+            "{}/datasets?pageSize={page_size}&pageNumber={page_number}&resultType=full",
+            opts.api_base.trim_end_matches('/')
+        );
+        let page_path = pages_dir.join(format!("page_{page_number:06}.json"));
+        let state = fetch_cached(
+            &client,
+            &url,
+            &page_path,
+            opts.force,
+            opts.retries,
+            true,
+            true,
+        )
+        .await
+        .with_context(|| format!("enumerate ProteomeCentral page {page_number} from {url}"))?;
+        match state {
+            FetchState::Fetched => summary.pages_fetched += 1,
+            FetchState::Cached => summary.pages_cached += 1,
+            FetchState::NotFound => {
+                summary.enumeration_termination = "not_found_page".to_string();
+                break;
+            }
+        }
+
+        let value: Value = pride_scp_core::read_json(&page_path)
+            .with_context(|| format!("read ProteomeCentral page {}", page_path.display()))?;
+        let entries = registry_dataset_entries(&value);
+        if entries.is_empty() {
+            summary.enumeration_termination = "empty_page".to_string();
+            break;
+        }
+
+        summary.datasets_seen += entries.len();
+        let mut page_pxd_count = 0usize;
+        for dataset in &entries {
+            let pxd_accessions = registry_pxd_accessions(dataset);
+            if pxd_accessions.is_empty() {
+                continue;
+            }
+            summary.datasets_with_pxd_alias += 1;
+            page_pxd_count += pxd_accessions.len();
+            let natives = registry_native_accessions(dataset);
+            native_aliases.extend(natives.iter().cloned());
+            let repository = infer_registry_repository(dataset, &natives);
+            let title = first_string_for_keys(dataset, &["title", "datasetTitle", "name"])
+                .replace('\t', " ")
+                .replace('\n', " ");
+            let native_joined = natives.join("; ");
+
+            for accession in pxd_accessions {
+                let is_new = seen_pxd.insert(accession.clone());
+                if !is_new {
+                    continue;
+                }
+                let present_primary = primary_accessions.contains(&accession);
+                if present_primary {
+                    summary.primary_snapshot_overlaps += 1;
+                } else {
+                    summary.supplemental_pxd_accessions += 1;
+                    supplemental_pxd.insert(accession.clone());
+                }
+
+                let path = projects_dir.join(format!("{accession}.json"));
+                let registry_json_path = if present_primary {
+                    String::new()
+                } else {
+                    let normalized = normalized_registry_dataset(&accession, dataset);
+                    if opts.force || !path.is_file() {
+                        write_json(&path, &normalized).with_context(|| {
+                            format!("write normalized registry record {}", path.display())
+                        })?;
+                        summary.normalized_records_written += 1;
+                    }
+                    path.display().to_string()
+                };
+                alias_rows.push(format!(
+                    "{}\t{}\t{}\t{}\t{}\t{}",
+                    accession,
+                    repository,
+                    native_joined.replace('\t', " "),
+                    present_primary,
+                    registry_json_path,
+                    title,
+                ));
+            }
+        }
+
+        spinner.set_message(format!(
+            "ProteomeCentral page {} | datasets={} | PXD aliases={} | unique PXD={} | supplements={}",
+            page_number,
+            entries.len(),
+            page_pxd_count,
+            seen_pxd.len(),
+            summary.supplemental_pxd_accessions,
+        ));
+
+        if entries.len() < page_size {
+            summary.enumeration_termination = "short_page".to_string();
+            break;
+        }
+        page_number = page_number.saturating_add(1);
+    }
+
+    // Reconcile generated supplement files only after a complete enumeration.
+    // This prevents a removed/reclassified registry alias from surviving as a
+    // stale discovery candidate across --force refreshes. Primary overlaps are
+    // intentionally never materialized in this directory.
+    for entry in std::fs::read_dir(&projects_dir)? {
+        let path = entry?.path();
+        if path.extension().and_then(|x| x.to_str()) != Some("json") {
+            continue;
+        }
+        let Some(accession) = accession_from_named_file(&path) else {
+            continue;
+        };
+        if !supplemental_pxd.contains(&accession) {
+            std::fs::remove_file(&path)
+                .with_context(|| format!("remove stale registry record {}", path.display()))?;
+            summary.stale_normalized_records_removed += 1;
+        }
+    }
+
+    summary.unique_pxd_accessions = seen_pxd.len();
+    summary.native_aliases_observed = native_aliases.len();
+    if summary.enumeration_termination.is_empty() {
+        summary.enumeration_termination = "unknown".to_string();
+    }
+
+    let accessions_text = if seen_pxd.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "{}\n",
+            seen_pxd.iter().cloned().collect::<Vec<_>>().join("\n")
+        )
+    };
+    tokio::fs::write(registry_dir.join("accessions.txt"), accessions_text)
+        .await
+        .context("write registry accessions.txt")?;
+    tokio::fs::write(
+        registry_dir.join("registry_accessions.tsv"),
+        format!("{}\n", alias_rows.join("\n")),
+    )
+    .await
+    .context("write registry_accessions.tsv")?;
+    write_json(&registry_dir.join("registry_summary.json"), &summary)?;
+
+    spinner.finish_with_message(format!(
+        "ProteomeCentral registry complete | {} PXD aliases | {} supplemental",
+        summary.unique_pxd_accessions, summary.supplemental_pxd_accessions
+    ));
+    log::info!(
+        "registry snapshot complete in {:.1}s: datasets={} unique_pxd={} overlaps={} supplements={} pages_fetched={} cached={}",
+        started.elapsed().as_secs_f64(),
+        summary.datasets_seen,
+        summary.unique_pxd_accessions,
+        summary.primary_snapshot_overlaps,
+        summary.supplemental_pxd_accessions,
+        summary.pages_fetched,
+        summary.pages_cached,
+    );
+    Ok(summary)
+}
+
 fn file_size(path: &Path) -> u64 {
     std::fs::metadata(path).map(|meta| meta.len()).unwrap_or(0)
 }
@@ -1126,5 +1512,42 @@ mod tests {
             "last": false
         });
         assert!(!catalogue_response_is_monolithic(&value, 100));
+    }
+    #[test]
+    fn proteomecentral_dataset_extracts_secondary_pxd_and_native_massive_alias() {
+        let dataset = json!({
+            "title": "Single cell proteomics and epiproteomics",
+            "description": "Single cells were isolated by FACS and analyzed by timsTOF SCP.",
+            "identifiers": [
+                {"accession": "MS:1001919", "name": "ProteomeXchange accession", "value": "PXD047101"},
+                {"accession": "MS:1002634", "name": "MassIVE dataset identifier", "value": "MSV000093434"}
+            ],
+            "fullDatasetLinks": [
+                {"accession": "MS:1002846", "name": "MassIVE dataset URI", "value": "ftp://massive.ucsd.edu/MSV000093434/"}
+            ]
+        });
+        assert_eq!(registry_pxd_accessions(&dataset), vec!["PXD047101"]);
+        assert!(registry_native_accessions(&dataset).contains(&"MSV000093434".to_string()));
+        assert_eq!(
+            infer_registry_repository(&dataset, &registry_native_accessions(&dataset)),
+            "MassIVE"
+        );
+
+        let normalized = normalized_registry_dataset("PXD047101", &dataset);
+        assert_eq!(normalized["accession"], "PXD047101");
+        assert_eq!(normalized["registryHostingRepository"], "MassIVE");
+        assert_eq!(normalized["registryNativeAccessions"][0], "MSV000093434");
+    }
+
+    #[test]
+    fn proteomecentral_dataset_entries_accept_array_and_common_wrappers() {
+        let a = json!([{"title": "a"}, {"title": "b"}]);
+        assert_eq!(registry_dataset_entries(&a).len(), 2);
+
+        let wrapped = json!({"datasets": [{"title": "a"}]});
+        assert_eq!(registry_dataset_entries(&wrapped).len(), 1);
+
+        let nested = json!({"data": {"results": [{"title": "a"}]}});
+        assert_eq!(registry_dataset_entries(&nested).len(), 1);
     }
 }

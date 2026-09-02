@@ -1,7 +1,9 @@
 # PRIDE_SCP architecture — GT196 optimization state
 
-**Status:** discovery Iteration 1 accepted against frozen GT196; annotation
-redesign is the next major phase.
+**Status:** discovery Iteration 1 accepted against frozen GT196; discovery
+Iteration 2 (ProteomeCentral registry/native-accession supplementation) is
+implemented and awaiting the frozen acceptance rerun. Annotation redesign is
+the next major phase after that check.
 
 PRIDE_SCP is a hybrid Rust + Python pipeline. Rust owns deterministic,
 high-volume repository enumeration and recall-first discovery. Python owns
@@ -21,25 +23,25 @@ and is never a production lookup table.
 ```text
                          PRODUCTION DATA FLOW
 
-                    PRIDE public project universe
-                              |
-                              v
-                  +-------------------------+
-                  | Rust snapshot / index   |
-                  | project JSON            |
-                  | file manifests          |
-                  | SDRF when available     |
-                  +-------------------------+
-                              |
-                              v
+        PRIDE public project universe          ProteomeCentral / PROXI registry
+                    |                                  |
+                    v                                  v
+        +-------------------------+        +-------------------------+
+        | Rust PRIDE snapshot     |        | Rust registry snapshot  |
+        | project JSON            |        | PXD aliases             |
+        | file manifests          |        | native accessions       |
+        | SDRF when available     |        | hosting provenance      |
+        +-------------------------+        +-------------------------+
+                    |                                  |
+                    +---------------+------------------+
+                                    v
                   +-------------------------+
                   | Rust discovery UNION    |
-                  | repository text         |
-                  | file/SDRF text          |
-                  | SCP method vocabulary   |
-                  | biological-unit regex   |
-                  | fibre/myofibre signals  |
-                  | bounded MALDI/MSI SCP   |
+                  | primary PRIDE evidence  |
+                  | registry-only PXD       |
+                  | supplements absent from |
+                  | the PRIDE snapshot      |
+                  | SCP/method/unit signals |
                   +-------------------------+
                               |
                               | all positive-signal candidates retained
@@ -102,7 +104,7 @@ Stage 04 in the recall-first architecture.
 
 frozen GT196 master -------------------------------+
                                                    |
-existing snapshot -> discover -> candidates -------+--> recall-audit
+PRIDE + registry snapshot -> discover -> candidates +--> recall-audit
                                                    |
                                                    +--> exact accession deltas
 ```
@@ -170,13 +172,34 @@ this as a cross-repository/native-accession problem rather than another PRIDE
 vocabulary miss. That class should be addressed by registry/native-accession
 normalization, not an accession-specific exception.
 
+### GT196 discovery Iteration 2 — implemented, acceptance pending
+
+Iteration 2 adds `registry-snapshot`, which enumerates ProteomeCentral's PROXI
+dataset registry, extracts PXD identifiers plus native repository aliases, and
+materializes normalized records under `snapshot/registry/`. The production
+discovery rule is intentionally narrow:
+
+> A registry record is scanned only when its PXD alias is absent from the
+> primary `snapshot/projects/` directory.
+
+This prevents duplicate ProteomeCentral metadata from changing the accepted
+score/tier of existing PRIDE candidates. It directly addresses the measured
+`PXD047101` class, where the PXD is secondary to MassIVE `MSV000093434`.
+
+Acceptance requires the real frozen benchmark to show:
+
+- `PXD047101` recovered;
+- all 334 Iteration-1 candidates preserved;
+- no broad candidate explosion from registry-only aliases;
+- ideally 106/106 PRIDE-labelled GT recovery.
+
 ## Layer 1 — Rust snapshot/index
 
 `pride-scp-index` performs bounded, resumable repository acquisition and
 materializes local evidence so discovery can be rerun without repeatedly
-querying PRIDE.
+querying remote services.
 
-Inputs/outputs include:
+The primary PRIDE snapshot includes:
 
 - project catalogue and project metadata JSON;
 - file manifests;
@@ -184,19 +207,31 @@ Inputs/outputs include:
 - per-accession errors without aborting the whole crawl;
 - cached catalogue pages and materialized project records.
 
+Iteration 2 adds a separate ProteomeCentral registry cache:
+
+- raw PROXI dataset pages;
+- normalized `registry/projects/PXD....json` records;
+- `registry_accessions.tsv` mapping PXD aliases to native repository accessions;
+- inferred hosting-repository provenance where exposed by registry metadata;
+- a registry summary distinguishing PXD aliases already present in PRIDE from
+  true supplemental aliases.
+
 A project-catalogue enumeration failure is treated differently from an
 individual evidence failure: silently truncating the accession universe is a
 recall error and must stop the run.
 
 ## Layer 2 — Rust recall-first discovery
 
-`pride-scp-discovery` scans all cached projects in parallel and unions
-independent positive-signal lanes. Signals include:
+`pride-scp-discovery` scans all cached primary PRIDE projects plus only those
+registry PXD aliases missing from the primary snapshot, then unions independent
+positive-signal lanes. Signals include:
 
 - explicit SCP terminology;
 - known SCP workflow/method names;
 - biological-unit language;
-- repository title/description/metadata;
+- primary repository title/description/metadata;
+- supplemental ProteomeCentral title/description/native-alias metadata for PXD
+  aliases absent from PRIDE;
 - filenames/file-manifest text;
 - SDRF text;
 - proximity-constrained cell/fibre + proteomics/MS patterns;
@@ -338,15 +373,16 @@ not the current recall-first output.
 7. Never hard-code GT accessions into production discovery logic.
 8. Keep accession-level and canonical-study-level decisions separate.
 9. Old v0.1.8-v0.1.12 Phi/Gemma decisions are quarantined.
-10. Every code iteration reports the exact accessions gained/lost, not only a
+10. ProteomeCentral is supplemental: duplicate PXD records never rescore the
+    primary PRIDE project.
+11. Every code iteration reports the exact accessions gained/lost, not only a
     summary metric.
 
 ## Near-term roadmap
 
-1. **Discovery Iteration 2:** add cross-repository/ProteomeXchange registry and
-   native/secondary accession normalization for the remaining discovery class;
-   target 106/106 without widening PRIDE vocabulary indiscriminately.
-2. Freeze that candidate universe and rerun stage-by-stage GT crosswalks.
+1. **Accept Discovery Iteration 2** on the real ProteomeCentral registry cache;
+   target 106/106 while preserving all 334 Iteration-1 candidates.
+2. Freeze the resulting candidate universe and rerun stage-by-stage GT crosswalks.
 3. Redesign the primary biological-unit/pooling annotation lane against GT196.
 4. Measure per-field annotation agreement and source provenance.
 5. Only after the primary lane is sound, reconsider an independent QC model.

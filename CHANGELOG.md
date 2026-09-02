@@ -1,5 +1,12 @@
 # Unreleased — GT196 optimization
 
+- Implement discovery Iteration 2 with a cached ProteomeCentral/PROXI registry snapshot and PXD/native-accession normalization for cross-repository datasets absent from the primary PRIDE catalogue.
+- Reconcile generated registry supplements after complete enumeration so stale PXD aliases cannot survive refreshes, and fail on an explicit page-cap hit instead of benchmarking an incomplete registry snapshot.
+- Keep ProteomeCentral strictly supplemental during discovery: registry records whose PXD already exists under `snapshot/projects/` are not rescored, preserving accepted Iteration-1 scores/tiers.
+- Add `registry-snapshot` CLI support, normalized `snapshot/registry/projects/` records, an explicit `registry_accessions.tsv` alias/provenance crosswalk, and registry enumeration diagnostics.
+- Update production and GT196 benchmark runners to ensure the registry cache before discovery, with explicit offline/refresh controls.
+- Extend discovery summaries with primary-project and registry-supplement counts and add regression tests for PXD/native-alias parsing plus primary-snapshot precedence.
+- Keep GT196 evaluation-only: registry enumeration is global and never receives GT accessions. The Iteration-2 acceptance target is recovery of the sole Iteration-1 miss (`PXD047101`) through general registry normalization, not an accession-specific rule.
 - Accept discovery Iteration 1 on the frozen 40,364-project snapshot: 334 candidates, 105/106 PRIDE GT positives recovered (99.06% recall), one miss, and no loss from the original Rust321 universe.
 - Confirm the 13 candidate additions: eight GT recoveries and five non-GT review candidates; PXD053022 is recovered from repository metadata at weak priority.
 - Update architecture/model documentation to distinguish active Qwen extraction/triage, deterministic lossless unification, quarantined v0.1.8-v0.1.12 Phi/Gemma recall semantic QC, and the separate historical Stage-06 MiniCheck/Phi/Gemma claim-QC lane.

@@ -100,7 +100,14 @@ pub struct PythonBridgeSummary {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct DiscoverySummary {
+    /// Total project-like records scanned across the primary PRIDE snapshot and
+    /// supplemental registry-only PXD aliases.
     pub projects_scanned: usize,
+    /// Number of primary PRIDE project records scanned.
+    pub primary_projects_scanned: usize,
+    /// Number of ProteomeCentral registry records scanned because their PXD alias
+    /// was absent from the primary PRIDE snapshot.
+    pub registry_supplements_scanned: usize,
     pub projects_with_positive_signal: usize,
     pub candidates_emitted: usize,
     pub strong_candidates: usize,

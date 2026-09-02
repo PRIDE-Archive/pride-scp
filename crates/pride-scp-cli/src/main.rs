@@ -6,8 +6,9 @@ use pride_scp_discovery::{
     ExportPythonOptions, RecallAuditOptions,
 };
 use pride_scp_index::{
-    compact_snapshot, snapshot, CompactSnapshotOptions, SnapshotOptions, DEFAULT_PRIDE_API,
-    DEFAULT_PROJECT_PAGE_SIZE,
+    compact_snapshot, registry_snapshot, snapshot, CompactSnapshotOptions, RegistrySnapshotOptions,
+    SnapshotOptions, DEFAULT_PRIDE_API, DEFAULT_PROJECT_PAGE_SIZE,
+    DEFAULT_PROTEOMECENTRAL_PROXI_API, DEFAULT_REGISTRY_PAGE_SIZE,
 };
 use std::path::PathBuf;
 use std::time::Instant;
@@ -81,6 +82,33 @@ enum Command {
         limit: usize,
         #[arg(long)]
         accessions_file: Option<PathBuf>,
+    },
+    /// Snapshot ProteomeCentral/PROXI metadata to recover cross-repository PXD aliases
+    /// that are absent from the primary PRIDE project catalogue.
+    RegistrySnapshot {
+        /// Existing PRIDE snapshot directory to supplement.
+        #[arg(long, default_value = "data/snapshot")]
+        snapshot: PathBuf,
+        #[arg(long, default_value = DEFAULT_PROTEOMECENTRAL_PROXI_API)]
+        api_base: String,
+        /// PROXI datasets page size (public API maximum: 100).
+        #[arg(long, default_value_t = DEFAULT_REGISTRY_PAGE_SIZE)]
+        page_size: usize,
+        /// Per-request timeout, including response-body transfer.
+        #[arg(long, default_value_t = 120)]
+        timeout: u64,
+        /// Number of retries after the initial HTTP attempt.
+        #[arg(long, default_value_t = 4)]
+        retries: usize,
+        /// Safety page cap; hitting the cap is an error because a partial registry
+        /// snapshot is unsafe for recall benchmarking. Zero disables the user cap.
+        #[arg(long, default_value_t = 10_000)]
+        max_pages: usize,
+        #[arg(long, default_value = "PRIDE-SCP-registry-index/0.1.12")]
+        user_agent: String,
+        /// Refresh cached ProteomeCentral pages and normalized registry records.
+        #[arg(long)]
+        force: bool,
     },
     /// Discover SCP candidates from the union of repository/file/SDRF signals.
     Discover {
@@ -211,6 +239,31 @@ async fn main() -> Result<()> {
                 force,
                 limit,
                 accessions_file,
+                progress,
+            })
+            .await?;
+            println!("{}", serde_json::to_string_pretty(&summary)?);
+        }
+        Command::RegistrySnapshot {
+            snapshot,
+            api_base,
+            page_size,
+            timeout,
+            retries,
+            max_pages,
+            user_agent,
+            force,
+        } => {
+            log::info!("command=registry-snapshot snapshot={}", snapshot.display());
+            let summary = registry_snapshot(RegistrySnapshotOptions {
+                snapshot_dir: snapshot,
+                api_base,
+                timeout_seconds: timeout,
+                retries,
+                user_agent,
+                page_size,
+                max_pages,
+                force,
                 progress,
             })
             .await?;

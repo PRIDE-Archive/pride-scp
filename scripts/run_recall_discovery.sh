@@ -11,6 +11,10 @@ CONCURRENCY="${PRIDE_CONCURRENCY:-8}"
 TIMEOUT="${PRIDE_TIMEOUT:-120}"
 RETRIES="${PRIDE_RETRIES:-4}"
 PROJECT_PAGE_SIZE="${PRIDE_PROJECT_PAGE_SIZE:-100}"
+REGISTRY_API_BASE="${REGISTRY_API_BASE:-https://proteomecentral.proteomexchange.org/api/proxi/v0.1}"
+REGISTRY_PAGE_SIZE="${REGISTRY_PAGE_SIZE:-100}"
+SKIP_REGISTRY_SNAPSHOT="${SKIP_REGISTRY_SNAPSHOT:-0}"
+REGISTRY_FORCE="${REGISTRY_FORCE:-0}"
 
 if [[ ! -x "$BIN" ]]; then
   echo "ERROR: build the Rust CLI first: cargo build --release --locked" >&2
@@ -23,6 +27,21 @@ fi
   --timeout "$TIMEOUT" \
   --retries "$RETRIES" \
   --project-page-size "$PROJECT_PAGE_SIZE"
+
+if [[ "$SKIP_REGISTRY_SNAPSHOT" != "1" ]]; then
+  registry_args=(
+    registry-snapshot
+    --snapshot "$SNAPSHOT_DIR"
+    --api-base "$REGISTRY_API_BASE"
+    --page-size "$REGISTRY_PAGE_SIZE"
+    --timeout "$TIMEOUT"
+    --retries "$RETRIES"
+  )
+  if [[ "$REGISTRY_FORCE" == "1" ]]; then
+    registry_args+=(--force)
+  fi
+  "$BIN" "${registry_args[@]}"
+fi
 
 "$BIN" discover \
   --snapshot "$SNAPSHOT_DIR" \

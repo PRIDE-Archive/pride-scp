@@ -371,16 +371,51 @@ pub fn discover(opts: DiscoverOptions) -> Result<DiscoverySummary> {
     );
     let cfg: DiscoveryConfig = read_json(&opts.config_path)?;
     let project_dir = opts.snapshot_dir.join("projects");
-    let mut project_paths = std::fs::read_dir(&project_dir)
+    let mut primary_project_paths = std::fs::read_dir(&project_dir)
         .with_context(|| format!("read {}", project_dir.display()))?
         .filter_map(|entry| entry.ok().map(|x| x.path()))
         .filter(|path| path.extension().and_then(|x| x.to_str()) == Some("json"))
         .collect::<Vec<_>>();
-    project_paths.sort();
+    primary_project_paths.sort();
+    let primary_accessions = primary_project_paths
+        .iter()
+        .filter_map(|path| path.file_stem().and_then(|x| x.to_str()))
+        .map(str::to_ascii_uppercase)
+        .collect::<HashSet<_>>();
+
+    // ProteomeCentral is a supplemental registry lane, not a replacement for the
+    // primary PRIDE snapshot. Only scan registry PXD aliases that are absent from
+    // snapshot/projects so duplicate registry metadata cannot perturb the accepted
+    // score/tier of existing PRIDE candidates.
+    let registry_project_dir = opts.snapshot_dir.join("registry").join("projects");
+    let mut registry_project_paths = if registry_project_dir.is_dir() {
+        std::fs::read_dir(&registry_project_dir)
+            .with_context(|| format!("read {}", registry_project_dir.display()))?
+            .filter_map(|entry| entry.ok().map(|x| x.path()))
+            .filter(|path| path.extension().and_then(|x| x.to_str()) == Some("json"))
+            .filter(|path| {
+                path.file_stem()
+                    .and_then(|x| x.to_str())
+                    .map(str::to_ascii_uppercase)
+                    .map(|accession| !primary_accessions.contains(&accession))
+                    .unwrap_or(false)
+            })
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
+    registry_project_paths.sort();
+
+    let primary_projects_scanned = primary_project_paths.len();
+    let registry_supplements_scanned = registry_project_paths.len();
+    let mut project_paths = primary_project_paths;
+    project_paths.extend(registry_project_paths);
 
     log::info!(
-        "discovery scan: {} cached project records",
-        project_paths.len()
+        "discovery scan: {} project records (primary={} registry_supplements={})",
+        project_paths.len(),
+        primary_projects_scanned,
+        registry_supplements_scanned,
     );
     let progress = make_progress_bar(
         project_paths.len() as u64,
@@ -426,6 +461,8 @@ pub fn discover(opts: DiscoverOptions) -> Result<DiscoverySummary> {
 
     let summary = DiscoverySummary {
         projects_scanned: project_paths.len(),
+        primary_projects_scanned,
+        registry_supplements_scanned,
         projects_with_positive_signal: positive_count,
         candidates_emitted: emitted.len(),
         strong_candidates: emitted.iter().filter(|x| x.tier == "strong").count(),
@@ -1272,5 +1309,99 @@ mod tests {
         assert_eq!(summary.missed_positives, 0);
 
         let _ = std::fs::remove_dir_all(output);
+    }
+    #[test]
+    fn registry_supplements_only_add_pxd_aliases_missing_from_primary_snapshot() {
+        let root = std::env::temp_dir().join(format!(
+            "pride_scp_registry_discovery_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let projects = root.join("projects");
+        let registry_projects = root.join("registry/projects");
+        std::fs::create_dir_all(&projects).unwrap();
+        std::fs::create_dir_all(&registry_projects).unwrap();
+
+        // Primary metadata wins for an accession that exists in both sources. The
+        // registry duplicate contains a strong SCP phrase but must not perturb score.
+        write_json(
+            &projects.join("PXD900010.json"),
+            &serde_json::json!({
+                "accession": "PXD900010",
+                "title": "ordinary bulk proteomics",
+                "description": "bulk tissue proteomics"
+            }),
+        )
+        .unwrap();
+        write_json(
+            &registry_projects.join("PXD900010.json"),
+            &serde_json::json!({
+                "accession": "PXD900010",
+                "title": "single-cell proteomics duplicate registry metadata"
+            }),
+        )
+        .unwrap();
+
+        // A PXD alias absent from PRIDE is admitted as a registry supplement.
+        write_json(
+            &registry_projects.join("PXD900011.json"),
+            &serde_json::json!({
+                "accession": "PXD900011",
+                "title": "Single-cell proteomics of isolated cancer cells",
+                "description": "Single cells analyzed by LC-MS/MS",
+                "registryHostingRepository": "MassIVE",
+                "registryNativeAccessions": ["MSV000000011"]
+            }),
+        )
+        .unwrap();
+
+        let config = root.join("terms.json");
+        write_json(
+            &config,
+            &DiscoveryConfig {
+                explicit_terms: vec![WeightedTerm {
+                    label: "single_cell_proteomics".into(),
+                    term: "single-cell proteomics".into(),
+                    weight: 14,
+                }],
+                method_terms: vec![],
+                biological_terms: vec![],
+                adjacent_terms: vec![],
+                negative_context_terms: vec![],
+                strong_score: 36,
+                possible_score: 14,
+            },
+        )
+        .unwrap();
+
+        let out = root.join("out");
+        let summary = discover(DiscoverOptions {
+            snapshot_dir: root.clone(),
+            output_dir: out.clone(),
+            config_path: config,
+            min_score: 1,
+            expected_positive_count: 0,
+            progress: false,
+        })
+        .unwrap();
+        assert_eq!(summary.primary_projects_scanned, 1);
+        assert_eq!(summary.registry_supplements_scanned, 1);
+        assert_eq!(summary.projects_scanned, 2);
+
+        let candidates = read_candidate_tsv(&out.join("candidates.tsv")).unwrap();
+        assert!(candidates.iter().any(|row| row.accession == "PXD900011"));
+        assert!(!candidates.iter().any(|row| row.accession == "PXD900010"));
+        let registry = candidates
+            .iter()
+            .find(|row| row.accession == "PXD900011")
+            .unwrap();
+        assert!(registry
+            .project_json_path
+            .contains("registry/projects/PXD900011.json"));
+
+        let _ = std::fs::remove_dir_all(root);
     }
 }

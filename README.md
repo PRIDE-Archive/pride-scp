@@ -15,45 +15,57 @@ coverage before semantic stages optimize precision.  Missing publications,
 weak metadata, negative context, or an uncertain model decision must not
 silently delete a candidate from the recall universe.
 
-## Current status — GT196 discovery Iteration 1 accepted
+## Current status — GT196 discovery Iteration 2 implemented
 
-The frozen pre-change Rust321 baseline recovered 97/106 PRIDE GT positives
-(91.51%).  Discovery Iteration 1 added measured single-fibre/myofibre and
-bounded MALDI/MSI single-cell context coverage.  The real frozen-snapshot
-benchmark now reports:
+The accepted discovery baseline is Iteration 1: 105/106 PRIDE-labelled GT
+positives recovered (99.06%) from 334 candidates, with no loss from the original
+Rust321 universe.  Its sole frozen-GT miss is `PXD047101`, which is absent from
+the primary PRIDE snapshot because ProteomeCentral identifies the PXD as a
+secondary accession for the MassIVE-hosted dataset `MSV000093434`.
+
+Discovery Iteration 2 therefore adds a **ProteomeCentral/PROXI supplemental
+registry index and native/secondary-accession normalization**.  It does not
+rescore duplicate PRIDE records.  Discovery scans a registry PXD record only
+when that PXD alias is absent from `snapshot/projects/`, preserving the accepted
+Iteration-1 scores and tiers for the 40,364 primary PRIDE projects.
+
+Accepted Iteration-1 baseline:
 
 ```text
-projects scanned:        40,364
-candidates:                  334
-strong / possible / weak:   191 / 68 / 75
-A / B / C / D priority:     141 / 33 / 154 / 6
-GT recovered:               105 / 106
-GT missed:                    1
-PRIDE discovery recall:      99.06%
+primary PRIDE projects:      40,364
+candidates:                     334
+strong / possible / weak:      191 / 68 / 75
+A / B / C / D priority:        141 / 33 / 154 / 6
+GT recovered:                  105 / 106
+GT missed:                       1
+PRIDE discovery recall:         99.06%
 ```
 
-No original Rust321 candidate disappeared.  The remaining discovery class is
-cross-repository/native-accession normalization rather than another broad PRIDE
-vocabulary expansion.
+Iteration 2 is **implemented but not yet accepted** until the same frozen GT196
+benchmark is rerun on the real registry snapshot.  The intended acceptance
+criterion is recovery of `PXD047101` without losing any of the 334 accepted
+candidates and without a broad candidate explosion.
 
-The **current optimization frontier is annotation quality**, not discovery
-keyword accumulation.  Historical Stage-04 sensitivity was only 36/64 on
-publication-backed recovered GT positives, so biological-unit, sample-unit,
-pooling, benchmark/reanalysis and provenance fields must be rebuilt and
-re-scored against GT196 before the recall-first branch is allowed into Stage 05.
+After that acceptance run, the optimization frontier moves fully to annotation
+quality.  Historical Stage-04 sensitivity was only 36/64 on publication-backed
+recovered GT positives, so biological-unit, sample-unit, pooling,
+benchmark/reanalysis and provenance fields must be rebuilt and re-scored
+against GT196 before the recall-first branch is allowed into Stage 05.
 
 ## Current architecture
 
 ```text
-PRIDE public project universe
-        |
-        v
-Rust snapshot/index
-  project JSON + file manifests + SDRF
-        |
-        v
+PRIDE public project universe                 ProteomeCentral / PROXI registry
+        |                                              |
+        v                                              v
+Rust PRIDE snapshot/index                     Rust registry snapshot/index
+  project JSON + file manifests + SDRF          PXD aliases + native accessions
+        |                                              |
+        +----------------------+-----------------------+
+                               v
 Rust recall-first discovery UNION
-  repository/file/SDRF text
+  primary PRIDE repository/file/SDRF text
+  registry-only PXD supplements absent from PRIDE
   SCP methods + biological-unit patterns
   fibre/myofibre + bounded MALDI/MSI signals
         |
@@ -105,6 +117,7 @@ See:
 Rust handles the deterministic and potentially high-volume work:
 
 - whole-PRIDE enumeration and local snapshotting;
+- ProteomeCentral/PROXI registry enumeration and PXD/native-accession normalization;
 - bounded concurrent API requests;
 - resumable caches and retry/backoff;
 - project/file/SDRF parsing;
@@ -251,6 +264,12 @@ target/release/pride-scp snapshot \
   --retries 4 \
   --project-page-size 100
 
+target/release/pride-scp registry-snapshot \
+  --snapshot data/snapshot \
+  --page-size 100 \
+  --timeout 120 \
+  --retries 4
+
 target/release/pride-scp discover \
   --snapshot data/snapshot \
   --config config/discovery_terms.json \
@@ -322,17 +341,19 @@ positives. Do not copy GT accessions into discovery terms, runtime allow-lists,
 or production tests. Keep the frozen GT directory immutable and out of Git
 staging.
 
-To rerun the same frozen discovery benchmark after a vocabulary/logic change
-without refreshing the repository snapshot, use:
+To rerun the same frozen discovery benchmark after a discovery/index change, use:
 
 ```bash
-OUT_ROOT=data/gt196_discovery_iter1 \
+OUT_ROOT=data/gt196_discovery_iter2 \
   ./scripts/run_gt196_discovery_benchmark.sh
 ```
 
-The script runs `discover`, `candidate-audit`, and the PRIDE-filtered recall
-audit against the existing snapshot. Set `SNAPSHOT_DIR`, `GT_MASTER`, or
-`OUT_ROOT` to override the defaults.
+The Iteration-2 runner first ensures the cached ProteomeCentral registry index,
+then runs `discover`, `candidate-audit`, and the PRIDE-filtered recall audit.
+The frozen GT is still read only by `recall-audit`, after candidate generation.
+Set `SNAPSHOT_DIR`, `GT_MASTER`, `OUT_ROOT`, or `REGISTRY_API_BASE` to override
+defaults.  Set `REGISTRY_FORCE=1` to refresh the registry cache or
+`SKIP_REGISTRY_SNAPSHOT=1` for an intentional offline Iteration-1-style rerun.
 
 Outputs:
 
@@ -432,8 +453,9 @@ experiments that use exactly those phrases.
 Recommended starting values on a normal workstation:
 
 ```text
-PRIDE API concurrency: 8
-local discovery:        Rayon default CPU pool
+PRIDE API concurrency:        8
+ProteomeCentral registry:      sequential cached pages (100 datasets/page)
+local discovery:               Rayon default CPU pool
 PDF workers:            4
 publication workers:    8
 Ollama annotations:     1 local worker
@@ -445,15 +467,16 @@ pipeline efficient without aggressively hammering external services.
 ## Current optimization status
 
 Discovery Iteration 1 is accepted at **105/106 PRIDE GT positives (99.06%)**
-on the frozen 40,364-project snapshot with 334 candidates.  The next discovery
-change should target cross-repository/native-accession normalization for the
-sole remaining GT miss; avoid broad vocabulary expansion unless a measured
-error class requires it.
+on the frozen 40,364-project snapshot with 334 candidates. Discovery Iteration
+2 is implemented to solve the sole remaining cross-repository/native-accession
+class through ProteomeCentral/PROXI supplementation. It is not accepted until
+the real frozen benchmark confirms the exact candidate delta.
 
-The larger remaining quality gap is semantic annotation.  Preserve the 334-row
-candidate universe while the publication/repository evidence lanes are
-re-scored against GT196 field by field.  Only after the primary lane is sound
-should Stage 05 and any secondary QC model be reconsidered.
+The intended discovery stopping condition is 106/106 with all 334 Iteration-1
+candidates preserved and only a bounded number of registry-only additions.
+After that, freeze discovery and move to the larger semantic-annotation gap.
+Only after the primary annotation lane is sound should Stage 05 and any
+secondary QC model be reconsidered.
 
 ## Progress, timing, and logs (v0.1.2)
 
@@ -632,10 +655,12 @@ python_bridge_summary.json
 
 After publication/content enrichment, `run_python_publication_enrichment.sh`
 partitions the **current discovery candidate universe** into publication-backed
-and repository-only evidence modes.  The accepted GT196 Iteration-1 universe is
-334 candidates; the earlier v0.1.8 semantic-unification experiment used 321.
-Every candidate is assigned exactly one evidence mode, and absence of a PDF or
-full text never removes a candidate.
+and repository-only evidence modes. The last accepted universe is the GT196
+Iteration-1 set of 334 candidates; Iteration 2 may add registry-only PXD aliases
+and must be re-partitioned from its new candidate output rather than assuming
+334. The earlier v0.1.8 semantic-unification experiment used 321. Every
+candidate is assigned exactly one evidence mode, and absence of a PDF or full
+text never removes a candidate.
 
 ## Snapshot compaction
 
@@ -843,8 +868,8 @@ work/python/semantic_unification/
 Routing remains recall-preserving. `likely_non_scp` is a retained route, not a
 deletion. `include_candidate` is provisional, not a GT label.  The v0.1.8
 implementation validated complete coverage of the historical 321-candidate
-universe; rerun it on the current 334-candidate universe rather than assuming
-old counts.
+universe; rerun it on the accepted post-Iteration-2 candidate universe rather
+than assuming either the historical 321 or Iteration-1 334 counts.
 
 ### Quarantined v0.1.8-v0.1.12 Phi/Gemma semantic QC
 

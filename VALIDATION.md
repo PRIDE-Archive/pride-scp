@@ -458,3 +458,68 @@ scripts/run_semantic_qc_extended_smoke.sh \
 ```
 
 The extended set adds genuine PXD004174/PXD035339 and negative PXD004931/PXD012307 controls to reduce four-case overfitting.
+
+## GT196 discovery Iteration 2 — ProteomeCentral registry/native accessions
+
+Iteration 2 adds deterministic cross-repository indexing only; no model or
+annotation logic changes in this iteration.
+
+Run the normal Rust/shell checks first:
+
+```bash
+cargo fmt --all
+cargo check --workspace --locked
+cargo test --workspace --locked
+cargo build --release --locked
+git diff --check
+bash -n scripts/run_recall_discovery.sh
+bash -n scripts/run_gt196_discovery_benchmark.sh
+```
+
+The unit suite should additionally cover:
+
+- extraction of secondary PXD identifiers from a PROXI dataset record;
+- preservation of a native MassIVE-style `MSV...` alias;
+- common PROXI response wrappers;
+- discovery of a registry-only PXD alias;
+- primary-PRIDE precedence when the same PXD exists in both primary and
+  registry caches.
+
+Then materialize/update the supplemental registry and rerun the frozen GT196
+benchmark:
+
+```bash
+OUT_ROOT="$PWD/data/gt196_discovery_iter2" \
+SNAPSHOT_DIR="$PWD/data/snapshot" \
+GT_MASTER="$PWD/gpt/final_curation_20260831/PRIDE_SCP_GT_REFERENCE_MASTER_2026-08-31_FINAL_v196.csv" \
+  ./scripts/run_gt196_discovery_benchmark.sh
+```
+
+Inspect at minimum:
+
+```text
+data/snapshot/registry/registry_summary.json
+data/snapshot/registry/registry_accessions.tsv
+data/gt196_discovery_iter2/discovery/discovery_summary.json
+data/gt196_discovery_iter2/discovery/candidates.tsv
+data/gt196_discovery_iter2/recall_pride/recall_summary.json
+data/gt196_discovery_iter2/recall_pride/missed_known_positives.tsv
+```
+
+Acceptance criteria:
+
+1. `PXD047101` is recovered through general registry/native-accession handling,
+   not an accession-specific rule;
+2. frozen PRIDE-labelled GT recall reaches 106/106 if ProteomeCentral exposes
+   that record through PROXI;
+3. all 334 accepted Iteration-1 candidates remain present;
+4. registry-only candidate additions are explicitly reviewed and bounded;
+5. the primary PRIDE project count remains 40,364 and existing PRIDE scores are
+   not perturbed by duplicate registry metadata;
+6. `registry_summary.json` ends through `short_page`, `empty_page`, or
+   `not_found_page` rather than a user page-cap, and any stale generated
+   supplement records are reconciled before discovery.
+
+If the PROXI endpoint does not expose `PXD047101`, do not add a hard-coded
+exception. Preserve the registry diagnostics and investigate the registry
+response/alias contract before changing discovery further.

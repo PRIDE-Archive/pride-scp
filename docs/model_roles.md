@@ -17,7 +17,9 @@ artifact only. Production inference must never look up GT accessions.
 
 | Component | Default model | Current status | Responsibility | Must not do |
 |---|---|---|---|---|
-| Rust discovery | none | **active** | Deterministic high-recall candidate generation from repository metadata, file names/manifests, SDRF, method vocabulary, biological-unit language and bounded regex patterns. | Use an LLM or GT accession lookup to decide candidate membership. |
+| Rust PRIDE snapshot/index | none | **active** | Materialize the primary PRIDE project universe plus file/SDRF evidence. | Treat an individual project/API failure as evidence that a dataset is negative. |
+| Rust ProteomeCentral registry index | none | **active in discovery Iteration 2; acceptance pending** | Enumerate PROXI datasets, normalize PXD aliases to native repository accessions, and expose only PXD aliases absent from the primary PRIDE snapshot as discovery supplements. | Rescore duplicate PRIDE projects, use GT accessions as lookup keys, or infer biological truth from repository identity. |
+| Rust discovery | none | **active** | Deterministic high-recall candidate generation from primary repository metadata, registry-only PXD supplements, file names/manifests, SDRF, method vocabulary, biological-unit language and bounded regex patterns. | Use an LLM or GT accession lookup to decide candidate membership. |
 | Publication-backed Stage 04 | `qwen2.5:3b` | **active, under GT196 re-benchmarking** | Five compact source-grounded extraction tasks: sample/SCP classification, preparation/isolation, LC configuration, genuine single-cell performance, and low-input performance. | Be treated as final benchmark truth. |
 | Stage-04 deterministic gate | none | **active** | Validate/normalize Qwen output and apply source-evidence rules for accession scope, direct cell-to-MS evidence, false friends, synthetic benchmarks, non-MS modalities and metadata sanity. | Recover candidates already lost by discovery. |
 | Repository-only triage | `qwen2.5:3b` | **active, non-destructive** | Interpret only repository evidence and emit structured cell/MS evidence plus a triage class for candidates with no usable publication content. | Automatically exclude a candidate or claim certainty from a method name alone. |
@@ -26,6 +28,14 @@ artifact only. Production inference must never look up GT accessions.
 | Recall semantic jury | `gemma3:4b` | **quarantined for affirmative/final decisions** | Historical selective second reviewer for critic conflicts/uncertainty. | Be used as an approved current adjudicator. |
 | Historical Stage-06 fact checker | `bespoke-minicheck` | **historical/read-only audit** | Check individual catalogue claims against retrieved source passages. Easy supported claims passed directly in the old v3.2 selective-jury design. | Define whether an accession belongs in the current GT-driven catalogue. |
 | Historical Stage-06 critic/jury | `phi4-mini:3.8b` + `gemma3:4b` | **historical/read-only audit** | Adjudicate MiniCheck non-support or deterministic high-risk claims in the older final-catalogue QC lane. | Be confused with the quarantined recall semantic-QC lane or automatically rewrite catalogue values. |
+
+## Deterministic discovery/index layers — no model
+
+Discovery Iteration 2 does not add another LLM. The new ProteomeCentral/PROXI
+index is deterministic plumbing for repository completeness and alias handling.
+It materializes PXD-to-native-accession provenance and deliberately contributes
+only PXD aliases missing from the primary PRIDE snapshot. Biological inclusion
+remains a downstream evidence question.
 
 ## 1. `qwen2.5:3b` — publication-backed Stage 04
 
