@@ -1,96 +1,233 @@
 # Python semantic / curation layer
 
-`python/stages/` is populated from the **current local pipeline**, not from a
-stale copy embedded in this repository archive.
+The Python side consumes the recall-first Rust candidate universe. Its current
+job is **evidence enrichment and structured interpretation without candidate
+loss**. The GT196 optimization phase has changed the trust boundary: old final
+catalogue/QC scripts remain available, but the recall-first branch should not
+be pushed into Stage 05 until the primary semantic annotations are validated
+against the frozen reference.
 
-Run:
+See also:
 
-```bash
-scripts/import_current_python.sh \
-  ~/Documents/PRIDE_SCP/pride_scp_catalogue_pipeline
-```
+- `../docs/architecture.md`
+- `../docs/model_roles.md`
 
-This copies the current versions of:
+## Imported stage scripts
+
+`python/stages/` contains the current imported legacy-stage implementations:
 
 - `pride_scp_pipeline_common.py`
 - `01_fetch_pride_publications.py`
 - `02_download_publication_pdfs.py`
-- Stage-03 publication screen (diagnostic only in the new architecture)
+- `03_resolve_publication_content.py`
+- `03_screen_pride_scp_publications.py` — diagnostic only in recall-first mode
 - `04_run_pride_scp_annotations.py`
 - `05_merge_pride_scp_catalogue.py`
 - `06_review_pride_scp_catalogue.py`
 - `pride_scp_targeted_ollama.py`
 
-and writes `python/STAGE_SOURCES.sha256` so the imported state is explicit.
+`python/STAGE_SOURCES.sha256` records the imported source state.
 
-## Important architecture change
+## Current recall-first flow
 
-Stage 03 is no longer a gate. The annotation runner should use
-`--all-valid-pdfs` for the recall-first candidate set.
-
-Repository-only candidates are retained even when no PDF can be resolved.
-`python/recall/triage_repository_candidates.py` can prioritize those cases
-using only the Rust evidence bundle; it does not mutate or reject candidates.
-
-## v0.1.4 unified semantic evidence modes
-
-`pride-scp export-python` now writes `semantic_candidates.jsonl`, including
-specific/method/broad/adjacent discovery labels and source-hit excerpts.
-
-After Stage 01/02 publication enrichment:
-
-```bash
-python python/recall/partition_semantic_candidates.py \
-  data/python_bridge/semantic_candidates.jsonl \
-  --pdf-manifest work/python/pride_candidate_publications_with_pdfs.tsv \
-  --output-dir work/python/semantic_partition
+```text
+Rust semantic_candidates.jsonl
+        |
+        v
+Stage 01 publication mapping
+        |
+        v
+Stage 02 PDF resolution
+        |
+        v
+Stage 03 content resolution
+        |
+        v
+partition by usable publication content
+       / \
+      /   \
+     v     v
+Stage 04   repository-only
+Qwen v18   Qwen triage
+     \     /
+      \   /
+       v v
+ deterministic semantic unifier
+        |
+        v
+ GT-driven annotation/review frontier
 ```
 
-This produces publication-backed and repository-only candidate JSONL files.
-No candidate is removed because it lacks a publication or usable PDF.
+The old Stage-03 *screen* must not gate Stage 04. Use
+`--all-valid-content` (or the legacy `--all-valid-pdfs` alias when appropriate)
+so all candidates with usable publication content can be annotated.
 
-Use the current Stage 04 with `--all-valid-pdfs` for publication-backed
-candidates, and use `triage_repository_candidates.py` on the repository-only
-JSONL as non-destructive semantic evidence. A later reconciliation stage can
-merge both evidence modes before deterministic curation.
+Repository-only candidates remain in scope even when no manuscript can be
+resolved.
 
-## v0.1.8 semantic unification
+## Prepare the semantic bridge
 
-After publication-backed Stage 04 and repository-only triage both finish, run:
+```bash
+scripts/prepare_semantic_bridge.sh
+```
+
+This runs Rust `candidate-audit` + `export-python` and writes:
+
+```text
+data/candidate_audit/candidate_diagnostics.tsv
+data/candidate_audit/candidate_diagnostics.jsonl
+data/python_bridge/candidate_accessions.txt
+data/python_bridge/candidate_manifest.tsv
+data/python_bridge/semantic_candidates.jsonl
+```
+
+Semantic priorities are non-destructive:
+
+```text
+A_specific
+B_method
+C_broad
+D_adjacent
+```
+
+## Publication/content enrichment
+
+```bash
+scripts/run_python_publication_enrichment.sh
+```
+
+The helper performs publication mapping, PDF resolution, full-text fallback,
+manual-manuscript queue generation and semantic partitioning.
+
+It writes:
+
+```text
+work/python/semantic_partition/publication_backed_candidates.jsonl
+work/python/semantic_partition/repository_only_candidates.jsonl
+```
+
+No candidate is removed because a publication/PDF is absent.
+
+## Publication-backed Stage 04 — active, under GT196 re-benchmarking
+
+Recommended recall-first invocation:
+
+```bash
+python python/stages/04_run_pride_scp_annotations.py \
+  work/python/pride_candidate_publications_with_content.tsv \
+  --targeted-script python/stages/pride_scp_targeted_ollama.py \
+  --output-dir work/python/pride_scp_annotations \
+  --model qwen2.5:3b \
+  --cpu-threads 4 \
+  --workers 1 \
+  --all-valid-content
+```
+
+The targeted v18 annotator performs deterministic evidence retrieval and up to
+five small Qwen extraction calls for:
+
+1. single-cell samples / low-input benchmarks / model SCP opinion;
+2. sample preparation and cell isolation;
+3. LC configuration/gradient;
+4. genuine single-cell performance;
+5. low-input performance.
+
+Deterministic validation and the v17 source-evidence gate can override Qwen's
+top-level classification. Nevertheless, the historical GT196 baseline showed
+only 36/64 publication-backed recovered GT positives called `yes`, so Stage 04
+is **not yet trusted as final accession truth**.
+
+## Repository-only triage — active and non-destructive
+
+```bash
+python python/recall/triage_repository_candidates.py \
+  work/python/semantic_partition/repository_only_candidates.jsonl \
+  --output-dir work/python/repository_triage \
+  --model qwen2.5:3b \
+  --cpu-threads 4
+```
+
+The model sees repository evidence only and returns a triage class plus
+structured individual-cell and MS/proteomics evidence. Missing evidence must
+not become automatic exclusion.
+
+## Deterministic semantic unification — active
 
 ```bash
 scripts/unify_semantic_results.sh
 ```
 
-This produces a lossless 321-row semantic manifest and a secondary-review
-queue. The routing layer intentionally distrusts unsupported
-`possible_true_scp` calls when the repository triage's own structured fields
-report absent/contradictory individual-cell evidence or absent MS/proteomics
-evidence. It also preserves `A_specific` candidates when Stage 04 is negative,
-because historical genuine SCP datasets occur in that conflict pattern.
+The unifier combines discovery, Stage-04 and repository-only evidence into a
+lossless manifest and review routes. It intentionally preserves cases where a
+high-recall discovery signal conflicts with a negative model/gate decision.
 
-Do not run final Stage 05 directly from the two raw semantic lanes. After the
-secondary-review decisions have been filled, use:
+Primary output:
 
-```bash
-scripts/build_stage05_bridge.sh
+```text
+work/python/semantic_unification/unified_semantic_manifest.tsv
 ```
 
-The bridge is compatible with the imported current Stage-05 script and keeps
-repository-only records in scope without inventing publication metadata.
-### Independent semantic QC
+The unifier is currently the safe end of the automated recall-first path.
 
-The deterministic unifier also writes `qc_candidate_queue.jsonl`, containing
-provisional includes plus all review routes. Run:
+## Recall semantic QC — QUARANTINED
 
-```bash
+These files implement the v0.1.8-v0.1.12 Phi/Gemma semantic-QC experiment:
+
+```text
+python/recall/build_semantic_qc_packets.py
+python/recall/adjudicate_semantic_qc.py
 scripts/run_semantic_qc.sh
 ```
 
-The default critic is `phi4-mini:3.8b`; the default selective jury is
-`gemma3:4b`. Model phases are separated by an explicit Ollama unload to avoid
-the multi-model memory pressure seen in earlier Stage-06 development. The
-reviewer uses only the unified evidence packet and never web/outside knowledge.
-It writes `include`, `exclude`, or `uncertain`; uncertain decisions intentionally
-block the final Stage-05 bridge.
+Defaults:
 
+```text
+critic: phi4-mini:3.8b
+jury:   gemma3:4b
+```
+
+Their factual-axis design remains useful for research, but the historical
+affirmative/final decisions are **not approved labels** and must not be used to
+feed Stage 05. They are retained only for error analysis/regression work until
+a GT196-calibrated replacement is demonstrated.
+
+Do not copy an old semantic-QC `review_decisions.tsv` into the Stage-05 bridge.
+
+## Stage 05 bridge / catalogue — historical until revalidated
+
+`build_stage05_bridge.sh` and `05_merge_pride_scp_catalogue.py` remain in the
+repository for compatibility with the older pipeline. During the current
+GT196 optimization phase, do not use the quarantined semantic-QC decisions to
+unlock the bridge.
+
+The old v19.1 catalogue is a historical baseline, not the current recall-first
+catalogue.
+
+## Stage 06 — separate historical read-only claim QC
+
+`06_review_pride_scp_catalogue.py` is **not the same thing** as the quarantined
+recall semantic-QC lane.
+
+Historical v3.2 defaults:
+
+```text
+fact checker: bespoke-minicheck
+critic:       phi4-mini:3.8b
+jury:         gemma3:4b
+```
+
+It reviews atomic claims in an already-built Stage-05 catalogue and is
+read-only. Easy MiniCheck-supported claims pass directly; Phi/Gemma are used
+selectively for non-support/high-risk cases.
+
+This remains useful historical infrastructure, but it should be reconsidered
+only after the primary GT196-calibrated annotation lane is sound.
+
+## Current model policy
+
+- Qwen is a bounded evidence extractor/interpreter, not benchmark truth.
+- Missing manuscript evidence becomes repository-based review/uncertainty, not
+  exclusion.
+- The v0.1.8-v0.1.12 Phi/Gemma decisions are quarantined.
+- Stage-06 MiniCheck/Phi/Gemma is a separate read-only historical claim audit.
+- GT196 is evaluation-only and never passed into model prompts.

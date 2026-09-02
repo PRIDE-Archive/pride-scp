@@ -1,5 +1,9 @@
 # Unreleased — GT196 optimization
 
+- Accept discovery Iteration 1 on the frozen 40,364-project snapshot: 334 candidates, 105/106 PRIDE GT positives recovered (99.06% recall), one miss, and no loss from the original Rust321 universe.
+- Confirm the 13 candidate additions: eight GT recoveries and five non-GT review candidates; PXD053022 is recovered from repository metadata at weak priority.
+- Update architecture/model documentation to distinguish active Qwen extraction/triage, deterministic lossless unification, quarantined v0.1.8-v0.1.12 Phi/Gemma recall semantic QC, and the separate historical Stage-06 MiniCheck/Phi/Gemma claim-QC lane.
+- Mark GT-driven biological-unit/pooling annotation redesign as the current optimization frontier before Stage 05 is re-enabled for the recall-first branch.
 - Freeze the pre-change Rust321 discovery baseline at 97/106 PRIDE-labelled GT196 positives (91.51% recall) before changing discovery logic.
 - Expand recall-first discovery vocabulary for single muscle fibre/fiber and myofibre/myofiber proteomics, a measured dominant false-negative class.
 - Add a bounded MALDI/MSI + single-cell-context regex signal so single-cell MALDI imaging datasets can enter review without making generic spatial or MALDI studies positive.

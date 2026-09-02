@@ -1,53 +1,104 @@
 # PRIDE SCP catalogue — recall-first pipeline
 
 A hybrid Rust + Python pipeline for building a high-recall catalogue of public
-PRIDE single-cell proteomics (SCP) datasets, followed by evidence-grounded
-semantic annotation and conservative QC.
+mass-spectrometry single-cell proteomics (SCP) datasets, followed by
+source-grounded biological-unit annotation and conservative catalogue QC.
 
-This repository starts from a deliberately different premise than the older
-pipeline: **candidate discovery must maximize recall before downstream models
-optimize precision**.
+The pipeline is currently being optimized against the **frozen independent
+GT196 v1 reference** (31 August 2026 cutoff).  GT196 contains 196 public
+accession-level positives across repositories, including **106 PRIDE-labelled
+positives** used to benchmark the PRIDE discovery front end.  The GT is
+evaluation-only and must never be used as a production accession lookup.
 
-The current grant estimate is approximately 208 public PRIDE SCP datasets, so
-an upstream candidate universe smaller than that is an immediate recall alarm.
+The core architecture is **recall first**: candidate discovery should maximize
+coverage before semantic stages optimize precision.  Missing publications,
+weak metadata, negative context, or an uncertain model decision must not
+silently delete a candidate from the recall universe.
 
-## Architecture
+## Current status — GT196 discovery Iteration 1 accepted
+
+The frozen pre-change Rust321 baseline recovered 97/106 PRIDE GT positives
+(91.51%).  Discovery Iteration 1 added measured single-fibre/myofibre and
+bounded MALDI/MSI single-cell context coverage.  The real frozen-snapshot
+benchmark now reports:
 
 ```text
-ALL PUBLIC PRIDE PROJECTS
+projects scanned:        40,364
+candidates:                  334
+strong / possible / weak:   191 / 68 / 75
+A / B / C / D priority:     141 / 33 / 154 / 6
+GT recovered:               105 / 106
+GT missed:                    1
+PRIDE discovery recall:      99.06%
+```
+
+No original Rust321 candidate disappeared.  The remaining discovery class is
+cross-repository/native-accession normalization rather than another broad PRIDE
+vocabulary expansion.
+
+The **current optimization frontier is annotation quality**, not discovery
+keyword accumulation.  Historical Stage-04 sensitivity was only 36/64 on
+publication-backed recovered GT positives, so biological-unit, sample-unit,
+pooling, benchmark/reanalysis and provenance fields must be rebuilt and
+re-scored against GT196 before the recall-first branch is allowed into Stage 05.
+
+## Current architecture
+
+```text
+PRIDE public project universe
         |
         v
 Rust snapshot/index
-  project JSON
-  file manifests
-  SDRF when available
+  project JSON + file manifests + SDRF
         |
         v
-Rust multi-lane discovery UNION
-  repository text
-  filenames/file metadata
-  SDRF text
-  known SCP methods
-  individual-cell language
-  low-input/adjacent context retained
+Rust recall-first discovery UNION
+  repository/file/SDRF text
+  SCP methods + biological-unit patterns
+  fibre/myofibre + bounded MALDI/MSI signals
         |
-        +----------------------------+
-        |                            |
-        v                            v
-repository semantic triage       publication enrichment
-(optional, non-destructive)      + PDF when available
-                                     |
-                                     v
-                            existing targeted Qwen annotator
-                                     |
-                                     v
-                            existing deterministic curation
-                                     |
-                                     v
-                            existing Stage-06 jury QC
+        v
+candidate-audit + export-python
+  A_specific / B_method / C_broad / D_adjacent
+        |
+        v
+publication/content enrichment
+        |
+        +-------------------------------+
+        |                               |
+        v                               v
+publication-backed                  repository-only
+Stage 04 Qwen v18                  Qwen triage
++ deterministic evidence gate      (non-destructive)
+        |                               |
+        +---------------+---------------+
+                        v
+              deterministic semantic unifier
+                 (no candidate deletion)
+                        |
+                        v
+              GT-driven annotation redesign
+                  **current frontier**
+                        |
+              only after revalidation
+                        v
+              deterministic Stage 05
+                        |
+                        v
+              read-only Stage 06 QC
+              (historical infrastructure)
 ```
 
-See `docs/architecture.md` and `docs/data_contracts.md`.
+The old Stage-03 publication screen is diagnostic only; it is not a recall
+gate.  The v0.1.8-v0.1.12 Phi/Gemma recall semantic-QC decisions are
+**quarantined** and must not be used as labels or to feed Stage 05.
+
+See:
+
+- `docs/architecture.md` for the full data flow and trust boundaries;
+- `docs/model_roles.md` for what each model does and which model lanes are
+  active, historical, or quarantined;
+- `docs/data_contracts.md` for Rust/Python interchange formats.
 
 ## Why a hybrid implementation?
 
@@ -62,9 +113,13 @@ Rust handles the deterministic and potentially high-volume work:
 - known-positive recall auditing;
 - TSV/JSONL bridge generation.
 
-Python remains the semantic layer because the current PDF extraction,
-Qwen/Ollama annotator, deterministic Stage 05 curation, and Stage 06
-MiniCheck/Phi/Gemma QC have already been developed and tested.
+Python remains the semantic/evidence layer because the publication-content
+resolvers, targeted Qwen extractor, deterministic reconciliation, catalogue
+merger, and historical QC utilities already exist there.  Their trust levels
+are now explicit: Qwen extraction/triage is active but being re-benchmarked,
+the deterministic unifier is active and lossless, the recall Phi/Gemma
+semantic-QC decisions are quarantined, and the older Stage-05/Stage-06 lane is
+historical until the primary annotations are GT196-calibrated.
 
 No FFI is used. Rust and Python communicate via plain TSV/JSONL files.
 
@@ -81,18 +136,23 @@ pride-scp/
 │   ├── pride-scp-discovery/
 │   └── pride-scp-cli/
 ├── python/
-│   ├── stages/                  # imported exact current Python scripts
-│   └── recall/
-│       └── triage_repository_candidates.py
+│   ├── stages/                  # imported legacy-stage implementations
+│   └── recall/                  # recall-first partition/unification/QC research
 ├── scripts/
 │   ├── import_current_python.sh
 │   ├── run_recall_discovery.sh
+│   ├── run_gt196_discovery_benchmark.sh
+│   ├── prepare_semantic_bridge.sh
 │   ├── run_python_publication_enrichment.sh
+│   ├── unify_semantic_results.sh
 │   ├── smoke_fixture.sh
 │   └── check_repo.sh
 ├── benchmarks/
 ├── tests/fixtures/
 └── docs/
+    ├── architecture.md
+    ├── model_roles.md
+    └── data_contracts.md
 ```
 
 ## 1. Create the new repo from this release
@@ -325,18 +385,23 @@ python python/recall/triage_repository_candidates.py \
 
 This triage is **non-destructive** and never automatically rejects a candidate.
 
-## 7. Existing curation/QC
+## 7. Curation/QC trust boundary during GT196 optimization
 
-Once the candidate universe and semantic annotations are rebuilt, reuse the
-imported current scripts:
+The imported Stage-05 merger and Stage-06 read-only claim reviewer remain in
+the repository, but they are **not the next automated step** for the current
+recall-first branch.  First re-benchmark and redesign the primary annotation
+lane against GT196.
 
-```text
-05_merge_pride_scp_catalogue.py
-06_review_pride_scp_catalogue.py
-```
+In particular:
 
-The validated Stage-06 selective-jury architecture remains downstream QC; it
-should not compensate for missed discovery candidates.
+- do not use v0.1.8-v0.1.12 Phi/Gemma recall semantic-QC decisions as labels;
+- do not build Stage 05 from those quarantined decisions;
+- do not treat the old v19.1 catalogue as the current recall-first output;
+- Stage 06 remains historical/read-only infrastructure for claim auditing and
+  never changes GT or catalogue values automatically.
+
+See `docs/model_roles.md` for the distinction between recall semantic QC and
+the separate historical Stage-06 MiniCheck/Phi/Gemma claim-QC lane.
 
 ## Discovery scoring philosophy
 
@@ -377,16 +442,18 @@ Ollama annotations:     1 local worker
 The PRIDE concurrency is intentionally bounded. Rust makes the local and I/O
 pipeline efficient without aggressively hammering external services.
 
-## Current status
+## Current optimization status
 
-This v0.1.0 release establishes the new repository structure and the
-recall-first front end. Before using it to replace the old catalogue, validate:
+Discovery Iteration 1 is accepted at **105/106 PRIDE GT positives (99.06%)**
+on the frozen 40,364-project snapshot with 334 candidates.  The next discovery
+change should target cross-repository/native-accession normalization for the
+sole remaining GT miss; avoid broad vocabulary expansion unless a measured
+error class requires it.
 
-1. Rust workspace tests;
-2. a small live PRIDE snapshot;
-3. recall against the earlier manual positive set;
-4. candidate count and missed-positive report;
-5. only then run the expensive publication/Qwen stages.
+The larger remaining quality gap is semantic annotation.  Preserve the 334-row
+candidate universe while the publication/repository evidence lanes are
+re-scored against GT196 field by field.  Only after the primary lane is sound
+should Stage 05 and any secondary QC model be reconsidered.
 
 ## Progress, timing, and logs (v0.1.2)
 
@@ -563,10 +630,12 @@ semantic_candidates.jsonl
 python_bridge_summary.json
 ```
 
-After Stage-01/02 publication enrichment, `run_python_publication_enrichment.sh`
-partitions the 321-candidate universe into publication-backed and repository-only
-evidence modes. Every candidate is assigned exactly one mode; absence of a PDF
-never removes a candidate.
+After publication/content enrichment, `run_python_publication_enrichment.sh`
+partitions the **current discovery candidate universe** into publication-backed
+and repository-only evidence modes.  The accepted GT196 Iteration-1 universe is
+334 candidates; the earlier v0.1.8 semantic-unification experiment used 321.
+Every candidate is assigned exactly one evidence mode, and absence of a PDF or
+full text never removes a candidate.
 
 ## Snapshot compaction
 
@@ -744,19 +813,17 @@ python python/stages/04_run_pride_scp_annotations.py \
   --all-valid-content
 ```
 
-## 9. Semantic unification before Stage 05 (v0.1.8)
+## 9. Semantic unification and historical semantic-QC experiments
 
 The publication-backed Stage-04 decision and repository-only Qwen triage are
-**not calibrated equivalents**. Do not concatenate them or use
-`possible_true_scp` as an inclusion rule.
-
-After both semantic lanes finish, run:
+**not calibrated equivalents**.  Run the deterministic unifier after both
+lanes finish:
 
 ```bash
 scripts/unify_semantic_results.sh
 ```
 
-The unifier validates complete 321-candidate coverage and writes:
+The unifier writes a lossless manifest and review routes:
 
 ```text
 work/python/semantic_unification/
@@ -774,70 +841,38 @@ work/python/semantic_unification/
 ```
 
 Routing remains recall-preserving. `likely_non_scp` is a retained route, not a
-deletion. `include_candidate` is also provisional and still requires QC.
+deletion. `include_candidate` is provisional, not a GT label.  The v0.1.8
+implementation validated complete coverage of the historical 321-candidate
+universe; rerun it on the current 334-candidate universe rather than assuming
+old counts.
 
-The recommended next step is an independent small-model QC pass over the
-provisional includes plus all review routes:
+### Quarantined v0.1.8-v0.1.12 Phi/Gemma semantic QC
 
-```bash
-scripts/run_semantic_qc.sh
-```
-
-By default this runs `phi4-mini:3.8b` as a strict critic, explicitly unloads
-it, then calls `gemma3:4b` only for selected conflicts/uncertainties. The
-resulting `review_decisions.tsv` can override provisional includes as well as
-review candidates. Critic/jury disagreement remains `uncertain` and therefore
-blocks final Stage-05 bridge generation rather than being forced.
-
-A final Stage-05 bridge is deliberately gated. Copy/fill the generated review
-decision template as:
+The repository still contains:
 
 ```text
-work/python/semantic_unification/review_decisions.tsv
-```
-
-and set every review candidate to `include` or `exclude`. Then run:
-
-```bash
-scripts/build_stage05_bridge.sh
-```
-
-The bridge generator refuses to create a final bridge while review decisions
-remain unresolved. Once complete, it emits a Stage-05-compatible manifest,
-status directory, and annotations under `work/python/stage05_bridge/`.
-Repository-only annotations are intentionally metadata-sparse; the unified
-semantic manifest remains the classification provenance authority.
-
-
-
-## v0.1.9 evidence-grounded semantic QC
-
-If the v0.1.8 QC produced a near-universal `uncertain` result, do not manually adjudicate hundreds of accessions. v0.1.9 rebuilds QC packets from the exact Stage-04 source passages and repository excerpts, automatically invalidates the old QC cache, and reruns only the evidence-grounded critic/jury workflow.
-
-```bash
-python python/recall/evidence_grounded_qc_regression_smoke.py
-scripts/run_semantic_qc_smoke.sh
-# Only after the four-accession smoke is qualitatively correct:
 scripts/run_semantic_qc.sh
+python/recall/build_semantic_qc_packets.py
+python/recall/adjudicate_semantic_qc.py
 ```
 
-Inspect `work/python/semantic_unification/qc_evidence_packet_summary.json` and `work/python/semantic_qc/semantic_qc_summary.json` before building the Stage-05 bridge.
+Those scripts implemented the historical `phi4-mini:3.8b` critic + selective
+`gemma3:4b` jury experiments.  The factual axes and regression fixtures are
+useful for error analysis, but the **affirmative/final decisions are
+quarantined** after comparison with the independent GT reference.
 
+Do not run this lane to produce current truth labels, do not copy its old
+`review_decisions.tsv` into Stage 05, and do not tune GT196 to agree with it.
+The v0.1.9-v0.1.12 changes below should therefore be read as historical design
+experiments, not current operating instructions:
 
-## v0.1.10 semantic-QC calibration
+- v0.1.9 rehydrated primary source passages and factual axes after v0.1.8
+  collapsed toward uncertainty;
+- v0.1.10 formalized an individual-cell-to-MS evidence chain and structured
+  retry/repair;
+- v0.1.11 made target-MS sample composition and many-cell populations explicit;
+- v0.1.12 scoped many-cell counts to exact passages/sample roles.
 
-The independent semantic QC now evaluates a complete individual-cell-to-MS evidence chain rather than requiring a literal same-cell/MS sentence. It accepts separate preparation or identity-preserving labels followed by MS, including identity-preserving multiplexing, while continuing to reject population/bulk samples and destructive pooling before cell identity is preserved. Critic and jury use separate output-token budgets and malformed structured responses receive one corrective JSON retry. Run `scripts/run_semantic_qc_smoke.sh` and require the 2-positive/2-negative qualitative controls to pass before launching the full QC batch.
-
-
-### v0.1.11 semantic QC calibration
-
-Independent semantic QC now evaluates the composition of each target MS sample explicitly.
-A many-cell FACS population feeding one proteomic replicate is not single-cell MS, whereas
-one-cell-per-well target samples remain SCP even when separate multi-cell libraries or
-low-input benchmarks are present. Run `scripts/run_semantic_qc_smoke.sh` and require the
-four-control 2-include/2-exclude result before starting the full QC batch.
-
-
-### v0.1.12 semantic-QC sample-unit scoping
-
-Semantic QC now uses passage-scoped lexical anchors so a many-cell count from a library, carrier, benchmark, or other control cannot be transferred to an explicit one-cell target MS sample. A many-cell count tied directly to a replicate/sample and downstream proteomic handling remains a strong population-sample exclusion signal. Run the four-control smoke and then the eight-control extended smoke before launching the full QC batch.
+The next production annotation lane should reuse the useful source-grounding
+ideas only after each factual axis is re-benchmarked directly against GT196.
+See `docs/model_roles.md`.
