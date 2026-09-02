@@ -485,6 +485,13 @@ The unit suite should additionally cover:
 - primary-PRIDE precedence when the same PXD exists in both primary and
   registry caches.
 
+The 2 September 2026 live run already cached 558 PROXI pages. For the parser-fix
+acceptance, **do not set `REGISTRY_FORCE=1`**. `registry-snapshot` should reparse
+those files locally. If the first cached page is non-empty but still yields zero
+PXD aliases, the new schema guard must fail immediately and report the first
+entry keys plus the count of unrestricted PXD tokens; do not continue to a full
+network refresh until that schema diagnostic is resolved.
+
 Then materialize/update the supplemental registry and rerun the frozen GT196
 benchmark:
 

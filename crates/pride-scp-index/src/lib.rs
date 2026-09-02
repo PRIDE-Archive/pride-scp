@@ -207,21 +207,86 @@ fn accession_tokens(text: &str) -> impl Iterator<Item = String> + '_ {
         .map(str::to_ascii_uppercase)
 }
 
+fn normalized_json_key(key: &str) -> String {
+    key.chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .flat_map(|c| c.to_lowercase())
+        .collect()
+}
+
+fn ontology_term_looks_identifier_like(map: &serde_json::Map<String, Value>) -> bool {
+    let name = map
+        .get("name")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let accession = map
+        .get("accession")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_ascii_uppercase();
+
+    name.contains("accession")
+        || name.contains("identifier")
+        || name.contains("dataset uri")
+        || name.contains("dataset url")
+        || accession == "MS:1001919" // ProteomeXchange accession number
+}
+
+fn collect_registry_identifier_strings(value: &Value, out: &mut Vec<String>) {
+    match value {
+        Value::Array(items) => {
+            for item in items {
+                collect_registry_identifier_strings(item, out);
+            }
+        }
+        Value::Object(map) => {
+            // PROXI full/compact objects normally expose identifiers directly,
+            // but ProteomeCentral has also returned wrapper/result-set shapes in
+            // which identifier CV terms are nested below another object. Capture
+            // an entire ontology term when its semantics say it is an identifier
+            // so the PXD stored in the term's `value` field is not lost.
+            if ontology_term_looks_identifier_like(map) {
+                flatten_json_strings(value, out);
+            }
+
+            for (key, child) in map {
+                let key = normalized_json_key(key);
+                let structured_identifier_field = key.contains("identifier")
+                    || key.contains("accession")
+                    || key == "pxd"
+                    || key == "pxdaccession"
+                    || key == "datasetid"
+                    || key == "datasetidentifier"
+                    || key == "fulldatasetlinks"
+                    || key == "fulldatasetlink";
+                if structured_identifier_field {
+                    flatten_json_strings(child, out);
+                } else {
+                    collect_registry_identifier_strings(child, out);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
 fn registry_identifier_strings(dataset: &Value) -> Vec<String> {
     let mut strings = Vec::new();
-    if let Some(value) = dataset.get("identifiers") {
-        flatten_json_strings(value, &mut strings);
-    }
-    if let Some(value) = dataset.get("accession") {
-        flatten_json_strings(value, &mut strings);
-    }
-    // Some registry providers expose the PX accession only in a dataset link
-    // rather than the identifiers array. Restrict this fallback to structured
-    // links so PXD mentions in free-text descriptions are not mistaken for aliases.
-    if let Some(value) = dataset.get("fullDatasetLinks") {
-        flatten_json_strings(value, &mut strings);
-    }
+    collect_registry_identifier_strings(dataset, &mut strings);
     strings
+}
+
+fn pxd_accessions_anywhere(value: &Value) -> Vec<String> {
+    let mut strings = Vec::new();
+    flatten_json_strings(value, &mut strings);
+    strings
+        .iter()
+        .flat_map(|text| accession_tokens(text))
+        .filter(|token| is_pxd(token))
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
 }
 
 fn registry_pxd_accessions(dataset: &Value) -> Vec<String> {
@@ -232,6 +297,39 @@ fn registry_pxd_accessions(dataset: &Value) -> Vec<String> {
         .collect::<BTreeSet<_>>()
         .into_iter()
         .collect()
+}
+
+fn first_registry_string(value: &Value, keys: &[&str]) -> String {
+    let wanted = keys
+        .iter()
+        .map(|key| normalized_json_key(key))
+        .collect::<BTreeSet<_>>();
+
+    fn visit(value: &Value, wanted: &BTreeSet<String>) -> Option<String> {
+        match value {
+            Value::Object(map) => {
+                for (key, child) in map {
+                    if wanted.contains(&normalized_json_key(key)) {
+                        if let Some(text) = child.as_str() {
+                            if !text.trim().is_empty() {
+                                return Some(text.trim().to_string());
+                            }
+                        }
+                    }
+                }
+                for child in map.values() {
+                    if let Some(text) = visit(child, wanted) {
+                        return Some(text);
+                    }
+                }
+                None
+            }
+            Value::Array(items) => items.iter().find_map(|item| visit(item, wanted)),
+            _ => None,
+        }
+    }
+
+    visit(value, &wanted).unwrap_or_default()
 }
 
 fn registry_native_accessions(dataset: &Value) -> Vec<String> {
@@ -288,11 +386,28 @@ fn infer_registry_repository(dataset: &Value, native_accessions: &[String]) -> S
 fn normalized_registry_dataset(accession: &str, dataset: &Value) -> Value {
     let native_accessions = registry_native_accessions(dataset);
     let hosting_repository = infer_registry_repository(dataset, &native_accessions);
-    let title = first_string_for_keys(dataset, &["title", "datasetTitle", "name"]);
-    let description = first_string_for_keys(
-        dataset,
-        &["description", "projectDescription", "datasetDescription"],
-    );
+    let title = {
+        let direct = first_string_for_keys(dataset, &["title", "datasetTitle", "name"]);
+        if direct.is_empty() {
+            first_registry_string(dataset, &["title", "datasetTitle"])
+        } else {
+            direct
+        }
+    };
+    let description = {
+        let direct = first_string_for_keys(
+            dataset,
+            &["description", "projectDescription", "datasetDescription"],
+        );
+        if direct.is_empty() {
+            first_registry_string(
+                dataset,
+                &["description", "projectDescription", "datasetDescription"],
+            )
+        } else {
+            direct
+        }
+    };
     serde_json::json!({
         "accession": accession,
         "projectAccession": accession,
@@ -1116,9 +1231,16 @@ pub async fn registry_snapshot(opts: RegistrySnapshotOptions) -> Result<Registry
             let natives = registry_native_accessions(dataset);
             native_aliases.extend(natives.iter().cloned());
             let repository = infer_registry_repository(dataset, &natives);
-            let title = first_string_for_keys(dataset, &["title", "datasetTitle", "name"])
-                .replace('\t', " ")
-                .replace('\n', " ");
+            let title = {
+                let direct = first_string_for_keys(dataset, &["title", "datasetTitle", "name"]);
+                if direct.is_empty() {
+                    first_registry_string(dataset, &["title", "datasetTitle"])
+                } else {
+                    direct
+                }
+            }
+            .replace('\t', " ")
+            .replace('\n', " ");
             let native_joined = natives.join("; ");
 
             for accession in pxd_accessions {
@@ -1157,6 +1279,46 @@ pub async fn registry_snapshot(opts: RegistrySnapshotOptions) -> Result<Registry
                     title,
                 ));
             }
+        }
+
+        // A populated ProteomeCentral page containing zero PXD aliases is not a
+        // valid success state for the public PX catalogue. The 2026-09-02 GT196
+        // Iteration-2 run exposed a response-shape mismatch that otherwise spent
+        // more than three hours scanning 55,706 datasets and silently produced
+        // an empty alias index. Fail on the first page instead. The unrestricted
+        // fallback count makes the diagnostic explicit if PXD text is present but
+        // still outside the structured parser.
+        if page_number == 1 && page_pxd_count == 0 {
+            let fallback = entries
+                .iter()
+                .flat_map(|dataset| pxd_accessions_anywhere(dataset))
+                .collect::<BTreeSet<_>>();
+            let first_entry_shape = entries
+                .first()
+                .and_then(|entry| entry.as_object())
+                .map(|map| map.keys().cloned().collect::<Vec<_>>().join(","))
+                .unwrap_or_else(|| {
+                    let first = &entries[0];
+                    if first.is_array() {
+                        "non_object:array".to_string()
+                    } else if first.is_string() {
+                        "non_object:string".to_string()
+                    } else if first.is_number() {
+                        "non_object:number".to_string()
+                    } else if first.is_boolean() {
+                        "non_object:boolean".to_string()
+                    } else if first.is_null() {
+                        "non_object:null".to_string()
+                    } else {
+                        "non_object:unknown".to_string()
+                    }
+                });
+            return Err(anyhow!(
+                "ProteomeCentral schema guard: page 1 contained {} datasets but the structured parser found zero PXD aliases (unrestricted PXD tokens={} first_entry_keys={}). Refusing to enumerate the remaining registry because the alias snapshot would be invalid.",
+                entries.len(),
+                fallback.len(),
+                first_entry_shape
+            ));
         }
 
         spinner.set_message(format!(
@@ -1549,5 +1711,53 @@ mod tests {
 
         let nested = json!({"data": {"results": [{"title": "a"}]}});
         assert_eq!(registry_dataset_entries(&nested).len(), 1);
+    }
+
+    #[test]
+    fn proteomecentral_dataset_extracts_pxd_from_nested_dataset_wrapper() {
+        let dataset = json!({
+            "dataset": {
+                "identifiers": [
+                    {"accession": "MS:1001919", "name": "ProteomeXchange accession number", "value": "PXD047101"},
+                    {"accession": "MS:1002634", "name": "MassIVE dataset identifier", "value": "MSV000093434"}
+                ],
+                "title": "Single cell proteomics and epiproteomics"
+            }
+        });
+        assert_eq!(registry_pxd_accessions(&dataset), vec!["PXD047101"]);
+        let normalized = normalized_registry_dataset("PXD047101", &dataset);
+        assert_eq!(
+            normalized["title"],
+            "Single cell proteomics and epiproteomics"
+        );
+    }
+
+    #[test]
+    fn proteomecentral_dataset_extracts_pxd_from_resultset_style_attributes() {
+        let dataset = json!({
+            "attributes": [
+                {"accession": "MS:1001919", "name": "ProteomeXchange accession number", "value": "PXD047101"},
+                {"name": "hosting repository", "value": "MassIVE"},
+                {"name": "dataset identifier", "value": "MSV000093434"}
+            ],
+            "title": "Single cell proteomics and epiproteomics"
+        });
+        assert_eq!(registry_pxd_accessions(&dataset), vec!["PXD047101"]);
+    }
+
+    #[test]
+    fn registry_identifier_parser_does_not_promote_description_only_pxd_mentions() {
+        let dataset = json!({
+            "title": "Reanalysis project",
+            "description": "This study compares results from PXD047101 with another dataset",
+            "identifiers": [
+                {"accession": "MS:1001919", "name": "ProteomeXchange accession number", "value": "PXD099999"}
+            ]
+        });
+        assert_eq!(registry_pxd_accessions(&dataset), vec!["PXD099999"]);
+        assert_eq!(
+            pxd_accessions_anywhere(&dataset),
+            vec!["PXD047101", "PXD099999"]
+        );
     }
 }

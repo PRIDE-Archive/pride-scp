@@ -15,7 +15,7 @@ coverage before semantic stages optimize precision.  Missing publications,
 weak metadata, negative context, or an uncertain model decision must not
 silently delete a candidate from the recall universe.
 
-## Current status — GT196 discovery Iteration 2 implemented
+## Current status — GT196 discovery Iteration 2 parser fix implemented
 
 The accepted discovery baseline is Iteration 1: 105/106 PRIDE-labelled GT
 positives recovered (99.06%) from 334 candidates, with no loss from the original
@@ -41,10 +41,19 @@ GT missed:                       1
 PRIDE discovery recall:         99.06%
 ```
 
-Iteration 2 is **implemented but not yet accepted** until the same frozen GT196
-benchmark is rerun on the real registry snapshot.  The intended acceptance
-criterion is recovery of `PXD047101` without losing any of the 334 accepted
-candidates and without a broad candidate explosion.
+The first live Iteration-2 registry run on 2 September 2026 exposed a parser
+failure rather than a discovery failure: ProteomeCentral returned 55,706 dataset
+records across 558 pages, but the original registry parser extracted zero PXD
+aliases, so discovery remained byte-for-byte at the Iteration-1 state (334
+candidates; 105/106 recall). The downloaded PROXI pages are valid reusable cache
+artifacts and must **not** be fetched again just to test the parser fix.
+
+Iteration 2 now includes a structure-aware recursive identifier parser for
+nested/wrapped PROXI CV terms plus a page-1 schema guard. A populated first page
+with zero parsed PXD aliases is an immediate error instead of a multi-hour empty
+registry crawl. The next acceptance rerun should reuse the cached pages with
+`REGISTRY_FORCE=0` and recover `PXD047101` without losing any of the 334 accepted
+candidates or causing a broad candidate explosion.
 
 After that acceptance run, the optimization frontier moves fully to annotation
 quality.  Historical Stage-04 sensitivity was only 36/64 on publication-backed
@@ -352,8 +361,10 @@ The Iteration-2 runner first ensures the cached ProteomeCentral registry index,
 then runs `discover`, `candidate-audit`, and the PRIDE-filtered recall audit.
 The frozen GT is still read only by `recall-audit`, after candidate generation.
 Set `SNAPSHOT_DIR`, `GT_MASTER`, `OUT_ROOT`, or `REGISTRY_API_BASE` to override
-defaults.  Set `REGISTRY_FORCE=1` to refresh the registry cache or
-`SKIP_REGISTRY_SNAPSHOT=1` for an intentional offline Iteration-1-style rerun.
+defaults. **After the 2 September parser-failure run, leave `REGISTRY_FORCE=0`**
+so the 558 already-downloaded pages are reparsed locally rather than downloaded
+again. Use `REGISTRY_FORCE=1` only when a genuine registry refresh is intended;
+`SKIP_REGISTRY_SNAPSHOT=1` remains an intentional Iteration-1-style offline run.
 
 Outputs:
 
@@ -467,10 +478,12 @@ pipeline efficient without aggressively hammering external services.
 ## Current optimization status
 
 Discovery Iteration 1 is accepted at **105/106 PRIDE GT positives (99.06%)**
-on the frozen 40,364-project snapshot with 334 candidates. Discovery Iteration
-2 is implemented to solve the sole remaining cross-repository/native-accession
-class through ProteomeCentral/PROXI supplementation. It is not accepted until
-the real frozen benchmark confirms the exact candidate delta.
+on the frozen 40,364-project snapshot with 334 candidates. The first live
+Iteration-2 registry enumeration downloaded 55,706 ProteomeCentral records but
+parsed zero PXD aliases because the response shape was not handled correctly;
+therefore it produced no discovery delta and is **rejected as an Iteration-2
+acceptance result**. The parser/cache fix is implemented and should be evaluated
+against the already-cached pages before any further discovery design change.
 
 The intended discovery stopping condition is 106/106 with all 334 Iteration-1
 candidates preserved and only a bounded number of registry-only additions.

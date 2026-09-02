@@ -1,5 +1,9 @@
 # Unreleased — GT196 optimization
 
+- Reject the first live discovery Iteration-2 result as a registry-parser failure: 55,706 ProteomeCentral records were fetched across 558 pages but zero PXD aliases were extracted, leaving discovery unchanged at 334 candidates and 105/106 GT recall.
+- Make ProteomeCentral PXD extraction recursively structure-aware for nested/wrapped PROXI identifier fields and identifier CV terms while avoiding promotion of PXD mentions that occur only in free-text descriptions.
+- Add a page-1 registry schema guard so a populated PROXI response with zero parsed PXD aliases fails immediately instead of spending hours producing an invalid empty alias index.
+- Reuse the 558 cached PROXI pages for parser-fix acceptance when `--force`/`REGISTRY_FORCE` is not set; no repeat network crawl is required.
 - Implement discovery Iteration 2 with a cached ProteomeCentral/PROXI registry snapshot and PXD/native-accession normalization for cross-repository datasets absent from the primary PRIDE catalogue.
 - Reconcile generated registry supplements after complete enumeration so stale PXD aliases cannot survive refreshes, and fail on an explicit page-cap hit instead of benchmarking an incomplete registry snapshot.
 - Keep ProteomeCentral strictly supplemental during discovery: registry records whose PXD already exists under `snapshot/projects/` are not rescored, preserving accepted Iteration-1 scores/tiers.

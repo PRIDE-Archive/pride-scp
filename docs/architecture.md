@@ -172,7 +172,7 @@ this as a cross-repository/native-accession problem rather than another PRIDE
 vocabulary miss. That class should be addressed by registry/native-accession
 normalization, not an accession-specific exception.
 
-### GT196 discovery Iteration 2 — implemented, acceptance pending
+### GT196 discovery Iteration 2 — registry parser fix implemented, acceptance pending
 
 Iteration 2 adds `registry-snapshot`, which enumerates ProteomeCentral's PROXI
 dataset registry, extracts PXD identifiers plus native repository aliases, and
@@ -186,8 +186,21 @@ This prevents duplicate ProteomeCentral metadata from changing the accepted
 score/tier of existing PRIDE candidates. It directly addresses the measured
 `PXD047101` class, where the PXD is secondary to MassIVE `MSV000093434`.
 
-Acceptance requires the real frozen benchmark to show:
+The first live registry run (2 September 2026) fetched 55,706 records in 558
+pages but extracted zero PXD aliases. Discovery therefore remained exactly at
+334 candidates and 105/106 recall. This run is a **registry-parser failure**, not
+evidence against the cross-repository architecture.
 
+The registry parser now searches nested/wrapped structured identifier contexts
+(including identifier CV terms whose PXD is stored in `value`) while excluding
+free-text-only description mentions from alias promotion. A page-1 schema guard
+aborts immediately if a non-empty page still yields zero PXD aliases. Existing
+cached pages are reparsed when `--force` is not supplied, so the failed run's
+three-hour network crawl does not need to be repeated.
+
+Acceptance requires the corrected frozen benchmark to show:
+
+- non-zero registry PXD aliases on the cached first page;
 - `PXD047101` recovered;
 - all 334 Iteration-1 candidates preserved;
 - no broad candidate explosion from registry-only aliases;

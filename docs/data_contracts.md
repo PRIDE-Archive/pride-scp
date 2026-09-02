@@ -57,6 +57,13 @@ uses `registry/projects/PXD....json` only when the same PXD is absent from the
 primary `projects/` directory. This preserves accepted PRIDE scores/tiers while
 recovering cross-repository PXD aliases.
 
+Registry alias parsing is structure-aware. PXD values may occur inside nested
+PROXI wrappers or ontology/CV terms, so identifier contexts are traversed
+recursively. PXD strings appearing only in free-text descriptions are not
+promoted to aliases. A non-empty first registry page that yields zero structured
+PXD aliases is a hard schema error; this prevents a long crawl from silently
+emitting an empty registry index.
+
 A successful registry enumeration reconciles `registry/projects/` against the
 current supplemental alias set and removes stale generated JSON records. If an
 explicit `--max-pages` cap is reached before the API signals the end of the
