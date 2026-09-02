@@ -1,5 +1,13 @@
+- Add v19-shadow-2.3 consistency calibration: normalize impossible `destructive_pooling=no` + pre-identity-pooling combinations, add deterministic benchmark-only/diluted-bulk evidence, require a cell-like sample-unit noun, and let multiple direct one-cell/MS support signals override a noisy biological-unit class without overriding direct risk evidence.
+- Add v19-shadow-2.2 evidence-authority hardening: LLM-only pooling/identity negatives can no longer exclude without deterministic corroboration; require accession-specific one-cell/MS linkage for inclusion; add lexical grounding checks for biological sample identity/counts; and route cell-enriched-sample linkage ambiguity to review.
 # Unreleased — GT196 optimization
 
+- Add v19-shadow-2.1 execution integrity: expose the curation pipeline version, refuse stale source versions in GT runners, and key cache reuse by pipeline version + model + evidence-packet SHA-256.
+- Make the 15-accession v19 smoke force recomputation by default so stale status JSON cannot masquerade as a new model/policy iteration.
+- Invalidate the attempted v19-shadow-2 smoke after archived outputs showed all 15 records were actually `v19-shadow-1`.
+- Soften `biological_unit_class` as an exclusion signal after replay showed the 3B extractor often used `cell_population` for studies containing many separate one-cell samples; contradictory class alone now routes to review.
+- Clarify the v19 prompt that `cell_population` means multiple cells in one target MS sample, and remove the HeLa formatting anchor that leaked into unrelated sample-unit outputs.
+- Extend direct multi-cell guards to scientific notation / extracted forms such as `1 x 10^6` / `1 x 106` and adjacent-sentence sample wording, covering the observed PXD028991 failure mode without accession hard-coding.
 - Reject the first live discovery Iteration-2 result as a registry-parser failure: 55,706 ProteomeCentral records were fetched across 558 pages but zero PXD aliases were extracted, leaving discovery unchanged at 334 candidates and 105/106 GT recall.
 - Make ProteomeCentral PXD extraction recursively structure-aware for nested/wrapped PROXI identifier fields and identifier CV terms while avoiding promotion of PXD mentions that occur only in free-text descriptions.
 - Add a page-1 registry schema guard so a populated PROXI response with zero parsed PXD aliases fails immediately instead of spending hours producing an invalid empty alias index.
@@ -177,3 +185,13 @@
 - Keep final JSON/stdout contracts separate from progress/logging on stderr.
 - Move snapshot progress updates into the network workers so progress reflects
   live PRIDE download completion.
+
+## GT196 curation v19 shadow lane — 2026-09-02
+
+- Froze discovery optimization at 106/106 PRIDE GT positives.
+- Added an evidence-first `v19-shadow-1` curation lane that combines repository evidence with saved Stage04 raw evidence blocks.
+- Added explicit GT-aligned biological-unit, identity-preservation, destructive-pooling, benchmark, adjacent-modality, reanalysis, and mixed-design fields.
+- Added field-specific evidence-reference validation; unsupported model assertions are downgraded rather than trusted.
+- Added deterministic include/exclude/review logic outside the LLM.
+- Added frozen-GT evaluation tooling. GT196 remains evaluation-only and is never supplied to production/shadow inference.
+- The historical Stage04 v18 final classifier remains unchanged while v19 is benchmarked.

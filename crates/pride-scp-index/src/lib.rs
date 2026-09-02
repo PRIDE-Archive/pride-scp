@@ -289,14 +289,46 @@ fn pxd_accessions_anywhere(value: &Value) -> Vec<String> {
         .collect()
 }
 
+fn collect_exact_scalar_accessions(value: &Value, out: &mut BTreeSet<String>) {
+    match value {
+        Value::String(text) => {
+            let token = text.trim().to_ascii_uppercase();
+            if is_pxd(&token) {
+                out.insert(token);
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                collect_exact_scalar_accessions(item, out);
+            }
+        }
+        Value::Object(map) => {
+            for child in map.values() {
+                collect_exact_scalar_accessions(child, out);
+            }
+        }
+        _ => {}
+    }
+}
+
 fn registry_pxd_accessions(dataset: &Value) -> Vec<String> {
-    registry_identifier_strings(dataset)
+    let mut pxds = registry_identifier_strings(dataset)
         .iter()
         .flat_map(|text| accession_tokens(text))
         .filter(|token| is_pxd(token))
-        .collect::<BTreeSet<_>>()
-        .into_iter()
-        .collect()
+        .collect::<BTreeSet<_>>();
+
+    // The live ProteomeCentral /datasets endpoint can return each dataset as a
+    // positional JSON array rather than an object. In that representation the
+    // dataset accession is an exact scalar cell (for example "PXD047101").
+    // Accept only exact accession-valued scalar cells here: do not tokenize
+    // arbitrary title/description strings, which preserves the guard against
+    // promoting free-text references to other PXDs as aliases.
+    if dataset.is_array() {
+        collect_exact_scalar_accessions(dataset, &mut pxds);
+    }
+
+    pxds.into_iter().collect()
 }
 
 fn first_registry_string(value: &Value, keys: &[&str]) -> String {
@@ -383,15 +415,50 @@ fn infer_registry_repository(dataset: &Value, native_accessions: &[String]) -> S
     "unknown".to_string()
 }
 
+fn proteomecentral_array_row_fields(dataset: &Value) -> Option<(String, String)> {
+    let row = dataset.as_array()?;
+    let first = row.first()?.as_str()?.trim().to_ascii_uppercase();
+    if !is_pxd(&first) {
+        return None;
+    }
+
+    // ProteomeCentral's tabular dataset representation starts with
+    // [dataset identifier, title, repository, ...]. Only use these positional
+    // fields when column 0 is itself an exact PXD accession, so unrelated nested
+    // arrays cannot be mistaken for table rows.
+    let title = row
+        .get(1)
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .unwrap_or_default()
+        .to_string();
+    let repository = row
+        .get(2)
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .unwrap_or_default()
+        .to_string();
+    Some((title, repository))
+}
+
 fn normalized_registry_dataset(accession: &str, dataset: &Value) -> Value {
     let native_accessions = registry_native_accessions(dataset);
-    let hosting_repository = infer_registry_repository(dataset, &native_accessions);
+    let array_row = proteomecentral_array_row_fields(dataset);
+    let inferred_repository = infer_registry_repository(dataset, &native_accessions);
+    let hosting_repository = array_row
+        .as_ref()
+        .map(|(_, repository)| repository.trim())
+        .filter(|repository| !repository.is_empty())
+        .map(str::to_string)
+        .unwrap_or(inferred_repository);
     let title = {
         let direct = first_string_for_keys(dataset, &["title", "datasetTitle", "name"]);
-        if direct.is_empty() {
-            first_registry_string(dataset, &["title", "datasetTitle"])
-        } else {
+        if !direct.is_empty() {
             direct
+        } else if let Some((title, _)) = array_row.as_ref() {
+            title.clone()
+        } else {
+            first_registry_string(dataset, &["title", "datasetTitle"])
         }
     };
     let description = {
@@ -1759,5 +1826,30 @@ mod tests {
             pxd_accessions_anywhere(&dataset),
             vec!["PXD047101", "PXD099999"]
         );
+    }
+
+    #[test]
+    fn proteomecentral_dataset_extracts_pxd_from_positional_array_row() {
+        let dataset = json!([
+            "PXD047101",
+            "Single cell proteomics and epiproteomics",
+            "MassIVE",
+            "Homo sapiens",
+            "",
+            "12/24"
+        ]);
+        assert_eq!(registry_pxd_accessions(&dataset), vec!["PXD047101"]);
+        let normalized = normalized_registry_dataset("PXD047101", &dataset);
+        assert_eq!(
+            normalized["title"],
+            "Single cell proteomics and epiproteomics"
+        );
+        assert_eq!(normalized["registryHostingRepository"], "MassIVE");
+    }
+
+    #[test]
+    fn positional_array_parser_does_not_promote_pxd_embedded_in_free_text() {
+        let dataset = json!(["MSV000012345", "Reanalysis of PXD047101", "MassIVE"]);
+        assert!(registry_pxd_accessions(&dataset).is_empty());
     }
 }

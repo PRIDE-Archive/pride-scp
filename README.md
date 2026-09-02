@@ -914,3 +914,9 @@ experiments, not current operating instructions:
 The next production annotation lane should reuse the useful source-grounding
 ideas only after each factual axis is re-benchmarked directly against GT196.
 See `docs/model_roles.md`.
+
+### Current curation optimization: v19 shadow lane
+
+After discovery reached 106/106 frozen PRIDE GT recall, the active optimization frontier moved to annotation quality. The historical Stage04-v18 annotation contract remains available but is not being treated as final benchmark truth: only 36/64 annotated PRIDE GT positives survived its final yes/no gate, and most GT196 biological-unit/pooling fields were not represented explicitly.
+
+The new evaluation-first shadow lane is documented in [`docs/curation_v19.md`](docs/curation_v19.md). It extracts source-grounded biological facts with `qwen2.5:3b`, requires field-specific evidence references, and applies the accession include/exclude/review policy deterministically. It does **not** overwrite Stage04 or Stage05 during the pilot phase.

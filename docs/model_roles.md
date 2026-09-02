@@ -208,3 +208,15 @@ against the frozen reference.
    accession changes, not only aggregate metrics.
 7. **Keep accession and canonical-study decisions separate.** A model should
    not collapse companion/mirror accessions merely because they share a paper.
+
+## Curation v19 shadow model role
+
+`qwen2.5:3b` is also used in the new `v19-shadow-1` evidence-first curation lane. This is a different role from the historical Stage04 yes/no classifier:
+
+- input: accession-specific raw repository evidence plus saved raw Stage04 source blocks;
+- output: structured biological facts and evidence-reference IDs;
+- authority: fact-extraction only;
+- final decision: deterministic include/exclude/review policy outside the model;
+- GT196 exposure: none during inference; frozen GT is read only by the evaluator.
+
+The v19 shadow lane must outperform the frozen Stage04 baseline before it can replace any existing final-classification behavior.
