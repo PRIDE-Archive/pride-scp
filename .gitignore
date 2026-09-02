@@ -12,3 +12,6 @@ __pycache__/
 .DS_Store
 /manual_pdfs/*.pdf
 /manual_pdfs/**/*.pdf
+PRIDE_SCP_HANDOFF*
+PRIDE_SCP_NEW_CONVERSATION*
+*.tar.gz.part*
