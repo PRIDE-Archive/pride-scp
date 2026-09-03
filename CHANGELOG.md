@@ -1,3 +1,18 @@
+
+## GT196 v19-shadow-2.5 sample-unit normalization
+
+- Preserve the accepted v19-shadow-2.4 decision policy while expanding literal biological-cell unit recognition.
+- Add deterministic, evidence-referenced sample-unit normalization from existing repository and Stage04 sample/preparation evidence.
+- Add a full PRIDE106 policy-replay runner so this policy-only change can be benchmarked without repeating Ollama inference.
+- Keep GT196 evaluation-only and keep Stage05 / historical affirmative Phi-Gemma QC quarantined.
+
+- Add v19-shadow-2.4 full-PRIDE106 calibration: make direct multi-cell risk branch-aware for mixed designs, add high-specificity diluted-bulk/single-cell-like and near-single-cell spatial exclusion evidence, preserve true mixed benchmark+single-cell studies, and report include/review/hard-exclude metrics explicitly in GT196 evaluation.
+### v19-shadow-2.4 reporting hotfix
+
+- Fix the end-of-run `NameError` caused by a missing `write_tsv` helper in `pride_scp_curation_v19.py`.
+- Preserve the `v19-shadow-2.4` curation/cache version because model inference, evidence packets, and deterministic curation policy are unchanged. Existing compatible accession status files can therefore be reused with `CURATION_FORCE=0` to regenerate the summary/evaluation without repeating Ollama inference.
+- Add regression coverage for heterogeneous and empty curation-summary TSV output.
+
 - Add v19-shadow-2.3 consistency calibration: normalize impossible `destructive_pooling=no` + pre-identity-pooling combinations, add deterministic benchmark-only/diluted-bulk evidence, require a cell-like sample-unit noun, and let multiple direct one-cell/MS support signals override a noisy biological-unit class without overriding direct risk evidence.
 - Add v19-shadow-2.2 evidence-authority hardening: LLM-only pooling/identity negatives can no longer exclude without deterministic corroboration; require accession-specific one-cell/MS linkage for inclusion; add lexical grounding checks for biological sample identity/counts; and route cell-enriched-sample linkage ambiguity to review.
 # Unreleased — GT196 optimization
@@ -195,3 +210,37 @@
 - Added deterministic include/exclude/review logic outside the LLM.
 - Added frozen-GT evaluation tooling. GT196 remains evaluation-only and is never supplied to production/shadow inference.
 - The historical Stage04 v18 final classifier remains unchanged while v19 is benchmarked.
+## 2026-09-03 — v19-shadow-2.6 deterministic evidence enrichment
+
+- Preserve the accepted shadow-2.5 model packet and Qwen prompt.
+- Add a broader deterministic-only evidence pool from full saved Stage04 evidence, project JSON, file metadata and SDRF rows.
+- Add publication-bundle accession-linkage diagnostics and suppress explicitly mismatched bundles from enrichment.
+- Expand one-cell procedural detection to zygotes and common cell-type nouns.
+- Allow direct qualifying one-cell procedural evidence to override model-only benchmark/pooling/identity conflicts when no direct negative evidence exists.
+- Add an evaluation-only enriched-evidence replay so the 114-row benchmark can be rescored without Ollama.
+- Conservative packet-only lower bound: 82/106 GT positives included, 24 reviewed, 0 excluded; strict-negative controls remain 0 include / 2 review / 6 exclude.
+
+### v19-shadow-2.6.1 — branch-safety evidence hotfix
+
+- Fixes the shadow-2.6 false-negative regression where a diluted/single-cell-equivalent benchmark arm could veto a separate genuine one-cell branch.
+- Recognizes high-specificity procedural wording such as `single cells were lysed` as a qualifying branch without treating noun phrases such as `single HeLa cell digest` as real-cell evidence.
+- Treats a real qualifying branch plus a separate diluted/benchmark or multi-cell branch as mixed design rather than automatic exclusion.
+- Allows biological-sample-unit normalization from the qualifying branch even when a separate nonqualifying benchmark arm is present.
+- Keeps the five explicit publication/accession mismatch diagnostics visible; source-linkage remediation remains a separate upstream task.
+
+## 2026-09-03 — v19-shadow-2.6.1 review-evidence audit lane
+
+- Accepted `v19-shadow-2.6.1` evidence replay baseline after the full PRIDE106 benchmark reached 90 include / 16 review / 0 hard excludes while preserving 0 strict-negative includes.
+- Added evaluation-only review evidence dossier generation (`audit_v19_review_evidence.py`) and runner.
+- The audit does not read GT labels or modify curation decisions. It inventories repository snapshot, file/SDRF, Stage04 publication evidence, and explicit publication↔PXD routing for current `review` accessions.
+- Added cross-directory explicit-PXD publication routing diagnostics so historical publication/accession mismatches can be repaired upstream rather than compensated for by decision rules.
+
+## 2026-09-03 — v19-shadow-2.7 provenance-safe evidence routing
+
+- Added an explicit-PXD publication evidence router with cross-directory routing.
+- Quarantined publication bundles whose explicit PXD list does not contain the declared annotation target.
+- Quarantined historical packet publication rows only for proven explicit publication/PXD mismatches; affected publication evidence is rebuilt from routed source bundles.
+- Added conservative procedural single-cell sample-unit grounding.
+- Added bacterial single-cell branch recognition while protecting `single-cell resolution` and method-only phrases.
+- Added linkage-clean replay and route-index diagnostics; no GT labels are used by the replay itself.
+- Kept the accepted v19-shadow-2.6.1 include/exclude policy unchanged.
