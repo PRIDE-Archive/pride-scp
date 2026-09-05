@@ -6,9 +6,10 @@ use pride_scp_discovery::{
     ExportPythonOptions, RecallAuditOptions,
 };
 use pride_scp_index::{
-    compact_snapshot, registry_snapshot, snapshot, CompactSnapshotOptions, RegistrySnapshotOptions,
-    SnapshotOptions, DEFAULT_PRIDE_API, DEFAULT_PROJECT_PAGE_SIZE,
-    DEFAULT_PROTEOMECENTRAL_PROXI_API, DEFAULT_REGISTRY_PAGE_SIZE,
+    compact_snapshot, massive_native_snapshot, registry_snapshot, snapshot, CompactSnapshotOptions,
+    MassiveNativeSnapshotOptions, RegistrySnapshotOptions, SnapshotOptions,
+    DEFAULT_MASSIVE_PAGE_SIZE, DEFAULT_MASSIVE_QUERY_DATASETS_API, DEFAULT_PRIDE_API,
+    DEFAULT_PROJECT_PAGE_SIZE, DEFAULT_PROTEOMECENTRAL_PROXI_API, DEFAULT_REGISTRY_PAGE_SIZE,
 };
 use std::path::PathBuf;
 use std::time::Instant;
@@ -110,6 +111,37 @@ enum Command {
         #[arg(long)]
         force: bool,
     },
+    /// Snapshot the native public MassIVE dataset catalogue using MassIVE's own
+    /// QueryDatasets endpoint. This lane can discover MSV datasets that have no PXD alias.
+    MassiveNativeSnapshot {
+        /// Existing unified snapshot directory.
+        #[arg(long, default_value = "data/snapshot")]
+        snapshot: PathBuf,
+        #[arg(long, default_value = DEFAULT_MASSIVE_QUERY_DATASETS_API)]
+        query_endpoint: String,
+        /// JSON query sent to MassIVE QueryDatasets. `{}` requests the public table unfiltered.
+        #[arg(long, default_value = "{}")]
+        query_json: String,
+        #[arg(long, default_value_t = DEFAULT_MASSIVE_PAGE_SIZE)]
+        page_size: usize,
+        /// Per-request timeout, including response-body transfer.
+        #[arg(long, default_value_t = 120)]
+        timeout: u64,
+        /// Number of retries after the initial HTTP attempt.
+        #[arg(long, default_value_t = 4)]
+        retries: usize,
+        /// Safety page cap. Reaching it is an error because a partial native catalogue
+        /// is unsafe for recall benchmarking. Zero disables the user cap.
+        #[arg(long, default_value_t = 10_000)]
+        max_pages: usize,
+        /// Fail if this many populated pages add no new MSV accessions.
+        #[arg(long, default_value_t = 3)]
+        max_stagnant_pages: usize,
+        #[arg(long, default_value = "PRIDE-SCP-massive-native-index/0.2.0")]
+        user_agent: String,
+        #[arg(long)]
+        force: bool,
+    },
     /// Discover SCP candidates from the union of repository/file/SDRF signals.
     Discover {
         #[arg(long, default_value = "data/snapshot")]
@@ -124,6 +156,14 @@ enum Command {
         /// Grant-informed scale guardrail; 0 disables the alarm.
         #[arg(long, default_value_t = 208)]
         expected_positive_count: usize,
+        /// Repository lane(s) to scan. `pride-primary` is the GT-independent
+        /// production scope for the PRIDE-only catalogue.
+        #[arg(
+            long,
+            default_value = "all",
+            value_parser = ["all", "pride-primary", "registry-supplement", "native-massive"]
+        )]
+        source_scope: String,
     },
     /// Categorize high-recall discovery evidence into semantic-review profiles.
     CandidateAudit {
@@ -269,12 +309,45 @@ async fn main() -> Result<()> {
             .await?;
             println!("{}", serde_json::to_string_pretty(&summary)?);
         }
+        Command::MassiveNativeSnapshot {
+            snapshot,
+            query_endpoint,
+            query_json,
+            page_size,
+            timeout,
+            retries,
+            max_pages,
+            max_stagnant_pages,
+            user_agent,
+            force,
+        } => {
+            log::info!(
+                "command=massive-native-snapshot snapshot={}",
+                snapshot.display()
+            );
+            let summary = massive_native_snapshot(MassiveNativeSnapshotOptions {
+                snapshot_dir: snapshot,
+                query_endpoint,
+                query_json,
+                timeout_seconds: timeout,
+                retries,
+                user_agent,
+                page_size,
+                max_pages,
+                max_stagnant_pages,
+                force,
+                progress,
+            })
+            .await?;
+            println!("{}", serde_json::to_string_pretty(&summary)?);
+        }
         Command::Discover {
             snapshot,
             output,
             config,
             min_score,
             expected_positive_count,
+            source_scope,
         } => {
             log::info!(
                 "command=discover snapshot={} output={}",
@@ -287,6 +360,7 @@ async fn main() -> Result<()> {
                 config_path: config,
                 min_score,
                 expected_positive_count,
+                source_scope,
                 progress,
             })?;
             println!("{}", serde_json::to_string_pretty(&summary)?);

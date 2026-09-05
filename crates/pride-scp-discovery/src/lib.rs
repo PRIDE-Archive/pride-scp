@@ -22,7 +22,55 @@ pub struct DiscoverOptions {
     pub config_path: PathBuf,
     pub min_score: i32,
     pub expected_positive_count: usize,
+    /// Repository-source scope. Supported values: `all`, `pride-primary`,
+    /// `registry-supplement`, `native-massive`. Production PRIDE catalogue
+    /// generation uses `pride-primary` so cross-repository registry/native
+    /// records cannot enter the candidate cohort.
+    pub source_scope: String,
     pub progress: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DiscoverySourceScope {
+    All,
+    PridePrimary,
+    RegistrySupplement,
+    NativeMassive,
+}
+
+impl DiscoverySourceScope {
+    fn parse(value: &str) -> Result<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "all" => Ok(Self::All),
+            "pride-primary" | "pride" | "primary" => Ok(Self::PridePrimary),
+            "registry-supplement" | "registry" => Ok(Self::RegistrySupplement),
+            "native-massive" | "massive" => Ok(Self::NativeMassive),
+            other => Err(anyhow!(
+                "unsupported discovery source scope {other:?}; expected all, pride-primary, registry-supplement, or native-massive"
+            )),
+        }
+    }
+
+    fn includes_primary(self) -> bool {
+        matches!(self, Self::All | Self::PridePrimary)
+    }
+
+    fn includes_registry(self) -> bool {
+        matches!(self, Self::All | Self::RegistrySupplement)
+    }
+
+    fn includes_native_massive(self) -> bool {
+        matches!(self, Self::All | Self::NativeMassive)
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::All => "all",
+            Self::PridePrimary => "pride-primary",
+            Self::RegistrySupplement => "registry-supplement",
+            Self::NativeMassive => "native-massive",
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -361,6 +409,24 @@ fn discover_project(
     })
 }
 
+fn project_pxd_aliases(path: &Path) -> Vec<String> {
+    let Ok(value) = read_json::<Value>(path) else {
+        return Vec::new();
+    };
+    let Some(items) = value.get("pxdAliases").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    items
+        .iter()
+        .filter_map(Value::as_str)
+        .map(str::trim)
+        .filter(|x| x.to_ascii_uppercase().starts_with("PXD"))
+        .map(str::to_ascii_uppercase)
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
 pub fn discover(opts: DiscoverOptions) -> Result<DiscoverySummary> {
     let started = Instant::now();
     log::info!(
@@ -370,25 +436,31 @@ pub fn discover(opts: DiscoverOptions) -> Result<DiscoverySummary> {
         opts.min_score
     );
     let cfg: DiscoveryConfig = read_json(&opts.config_path)?;
+    let source_scope = DiscoverySourceScope::parse(&opts.source_scope)?;
     let project_dir = opts.snapshot_dir.join("projects");
-    let mut primary_project_paths = std::fs::read_dir(&project_dir)
+    let mut all_primary_project_paths = std::fs::read_dir(&project_dir)
         .with_context(|| format!("read {}", project_dir.display()))?
         .filter_map(|entry| entry.ok().map(|x| x.path()))
         .filter(|path| path.extension().and_then(|x| x.to_str()) == Some("json"))
         .collect::<Vec<_>>();
-    primary_project_paths.sort();
-    let primary_accessions = primary_project_paths
+    all_primary_project_paths.sort();
+    let primary_accessions = all_primary_project_paths
         .iter()
         .filter_map(|path| path.file_stem().and_then(|x| x.to_str()))
         .map(str::to_ascii_uppercase)
         .collect::<HashSet<_>>();
+    let primary_project_paths = if source_scope.includes_primary() {
+        all_primary_project_paths.clone()
+    } else {
+        Vec::new()
+    };
 
     // ProteomeCentral is a supplemental registry lane, not a replacement for the
     // primary PRIDE snapshot. Only scan registry PXD aliases that are absent from
     // snapshot/projects so duplicate registry metadata cannot perturb the accepted
     // score/tier of existing PRIDE candidates.
     let registry_project_dir = opts.snapshot_dir.join("registry").join("projects");
-    let mut registry_project_paths = if registry_project_dir.is_dir() {
+    let mut registry_project_paths = if source_scope.includes_registry() && registry_project_dir.is_dir() {
         std::fs::read_dir(&registry_project_dir)
             .with_context(|| format!("read {}", registry_project_dir.display()))?
             .filter_map(|entry| entry.ok().map(|x| x.path()))
@@ -406,16 +478,42 @@ pub fn discover(opts: DiscoverOptions) -> Result<DiscoverySummary> {
     };
     registry_project_paths.sort();
 
+    // Scan every native MassIVE record, including records with a trusted PXD alias.
+    // Alias existence alone is not sufficient evidence that the PXD-side metadata is
+    // discovery-equivalent: ProteomeCentral/registry supplements can be sparse stubs
+    // while the native repository record carries the title/description that contains
+    // the actual SCP evidence. Identity-aware duplicate suppression therefore happens
+    // only *after* both representations have been scored below.
+    let native_massive_dir = opts
+        .snapshot_dir
+        .join("native")
+        .join("massive")
+        .join("projects");
+    let mut native_massive_paths = if source_scope.includes_native_massive() && native_massive_dir.is_dir() {
+        std::fs::read_dir(&native_massive_dir)
+            .with_context(|| format!("read {}", native_massive_dir.display()))?
+            .filter_map(|entry| entry.ok().map(|x| x.path()))
+            .filter(|path| path.extension().and_then(|x| x.to_str()) == Some("json"))
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
+    native_massive_paths.sort();
+
     let primary_projects_scanned = primary_project_paths.len();
     let registry_supplements_scanned = registry_project_paths.len();
+    let native_massive_projects_scanned = native_massive_paths.len();
     let mut project_paths = primary_project_paths;
     project_paths.extend(registry_project_paths);
+    project_paths.extend(native_massive_paths);
 
     log::info!(
-        "discovery scan: {} project records (primary={} registry_supplements={})",
+        "discovery scan: {} project records (scope={} primary={} registry_supplements={} native_massive={})",
         project_paths.len(),
+        source_scope.label(),
         primary_projects_scanned,
         registry_supplements_scanned,
+        native_massive_projects_scanned,
     );
     let progress = make_progress_bar(
         project_paths.len() as u64,
@@ -442,13 +540,67 @@ pub fn discover(opts: DiscoverOptions) -> Result<DiscoverySummary> {
     let positive_count = rows.iter().filter(|row| row.score > 0).count();
     std::fs::create_dir_all(&opts.output_dir)?;
     let output_progress = make_spinner("writing discovery outputs", opts.progress);
-    // Keep a complete scored audit table, including score=0 projects, so a
-    // missed known positive can be traced without repeating the snapshot.
+    // Keep a complete scored audit table, including score=0 projects and native
+    // alias duplicates, so identity/dedup decisions can be traced without
+    // repeating the snapshot.
     write_candidate_tsv(&opts.output_dir.join("project_discovery_audit.tsv"), &rows)?;
+
+    // A native MSV representation is suppressed only when at least one trusted
+    // PXD alias is itself a positive candidate. This is deliberately evidence-aware:
+    // a sparse registry PXD stub with score=0 must never shadow a positive native
+    // MassIVE record merely because the source-derived alias edge is valid.
+    let positive_pxd_accessions = rows
+        .iter()
+        .filter(|row| row.score >= opts.min_score)
+        .map(|row| row.accession.trim().to_ascii_uppercase())
+        .filter(|accession| accession.starts_with("PXD"))
+        .collect::<HashSet<_>>();
+
+    let mut identity_dedup_rows = Vec::<(String, String, i32, String, String)>::new();
     let emitted = rows
         .into_iter()
         .filter(|row| row.score >= opts.min_score)
+        .filter(|row| {
+            if !row.accession.to_ascii_uppercase().starts_with("MSV") {
+                return true;
+            }
+            let aliases = project_pxd_aliases(Path::new(&row.project_json_path));
+            let represented = aliases
+                .iter()
+                .filter(|alias| positive_pxd_accessions.contains(*alias))
+                .cloned()
+                .collect::<Vec<_>>();
+            let suppress = !represented.is_empty();
+            identity_dedup_rows.push((
+                row.accession.clone(),
+                aliases.join("; "),
+                row.score,
+                row.tier.clone(),
+                represented.join("; "),
+            ));
+            !suppress
+        })
         .collect::<Vec<_>>();
+
+    let mut dedup_writer = BufWriter::new(File::create(
+        opts.output_dir.join("native_identity_dedup_audit.tsv"),
+    )?);
+    writeln!(
+        dedup_writer,
+        "native_accession\ttrusted_pxd_aliases\tnative_score\tnative_tier\tpositive_pxd_aliases\tdecision"
+    )?;
+    for (native, aliases, score, tier, represented) in &identity_dedup_rows {
+        let decision = if represented.is_empty() {
+            "retain_native_no_positive_pxd_representation"
+        } else {
+            "suppress_native_positive_pxd_representation"
+        };
+        writeln!(
+            dedup_writer,
+            "{}\t{}\t{}\t{}\t{}\t{}",
+            native, aliases, score, tier, represented, decision
+        )?;
+    }
 
     write_candidate_tsv(&opts.output_dir.join("candidates.tsv"), &emitted)?;
     write_jsonl(&opts.output_dir.join("candidates.jsonl"), &emitted)?;
@@ -460,9 +612,11 @@ pub fn discover(opts: DiscoverOptions) -> Result<DiscoverySummary> {
     }
 
     let summary = DiscoverySummary {
+        source_scope: source_scope.label().to_string(),
         projects_scanned: project_paths.len(),
         primary_projects_scanned,
         registry_supplements_scanned,
+        native_massive_projects_scanned,
         projects_with_positive_signal: positive_count,
         candidates_emitted: emitted.len(),
         strong_candidates: emitted.iter().filter(|x| x.tier == "strong").count(),
@@ -1124,6 +1278,7 @@ mod tests {
             config_path: config,
             min_score: 1,
             expected_positive_count: 0,
+            source_scope: "all".into(),
             progress: false,
         })
         .expect("fixture discovery should succeed");
@@ -1384,6 +1539,7 @@ mod tests {
             config_path: config,
             min_score: 1,
             expected_positive_count: 0,
+            source_scope: "all".into(),
             progress: false,
         })
         .unwrap();
@@ -1401,6 +1557,203 @@ mod tests {
         assert!(registry
             .project_json_path
             .contains("registry/projects/PXD900011.json"));
+
+        // Production PRIDE scope must never admit registry-only aliases.
+        let pride_out = root.join("pride-only-out");
+        let pride_summary = discover(DiscoverOptions {
+            snapshot_dir: root.clone(),
+            output_dir: pride_out.clone(),
+            config_path: root.join("terms.json"),
+            min_score: 1,
+            expected_positive_count: 0,
+            source_scope: "pride-primary".into(),
+            progress: false,
+        })
+        .unwrap();
+        assert_eq!(pride_summary.primary_projects_scanned, 1);
+        assert_eq!(pride_summary.registry_supplements_scanned, 0);
+        assert_eq!(pride_summary.native_massive_projects_scanned, 0);
+        assert_eq!(pride_summary.projects_scanned, 1);
+        let pride_candidates = read_candidate_tsv(&pride_out.join("candidates.tsv")).unwrap();
+        assert!(pride_candidates.is_empty());
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn native_massive_discovery_adds_msv_only_records_but_suppresses_positive_pxd_aliases() {
+        let root = std::env::temp_dir().join(format!(
+            "pride_scp_native_massive_discovery_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let projects = root.join("projects");
+        let registry_projects = root.join("registry/projects");
+        let native_projects = root.join("native/massive/projects");
+        std::fs::create_dir_all(&projects).unwrap();
+        std::fs::create_dir_all(&registry_projects).unwrap();
+        std::fs::create_dir_all(&native_projects).unwrap();
+
+        write_json(
+            &registry_projects.join("PXD900021.json"),
+            &serde_json::json!({
+                "accession": "PXD900021",
+                "title": "Single-cell proteomics represented by PXD",
+                "registryNativeAccessions": ["MSV000900021"]
+            }),
+        )
+        .unwrap();
+        write_json(
+            &native_projects.join("MSV000900021.json"),
+            &serde_json::json!({
+                "accession": "MSV000900021",
+                "title": "Single-cell proteomics duplicate native record",
+                "pxdAliases": ["PXD900021"],
+                "sourceRepository": "MassIVE"
+            }),
+        )
+        .unwrap();
+        write_json(
+            &native_projects.join("MSV000900022.json"),
+            &serde_json::json!({
+                "accession": "MSV000900022",
+                "title": "Single-cell proteomics of native-only MassIVE cells",
+                "description": "Single cells analyzed by LC-MS/MS",
+                "pxdAliases": [],
+                "sourceRepository": "MassIVE"
+            }),
+        )
+        .unwrap();
+
+        let config = root.join("terms.json");
+        write_json(
+            &config,
+            &DiscoveryConfig {
+                explicit_terms: vec![WeightedTerm {
+                    label: "single_cell_proteomics".into(),
+                    term: "single-cell proteomics".into(),
+                    weight: 14,
+                }],
+                method_terms: vec![],
+                biological_terms: vec![],
+                adjacent_terms: vec![],
+                negative_context_terms: vec![],
+                strong_score: 36,
+                possible_score: 14,
+            },
+        )
+        .unwrap();
+
+        let out = root.join("out");
+        let summary = discover(DiscoverOptions {
+            snapshot_dir: root.clone(),
+            output_dir: out.clone(),
+            config_path: config,
+            min_score: 1,
+            expected_positive_count: 0,
+            source_scope: "all".into(),
+            progress: false,
+        })
+        .unwrap();
+        assert_eq!(summary.registry_supplements_scanned, 1);
+        assert_eq!(summary.native_massive_projects_scanned, 2);
+        let candidates = read_candidate_tsv(&out.join("candidates.tsv")).unwrap();
+        assert!(candidates.iter().any(|row| row.accession == "PXD900021"));
+        assert!(candidates.iter().any(|row| row.accession == "MSV000900022"));
+        assert!(!candidates.iter().any(|row| row.accession == "MSV000900021"));
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn native_massive_alias_does_not_hide_positive_native_evidence_when_pxd_stub_scores_zero() {
+        let root = std::env::temp_dir().join(format!(
+            "pride_scp_native_massive_sparse_pxd_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let projects = root.join("projects");
+        let registry_projects = root.join("registry/projects");
+        let native_projects = root.join("native/massive/projects");
+        std::fs::create_dir_all(&projects).unwrap();
+        std::fs::create_dir_all(&registry_projects).unwrap();
+        std::fs::create_dir_all(&native_projects).unwrap();
+
+        // The trusted identity edge is valid, but the PXD-side registry record is
+        // intentionally too sparse to carry discovery evidence.
+        write_json(
+            &registry_projects.join("PXD900031.json"),
+            &serde_json::json!({
+                "accession": "PXD900031",
+                "title": "Repository dataset",
+                "registryNativeAccessions": ["MSV000900031"]
+            }),
+        )
+        .unwrap();
+        write_json(
+            &native_projects.join("MSV000900031.json"),
+            &serde_json::json!({
+                "accession": "MSV000900031",
+                "title": "Single-cell proteomics of isolated cells",
+                "description": "Single cells analyzed by LC-MS/MS",
+                "pxdAliases": ["PXD900031"],
+                "sourceRepository": "MassIVE"
+            }),
+        )
+        .unwrap();
+
+        let config = root.join("terms.json");
+        write_json(
+            &config,
+            &DiscoveryConfig {
+                explicit_terms: vec![WeightedTerm {
+                    label: "single_cell_proteomics".into(),
+                    term: "single-cell proteomics".into(),
+                    weight: 14,
+                }],
+                method_terms: vec![],
+                biological_terms: vec![],
+                adjacent_terms: vec![],
+                negative_context_terms: vec![],
+                strong_score: 36,
+                possible_score: 14,
+            },
+        )
+        .unwrap();
+
+        let out = root.join("out");
+        let summary = discover(DiscoverOptions {
+            snapshot_dir: root.clone(),
+            output_dir: out.clone(),
+            config_path: config,
+            min_score: 1,
+            expected_positive_count: 0,
+            source_scope: "all".into(),
+            progress: false,
+        })
+        .unwrap();
+        assert_eq!(summary.registry_supplements_scanned, 1);
+        assert_eq!(summary.native_massive_projects_scanned, 1);
+
+        let candidates = read_candidate_tsv(&out.join("candidates.tsv")).unwrap();
+        assert!(candidates.iter().any(|row| row.accession == "MSV000900031"));
+        assert!(!candidates.iter().any(|row| row.accession == "PXD900031"));
+
+        let audit = read_candidate_tsv(&out.join("project_discovery_audit.tsv")).unwrap();
+        let pxd = audit.iter().find(|row| row.accession == "PXD900031").unwrap();
+        let msv = audit.iter().find(|row| row.accession == "MSV000900031").unwrap();
+        assert_eq!(pxd.score, 0);
+        assert!(msv.score > 0);
+
+        let dedup = std::fs::read_to_string(out.join("native_identity_dedup_audit.tsv")).unwrap();
+        assert!(dedup.contains("MSV000900031"));
+        assert!(dedup.contains("retain_native_no_positive_pxd_representation"));
 
         let _ = std::fs::remove_dir_all(root);
     }

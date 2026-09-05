@@ -100,6 +100,10 @@ pub struct PythonBridgeSummary {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct DiscoverySummary {
+    /// Repository-source scope used for this discovery run. Empty in historical
+    /// summaries written before source scoping was introduced.
+    #[serde(default)]
+    pub source_scope: String,
     /// Total project-like records scanned across the primary PRIDE snapshot and
     /// supplemental registry-only PXD aliases.
     pub projects_scanned: usize,
@@ -108,6 +112,10 @@ pub struct DiscoverySummary {
     /// Number of ProteomeCentral registry records scanned because their PXD alias
     /// was absent from the primary PRIDE snapshot.
     pub registry_supplements_scanned: usize,
+    /// Number of native MassIVE MSV records scored. Trusted alias duplicates are
+    /// suppressed only after scoring, so sparse PXD stubs cannot shadow richer native evidence.
+    #[serde(default)]
+    pub native_massive_projects_scanned: usize,
     pub projects_with_positive_signal: usize,
     pub candidates_emitted: usize,
     pub strong_candidates: usize,
