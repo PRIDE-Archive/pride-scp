@@ -304,3 +304,44 @@ Then separately test accessions with **no deposited SDRF**. This is important be
 SDRF enrichment and de-novo SDRF reconstruction are distinct scientific problems. Generate the
 missing-SDRF list from the GT106 cohort locally and smoke-test a few of those before starting the
 full 106-accession batch.
+
+## v0.2.1: field-targeted extraction and GT106 cohort modes
+
+The v0.2.0 existing-SDRF smoke established that preserving deposited SDRF rows is
+structurally correct, but also showed that a small LLM can still attach a valid
+evidence reference to the wrong semantic field (for example proposing MaxQuant as
+a single-cell isolation method). v0.2.1 therefore tightens the proposal layer
+without weakening provenance:
+
+- only fields that are missing in at least one deposited SDRF row are requested
+  from Ollama;
+- fields already represented by the deposited SDRF are locked and model values
+  for those fields are discarded;
+- evidence is shown to the model in field-specific sections rather than one flat
+  evidence pool;
+- evidence references are retained only when the cited evidence is relevant to
+  that field;
+- obvious category errors (analysis software as isolation method, instrument, or
+  acquisition method; non-integer fraction/technical replicate values) are
+  deterministically downgraded to unresolved;
+- factor proposals are deferred until per-row factor mapping is implemented;
+- a deposited SDRF with zero data rows can no longer pass local validation.
+
+The GT106 helper supports three accession-selection modes. GT remains cohort-only
+and never provides SDRF values:
+
+```bash
+COHORT_MODE=all ./scripts/run_gt106_pride_sdrf_annotation.sh
+COHORT_MODE=existing-sdrf ./scripts/run_gt106_pride_sdrf_annotation.sh
+COHORT_MODE=missing-sdrf ./scripts/run_gt106_pride_sdrf_annotation.sh
+```
+
+To inspect the cohort split without starting Ollama:
+
+```bash
+LIST_ONLY=1 COHORT_MODE=missing-sdrf \
+  ./scripts/run_gt106_pride_sdrf_annotation.sh
+```
+
+Each mode writes both the complete 106-accession list and the selected list, plus
+a JSON summary containing the number with and without deposited SDRFs.

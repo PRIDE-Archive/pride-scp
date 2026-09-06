@@ -20,7 +20,7 @@ pub const SINGLE_CELL_TEMPLATE_VERSION: &str = "1.0.0";
 pub const SINGLE_CELL_TEMPLATE_URL: &str =
     "https://github.com/bigbio/sdrf-templates/blob/main/single-cell/1.0.0/single-cell.yaml";
 pub const SDRF_SPEC_URL: &str = "https://sdrf.quantms.org/specification.html";
-pub const GENERATOR_VERSION: &str = "pride-scp-sdrf-v0.2.0";
+pub const GENERATOR_VERSION: &str = "pride-scp-sdrf-v0.2.1";
 pub const DEFAULT_OLLAMA_URL: &str = "http://localhost:11434/api/generate";
 
 // The linked single-cell template is work-in-progress. Generated drafts pin the
@@ -1049,34 +1049,66 @@ fn prompt_for(evidence: &DatasetEvidence, max_files: usize) -> String {
         .map(|f| format!("- {}", f.file_name))
         .collect::<Vec<_>>()
         .join("\n");
-    let ev = evidence
-        .evidence
+    let targets = proposal_target_fields(evidence);
+    let ordered_fields = [
+        "relation_mode",
+        "organism",
+        "organism_part",
+        "disease",
+        "cell_type",
+        "sample_type",
+        "single_cell_isolation_method",
+        "individual",
+        "sample_preparation_batch",
+        "cells_per_well",
+        "proteomics_data_acquisition_method",
+        "label",
+        "instrument",
+        "cleavage_agent_details",
+        "fraction_identifier",
+        "technical_replicate",
+        "carrier_channel",
+        "reference_channel",
+    ];
+    let target_list = ordered_fields
         .iter()
-        .map(|e| {
-            format!(
-                "[{}] {} / {}: {}",
-                e.id, e.source_kind, e.source_label, e.text
-            )
-        })
+        .filter(|f| targets.contains(**f))
+        .copied()
         .collect::<Vec<_>>()
-        .join("\n");
+        .join(", ");
+    let locked_list = ordered_fields
+        .iter()
+        .filter(|f| !targets.contains(**f))
+        .copied()
+        .collect::<Vec<_>>()
+        .join(", ");
+    let sections = ordered_fields
+        .iter()
+        .filter(|f| targets.contains(**f))
+        .map(|f| format!("### {f}\n{}", field_evidence_block(evidence, f, 10)))
+        .collect::<Vec<_>>()
+        .join("\n\n");
     format!(
-        "You are extracting metadata for an SDRF-Proteomics single-cell draft for {acc}.\n\n\
+        "You are extracting ONLY missing metadata fields for an SDRF-Proteomics single-cell draft for {acc}.\n\n\
+TARGET FIELDS: {target_list}\n\
+LOCKED/ALREADY-STRUCTURED FIELDS: {locked_list}\n\n\
 RULES:\n\
-1. Use ONLY the evidence records below. Never invent sample metadata, channel assignments, instruments, enzymes, conditions, or cell identifiers.\n\
-2. If a value is not evidenced, return exactly 'not available' unless the concept genuinely does not apply, in which case use 'not applicable'.\n\
-3. relation_mode means the biological sample-to-RAW-file design: one_cell_per_data_file, multiplexed_cells_per_data_file, mixed, or uncertain. Be conservative.\n\
-4. sample_type is the dominant target sample class, not a claim that every row has that type.\n\
-5. For label, acquisition method, instrument and cleavage agent, prefer terminology already present in PRIDE/manuscript evidence.\n\
-6. Every non-reserved proposed value must cite one or more E#### refs in evidence_refs. Reserved values may have an empty ref list. relation_mode=uncertain is explicitly non-assertive and may have no evidence refs.\n\
-7. Do not infer a per-cell identifier from a filename here; Rust may do that deterministically only when relation_mode is one_cell_per_data_file.\n\
-8. Dataset-level fields (organism part, disease, cell type, individual, batch, factors) may vary across samples. Return a concrete value only if the evidence supports that the same value applies to all target single-cell samples; otherwise use 'not available'.\n\
-9. Factor proposals are review hints only in v0.1 because per-row factor assignments are not yet reconstructed safely.\n\
-10. Repository provenance labels (for example PRIDE, fileCategory, publicFileLocations, FTP/HTTP locations) are NEVER biological or SDRF values. Do not copy provenance/source labels into metadata fields.\n\
-11. Existing SDRF structured evidence has highest priority for values already deposited by submitters. Preserve it unless stronger evidence demonstrates it is missing, not that it is wrong.\n\
-12. Factors must describe biological/experimental study variables only. Never propose repository/file bookkeeping fields as factors.\n\
-13. This is a draft annotation pass. Uncertainty is preferable to hallucination.\n\n\
-RAW FILE COUNT: {nfiles}\nRAW FILE SAMPLE (max {max_files}):\n{files}\n\nEVIDENCE:\n{ev}",
+1. Use ONLY the field-specific evidence shown under the matching field heading. Never invent metadata or borrow a value from an unrelated field.\n\
+2. Fields in LOCKED/ALREADY-STRUCTURED FIELDS must be returned exactly as 'not available' with an empty evidence_refs list; for relation_mode use 'uncertain'. Rust preserves existing SDRF values deterministically.\n\
+3. If a TARGET field is not supported by its own evidence section, return exactly 'not available' (or relation_mode='uncertain').\n\
+4. Every concrete TARGET value must cite one or more E#### refs from that SAME field section.\n\
+5. relation_mode means sample-to-RAW design: one_cell_per_data_file, multiplexed_cells_per_data_file, mixed, or uncertain. Do not infer it merely from the phrase 'single-cell'.\n\
+6. single_cell_isolation_method must be a cell-isolation method such as FACS, cellenONE, microfluidics, laser capture microdissection, manual picking, nanoPOTS, droplet microfluidics, or acoustic droplet ejection. Software such as MaxQuant is never an isolation method.\n\
+7. proteomics_data_acquisition_method describes MS acquisition (for example DDA, DIA, diaPASEF, PRM), not analysis/search software.\n\
+8. instrument is the mass spectrometer/instrument, not software.\n\
+9. Do not infer a per-cell identifier from filenames here. Rust constructs identifiers only when the row relationship is deterministically supported.\n\
+10. Dataset-level biological values may vary by row. Return a concrete value only if the evidence supports a single dataset-wide value; otherwise use 'not available'.\n\
+11. Return factors=[] in this version. Per-row factor reconstruction is deferred.\n\
+12. Repository labels (PRIDE, PXD accessions, fileCategory, URLs) and analysis software must never be copied into biological/MS fields.\n\
+13. Uncertainty is preferable to hallucination.\n\n\
+RAW FILE COUNT: {nfiles}\n\
+RAW FILE SAMPLE (context only; max {max_files}):\n{files}\n\n\
+FIELD-SPECIFIC EVIDENCE:\n{sections}",
         acc = evidence.accession,
         nfiles = evidence.raw_files.len(),
     )
@@ -1135,24 +1167,404 @@ fn proposal_value_is_reserved(field: &str, value: &str) -> bool {
     canonical_reserved_alias(value).is_some()
 }
 
+fn field_existing_header(field: &str) -> Option<&'static str> {
+    match field {
+        "organism" => Some("characteristics[organism]"),
+        "organism_part" => Some("characteristics[organism part]"),
+        "disease" => Some("characteristics[disease]"),
+        "cell_type" => Some("characteristics[cell type]"),
+        "sample_type" => Some(SC_SAMPLE_TYPE),
+        "single_cell_isolation_method" => Some(SC_ISOLATION_METHOD),
+        "individual" => Some(SC_INDIVIDUAL),
+        "sample_preparation_batch" => Some(SC_PREP_BATCH),
+        "cells_per_well" => Some(SC_CELLS_PER_WELL),
+        "proteomics_data_acquisition_method" => Some("comment[proteomics data acquisition method]"),
+        "label" => Some("comment[label]"),
+        "instrument" => Some("comment[instrument]"),
+        "cleavage_agent_details" => Some("comment[cleavage agent details]"),
+        "fraction_identifier" => Some("comment[fraction identifier]"),
+        "technical_replicate" => Some("comment[technical replicate]"),
+        "carrier_channel" => Some(SC_CARRIER_CHANNEL),
+        "reference_channel" => Some(SC_REFERENCE_CHANNEL),
+        _ => None,
+    }
+}
+
+fn concrete_table_value(value: &str) -> bool {
+    let v = value.trim();
+    !v.is_empty() && canonical_reserved_alias(v).is_none()
+}
+
+fn proposal_target_fields(evidence: &DatasetEvidence) -> BTreeSet<String> {
+    let fields = [
+        "relation_mode",
+        "organism",
+        "organism_part",
+        "disease",
+        "cell_type",
+        "sample_type",
+        "single_cell_isolation_method",
+        "individual",
+        "sample_preparation_batch",
+        "cells_per_well",
+        "proteomics_data_acquisition_method",
+        "label",
+        "instrument",
+        "cleavage_agent_details",
+        "fraction_identifier",
+        "technical_replicate",
+        "carrier_channel",
+        "reference_channel",
+    ];
+    if evidence.existing_sdrf_path.is_empty() {
+        return fields.iter().map(|x| x.to_string()).collect();
+    }
+    let Ok((headers, rows)) = read_existing_sdrf_table(Path::new(&evidence.existing_sdrf_path))
+    else {
+        return fields.iter().map(|x| x.to_string()).collect();
+    };
+    if rows.is_empty() {
+        return fields.iter().map(|x| x.to_string()).collect();
+    }
+
+    let mut out = BTreeSet::new();
+    if existing_sdrf_relation_hint(&headers, &rows) == "uncertain" {
+        out.insert("relation_mode".to_string());
+    }
+    for field in fields.iter().copied().filter(|f| *f != "relation_mode") {
+        let Some(header) = field_existing_header(field) else {
+            continue;
+        };
+        let Some(j) = header_first_index(&headers, header) else {
+            out.insert(field.to_string());
+            continue;
+        };
+        // Ask Ollama only when at least one existing row is unresolved. Existing
+        // values are preserved and are never overwritten by a dataset-level guess.
+        if rows
+            .iter()
+            .any(|r| r.get(j).map_or(true, |v| !concrete_table_value(v)))
+        {
+            out.insert(field.to_string());
+        }
+    }
+    out
+}
+
+fn evidence_relevant_to_field(field: &str, item: &EvidenceItem) -> bool {
+    let label = item.source_label.to_ascii_lowercase();
+    let text = item.text.to_ascii_lowercase();
+    let hay = format!("{label} {text}");
+    if item.source_kind == "existing_sdrf_structured" {
+        if field == "relation_mode" && label.contains("relationship_summary") {
+            return true;
+        }
+        if let Some(header) = field_existing_header(field) {
+            if label.contains(&header.to_ascii_lowercase()) {
+                return true;
+            }
+        }
+    }
+    let terms: &[&str] = match field {
+        "relation_mode" => &[
+            "single cell",
+            "single-cell",
+            "single nucleus",
+            "single-nucleus",
+            "tmt",
+            "plex",
+            "carrier",
+            "reference channel",
+            "channel",
+            "multiplex",
+        ],
+        "organism" => &[
+            "organism",
+            "species",
+            "homo sapiens",
+            "human",
+            "mus musculus",
+            "mouse",
+            "rat",
+            "rattus",
+            "xenopus",
+            "zebrafish",
+            "danio rerio",
+            "drosophila",
+            "yeast",
+            "arabidopsis",
+        ],
+        "organism_part" => &[
+            "organism part",
+            "tissue",
+            "brain",
+            "blood",
+            "marrow",
+            "liver",
+            "kidney",
+            "embryo",
+            "oocyte",
+            "egg",
+            "cell line",
+        ],
+        "disease" => &[
+            "disease",
+            "cancer",
+            "tumor",
+            "carcinoma",
+            "leukemia",
+            "lymphoma",
+            "healthy",
+            "control",
+            "patient",
+        ],
+        "cell_type" => &[
+            "cell type",
+            "cell-type",
+            "hela",
+            "macrophage",
+            "monocyte",
+            "lymphocyte",
+            "t cell",
+            "b cell",
+            "oocyte",
+            "blastomere",
+            "neuron",
+            "fibroblast",
+            "stem cell",
+        ],
+        "sample_type" => &[
+            "sample type",
+            "single cell",
+            "single-cell",
+            "carrier",
+            "reference",
+            "empty",
+            "control",
+            "bulk",
+        ],
+        "single_cell_isolation_method" => &[
+            "isolation",
+            "isolated",
+            "sort",
+            "sorting",
+            "facs",
+            "flow cytometry",
+            "cellenone",
+            "cellenone",
+            "microfluid",
+            "laser capture",
+            "lcm",
+            "manual picking",
+            "nanopots",
+            "nanowell",
+            "droplet",
+            "acoustic droplet",
+        ],
+        "individual" => &[
+            "individual",
+            "donor",
+            "patient",
+            "subject",
+            "mouse",
+            "animal",
+            "embryo",
+        ],
+        "sample_preparation_batch" => &[
+            "sample preparation batch",
+            "batch",
+            "plate",
+            "chip",
+            "processing batch",
+        ],
+        "cells_per_well" => &[
+            "cells per well",
+            "cell per well",
+            "one cell",
+            "single cell",
+            "single-cell",
+            "small pool",
+        ],
+        "proteomics_data_acquisition_method" => &[
+            "acquisition",
+            "data-dependent",
+            "data dependent",
+            "dda",
+            "data-independent",
+            "data independent",
+            "dia",
+            "dia-pasef",
+            "diapasef",
+            "pasef",
+            "prm",
+            "srm",
+            "targeted",
+        ],
+        "label" => &[
+            "label",
+            "tmt",
+            "tmtpro",
+            "itraq",
+            "silac",
+            "dimethyl",
+            "label-free",
+            "label free",
+            "plexdia",
+        ],
+        "instrument" => &[
+            "instrument",
+            "orbitrap",
+            "q exactive",
+            "exploris",
+            "eclipse",
+            "fusion",
+            "lumos",
+            "astral",
+            "timstof",
+            "tims tof",
+            "tof",
+            "mass spectrometer",
+        ],
+        "cleavage_agent_details" => &[
+            "cleavage",
+            "digest",
+            "digestion",
+            "trypsin",
+            "lys-c",
+            "lysc",
+            "chymotrypsin",
+            "glu-c",
+            "asp-n",
+            "arg-c",
+            "pepsin",
+        ],
+        "fraction_identifier" => &["fraction", "fractionation"],
+        "technical_replicate" => &["technical replicate", "replicate"],
+        "carrier_channel" => &["carrier channel", "carrier proteome", "carrier", "tmt"],
+        "reference_channel" => &["reference channel", "reference sample", "reference", "tmt"],
+        _ => &[],
+    };
+    terms.iter().any(|t| hay.contains(t))
+}
+
+fn obviously_invalid_field_value(field: &str, value: &str) -> bool {
+    let v = value.trim().to_ascii_lowercase();
+    if v.is_empty() || proposal_value_is_reserved(field, value) {
+        return false;
+    }
+    if ["pride", "singlecells", "single cells", "pxd", "repository"]
+        .iter()
+        .any(|x| v == *x || v.starts_with("pxd"))
+    {
+        return true;
+    }
+    let analysis_software = [
+        "maxquant",
+        "proteome discoverer",
+        "fragpipe",
+        "spectronaut",
+        "dia-nn",
+        "diann",
+        "skyline",
+        "msfragger",
+    ];
+    if matches!(
+        field,
+        "single_cell_isolation_method" | "instrument" | "proteomics_data_acquisition_method"
+    ) && analysis_software.iter().any(|x| v.contains(x))
+    {
+        return true;
+    }
+    if field == "single_cell_isolation_method" {
+        return ![
+            "facs",
+            "flow cytometry",
+            "cellenone",
+            "cellenone",
+            "microfluid",
+            "laser capture",
+            "lcm",
+            "manual picking",
+            "nanopots",
+            "droplet",
+            "acoustic droplet",
+        ]
+        .iter()
+        .any(|x| v.contains(x));
+    }
+    if matches!(field, "fraction_identifier" | "technical_replicate") {
+        return !v.chars().all(|c| c.is_ascii_digit());
+    }
+    false
+}
+
+fn field_evidence_block(evidence: &DatasetEvidence, field: &str, max_items: usize) -> String {
+    let rows = evidence
+        .evidence
+        .iter()
+        .filter(|e| evidence_relevant_to_field(field, e))
+        .take(max_items)
+        .map(|e| {
+            format!(
+                "[{}] {} / {}: {}",
+                e.id, e.source_kind, e.source_label, e.text
+            )
+        })
+        .collect::<Vec<_>>();
+    if rows.is_empty() {
+        "(no field-specific evidence)".to_string()
+    } else {
+        rows.join("\n")
+    }
+}
+
 fn repair_proposal_provenance(
     proposal: &mut SdrfProposal,
     evidence: &DatasetEvidence,
 ) -> Vec<ValidationIssue> {
-    let valid: BTreeSet<&str> = evidence.evidence.iter().map(|e| e.id.as_str()).collect();
+    let evidence_by_id: BTreeMap<&str, &EvidenceItem> = evidence
+        .evidence
+        .iter()
+        .map(|e| (e.id.as_str(), e))
+        .collect();
+    let targets = proposal_target_fields(evidence);
     let mut issues = Vec::new();
 
     for (field, refs) in &mut proposal.evidence_refs {
         let before = refs.clone();
-        refs.retain(|r| valid.contains(r.as_str()));
-        for removed in before.iter().filter(|r| !refs.iter().any(|x| x == *r)) {
-            issues.push(ValidationIssue {
-                level: "warning".into(),
-                code: "proposal_unknown_evidence_ref_removed".into(),
-                row: 0,
-                column: field.clone(),
-                message: format!("removed unknown model evidence reference {removed}"),
-            });
+        refs.clear();
+        for r in before {
+            let Some(item) = evidence_by_id.get(r.as_str()).copied() else {
+                issues.push(ValidationIssue {
+                    level: "warning".into(),
+                    code: "proposal_unknown_evidence_ref_removed".into(),
+                    row: 0,
+                    column: field.clone(),
+                    message: format!("removed unknown model evidence reference {r}"),
+                });
+                continue;
+            };
+            if !targets.contains(field) {
+                issues.push(ValidationIssue {
+                    level: "warning".into(),
+                    code: "proposal_ref_removed_for_locked_field".into(),
+                    row: 0,
+                    column: field.clone(),
+                    message: format!("removed evidence reference {r} because the field is already structured/locked by the deposited SDRF"),
+                });
+                continue;
+            }
+            if !evidence_relevant_to_field(field, item) {
+                issues.push(ValidationIssue {
+                    level: "warning".into(),
+                    code: "proposal_irrelevant_evidence_ref_removed".into(),
+                    row: 0,
+                    column: field.clone(),
+                    message: format!("removed evidence reference {r} because it is not field-specific support for {field}"),
+                });
+                continue;
+            }
+            refs.push(r);
         }
     }
 
@@ -1160,6 +1572,7 @@ fn repair_proposal_provenance(
         field: &str,
         value: &mut String,
         refs: &BTreeMap<String, Vec<String>>,
+        targets: &BTreeSet<String>,
         issues: &mut Vec<ValidationIssue>,
     ) {
         if field != "relation_mode" {
@@ -1183,6 +1596,38 @@ fn repair_proposal_provenance(
         if proposal_value_is_reserved(field, value) {
             return;
         }
+        if !targets.contains(field) {
+            let original = value.clone();
+            *value = if field == "relation_mode" {
+                "uncertain".into()
+            } else {
+                "not available".into()
+            };
+            issues.push(ValidationIssue {
+                level: "warning".into(),
+                code: "proposal_locked_field_discarded".into(),
+                row: 0,
+                column: field.into(),
+                message: format!("discarded model value '{original}' because {field} is already represented by the deposited SDRF"),
+            });
+            return;
+        }
+        if obviously_invalid_field_value(field, value) {
+            let original = value.clone();
+            *value = if field == "relation_mode" {
+                "uncertain".into()
+            } else {
+                "not available".into()
+            };
+            issues.push(ValidationIssue {
+                level: "warning".into(),
+                code: "proposal_field_downgraded_semantically_invalid".into(),
+                row: 0,
+                column: field.into(),
+                message: format!("model proposed semantically invalid value '{original}' for {field}; downgraded to '{}'", value),
+            });
+            return;
+        }
         if refs.get(field).map_or(true, |r| r.is_empty()) {
             let original = value.clone();
             *value = if field == "relation_mode" {
@@ -1196,7 +1641,7 @@ fn repair_proposal_provenance(
                 row: 0,
                 column: field.into(),
                 message: format!(
-                    "model proposed '{original}' without a valid evidence reference; downgraded to '{}'",
+                    "model proposed '{original}' without a valid field-specific evidence reference; downgraded to '{}'",
                     value
                 ),
             });
@@ -1208,103 +1653,161 @@ fn repair_proposal_provenance(
         "relation_mode",
         &mut proposal.relation_mode,
         refs,
+        &targets,
         &mut issues,
     );
-    repair_field("organism", &mut proposal.organism, refs, &mut issues);
+    repair_field(
+        "organism",
+        &mut proposal.organism,
+        refs,
+        &targets,
+        &mut issues,
+    );
     repair_field(
         "organism_part",
         &mut proposal.organism_part,
         refs,
+        &targets,
         &mut issues,
     );
-    repair_field("disease", &mut proposal.disease, refs, &mut issues);
-    repair_field("cell_type", &mut proposal.cell_type, refs, &mut issues);
-    repair_field("sample_type", &mut proposal.sample_type, refs, &mut issues);
+    repair_field(
+        "disease",
+        &mut proposal.disease,
+        refs,
+        &targets,
+        &mut issues,
+    );
+    repair_field(
+        "cell_type",
+        &mut proposal.cell_type,
+        refs,
+        &targets,
+        &mut issues,
+    );
+    repair_field(
+        "sample_type",
+        &mut proposal.sample_type,
+        refs,
+        &targets,
+        &mut issues,
+    );
     repair_field(
         "single_cell_isolation_method",
         &mut proposal.single_cell_isolation_method,
         refs,
+        &targets,
         &mut issues,
     );
-    repair_field("individual", &mut proposal.individual, refs, &mut issues);
+    repair_field(
+        "individual",
+        &mut proposal.individual,
+        refs,
+        &targets,
+        &mut issues,
+    );
     repair_field(
         "sample_preparation_batch",
         &mut proposal.sample_preparation_batch,
         refs,
+        &targets,
         &mut issues,
     );
     repair_field(
         "cells_per_well",
         &mut proposal.cells_per_well,
         refs,
+        &targets,
         &mut issues,
     );
     repair_field(
         "proteomics_data_acquisition_method",
         &mut proposal.proteomics_data_acquisition_method,
         refs,
+        &targets,
         &mut issues,
     );
-    repair_field("label", &mut proposal.label, refs, &mut issues);
-    repair_field("instrument", &mut proposal.instrument, refs, &mut issues);
+    repair_field("label", &mut proposal.label, refs, &targets, &mut issues);
+    repair_field(
+        "instrument",
+        &mut proposal.instrument,
+        refs,
+        &targets,
+        &mut issues,
+    );
     repair_field(
         "cleavage_agent_details",
         &mut proposal.cleavage_agent_details,
         refs,
+        &targets,
         &mut issues,
     );
     repair_field(
         "fraction_identifier",
         &mut proposal.fraction_identifier,
         refs,
+        &targets,
         &mut issues,
     );
     repair_field(
         "technical_replicate",
         &mut proposal.technical_replicate,
         refs,
+        &targets,
         &mut issues,
     );
     repair_field(
         "carrier_channel",
         &mut proposal.carrier_channel,
         refs,
+        &targets,
         &mut issues,
     );
     repair_field(
         "reference_channel",
         &mut proposal.reference_channel,
         refs,
+        &targets,
         &mut issues,
     );
 
-    for factor in &mut proposal.factors {
-        let before = factor.evidence_refs.clone();
-        factor.evidence_refs.retain(|r| valid.contains(r.as_str()));
-        for removed in before
-            .iter()
-            .filter(|r| !factor.evidence_refs.iter().any(|x| x == *r))
+    if !proposal.factors.is_empty() {
+        issues.push(ValidationIssue {
+            level: "warning".into(),
+            code: "proposal_factors_deferred".into(),
+            row: 0,
+            column: "factors".into(),
+            message: format!(
+                "discarded {} model factor proposal(s); per-row factor reconstruction is deferred",
+                proposal.factors.len()
+            ),
+        });
+        proposal.factors.clear();
+    }
+
+    if !evidence.existing_sdrf_path.is_empty() {
+        if let Ok((headers, rows)) =
+            read_existing_sdrf_table(Path::new(&evidence.existing_sdrf_path))
         {
-            issues.push(ValidationIssue {
-                level: "warning".into(),
-                code: "factor_unknown_evidence_ref_removed".into(),
-                row: 0,
-                column: format!("factor[{}]", factor.name),
-                message: format!("removed unknown model evidence reference {removed}"),
-            });
-        }
-        if let Some(canonical) = canonical_reserved_alias(&factor.value) {
-            factor.value = canonical.to_string();
-        } else if !factor.name.trim().is_empty() && factor.evidence_refs.is_empty() {
-            let original = factor.value.clone();
-            factor.value = "not available".into();
-            issues.push(ValidationIssue {
-                level: "warning".into(),
-                code: "factor_downgraded_missing_provenance".into(),
-                row: 0,
-                column: format!("factor[{}]", factor.name),
-                message: format!("factor value '{original}' lacked a valid evidence reference; downgraded to 'not available'"),
-            });
+            let hint = existing_sdrf_relation_hint(&headers, &rows);
+            if hint != "uncertain" && proposal.relation_mode != hint {
+                let before = proposal.relation_mode.clone();
+                proposal.relation_mode = hint.clone();
+                if let Some(item) = evidence.evidence.iter().find(|e| {
+                    e.source_kind == "existing_sdrf_structured"
+                        && e.source_label.contains("relationship_summary")
+                }) {
+                    proposal
+                        .evidence_refs
+                        .insert("relation_mode".into(), vec![item.id.clone()]);
+                }
+                issues.push(ValidationIssue {
+                    level: "warning".into(),
+                    code: "proposal_relation_overridden_by_existing_sdrf".into(),
+                    row: 0,
+                    column: "relation_mode".into(),
+                    message: format!("replaced model relation '{before}' with deterministic deposited-SDRF relation '{hint}'"),
+                });
+            }
         }
     }
 
@@ -1517,6 +2020,9 @@ fn merge_existing_sdrf(
 ) -> Result<(Vec<String>, Vec<Vec<String>>, String)> {
     let path = Path::new(&evidence.existing_sdrf_path);
     let (mut headers, mut rows) = read_existing_sdrf_table(path)?;
+    if rows.is_empty() {
+        bail!("existing SDRF has no data rows: {}", path.display());
+    }
     let original_header_count = headers.len();
 
     for required in [
@@ -1952,6 +2458,15 @@ fn validate_draft(
     evidence: &DatasetEvidence,
 ) -> Vec<ValidationIssue> {
     let mut issues = Vec::new();
+    if rows.is_empty() {
+        issues.push(ValidationIssue {
+            level: "error".into(),
+            code: "no_data_rows".into(),
+            row: 0,
+            column: String::new(),
+            message: "SDRF contains a header but no sample/data rows".into(),
+        });
+    }
     let required = [
         "source name",
         "characteristics[organism]",
@@ -2659,6 +3174,87 @@ mod tests {
         assert!(!relevant_sdrf_metadata_path("fileCategory.value"));
         assert!(relevant_sdrf_metadata_path("organisms[0].name"));
         assert!(relevant_sdrf_metadata_path("instruments[0].name"));
+    }
+
+    #[test]
+    fn existing_sdrf_targets_only_missing_fields() {
+        let root = tmp();
+        fs::create_dir_all(&root).unwrap();
+        let existing = root.join("existing.sdrf.tsv");
+        fs::write(&existing,
+            "source name\tcharacteristics[organism]\tassay name\ttechnology type\tcomment[proteomics data acquisition method]\tcomment[label]\tcomment[instrument]\tcomment[cleavage agent details]\tcomment[fraction identifier]\tcomment[technical replicate]\tcomment[data file]\ncell_A\thomo sapiens\tassay_A\tproteomic profiling by mass spectrometry\tData-dependent acquisition\tlabel free sample\tOrbitrap\tNT=Trypsin;AC=MS:1001251\t1\t1\tcell_A.raw\n"
+        ).unwrap();
+        let evidence = DatasetEvidence {
+            accession: "PXD999999".into(),
+            project_json_path: String::new(),
+            files_json_path: String::new(),
+            existing_sdrf_path: existing.display().to_string(),
+            raw_files: vec![],
+            evidence: vec![],
+            manuscript_sources: vec![],
+            annotation_sources: vec![],
+        };
+        let targets = proposal_target_fields(&evidence);
+        assert!(!targets.contains("organism"));
+        assert!(!targets.contains("instrument"));
+        assert!(targets.contains("single_cell_isolation_method"));
+        assert!(targets.contains("cell_type"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn analysis_software_is_not_accepted_as_isolation_or_instrument() {
+        assert!(obviously_invalid_field_value(
+            "single_cell_isolation_method",
+            "MaxQuant"
+        ));
+        assert!(obviously_invalid_field_value("instrument", "MaxQuant"));
+        assert!(obviously_invalid_field_value(
+            "proteomics_data_acquisition_method",
+            "Proteome Discoverer"
+        ));
+        assert!(!obviously_invalid_field_value(
+            "single_cell_isolation_method",
+            "cellenONE"
+        ));
+        assert!(!obviously_invalid_field_value(
+            "instrument",
+            "Orbitrap Eclipse"
+        ));
+    }
+
+    #[test]
+    fn field_specific_evidence_filter_rejects_unrelated_software_text() {
+        let item = EvidenceItem {
+            id: "E0001".into(),
+            source_kind: "manuscript_text".into(),
+            source_label: "manuscript:paper.txt:window=1".into(),
+            text: "Peptide identifications were processed using MaxQuant version 2.0.".into(),
+        };
+        assert!(!evidence_relevant_to_field(
+            "single_cell_isolation_method",
+            &item
+        ));
+        assert!(!evidence_relevant_to_field("instrument", &item));
+    }
+
+    #[test]
+    fn header_only_sdrf_is_not_locally_valid() {
+        let evidence = DatasetEvidence {
+            accession: "PXD999999".into(),
+            project_json_path: String::new(),
+            files_json_path: String::new(),
+            existing_sdrf_path: String::new(),
+            raw_files: vec![],
+            evidence: vec![],
+            manuscript_sources: vec![],
+            annotation_sources: vec![],
+        };
+        let headers = vec!["source name".into()];
+        let issues = validate_draft(&headers, &[], &evidence);
+        assert!(issues
+            .iter()
+            .any(|x| x.code == "no_data_rows" && x.level == "error"));
     }
 
     #[test]
