@@ -514,3 +514,53 @@ The wrapper also materializes `resolved_accessions.txt` and
 `unresolved_accessions.txt` directly from `sdrf_source_resolution.tsv`. The latter
 is the only cohort eligible for de-novo manuscript-assisted reconstruction unless
 an audited resolved SDRF is explicitly selected for gap filling.
+
+## v0.2.6 resolved-SDRF audit semantics: separate SDRF validity from repository linkage
+
+The first deterministic audit of the 67 resolved SDRFs reported 49 locally valid and
+18 locally invalid. Inspection of the invalid pattern showed that many failures were
+one error per SDRF row while the local PRIDE RAW inventory contained far fewer top-level
+files. This is characteristic of repository packaging/linkage differences (for example
+logical Bruker `.d` acquisitions versus archives/containers), not necessarily malformed
+SDRF metadata.
+
+The auditor therefore no longer treats a resolved external SDRF as schema-invalid merely
+because `comment[data file]` is not represented one-to-one in the local PRIDE RAW snapshot.
+For resolved-SDRF audits:
+
+- core/template validation errors remain errors;
+- PRIDE snapshot file-linkage mismatches are warnings;
+- linkage is reported independently as `complete`, `partial`, `none`, or `unavailable`;
+- common archive wrappers (`.tar.gz`, `.tgz`, `.zip`, `.tar`) are normalized when comparing
+  logical vendor entities to repository files;
+- the original generated-SDRF path remains strict: a newly generated SDRF must map its data
+  files back to the PRIDE inventory.
+
+The relationship classifier is also role-aware. If `characteristics[sample type]` exists,
+`one_cell_per_data_file` versus `multiplexed_cells_per_data_file` is inferred from the
+`single cell` rows first. Pooled controls, carrier/reference material, secretome controls,
+and other non-single-cell rows do not make the single-cell branch look multiplexed merely
+because they share a RAW file or use multiple labels.
+
+Single-cell-specific validation is role-aware as well. Explicit carrier/reference/control/
+pooled rows may use unresolved/not-applicable cell-specific values without being treated as
+single-cell study-row errors; study/single-cell rows remain strict.
+
+The v0.2.6 auditor also separates metadata gaps into bounded enrichment priorities:
+
+```text
+P0_structural_review  local core/template error remains
+P1_blocking_gap       relationship/core annotation gap that should be resolved first
+P2_recommended_gap    recommended SCP metadata can be enriched
+P3_optional_gap       optional metadata only (for example individual)
+P4_preserve           no current target-field gap
+```
+
+Carrier/reference channel gaps are context-sensitive and are not reported for label-free or
+non-isobaric experiments. `individual` is tracked as optional rather than making every SDRF
+require review.
+
+The audit output now includes separate repository linkage metrics and priority counts. Local
+`locally_valid` means the Rust structural/template checks passed **excluding repository-file
+linkage**. It is still not a substitute for final `sdrf-pipelines`/PRIDE SDRF Validator
+validation before submission.

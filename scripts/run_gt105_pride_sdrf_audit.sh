@@ -2,13 +2,14 @@
 set -euo pipefail
 
 # Deterministically audit the usable SDRFs resolved for the source-resolved
-# primary-PRIDE subset. This stage never invokes Ollama.
+# primary-PRIDE subset. This stage never invokes Ollama. v0.2.6 separates
+# SDRF/template validity from local PRIDE repository-file linkage.
 
 ROOT="${ROOT:-$(pwd)}"
 SNAPSHOT="${SNAPSHOT:-$ROOT/data/snapshot}"
 BINARY="${BINARY:-$ROOT/target/release/pride-scp}"
 SOURCE_ROOT="${SOURCE_ROOT:-$ROOT/data/sdrf_source_resolution_gt105_pride_v024}"
-OUT="${OUT:-$ROOT/data/sdrf_audit_gt105_pride_v025}"
+OUT="${OUT:-$ROOT/data/sdrf_audit_gt105_pride_v026}"
 
 [[ -x "$BINARY" ]] || { echo "missing executable: $BINARY" >&2; exit 2; }
 [[ -d "$SNAPSHOT" ]] || { echo "missing snapshot: $SNAPSHOT" >&2; exit 2; }

@@ -22,7 +22,7 @@ pub const SINGLE_CELL_TEMPLATE_URL: &str =
 pub const SDRF_SPEC_URL: &str = "https://sdrf.quantms.org/specification.html";
 pub const GENERATOR_VERSION: &str = "pride-scp-sdrf-v0.2.4";
 pub const SDRF_SOURCE_RESOLVER_VERSION: &str = "pride-scp-sdrf-source-resolver-v0.1";
-pub const SDRF_AUDITOR_VERSION: &str = "pride-scp-sdrf-auditor-v0.1";
+pub const SDRF_AUDITOR_VERSION: &str = "pride-scp-sdrf-auditor-v0.2";
 pub const DEFAULT_OLLAMA_URL: &str = "http://localhost:11434/api/generate";
 
 // The linked single-cell template is work-in-progress. Generated drafts pin the
@@ -104,8 +104,25 @@ pub struct SdrfAuditSummary {
     pub accessions_requested: usize,
     pub audited: usize,
     pub errors: usize,
+    /// Local SDRF/template checks excluding repository-inventory linkage.
     pub locally_valid: usize,
+    /// Accessions with complete exact/archive-normalized linkage to the local PRIDE RAW inventory.
+    pub repository_linkage_complete: usize,
+    /// Accessions with some but not all SDRF data files represented by the local PRIDE RAW inventory.
+    pub repository_linkage_partial: usize,
+    /// Accessions with no direct logical filename matches in the local PRIDE RAW inventory.
+    pub repository_linkage_none: usize,
+    /// Accessions for which the local PRIDE RAW inventory is empty/unavailable.
+    pub repository_linkage_unavailable: usize,
+    /// Structural/template review or an unresolved sample-to-file relationship is still needed.
     pub requires_review: usize,
+    /// Any bounded metadata gap remains, including recommended/optional enrichment fields.
+    pub metadata_enrichment_candidates: usize,
+    pub priority_p0_structural_review: usize,
+    pub priority_p1_blocking_gap: usize,
+    pub priority_p2_recommended_gap: usize,
+    pub priority_p3_optional_gap: usize,
+    pub priority_p4_preserve: usize,
     pub curated_bigbio: usize,
     pub repository_submitted: usize,
     pub other_source: usize,
@@ -125,7 +142,12 @@ struct SdrfResolvedAudit {
     locally_valid: bool,
     validation_error_count: usize,
     validation_warning_count: usize,
+    data_file_linkage: DataFileLinkageStats,
     missing_target_fields: Vec<String>,
+    blocking_gap_fields: Vec<String>,
+    recommended_gap_fields: Vec<String>,
+    optional_gap_fields: Vec<String>,
+    enrichment_priority: String,
     validation_issues: Vec<ValidationIssue>,
 }
 
@@ -140,8 +162,20 @@ struct SdrfAuditResultRow {
     locally_valid: bool,
     validation_errors: usize,
     validation_warnings: usize,
+    repository_linkage_status: String,
+    sdrf_unique_data_files: usize,
+    matched_unique_data_files: usize,
+    unmatched_unique_data_files: usize,
+    unmatched_data_file_rows: usize,
     missing_target_fields: usize,
     missing_target_field_names: String,
+    blocking_gap_fields: usize,
+    blocking_gap_field_names: String,
+    recommended_gap_fields: usize,
+    recommended_gap_field_names: String,
+    optional_gap_fields: usize,
+    optional_gap_field_names: String,
+    enrichment_priority: String,
     sdrf_path: String,
     review_path: String,
     error: String,
@@ -264,6 +298,29 @@ struct ValidationIssue {
     row: usize,
     column: String,
     message: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DataFileValidationPolicy {
+    /// Generated SDRFs are owned by this tool, so every data-file value must map
+    /// back to the PRIDE snapshot inventory.
+    EnforceSnapshotInventory,
+    /// Resolved external SDRFs may legitimately describe logical vendor entities
+    /// (for example Bruker .d folders) that a repository exposes as archives or
+    /// otherwise does not enumerate one-to-one. Keep linkage mismatches visible
+    /// but do not conflate them with SDRF/template validity.
+    AuditSnapshotInventory,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct DataFileLinkageStats {
+    sdrf_unique_data_files: usize,
+    snapshot_raw_files: usize,
+    matched_unique_data_files: usize,
+    unmatched_unique_data_files: usize,
+    matched_rows: usize,
+    unmatched_rows: usize,
+    status: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1111,10 +1168,29 @@ fn existing_sdrf_relation_hint(headers: &[String], rows: &[Vec<String>]) -> Stri
     let cell_idx = header_first_index(headers, SC_CELL_IDENTIFIER);
     let sample_type_idx = header_first_index(headers, SC_SAMPLE_TYPE);
     let label_idx = header_first_index(headers, "comment[label]");
+
+    // When the SDRF declares sample roles, infer the relationship from the
+    // single-cell study rows only. Pooled controls, carrier/reference material,
+    // secretome controls, etc. may legitimately share one raw file or use
+    // multiple labels and must not make a label-free single-cell study look
+    // multiplexed.
+    let single_cell_rows: Vec<&Vec<String>> = sample_type_idx
+        .map(|j| {
+            rows.iter()
+                .filter(|r| j < r.len() && r[j].trim().eq_ignore_ascii_case("single cell"))
+                .collect()
+        })
+        .unwrap_or_default();
+    let scoped_rows: Vec<&Vec<String>> = if single_cell_rows.is_empty() {
+        rows.iter().collect()
+    } else {
+        single_cell_rows
+    };
+
     let mut per_file_rows: BTreeMap<String, usize> = BTreeMap::new();
     let mut per_file_cells: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
     let mut per_file_labels: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
-    for row in rows {
+    for row in scoped_rows {
         if data_idx >= row.len() {
             continue;
         }
@@ -1156,23 +1232,38 @@ fn existing_sdrf_relation_hint(headers: &[String], rows: &[Vec<String>]) -> Stri
             }
         }
     }
-    let has_multi_cells = per_file_cells.values().any(|x| x.len() > 1);
-    let has_multi_labels = per_file_labels.values().any(|x| x.len() > 1);
-    let has_multi_rows = per_file_rows.values().any(|&n| n > 1);
-    if has_multi_cells || (has_multi_rows && has_multi_labels) {
+    if per_file_rows.is_empty() {
+        return "uncertain".into();
+    }
+    let mut multiplexed = BTreeSet::new();
+    for (file, cells) in &per_file_cells {
+        if cells.len() > 1 {
+            multiplexed.insert(file.clone());
+        }
+    }
+    for (file, n) in &per_file_rows {
+        if *n > 1
+            && per_file_labels
+                .get(file)
+                .map(|x| x.len() > 1)
+                .unwrap_or(false)
+        {
+            multiplexed.insert(file.clone());
+        }
+    }
+    let multiplexed_files = multiplexed.len();
+    let single_files = per_file_rows.len().saturating_sub(multiplexed_files);
+    if multiplexed_files > 0 && single_files > 0 {
+        return "mixed".into();
+    }
+    if multiplexed_files > 0 {
         return "multiplexed_cells_per_data_file".into();
+    }
+    if per_file_rows.values().all(|&n| n == 1) {
+        return "one_cell_per_data_file".into();
     }
     if !per_file_cells.is_empty() && per_file_cells.values().all(|x| x.len() == 1) {
         return "one_cell_per_data_file".into();
-    }
-    if let Some(j) = sample_type_idx {
-        let target_rows = rows
-            .iter()
-            .filter(|r| j < r.len() && r[j].trim().eq_ignore_ascii_case("single cell"))
-            .count();
-        if target_rows > 0 && !has_multi_rows {
-            return "one_cell_per_data_file".into();
-        }
     }
     "uncertain".into()
 }
@@ -3081,10 +3172,129 @@ fn draft_rows(
     Ok((headers, rows, mode.to_string()))
 }
 
-fn validate_draft(
+fn normalized_data_file_aliases(value: &str) -> BTreeSet<String> {
+    let mut aliases = BTreeSet::new();
+    let base = data_file_basename(value)
+        .replace("%20", " ")
+        .trim()
+        .to_ascii_lowercase();
+    if base.is_empty() {
+        return aliases;
+    }
+    aliases.insert(base.clone());
+    // Repositories often expose a logical vendor entity (especially Bruker .d)
+    // as an archive. Treat the archive wrapper as a linkage alias, but retain the
+    // exact name in audit output.
+    for suffix in [".tar.gz", ".tgz", ".zip", ".tar"] {
+        if let Some(stripped) = base.strip_suffix(suffix) {
+            if !stripped.is_empty() {
+                aliases.insert(stripped.to_string());
+            }
+        }
+    }
+    aliases
+}
+
+fn raw_inventory_aliases(raw_files: &[RawFile]) -> BTreeSet<String> {
+    raw_files
+        .iter()
+        .flat_map(|f| normalized_data_file_aliases(&f.file_name))
+        .collect()
+}
+
+fn data_file_linkage_stats(
+    headers: &[String],
+    rows: &[Vec<String>],
+    raw_files: &[RawFile],
+) -> DataFileLinkageStats {
+    let mut stats = DataFileLinkageStats {
+        snapshot_raw_files: raw_files.len(),
+        ..Default::default()
+    };
+    let Some(data_idx) = header_first_index(headers, "comment[data file]") else {
+        stats.status = "missing_data_file_column".into();
+        return stats;
+    };
+    let inventory = raw_inventory_aliases(raw_files);
+    let mut unique = BTreeSet::new();
+    let mut matched = BTreeSet::new();
+    let mut unmatched = BTreeSet::new();
+    for row in rows {
+        let Some(value) = row.get(data_idx) else {
+            continue;
+        };
+        let value = value.trim();
+        if value.is_empty() || value.eq_ignore_ascii_case("not available") {
+            continue;
+        }
+        let base = data_file_basename(value).to_ascii_lowercase();
+        unique.insert(base.clone());
+        let aliases = normalized_data_file_aliases(value);
+        let is_match = aliases.iter().any(|x| inventory.contains(x));
+        if is_match {
+            matched.insert(base);
+            stats.matched_rows += 1;
+        } else {
+            unmatched.insert(base);
+            stats.unmatched_rows += 1;
+        }
+    }
+    stats.sdrf_unique_data_files = unique.len();
+    stats.matched_unique_data_files = matched.len();
+    stats.unmatched_unique_data_files = unmatched.len();
+    stats.status = if raw_files.is_empty() {
+        "unavailable".into()
+    } else if stats.sdrf_unique_data_files == 0 {
+        "no_sdrf_data_files".into()
+    } else if stats.unmatched_unique_data_files == 0 {
+        "complete".into()
+    } else if stats.matched_unique_data_files == 0 {
+        "none".into()
+    } else {
+        "partial".into()
+    };
+    stats
+}
+
+fn row_explicit_non_single_cell_role(index: &HashMap<&str, usize>, row: &[String]) -> bool {
+    let sample_type = index
+        .get(SC_SAMPLE_TYPE)
+        .and_then(|&j| row.get(j))
+        .map(|v| v.trim().to_ascii_lowercase())
+        .unwrap_or_default();
+    if [
+        "reference",
+        "bridge",
+        "carrier",
+        "negative control",
+        "positive control",
+        "calibrator",
+        "plate control",
+        "quality control sample",
+        "empty",
+        "bulk control",
+        "pooled",
+        "not applicable",
+    ]
+    .contains(&sample_type.as_str())
+    {
+        return true;
+    }
+    index
+        .get("characteristics[pooled sample]")
+        .and_then(|&j| row.get(j))
+        .map(|v| {
+            let low = v.trim().to_ascii_lowercase();
+            low == "pooled" || low.starts_with("sn=")
+        })
+        .unwrap_or(false)
+}
+
+fn validate_draft_with_policy(
     headers: &[String],
     rows: &[Vec<String>],
     evidence: &DatasetEvidence,
+    data_file_policy: DataFileValidationPolicy,
 ) -> Vec<ValidationIssue> {
     let mut issues = Vec::new();
     if rows.is_empty() {
@@ -3138,11 +3348,7 @@ fn validate_draft(
             });
         }
     }
-    let valid_files: BTreeSet<String> = evidence
-        .raw_files
-        .iter()
-        .map(|f| data_file_basename(&f.file_name))
-        .collect();
+    let valid_files = raw_inventory_aliases(&evidence.raw_files);
     let cell_id =
         Regex::new(r"^[A-Za-z0-9_.-]+$|^(?:carrier|reference|empty|not applicable)$").unwrap();
     let sample_types = [
@@ -3172,6 +3378,7 @@ fn validate_draft(
             });
             continue;
         }
+        let non_single_role = row_explicit_non_single_cell_role(&index, row);
         for h in &required {
             let Some(&j) = index.get(h) else { continue };
             let v = row[j].trim();
@@ -3186,19 +3393,29 @@ fn validate_draft(
             }
         }
         if let Some(&j) = index.get(SC_ISOLATION_METHOD) {
-            if row[j].trim().eq_ignore_ascii_case("not available") {
-                issues.push(ValidationIssue { level: "error".into(), code: "single_cell_isolation_unresolved".into(), row: ri + 1, column: SC_ISOLATION_METHOD.into(), message: "single-cell 1.0.0 template does not allow 'not available' for isolation method".into() });
+            let v = row[j].trim();
+            if v.eq_ignore_ascii_case("not available") {
+                let level = if non_single_role { "warning" } else { "error" };
+                issues.push(ValidationIssue { level: level.into(), code: "single_cell_isolation_unresolved".into(), row: ri + 1, column: SC_ISOLATION_METHOD.into(), message: if non_single_role { "non-single-cell/reference/control row has no applicable isolation method; preserve for external validator review".into() } else { "single-cell 1.0.0 template does not allow 'not available' for isolation method on a study/single-cell row".into() } });
             }
         }
         if let Some(&j) = index.get(SC_CELL_IDENTIFIER) {
             let v = row[j].trim();
             if !cell_id.is_match(v) {
+                let missing_reserved = v.eq_ignore_ascii_case("not available");
+                let level = if non_single_role && missing_reserved {
+                    "warning"
+                } else {
+                    "error"
+                };
                 issues.push(ValidationIssue {
-                    level: "error".into(),
+                    level: level.into(),
                     code: "cell_identifier_invalid_or_unresolved".into(),
                     row: ri + 1,
                     column: SC_CELL_IDENTIFIER.into(),
-                    message: format!("cell identifier is not template-valid: {v}"),
+                    message: format!(
+                        "cell identifier is not template-valid for this row role: {v}"
+                    ),
                 });
             }
         }
@@ -3210,14 +3427,27 @@ fn validate_draft(
         }
         if let Some(&j) = index.get("comment[data file]") {
             let v = row[j].trim();
-            let base = data_file_basename(v);
-            if !valid_files.contains(&base) {
+            let aliases = normalized_data_file_aliases(v);
+            let linked = aliases.iter().any(|x| valid_files.contains(x));
+            if !linked {
+                let (level, code, message) = match data_file_policy {
+                    DataFileValidationPolicy::EnforceSnapshotInventory => (
+                        "error",
+                        "data_file_not_in_pride_raw_inventory",
+                        format!("SDRF data file is not in PRIDE RAW inventory: {v}"),
+                    ),
+                    DataFileValidationPolicy::AuditSnapshotInventory => (
+                        "warning",
+                        "data_file_not_in_pride_snapshot_inventory",
+                        format!("resolved SDRF data file is not directly represented in the local PRIDE RAW inventory; this is a repository-linkage audit warning, not an SDRF schema error: {v}"),
+                    ),
+                };
                 issues.push(ValidationIssue {
-                    level: "error".into(),
-                    code: "data_file_not_in_pride_raw_inventory".into(),
+                    level: level.into(),
+                    code: code.into(),
                     row: ri + 1,
                     column: "comment[data file]".into(),
-                    message: format!("SDRF data file is not in PRIDE RAW inventory: {v}"),
+                    message,
                 });
             }
         }
@@ -3240,6 +3470,19 @@ fn validate_draft(
         }
     }
     issues
+}
+
+fn validate_draft(
+    headers: &[String],
+    rows: &[Vec<String>],
+    evidence: &DatasetEvidence,
+) -> Vec<ValidationIssue> {
+    validate_draft_with_policy(
+        headers,
+        rows,
+        evidence,
+        DataFileValidationPolicy::EnforceSnapshotInventory,
+    )
 }
 
 fn write_sdrf(path: &Path, headers: &[String], rows: &[Vec<String>]) -> Result<()> {
@@ -3450,6 +3693,134 @@ fn audit_raw_files(snapshot_dir: &Path, accession: &str) -> Result<Vec<RawFile>>
     Ok(extract_raw_files(&value))
 }
 
+fn sdrf_uses_isobaric_labels(headers: &[String], rows: &[Vec<String>]) -> bool {
+    let Some(j) = header_first_index(headers, "comment[label]") else {
+        return false;
+    };
+    rows.iter().filter_map(|r| r.get(j)).any(|v| {
+        let low = v.to_ascii_lowercase();
+        low.contains("tmt") || low.contains("itraq") || low.contains("isobaric")
+    })
+}
+
+fn field_needs_audit_enrichment(
+    field: &str,
+    headers: &[String],
+    rows: &[Vec<String>],
+    relation_mode: &str,
+) -> bool {
+    if field == "relation_mode" {
+        return relation_mode == "uncertain";
+    }
+    let Some(header) = field_existing_header(field) else {
+        return false;
+    };
+    let Some(j) = header_first_index(headers, header) else {
+        // Carrier/reference are context-dependent and should not become generic
+        // gaps in label-free or non-isobaric experiments.
+        if matches!(field, "carrier_channel" | "reference_channel") {
+            return relation_mode == "multiplexed_cells_per_data_file"
+                && sdrf_uses_isobaric_labels(headers, rows);
+        }
+        return true;
+    };
+
+    let index: HashMap<&str, usize> = headers
+        .iter()
+        .enumerate()
+        .map(|(i, x)| (x.as_str(), i))
+        .collect();
+    rows.iter().any(|row| {
+        let relevant = match field {
+            "single_cell_isolation_method" | "cells_per_well" => {
+                !row_explicit_non_single_cell_role(&index, row)
+            }
+            "carrier_channel" | "reference_channel" => {
+                relation_mode == "multiplexed_cells_per_data_file"
+                    && sdrf_uses_isobaric_labels(headers, rows)
+            }
+            _ => true,
+        };
+        relevant && row.get(j).map_or(true, |v| !concrete_table_value(v))
+    })
+}
+
+fn audit_gap_fields(
+    headers: &[String],
+    rows: &[Vec<String>],
+    relation_mode: &str,
+) -> (Vec<String>, Vec<String>, Vec<String>, Vec<String>) {
+    let fields = [
+        "relation_mode",
+        "organism",
+        "organism_part",
+        "disease",
+        "cell_type",
+        "sample_type",
+        "single_cell_isolation_method",
+        "individual",
+        "sample_preparation_batch",
+        "cells_per_well",
+        "proteomics_data_acquisition_method",
+        "label",
+        "instrument",
+        "cleavage_agent_details",
+        "fraction_identifier",
+        "technical_replicate",
+        "carrier_channel",
+        "reference_channel",
+    ];
+    let missing = fields
+        .iter()
+        .copied()
+        .filter(|f| field_needs_audit_enrichment(f, headers, rows, relation_mode))
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+
+    // Blocking means the gap affects core SDRF completeness or prevents this tool
+    // from interpreting the sample-to-file relationship. These are enrichment
+    // priorities, not claims that the external SDRF is invalid under sdrf-pipelines.
+    let blocking_names = BTreeSet::from([
+        "relation_mode",
+        "organism",
+        "organism_part",
+        "single_cell_isolation_method",
+        "proteomics_data_acquisition_method",
+        "label",
+        "instrument",
+        "cleavage_agent_details",
+        "fraction_identifier",
+        "technical_replicate",
+    ]);
+    let recommended_names = BTreeSet::from([
+        "disease",
+        "cell_type",
+        "sample_type",
+        "sample_preparation_batch",
+        "cells_per_well",
+        "carrier_channel",
+        "reference_channel",
+    ]);
+    let optional_names = BTreeSet::from(["individual"]);
+
+    let blocking = missing
+        .iter()
+        .filter(|f| blocking_names.contains(f.as_str()))
+        .cloned()
+        .collect();
+    let recommended = missing
+        .iter()
+        .filter(|f| recommended_names.contains(f.as_str()))
+        .cloned()
+        .collect();
+    let optional = missing
+        .iter()
+        .filter(|f| optional_names.contains(f.as_str()))
+        .cloned()
+        .collect();
+    (missing, blocking, recommended, optional)
+}
+
 fn write_validation_review(path: &Path, issues: &[ValidationIssue]) -> Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
@@ -3485,13 +3856,30 @@ fn audit_resolved_one(opts: &SdrfAuditOptions, accession: &str) -> Result<SdrfAu
         annotation_sources: Vec::new(),
     };
     let relation_mode = existing_sdrf_relation_hint(&headers, &rows);
-    let issues = validate_draft(&headers, &rows, &evidence);
+    let issues = validate_draft_with_policy(
+        &headers,
+        &rows,
+        &evidence,
+        DataFileValidationPolicy::AuditSnapshotInventory,
+    );
     let errors = issues.iter().filter(|x| x.level == "error").count();
     let warnings = issues.iter().filter(|x| x.level == "warning").count();
-    let missing = proposal_target_fields(&evidence)
-        .into_iter()
-        .collect::<Vec<_>>();
+    let linkage = data_file_linkage_stats(&headers, &rows, &evidence.raw_files);
+    let (missing, blocking, recommended, optional) =
+        audit_gap_fields(&headers, &rows, &relation_mode);
     let locally_valid = errors == 0;
+    let enrichment_priority = if !locally_valid {
+        "P0_structural_review"
+    } else if !blocking.is_empty() {
+        "P1_blocking_gap"
+    } else if !recommended.is_empty() {
+        "P2_recommended_gap"
+    } else if !optional.is_empty() {
+        "P3_optional_gap"
+    } else {
+        "P4_preserve"
+    }
+    .to_string();
     let review_path = opts
         .output_dir
         .join("review")
@@ -3508,7 +3896,12 @@ fn audit_resolved_one(opts: &SdrfAuditOptions, accession: &str) -> Result<SdrfAu
         locally_valid,
         validation_error_count: errors,
         validation_warning_count: warnings,
+        data_file_linkage: linkage.clone(),
         missing_target_fields: missing.clone(),
+        blocking_gap_fields: blocking.clone(),
+        recommended_gap_fields: recommended.clone(),
+        optional_gap_fields: optional.clone(),
+        enrichment_priority: enrichment_priority.clone(),
         validation_issues: issues,
     };
     let audit_path = opts
@@ -3529,8 +3922,20 @@ fn audit_resolved_one(opts: &SdrfAuditOptions, accession: &str) -> Result<SdrfAu
         locally_valid,
         validation_errors: errors,
         validation_warnings: warnings,
+        repository_linkage_status: linkage.status.clone(),
+        sdrf_unique_data_files: linkage.sdrf_unique_data_files,
+        matched_unique_data_files: linkage.matched_unique_data_files,
+        unmatched_unique_data_files: linkage.unmatched_unique_data_files,
+        unmatched_data_file_rows: linkage.unmatched_rows,
         missing_target_fields: missing.len(),
         missing_target_field_names: missing.join(";"),
+        blocking_gap_fields: blocking.len(),
+        blocking_gap_field_names: blocking.join(";"),
+        recommended_gap_fields: recommended.len(),
+        recommended_gap_field_names: recommended.join(";"),
+        optional_gap_fields: optional.len(),
+        optional_gap_field_names: optional.join(";"),
+        enrichment_priority,
         sdrf_path: sdrf_path.display().to_string(),
         review_path: review_path.display().to_string(),
         error: String::new(),
@@ -3549,14 +3954,7 @@ pub fn audit_sdrf_sources(opts: SdrfAuditOptions) -> Result<SdrfAuditSummary> {
         match audit_resolved_one(&opts, accession) {
             Ok(row) => {
                 if opts.progress {
-                    eprintln!(
-                        "  -> {} rows={} valid={} errors={} missing_fields={}",
-                        row.source_kind,
-                        row.rows,
-                        row.locally_valid,
-                        row.validation_errors,
-                        row.missing_target_fields
-                    );
+                    eprintln!("  -> {} rows={} valid={} errors={} linkage={} priority={} missing_fields={}", row.source_kind, row.rows, row.locally_valid, row.validation_errors, row.repository_linkage_status, row.enrichment_priority, row.missing_target_fields);
                 }
                 rows.push(row);
             }
@@ -3575,8 +3973,20 @@ pub fn audit_sdrf_sources(opts: SdrfAuditOptions) -> Result<SdrfAuditSummary> {
                     locally_valid: false,
                     validation_errors: 0,
                     validation_warnings: 0,
+                    repository_linkage_status: String::new(),
+                    sdrf_unique_data_files: 0,
+                    matched_unique_data_files: 0,
+                    unmatched_unique_data_files: 0,
+                    unmatched_data_file_rows: 0,
                     missing_target_fields: 0,
                     missing_target_field_names: String::new(),
+                    blocking_gap_fields: 0,
+                    blocking_gap_field_names: String::new(),
+                    recommended_gap_fields: 0,
+                    recommended_gap_field_names: String::new(),
+                    optional_gap_fields: 0,
+                    optional_gap_field_names: String::new(),
+                    enrichment_priority: "error".into(),
                     sdrf_path: String::new(),
                     review_path: String::new(),
                     error: format!("{err:#}"),
@@ -3610,9 +4020,49 @@ pub fn audit_sdrf_sources(opts: SdrfAuditOptions) -> Result<SdrfAuditSummary> {
             .iter()
             .filter(|r| r.status == "audited" && r.locally_valid)
             .count(),
+        repository_linkage_complete: rows
+            .iter()
+            .filter(|r| r.status == "audited" && r.repository_linkage_status == "complete")
+            .count(),
+        repository_linkage_partial: rows
+            .iter()
+            .filter(|r| r.status == "audited" && r.repository_linkage_status == "partial")
+            .count(),
+        repository_linkage_none: rows
+            .iter()
+            .filter(|r| r.status == "audited" && r.repository_linkage_status == "none")
+            .count(),
+        repository_linkage_unavailable: rows
+            .iter()
+            .filter(|r| r.status == "audited" && r.repository_linkage_status == "unavailable")
+            .count(),
         requires_review: rows
             .iter()
-            .filter(|r| r.status == "audited" && (!r.locally_valid || r.missing_target_fields > 0))
+            .filter(|r| r.status == "audited" && (!r.locally_valid || r.blocking_gap_fields > 0))
+            .count(),
+        metadata_enrichment_candidates: rows
+            .iter()
+            .filter(|r| r.status == "audited" && r.missing_target_fields > 0)
+            .count(),
+        priority_p0_structural_review: rows
+            .iter()
+            .filter(|r| r.enrichment_priority == "P0_structural_review")
+            .count(),
+        priority_p1_blocking_gap: rows
+            .iter()
+            .filter(|r| r.enrichment_priority == "P1_blocking_gap")
+            .count(),
+        priority_p2_recommended_gap: rows
+            .iter()
+            .filter(|r| r.enrichment_priority == "P2_recommended_gap")
+            .count(),
+        priority_p3_optional_gap: rows
+            .iter()
+            .filter(|r| r.enrichment_priority == "P3_optional_gap")
+            .count(),
+        priority_p4_preserve: rows
+            .iter()
+            .filter(|r| r.enrichment_priority == "P4_preserve")
             .count(),
         curated_bigbio: rows
             .iter()
@@ -3999,6 +4449,51 @@ mod tests {
     }
 
     #[test]
+    fn pooled_control_labels_do_not_make_single_cell_branch_multiplexed() {
+        let headers = vec![
+            "source name".into(),
+            "comment[data file]".into(),
+            SC_SAMPLE_TYPE.into(),
+            SC_CELL_IDENTIFIER.into(),
+            "comment[label]".into(),
+        ];
+        let rows = vec![
+            vec![
+                "cell1".into(),
+                "cell1.raw".into(),
+                "single cell".into(),
+                "cell1".into(),
+                "label free sample".into(),
+            ],
+            vec![
+                "cell2".into(),
+                "cell2.raw".into(),
+                "single cell".into(),
+                "cell2".into(),
+                "label free sample".into(),
+            ],
+            vec![
+                "poolA".into(),
+                "pool.raw".into(),
+                "pooled".into(),
+                "not applicable".into(),
+                "DIMETHYL0".into(),
+            ],
+            vec![
+                "poolB".into(),
+                "pool.raw".into(),
+                "pooled".into(),
+                "not applicable".into(),
+                "DIMETHYL8".into(),
+            ],
+        ];
+        assert_eq!(
+            existing_sdrf_relation_hint(&headers, &rows),
+            "one_cell_per_data_file"
+        );
+    }
+
+    #[test]
     fn existing_sdrf_merge_preserves_core_values_and_adds_single_cell_columns() {
         let root = tmp();
         fs::create_dir_all(&root).unwrap();
@@ -4307,5 +4802,239 @@ mod tests {
         };
         assert!(proposal_target_fields(&evidence).is_empty());
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn resolved_audit_repository_filename_mismatch_is_warning_not_schema_error() {
+        let headers = vec![
+            "source name".into(),
+            "characteristics[organism]".into(),
+            "assay name".into(),
+            "technology type".into(),
+            "comment[proteomics data acquisition method]".into(),
+            "comment[label]".into(),
+            "comment[instrument]".into(),
+            "comment[cleavage agent details]".into(),
+            "comment[fraction identifier]".into(),
+            "comment[technical replicate]".into(),
+            "comment[data file]".into(),
+            SC_SAMPLE_TYPE.into(),
+            SC_ISOLATION_METHOD.into(),
+            SC_CELL_IDENTIFIER.into(),
+        ];
+        let rows = vec![vec![
+            "cell1".into(),
+            "homo sapiens".into(),
+            "run1".into(),
+            "proteomic profiling by mass spectrometry".into(),
+            "data-dependent acquisition".into(),
+            "label free sample".into(),
+            "Orbitrap".into(),
+            "Trypsin".into(),
+            "1".into(),
+            "1".into(),
+            "logical_run.d".into(),
+            "single cell".into(),
+            "FACS".into(),
+            "cell1".into(),
+        ]];
+        let evidence = DatasetEvidence {
+            accession: "PXD999999".into(),
+            project_json_path: String::new(),
+            files_json_path: String::new(),
+            existing_sdrf_path: String::new(),
+            raw_files: vec![RawFile {
+                file_name: "submission_bundle.tar.gz".into(),
+                file_uri: String::new(),
+                category: "RAW".into(),
+            }],
+            evidence: vec![],
+            manuscript_sources: vec![],
+            annotation_sources: vec![],
+        };
+        let issues = validate_draft_with_policy(
+            &headers,
+            &rows,
+            &evidence,
+            DataFileValidationPolicy::AuditSnapshotInventory,
+        );
+        assert!(!issues
+            .iter()
+            .any(|x| x.code == "data_file_not_in_pride_snapshot_inventory" && x.level == "error"));
+        assert!(
+            issues
+                .iter()
+                .any(|x| x.code == "data_file_not_in_pride_snapshot_inventory"
+                    && x.level == "warning")
+        );
+    }
+
+    #[test]
+    fn generated_draft_repository_filename_mismatch_remains_error() {
+        let evidence = DatasetEvidence {
+            accession: "PXD999999".into(),
+            project_json_path: String::new(),
+            files_json_path: String::new(),
+            existing_sdrf_path: String::new(),
+            raw_files: vec![RawFile {
+                file_name: "known.raw".into(),
+                file_uri: String::new(),
+                category: "RAW".into(),
+            }],
+            evidence: vec![],
+            manuscript_sources: vec![],
+            annotation_sources: vec![],
+        };
+        let proposal = SdrfProposal {
+            relation_mode: "one_cell_per_data_file".into(),
+            organism: "homo sapiens".into(),
+            sample_type: "single cell".into(),
+            single_cell_isolation_method: "FACS".into(),
+            proteomics_data_acquisition_method: "data-dependent acquisition".into(),
+            label: "label free sample".into(),
+            instrument: "Orbitrap".into(),
+            cleavage_agent_details: "Trypsin".into(),
+            fraction_identifier: "1".into(),
+            technical_replicate: "1".into(),
+            ..Default::default()
+        };
+        let (headers, mut rows, _) = draft_rows(&proposal, &evidence).unwrap();
+        let j = header_first_index(&headers, "comment[data file]").unwrap();
+        rows[0][j] = "different.raw".into();
+        let issues = validate_draft(&headers, &rows, &evidence);
+        assert!(issues
+            .iter()
+            .any(|x| x.code == "data_file_not_in_pride_raw_inventory" && x.level == "error"));
+    }
+
+    #[test]
+    fn archive_wrapped_vendor_entity_matches_logical_sdrf_filename() {
+        let raw = vec![RawFile {
+            file_name: "run_001.d.tar.gz".into(),
+            file_uri: String::new(),
+            category: "RAW".into(),
+        }];
+        let headers = vec!["comment[data file]".into()];
+        let rows = vec![vec!["run_001.d".into()]];
+        let stats = data_file_linkage_stats(&headers, &rows, &raw);
+        assert_eq!(stats.status, "complete");
+        assert_eq!(stats.matched_unique_data_files, 1);
+        assert_eq!(stats.unmatched_unique_data_files, 0);
+    }
+
+    #[test]
+    fn non_single_cell_role_can_leave_cell_specific_values_unresolved_in_audit() {
+        let headers = vec![
+            "source name".into(),
+            "characteristics[organism]".into(),
+            "assay name".into(),
+            "technology type".into(),
+            "comment[proteomics data acquisition method]".into(),
+            "comment[label]".into(),
+            "comment[instrument]".into(),
+            "comment[cleavage agent details]".into(),
+            "comment[fraction identifier]".into(),
+            "comment[technical replicate]".into(),
+            "comment[data file]".into(),
+            SC_SAMPLE_TYPE.into(),
+            SC_ISOLATION_METHOD.into(),
+            SC_CELL_IDENTIFIER.into(),
+        ];
+        let rows = vec![vec![
+            "carrier".into(),
+            "homo sapiens".into(),
+            "run1".into(),
+            "proteomic profiling by mass spectrometry".into(),
+            "data-dependent acquisition".into(),
+            "TMT126".into(),
+            "Orbitrap".into(),
+            "Trypsin".into(),
+            "1".into(),
+            "1".into(),
+            "run1.raw".into(),
+            "carrier".into(),
+            "not available".into(),
+            "not available".into(),
+        ]];
+        let evidence = DatasetEvidence {
+            accession: "PXD999999".into(),
+            project_json_path: String::new(),
+            files_json_path: String::new(),
+            existing_sdrf_path: String::new(),
+            raw_files: vec![RawFile {
+                file_name: "run1.raw".into(),
+                file_uri: String::new(),
+                category: "RAW".into(),
+            }],
+            evidence: vec![],
+            manuscript_sources: vec![],
+            annotation_sources: vec![],
+        };
+        let issues = validate_draft_with_policy(
+            &headers,
+            &rows,
+            &evidence,
+            DataFileValidationPolicy::AuditSnapshotInventory,
+        );
+        assert!(!issues.iter().any(|x| x.level == "error"
+            && matches!(
+                x.code.as_str(),
+                "single_cell_isolation_unresolved" | "cell_identifier_invalid_or_unresolved"
+            )));
+    }
+
+    #[test]
+    fn label_free_resolved_sdrf_does_not_require_carrier_or_reference_channels() {
+        let headers = vec![
+            "source name".into(),
+            "characteristics[organism]".into(),
+            "characteristics[organism part]".into(),
+            "characteristics[disease]".into(),
+            "characteristics[cell type]".into(),
+            SC_SAMPLE_TYPE.into(),
+            SC_ISOLATION_METHOD.into(),
+            SC_CELL_IDENTIFIER.into(),
+            SC_INDIVIDUAL.into(),
+            SC_PREP_BATCH.into(),
+            SC_CELLS_PER_WELL.into(),
+            "assay name".into(),
+            "technology type".into(),
+            "comment[proteomics data acquisition method]".into(),
+            "comment[label]".into(),
+            "comment[instrument]".into(),
+            "comment[cleavage agent details]".into(),
+            "comment[fraction identifier]".into(),
+            "comment[technical replicate]".into(),
+            "comment[data file]".into(),
+        ];
+        let rows = vec![vec![
+            "cell1".into(),
+            "homo sapiens".into(),
+            "brain".into(),
+            "normal".into(),
+            "neuron".into(),
+            "single cell".into(),
+            "FACS".into(),
+            "cell1".into(),
+            "not available".into(),
+            "batch1".into(),
+            "1".into(),
+            "run1".into(),
+            "proteomic profiling by mass spectrometry".into(),
+            "data-dependent acquisition".into(),
+            "label free sample".into(),
+            "Orbitrap".into(),
+            "Trypsin".into(),
+            "1".into(),
+            "1".into(),
+            "run1.raw".into(),
+        ]];
+        let (missing, blocking, recommended, optional) =
+            audit_gap_fields(&headers, &rows, "one_cell_per_data_file");
+        assert!(!missing.contains(&"carrier_channel".to_string()));
+        assert!(!missing.contains(&"reference_channel".to_string()));
+        assert!(optional.contains(&"individual".to_string()));
+        assert!(blocking.is_empty());
+        assert!(recommended.is_empty());
     }
 }
