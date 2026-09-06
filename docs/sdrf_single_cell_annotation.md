@@ -231,3 +231,22 @@ For the specific reconstruction experiment on the 106 known PRIDE SCP accessions
 The wrapper reads the frozen GT master only to derive the 106 PRIDE accession identifiers. It writes the selected cohort and a machine-readable provenance statement into the output directory. GT labels, GT curation annotations, canonical-study mappings, and GT metadata are not passed to SDRF generation.
 
 This is appropriate for reconstructing SDRFs for a known evaluation/reference cohort; it must not be confused with GT-independent catalogue discovery.
+
+
+## v0.1.2 provenance-repair behavior
+
+Batch testing across the GT106 PRIDE cohort showed that small local LLMs frequently return a plausible metadata value without populating its `evidence_refs`, or emit placeholder refs such as `E0000`. These are model-output quality issues and must not turn an otherwise recoverable accession into a pipeline error.
+
+`pride-scp-sdrf-v0.1.2` therefore separates **proposal repair** from **draft validation**:
+
+- the raw Ollama JSON is preserved as `proposals/<PXD>.ollama.raw.json`;
+- evidence refs not present in the accession evidence packet are removed and logged;
+- common placeholder strings (`NA`, `N/A`, `unknown`, `default`, `not specified`, etc.) are normalized to `not available`;
+- an asserted field with no surviving provenance is downgraded to `not available`;
+- an unsupported asserted `relation_mode` is downgraded to `uncertain`;
+- unsupported factor values are downgraded rather than trusted;
+- the repaired proposal is written as `proposals/<PXD>.ollama.json`;
+- every repair appears as a warning in the review/audit output;
+- structural/template incompleteness remains a validation error in the SDRF draft, but does not abort the accession.
+
+This is intentionally fail-safe: unsupported model assertions are discarded, never silently accepted. True operational failures (Ollama timeout, malformed JSON, unreadable source files) remain accession errors.

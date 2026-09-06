@@ -20,7 +20,7 @@ pub const SINGLE_CELL_TEMPLATE_VERSION: &str = "1.0.0";
 pub const SINGLE_CELL_TEMPLATE_URL: &str =
     "https://github.com/bigbio/sdrf-templates/blob/main/single-cell/1.0.0/single-cell.yaml";
 pub const SDRF_SPEC_URL: &str = "https://sdrf.quantms.org/specification.html";
-pub const GENERATOR_VERSION: &str = "pride-scp-sdrf-v0.1.1";
+pub const GENERATOR_VERSION: &str = "pride-scp-sdrf-v0.1.2";
 pub const DEFAULT_OLLAMA_URL: &str = "http://localhost:11434/api/generate";
 
 // The linked single-cell template is work-in-progress. Generated drafts pin the
@@ -72,6 +72,10 @@ pub struct SdrfAnnotateSummary {
     pub drafts_written: usize,
     pub locally_valid_drafts: usize,
     pub incomplete_drafts: usize,
+    #[serde(default)]
+    pub accessions_with_provenance_repairs: usize,
+    #[serde(default)]
+    pub provenance_repairs: usize,
     pub results_tsv: String,
 }
 
@@ -171,6 +175,8 @@ struct DatasetAudit {
     review_path: String,
     validation_issue_count: usize,
     validation_error_count: usize,
+    #[serde(default)]
+    proposal_repair_count: usize,
     locally_valid: bool,
     completeness_status: String,
     template_drift_note: String,
@@ -188,6 +194,7 @@ struct ResultRow {
     locally_valid: bool,
     completeness_status: String,
     validation_errors: usize,
+    proposal_repairs: usize,
     draft_path: String,
     review_path: String,
     error: String,
@@ -904,6 +911,201 @@ async fn call_ollama(
     Ok(proposal)
 }
 
+fn canonical_reserved_alias(value: &str) -> Option<&'static str> {
+    let lower = value.trim().to_ascii_lowercase();
+    match lower.as_str() {
+        "" | "unknown" | "not specified" | "unspecified" | "na" | "n/a" | "none" | "null"
+        | "default" | "missing" | "not known" | "not provided" | "not reported"
+        | "not determined" | "not available" => Some("not available"),
+        "not applicable" => Some("not applicable"),
+        "pooled" => Some("pooled"),
+        _ => None,
+    }
+}
+
+fn proposal_value_is_reserved(field: &str, value: &str) -> bool {
+    if field == "relation_mode" && value.trim().eq_ignore_ascii_case("uncertain") {
+        return true;
+    }
+    canonical_reserved_alias(value).is_some()
+}
+
+fn repair_proposal_provenance(
+    proposal: &mut SdrfProposal,
+    evidence: &DatasetEvidence,
+) -> Vec<ValidationIssue> {
+    let valid: BTreeSet<&str> = evidence.evidence.iter().map(|e| e.id.as_str()).collect();
+    let mut issues = Vec::new();
+
+    for (field, refs) in &mut proposal.evidence_refs {
+        let before = refs.clone();
+        refs.retain(|r| valid.contains(r.as_str()));
+        for removed in before.iter().filter(|r| !refs.iter().any(|x| x == *r)) {
+            issues.push(ValidationIssue {
+                level: "warning".into(),
+                code: "proposal_unknown_evidence_ref_removed".into(),
+                row: 0,
+                column: field.clone(),
+                message: format!("removed unknown model evidence reference {removed}"),
+            });
+        }
+    }
+
+    fn repair_field(
+        field: &str,
+        value: &mut String,
+        refs: &BTreeMap<String, Vec<String>>,
+        issues: &mut Vec<ValidationIssue>,
+    ) {
+        if field != "relation_mode" {
+            if let Some(canonical) = canonical_reserved_alias(value) {
+                if value.trim() != canonical {
+                    let original = value.clone();
+                    *value = canonical.to_string();
+                    issues.push(ValidationIssue {
+                        level: "warning".into(),
+                        code: "proposal_reserved_value_normalized".into(),
+                        row: 0,
+                        column: field.into(),
+                        message: format!(
+                            "normalized non-canonical missing value '{original}' to '{canonical}'"
+                        ),
+                    });
+                }
+                return;
+            }
+        }
+        if proposal_value_is_reserved(field, value) {
+            return;
+        }
+        if refs.get(field).map_or(true, |r| r.is_empty()) {
+            let original = value.clone();
+            *value = if field == "relation_mode" {
+                "uncertain".to_string()
+            } else {
+                "not available".to_string()
+            };
+            issues.push(ValidationIssue {
+                level: "warning".into(),
+                code: "proposal_field_downgraded_missing_provenance".into(),
+                row: 0,
+                column: field.into(),
+                message: format!(
+                    "model proposed '{original}' without a valid evidence reference; downgraded to '{}'",
+                    value
+                ),
+            });
+        }
+    }
+
+    let refs = &proposal.evidence_refs;
+    repair_field(
+        "relation_mode",
+        &mut proposal.relation_mode,
+        refs,
+        &mut issues,
+    );
+    repair_field("organism", &mut proposal.organism, refs, &mut issues);
+    repair_field(
+        "organism_part",
+        &mut proposal.organism_part,
+        refs,
+        &mut issues,
+    );
+    repair_field("disease", &mut proposal.disease, refs, &mut issues);
+    repair_field("cell_type", &mut proposal.cell_type, refs, &mut issues);
+    repair_field("sample_type", &mut proposal.sample_type, refs, &mut issues);
+    repair_field(
+        "single_cell_isolation_method",
+        &mut proposal.single_cell_isolation_method,
+        refs,
+        &mut issues,
+    );
+    repair_field("individual", &mut proposal.individual, refs, &mut issues);
+    repair_field(
+        "sample_preparation_batch",
+        &mut proposal.sample_preparation_batch,
+        refs,
+        &mut issues,
+    );
+    repair_field(
+        "cells_per_well",
+        &mut proposal.cells_per_well,
+        refs,
+        &mut issues,
+    );
+    repair_field(
+        "proteomics_data_acquisition_method",
+        &mut proposal.proteomics_data_acquisition_method,
+        refs,
+        &mut issues,
+    );
+    repair_field("label", &mut proposal.label, refs, &mut issues);
+    repair_field("instrument", &mut proposal.instrument, refs, &mut issues);
+    repair_field(
+        "cleavage_agent_details",
+        &mut proposal.cleavage_agent_details,
+        refs,
+        &mut issues,
+    );
+    repair_field(
+        "fraction_identifier",
+        &mut proposal.fraction_identifier,
+        refs,
+        &mut issues,
+    );
+    repair_field(
+        "technical_replicate",
+        &mut proposal.technical_replicate,
+        refs,
+        &mut issues,
+    );
+    repair_field(
+        "carrier_channel",
+        &mut proposal.carrier_channel,
+        refs,
+        &mut issues,
+    );
+    repair_field(
+        "reference_channel",
+        &mut proposal.reference_channel,
+        refs,
+        &mut issues,
+    );
+
+    for factor in &mut proposal.factors {
+        let before = factor.evidence_refs.clone();
+        factor.evidence_refs.retain(|r| valid.contains(r.as_str()));
+        for removed in before
+            .iter()
+            .filter(|r| !factor.evidence_refs.iter().any(|x| x == *r))
+        {
+            issues.push(ValidationIssue {
+                level: "warning".into(),
+                code: "factor_unknown_evidence_ref_removed".into(),
+                row: 0,
+                column: format!("factor[{}]", factor.name),
+                message: format!("removed unknown model evidence reference {removed}"),
+            });
+        }
+        if let Some(canonical) = canonical_reserved_alias(&factor.value) {
+            factor.value = canonical.to_string();
+        } else if !factor.name.trim().is_empty() && factor.evidence_refs.is_empty() {
+            let original = factor.value.clone();
+            factor.value = "not available".into();
+            issues.push(ValidationIssue {
+                level: "warning".into(),
+                code: "factor_downgraded_missing_provenance".into(),
+                row: 0,
+                column: format!("factor[{}]", factor.name),
+                message: format!("factor value '{original}' lacked a valid evidence reference; downgraded to 'not available'"),
+            });
+        }
+    }
+
+    issues
+}
+
 fn validate_proposal_refs(proposal: &SdrfProposal, evidence: &DatasetEvidence) -> Result<()> {
     let valid: BTreeSet<&str> = evidence.evidence.iter().map(|e| e.id.as_str()).collect();
     for (field, refs) in &proposal.evidence_refs {
@@ -1456,6 +1658,7 @@ async fn annotate_one(opts: &SdrfAnnotateOptions, accession: &str) -> Result<Res
                 locally_valid: audit.locally_valid,
                 completeness_status: audit.completeness_status,
                 validation_errors: audit.validation_error_count,
+                proposal_repairs: audit.proposal_repair_count,
                 draft_path: audit.draft_path,
                 review_path: audit.review_path,
                 error: String::new(),
@@ -1476,16 +1679,22 @@ async fn annotate_one(opts: &SdrfAnnotateOptions, accession: &str) -> Result<Res
     }
     fs::write(&evidence_path, serde_json::to_string_pretty(&evidence)?)?;
 
-    let proposal = call_ollama(opts, &evidence).await?;
-    // Persist the parsed model proposal before semantic evidence-reference validation.
-    // This keeps failed batch items diagnosable without weakening provenance checks.
+    let mut proposal = call_ollama(opts, &evidence).await?;
+    // Preserve the model response verbatim, then construct a provenance-safe proposal.
+    // Unsupported assertions are downgraded to reserved values instead of aborting
+    // the entire accession; every repair is surfaced in the review/audit outputs.
+    let raw_proposal_path = proposal_path.with_file_name(format!("{accession}.ollama.raw.json"));
+    fs::write(&raw_proposal_path, serde_json::to_string_pretty(&proposal)?)?;
+    let provenance_issues = repair_proposal_provenance(&mut proposal, &evidence);
     fs::write(&proposal_path, serde_json::to_string_pretty(&proposal)?)?;
     validate_proposal_refs(&proposal, &evidence)?;
+    let proposal_repair_count = provenance_issues.len();
     let existing = !evidence.existing_sdrf_path.is_empty();
 
     let (headers, rows, generation_mode) = draft_rows(&proposal, &evidence);
     write_sdrf(&draft_path, &headers, &rows)?;
-    let issues = validate_draft(&headers, &rows, &evidence);
+    let mut issues = provenance_issues;
+    issues.extend(validate_draft(&headers, &rows, &evidence));
     write_review(&review_path, &issues)?;
     let errors = issues.iter().filter(|x| x.level == "error").count();
     let locally_valid = errors == 0;
@@ -1509,7 +1718,7 @@ async fn annotate_one(opts: &SdrfAnnotateOptions, accession: &str) -> Result<Res
         raw_file_count: evidence.raw_files.len(), evidence_item_count: evidence.evidence.len(), manuscript_source_count: evidence.manuscript_sources.len(),
         annotation_source_count: evidence.annotation_sources.len(), ollama_model: opts.model.clone(), ollama_used: true,
         draft_path: draft_path.display().to_string(), proposal_path: proposal_path.display().to_string(), evidence_path: evidence_path.display().to_string(),
-        review_path: review_path.display().to_string(), validation_issue_count: issues.len(), validation_error_count: errors, locally_valid,
+        review_path: review_path.display().to_string(), validation_issue_count: issues.len(), validation_error_count: errors, proposal_repair_count, locally_valid,
         completeness_status: completeness.into(),
         template_drift_note: "The linked single-cell template is work-in-progress. This generator pins the 1.0.0 column profile shown by the rendered specification/GitHub view observed 2026-09-06. Revalidate against the live template before submission because the template may change.".into(),
         validation_issues: issues,
@@ -1525,6 +1734,7 @@ async fn annotate_one(opts: &SdrfAnnotateOptions, accession: &str) -> Result<Res
         locally_valid,
         completeness_status: completeness.into(),
         validation_errors: errors,
+        proposal_repairs: proposal_repair_count,
         draft_path: draft_path.display().to_string(),
         review_path: review_path.display().to_string(),
         error: String::new(),
@@ -1579,6 +1789,7 @@ pub async fn annotate_sdrf(opts: SdrfAnnotateOptions) -> Result<SdrfAnnotateSumm
                     locally_valid: false,
                     completeness_status: "error".into(),
                     validation_errors: 0,
+                    proposal_repairs: 0,
                     draft_path: String::new(),
                     review_path: String::new(),
                     error: format!("{err:#}"),
@@ -1607,6 +1818,8 @@ pub async fn annotate_sdrf(opts: SdrfAnnotateOptions) -> Result<SdrfAnnotateSumm
         }
     }
     let locally_valid = rows.iter().filter(|r| r.locally_valid).count();
+    let accessions_with_provenance_repairs = rows.iter().filter(|r| r.proposal_repairs > 0).count();
+    let provenance_repairs = rows.iter().map(|r| r.proposal_repairs).sum();
     let summary = SdrfAnnotateSummary {
         generator_version: GENERATOR_VERSION.into(),
         sdrf_spec_version: SDRF_SPEC_VERSION.into(),
@@ -1619,6 +1832,8 @@ pub async fn annotate_sdrf(opts: SdrfAnnotateOptions) -> Result<SdrfAnnotateSumm
         drafts_written: successful,
         locally_valid_drafts: locally_valid,
         incomplete_drafts: successful.saturating_sub(locally_valid),
+        accessions_with_provenance_repairs,
+        provenance_repairs,
         results_tsv: results_path.display().to_string(),
     };
     fs::write(
@@ -1764,7 +1979,7 @@ mod tests {
     }
 
     #[test]
-    fn asserted_relation_mode_still_requires_evidence_ref() {
+    fn unsupported_asserted_relation_mode_is_downgraded_not_fatal() {
         let evidence = DatasetEvidence {
             accession: "PXD999999".into(),
             project_json_path: String::new(),
@@ -1775,14 +1990,73 @@ mod tests {
             manuscript_sources: vec![],
             annotation_sources: vec![],
         };
-        let proposal = SdrfProposal {
+        let mut proposal = SdrfProposal {
             relation_mode: "one_cell_per_data_file".into(),
             ..Default::default()
         };
-        let err = validate_proposal_refs(&proposal, &evidence)
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("relation_mode"));
+        let repairs = repair_proposal_provenance(&mut proposal, &evidence);
+        assert_eq!(proposal.relation_mode, "uncertain");
+        assert!(repairs
+            .iter()
+            .any(|x| x.code == "proposal_field_downgraded_missing_provenance"));
+        validate_proposal_refs(&proposal, &evidence).unwrap();
+    }
+
+    #[test]
+    fn unknown_ref_is_removed_and_field_is_downgraded() {
+        let evidence = DatasetEvidence {
+            accession: "PXD999999".into(),
+            project_json_path: String::new(),
+            files_json_path: String::new(),
+            existing_sdrf_path: String::new(),
+            raw_files: vec![],
+            evidence: vec![EvidenceItem {
+                id: "E0001".into(),
+                source_kind: "test".into(),
+                source_label: "test".into(),
+                text: "Homo sapiens".into(),
+            }],
+            manuscript_sources: vec![],
+            annotation_sources: vec![],
+        };
+        let mut refs = BTreeMap::new();
+        refs.insert("cell_type".into(), vec!["E0000".into()]);
+        let mut proposal = SdrfProposal {
+            relation_mode: "uncertain".into(),
+            cell_type: "HeLa".into(),
+            evidence_refs: refs,
+            ..Default::default()
+        };
+        let repairs = repair_proposal_provenance(&mut proposal, &evidence);
+        assert_eq!(proposal.cell_type, "not available");
+        assert!(repairs
+            .iter()
+            .any(|x| x.code == "proposal_unknown_evidence_ref_removed"));
+        validate_proposal_refs(&proposal, &evidence).unwrap();
+    }
+
+    #[test]
+    fn common_missing_aliases_are_normalized() {
+        let evidence = DatasetEvidence {
+            accession: "PXD999999".into(),
+            project_json_path: String::new(),
+            files_json_path: String::new(),
+            existing_sdrf_path: String::new(),
+            raw_files: vec![],
+            evidence: vec![],
+            manuscript_sources: vec![],
+            annotation_sources: vec![],
+        };
+        let mut proposal = SdrfProposal {
+            relation_mode: "uncertain".into(),
+            organism: "N/A".into(),
+            disease: "default".into(),
+            ..Default::default()
+        };
+        repair_proposal_provenance(&mut proposal, &evidence);
+        assert_eq!(proposal.organism, "not available");
+        assert_eq!(proposal.disease, "not available");
+        validate_proposal_refs(&proposal, &evidence).unwrap();
     }
 
     #[test]
