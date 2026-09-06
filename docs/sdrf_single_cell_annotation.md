@@ -2,7 +2,7 @@
 
 ## Status
 
-Initial implementation: `pride-scp sdrf-annotate` (`pride-scp-sdrf-v0.1`).
+Current implementation: `pride-scp sdrf-resolve` + `pride-scp sdrf-annotate` (`pride-scp-sdrf-v0.2.4`).
 
 This lane is intentionally independent of the frozen GT196/GT179 benchmark. It accepts an explicit list of PRIDE accessions and generates provenance-tracked SDRF-Proteomics **drafts** from source evidence only.
 
@@ -398,3 +398,99 @@ fed to the preservation/enrichment path and cannot block de-novo reconstruction.
 The GT106 wrapper now reports `sdrf_status`, `sdrf_usable`, snapshot-file counts, usable
 existing-SDRF counts, and unusable snapshot-SDRF counts. `COHORT_MODE=missing-sdrf`
 means **missing or unusable SDRF**, not merely missing cache file.
+
+
+## v0.2.4 external SDRF source resolver/cache
+
+The v0.2.3 GT106 inventory established that all 105 source-resolved primary-PRIDE
+SCP accessions had a local `data/snapshot/sdrf/<PXD>.sdrf.tsv` file, but every one
+was `header_only`. The local PRIDE SDRF API cache is therefore not an authoritative
+inventory of usable SDRF annotations for this cohort.
+
+v0.2.4 adds a separate source-resolution phase:
+
+```text
+pride-scp sdrf-resolve
+```
+
+The resolver is intentionally separate from Ollama annotation. It resolves and caches
+available SDRF sources first, records their provenance, and writes one selected usable
+SDRF per accession under `resolved/`.
+
+Trust/selection order in resolver v0.1:
+
+1. `curated_bigbio` — community-curated SDRF from
+   `bigbio/sdrf-annotated-datasets/datasets/{ACCESSION}/{ACCESSION}.sdrf.tsv`;
+2. `repository_submitted` — an actual `.sdrf.tsv` file listed in the repository file
+   manifest and downloadable through a public URL;
+3. `snapshot_pride_sdrf_api` — only when the cached API response itself has at least
+   one mapped `comment[data file]` row.
+
+HAMLET/agentic SDRFs are **not** automatically selected in this first resolver. They can
+be evaluated later as an explicitly lower-trust source.
+
+A candidate source is considered usable only after local TSV parsing confirms at least
+one real data row and at least one mapped `comment[data file]` value. HTML error pages,
+header-only payloads, and unmapped SDRFs are cached/audited but never selected.
+
+Per-accession output:
+
+```text
+cache/<PXD>/curated_bigbio.sdrf.tsv
+cache/<PXD>/repository_01.sdrf.tsv        # when discovered
+resolved/<PXD>.sdrf.tsv                   # selected usable source only
+audit/<PXD>.sdrf_source_audit.json
+```
+
+Batch outputs:
+
+```text
+sdrf_source_resolution.tsv
+sdrf_source_resolution_summary.json
+```
+
+Each audit records the source URL, parse/usability status, byte count, and deterministic
+FNV-1a content fingerprint. The fingerprint is an integrity/reproducibility marker, not a
+cryptographic security hash.
+
+### Source-resolver usage
+
+```bash
+target/release/pride-scp sdrf-resolve \
+  --accessions-file work/sdrf/pride_scp_accessions.txt \
+  --snapshot data/snapshot \
+  --output data/sdrf_sources
+```
+
+For the source-resolved primary-PRIDE portion of the frozen GT106 cohort:
+
+```bash
+./scripts/run_gt106_pride_sdrf_source_resolution.sh
+```
+
+GT is used by that wrapper only to seed the known accession cohort. Hosting-repository
+resolution and all SDRF source selection are source-derived.
+
+### Annotation after source resolution
+
+`pride-scp sdrf-annotate` now accepts:
+
+```text
+--resolved-sdrf-dir data/sdrf_sources/resolved
+```
+
+A usable SDRF in that directory takes precedence over the header-only PRIDE API cache.
+The annotator then preserves/audits/enriches that real SDRF. Accessions for which the
+resolver finds no usable source continue through the existing manuscript-assisted de-novo
+path.
+
+For the GT-seeded wrapper, set:
+
+```bash
+RESOLVED_SDRF_DIR=data/sdrf_source_resolution_gt105_pride_v024/resolved \
+  ./scripts/run_gt106_pride_sdrf_annotation.sh
+```
+
+Do not run the full annotation batch until the source-resolution inventory is reviewed.
+The immediate goal is to quantify how many of the 105 source-resolved PRIDE datasets are
+already covered by curated/repository SDRFs and how many genuinely require de-novo work.

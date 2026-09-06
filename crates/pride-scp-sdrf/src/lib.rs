@@ -20,7 +20,8 @@ pub const SINGLE_CELL_TEMPLATE_VERSION: &str = "1.0.0";
 pub const SINGLE_CELL_TEMPLATE_URL: &str =
     "https://github.com/bigbio/sdrf-templates/blob/main/single-cell/1.0.0/single-cell.yaml";
 pub const SDRF_SPEC_URL: &str = "https://sdrf.quantms.org/specification.html";
-pub const GENERATOR_VERSION: &str = "pride-scp-sdrf-v0.2.3";
+pub const GENERATOR_VERSION: &str = "pride-scp-sdrf-v0.2.4";
+pub const SDRF_SOURCE_RESOLVER_VERSION: &str = "pride-scp-sdrf-source-resolver-v0.1";
 pub const DEFAULT_OLLAMA_URL: &str = "http://localhost:11434/api/generate";
 
 // The linked single-cell template is work-in-progress. Generated drafts pin the
@@ -41,6 +42,52 @@ const RAW_EXTENSIONS: &[&str] = &[
 ];
 
 #[derive(Debug, Clone)]
+pub struct SdrfResolveOptions {
+    pub snapshot_dir: PathBuf,
+    pub output_dir: PathBuf,
+    pub accessions: Vec<String>,
+    pub accessions_file: Option<PathBuf>,
+    pub timeout_seconds: u64,
+    pub force: bool,
+    pub progress: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SdrfResolveSummary {
+    pub resolver_version: String,
+    pub accessions_requested: usize,
+    pub curated_bigbio_usable: usize,
+    pub repository_submitted_usable: usize,
+    pub snapshot_usable: usize,
+    pub unresolved: usize,
+    pub selected_sources_tsv: String,
+    pub resolved_dir: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct SdrfSourceCandidateAudit {
+    source_kind: String,
+    source_url: String,
+    status: String,
+    usable: bool,
+    local_path: String,
+    content_fingerprint: String,
+    bytes: usize,
+    note: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct SdrfSourceAudit {
+    accession: String,
+    resolver_version: String,
+    selected_source_kind: String,
+    selected_source_url: String,
+    selected_local_path: String,
+    selected_content_fingerprint: String,
+    candidates: Vec<SdrfSourceCandidateAudit>,
+}
+
+#[derive(Debug, Clone)]
 pub struct SdrfAnnotateOptions {
     pub snapshot_dir: PathBuf,
     pub annotations_dir: PathBuf,
@@ -49,6 +96,9 @@ pub struct SdrfAnnotateOptions {
     pub output_dir: PathBuf,
     pub accessions: Vec<String>,
     pub accessions_file: Option<PathBuf>,
+    /// Optional directory populated by `sdrf-resolve`. A usable `{PXD}.sdrf.tsv`
+    /// here takes precedence over the PRIDE snapshot SDRF cache.
+    pub resolved_sdrf_dir: Option<PathBuf>,
     pub model: String,
     pub ollama_url: String,
     pub timeout_seconds: u64,
@@ -211,13 +261,16 @@ fn norm_accession(value: &str) -> Option<String> {
     re.is_match(&acc).then_some(acc)
 }
 
-fn collect_accessions(opts: &SdrfAnnotateOptions) -> Result<Vec<String>> {
+fn collect_accessions_values(
+    accessions: &[String],
+    accessions_file: Option<&Path>,
+) -> Result<Vec<String>> {
     let mut out = BTreeSet::new();
-    for raw in &opts.accessions {
+    for raw in accessions {
         let acc = norm_accession(raw).ok_or_else(|| anyhow!("invalid PRIDE accession: {raw}"))?;
         out.insert(acc);
     }
-    if let Some(path) = &opts.accessions_file {
+    if let Some(path) = accessions_file {
         let text = fs::read_to_string(path)
             .with_context(|| format!("read accession file {}", path.display()))?;
         for line in text.lines() {
@@ -238,6 +291,10 @@ fn collect_accessions(opts: &SdrfAnnotateOptions) -> Result<Vec<String>> {
         bail!("no accessions supplied; use --accession and/or --accessions-file");
     }
     Ok(out.into_iter().collect())
+}
+
+fn collect_accessions(opts: &SdrfAnnotateOptions) -> Result<Vec<String>> {
+    collect_accessions_values(&opts.accessions, opts.accessions_file.as_deref())
 }
 
 fn json_string_leaves(value: &Value, prefix: &str, out: &mut Vec<(String, String)>) {
@@ -565,6 +622,428 @@ fn existing_sdrf_is_usable(path: &Path) -> bool {
     existing_sdrf_status(path) == "usable"
 }
 
+fn fnv1a64_hex(bytes: &[u8]) -> String {
+    let mut hash: u64 = 0xcbf29ce484222325;
+    for &b in bytes {
+        hash ^= b as u64;
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    format!("fnv1a64:{hash:016x}")
+}
+
+fn extract_sdrf_file_candidates(value: &Value) -> Vec<(String, String)> {
+    fn walk(value: &Value, out: &mut BTreeMap<String, String>) {
+        match value {
+            Value::Object(map) => {
+                let name = object_file_name(map);
+                let lower = name.to_ascii_lowercase();
+                if !name.is_empty() && lower.contains("sdrf") && lower.ends_with(".tsv") {
+                    out.entry(name).or_insert_with(|| file_uri(map));
+                }
+                for child in map.values() {
+                    walk(child, out);
+                }
+            }
+            Value::Array(items) => {
+                for child in items {
+                    walk(child, out);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut out = BTreeMap::new();
+    walk(value, &mut out);
+    out.into_iter().collect()
+}
+
+fn normalize_download_url(value: &str) -> Option<String> {
+    let value = value.trim();
+    if value.starts_with("https://") || value.starts_with("http://") {
+        return Some(value.to_string());
+    }
+    if let Some(rest) = value.strip_prefix("ftp://") {
+        // PRIDE's public FTP host is also HTTPS-accessible. For other hosts this
+        // is attempted best-effort and retained in the source audit if it fails.
+        return Some(format!("https://{rest}"));
+    }
+    None
+}
+
+async fn fetch_sdrf_candidate(
+    client: &Client,
+    source_kind: &str,
+    source_url: &str,
+    local_path: &Path,
+    force: bool,
+) -> SdrfSourceCandidateAudit {
+    if local_path.is_file() && !force {
+        let status = existing_sdrf_status(local_path);
+        let bytes = fs::read(local_path).unwrap_or_default();
+        return SdrfSourceCandidateAudit {
+            source_kind: source_kind.into(),
+            source_url: source_url.into(),
+            status: format!("cached_{status}"),
+            usable: status == "usable",
+            local_path: local_path.display().to_string(),
+            content_fingerprint: fnv1a64_hex(&bytes),
+            bytes: bytes.len(),
+            note: "reused cached source candidate".into(),
+        };
+    }
+    let Some(url) = normalize_download_url(source_url) else {
+        return SdrfSourceCandidateAudit {
+            source_kind: source_kind.into(),
+            source_url: source_url.into(),
+            status: "unsupported_url_scheme".into(),
+            usable: false,
+            local_path: String::new(),
+            content_fingerprint: String::new(),
+            bytes: 0,
+            note: "source URL is not HTTP(S) or convertible FTP".into(),
+        };
+    };
+    let response = match client.get(&url).send().await {
+        Ok(r) => r,
+        Err(err) => {
+            return SdrfSourceCandidateAudit {
+                source_kind: source_kind.into(),
+                source_url: url,
+                status: "fetch_error".into(),
+                usable: false,
+                local_path: String::new(),
+                content_fingerprint: String::new(),
+                bytes: 0,
+                note: err.to_string(),
+            };
+        }
+    };
+    let code = response.status().as_u16();
+    if code == 404 {
+        return SdrfSourceCandidateAudit {
+            source_kind: source_kind.into(),
+            source_url: url,
+            status: "not_found".into(),
+            usable: false,
+            local_path: String::new(),
+            content_fingerprint: String::new(),
+            bytes: 0,
+            note: "HTTP 404".into(),
+        };
+    }
+    if !response.status().is_success() {
+        return SdrfSourceCandidateAudit {
+            source_kind: source_kind.into(),
+            source_url: url,
+            status: format!("http_{code}"),
+            usable: false,
+            local_path: String::new(),
+            content_fingerprint: String::new(),
+            bytes: 0,
+            note: "non-success HTTP response".into(),
+        };
+    }
+    let bytes = match response.bytes().await {
+        Ok(v) => v.to_vec(),
+        Err(err) => {
+            return SdrfSourceCandidateAudit {
+                source_kind: source_kind.into(),
+                source_url: url,
+                status: "body_read_error".into(),
+                usable: false,
+                local_path: String::new(),
+                content_fingerprint: String::new(),
+                bytes: 0,
+                note: err.to_string(),
+            };
+        }
+    };
+    if let Some(parent) = local_path.parent() {
+        if let Err(err) = fs::create_dir_all(parent) {
+            return SdrfSourceCandidateAudit {
+                source_kind: source_kind.into(),
+                source_url: url,
+                status: "cache_write_error".into(),
+                usable: false,
+                local_path: String::new(),
+                content_fingerprint: fnv1a64_hex(&bytes),
+                bytes: bytes.len(),
+                note: err.to_string(),
+            };
+        }
+    }
+    if let Err(err) = fs::write(local_path, &bytes) {
+        return SdrfSourceCandidateAudit {
+            source_kind: source_kind.into(),
+            source_url: url,
+            status: "cache_write_error".into(),
+            usable: false,
+            local_path: String::new(),
+            content_fingerprint: fnv1a64_hex(&bytes),
+            bytes: bytes.len(),
+            note: err.to_string(),
+        };
+    }
+    let parsed_status = existing_sdrf_status(local_path);
+    SdrfSourceCandidateAudit {
+        source_kind: source_kind.into(),
+        source_url: url,
+        status: parsed_status.clone(),
+        usable: parsed_status == "usable",
+        local_path: local_path.display().to_string(),
+        content_fingerprint: fnv1a64_hex(&bytes),
+        bytes: bytes.len(),
+        note: "downloaded and parsed as SDRF candidate".into(),
+    }
+}
+
+fn select_sdrf_source_candidate(
+    candidates: &[SdrfSourceCandidateAudit],
+) -> Option<&SdrfSourceCandidateAudit> {
+    [
+        "curated_bigbio",
+        "repository_submitted",
+        "snapshot_pride_sdrf_api",
+    ]
+    .iter()
+    .find_map(|kind| {
+        candidates
+            .iter()
+            .find(|c| c.usable && c.source_kind.as_str() == *kind)
+    })
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct SdrfSourceResultRow {
+    accession: String,
+    selected_source_kind: String,
+    selected_source_url: String,
+    selected_content_fingerprint: String,
+    resolved_path: String,
+    curated_bigbio_status: String,
+    repository_candidate_count: usize,
+    repository_usable_count: usize,
+    snapshot_status: String,
+    unresolved: bool,
+}
+
+async fn resolve_sdrf_one(
+    opts: &SdrfResolveOptions,
+    client: &Client,
+    accession: &str,
+) -> Result<SdrfSourceResultRow> {
+    let cache_dir = opts.output_dir.join("cache").join(accession);
+    let audit_dir = opts.output_dir.join("audit");
+    let resolved_dir = opts.output_dir.join("resolved");
+    fs::create_dir_all(&cache_dir)?;
+    fs::create_dir_all(&audit_dir)?;
+    fs::create_dir_all(&resolved_dir)?;
+
+    let mut candidates = Vec::new();
+    let curated_url = format!(
+        "https://raw.githubusercontent.com/bigbio/sdrf-annotated-datasets/master/datasets/{0}/{0}.sdrf.tsv",
+        accession
+    );
+    let curated_path = cache_dir.join("curated_bigbio.sdrf.tsv");
+    let curated = fetch_sdrf_candidate(
+        client,
+        "curated_bigbio",
+        &curated_url,
+        &curated_path,
+        opts.force,
+    )
+    .await;
+    let curated_status = curated.status.clone();
+    candidates.push(curated);
+
+    let files_path = opts
+        .snapshot_dir
+        .join("files")
+        .join(format!("{accession}.json"));
+    let mut repository_candidate_count = 0usize;
+    if files_path.is_file() {
+        if let Ok(files) = load_json(&files_path) {
+            for (idx, (name, uri)) in extract_sdrf_file_candidates(&files).into_iter().enumerate() {
+                repository_candidate_count += 1;
+                if uri.trim().is_empty() {
+                    candidates.push(SdrfSourceCandidateAudit {
+                        source_kind: "repository_submitted".into(),
+                        source_url: String::new(),
+                        status: "missing_public_url".into(),
+                        usable: false,
+                        local_path: String::new(),
+                        content_fingerprint: String::new(),
+                        bytes: 0,
+                        note: format!("repository file manifest contains {name} but no public URL"),
+                    });
+                    continue;
+                }
+                let path = cache_dir.join(format!("repository_{:02}.sdrf.tsv", idx + 1));
+                candidates.push(
+                    fetch_sdrf_candidate(client, "repository_submitted", &uri, &path, opts.force)
+                        .await,
+                );
+            }
+        }
+    }
+
+    let snapshot_path = opts
+        .snapshot_dir
+        .join("sdrf")
+        .join(format!("{accession}.sdrf.tsv"));
+    let snapshot_status = existing_sdrf_status(&snapshot_path);
+    if snapshot_path.is_file() {
+        let bytes = fs::read(&snapshot_path).unwrap_or_default();
+        candidates.push(SdrfSourceCandidateAudit {
+            source_kind: "snapshot_pride_sdrf_api".into(),
+            source_url: String::new(),
+            status: snapshot_status.clone(),
+            usable: snapshot_status == "usable",
+            local_path: snapshot_path.display().to_string(),
+            content_fingerprint: fnv1a64_hex(&bytes),
+            bytes: bytes.len(),
+            note: "local PRIDE SDRF API cache; only usable when mapped data rows are present"
+                .into(),
+        });
+    }
+
+    // Trust precedence: community-curated > original repository submission >
+    // local snapshot API cache. Agentic sources are deliberately not selected
+    // automatically in v0.1 of the resolver.
+    let selected = select_sdrf_source_candidate(&candidates);
+
+    let resolved_path = resolved_dir.join(format!("{accession}.sdrf.tsv"));
+    let (selected_source_kind, selected_source_url, selected_fingerprint, resolved_path_text) =
+        if let Some(candidate) = selected {
+            fs::copy(Path::new(&candidate.local_path), &resolved_path).with_context(|| {
+                format!(
+                    "copy selected SDRF source {} -> {}",
+                    candidate.local_path,
+                    resolved_path.display()
+                )
+            })?;
+            (
+                candidate.source_kind.clone(),
+                candidate.source_url.clone(),
+                candidate.content_fingerprint.clone(),
+                resolved_path.display().to_string(),
+            )
+        } else {
+            let _ = fs::remove_file(&resolved_path);
+            (String::new(), String::new(), String::new(), String::new())
+        };
+
+    let repository_usable_count = candidates
+        .iter()
+        .filter(|c| c.source_kind == "repository_submitted" && c.usable)
+        .count();
+    let audit = SdrfSourceAudit {
+        accession: accession.into(),
+        resolver_version: SDRF_SOURCE_RESOLVER_VERSION.into(),
+        selected_source_kind: selected_source_kind.clone(),
+        selected_source_url: selected_source_url.clone(),
+        selected_local_path: resolved_path_text.clone(),
+        selected_content_fingerprint: selected_fingerprint.clone(),
+        candidates,
+    };
+    fs::write(
+        audit_dir.join(format!("{accession}.sdrf_source_audit.json")),
+        serde_json::to_string_pretty(&audit)?,
+    )?;
+
+    Ok(SdrfSourceResultRow {
+        accession: accession.into(),
+        selected_source_kind,
+        selected_source_url,
+        selected_content_fingerprint: selected_fingerprint,
+        resolved_path: resolved_path_text,
+        curated_bigbio_status: curated_status,
+        repository_candidate_count,
+        repository_usable_count,
+        snapshot_status,
+        unresolved: audit.selected_source_kind.is_empty(),
+    })
+}
+
+pub async fn resolve_sdrf_sources(opts: SdrfResolveOptions) -> Result<SdrfResolveSummary> {
+    let accessions = collect_accessions_values(&opts.accessions, opts.accessions_file.as_deref())?;
+    fs::create_dir_all(&opts.output_dir)?;
+    let client = Client::builder()
+        .timeout(Duration::from_secs(opts.timeout_seconds))
+        .user_agent("PRIDE-SCP-SDRF-source-resolver/0.1")
+        .build()?;
+    let mut rows = Vec::new();
+    for (i, accession) in accessions.iter().enumerate() {
+        if opts.progress {
+            eprintln!("[{}/{}] {}", i + 1, accessions.len(), accession);
+        }
+        match resolve_sdrf_one(&opts, &client, accession).await {
+            Ok(row) => {
+                if opts.progress {
+                    if row.unresolved {
+                        eprintln!(
+                            "  -> unresolved (curated={} repository_usable={} snapshot={})",
+                            row.curated_bigbio_status,
+                            row.repository_usable_count,
+                            row.snapshot_status
+                        );
+                    } else {
+                        eprintln!("  -> {} {}", row.selected_source_kind, row.resolved_path);
+                    }
+                }
+                rows.push(row);
+            }
+            Err(err) => {
+                eprintln!("  -> resolver error: {err:#}");
+                rows.push(SdrfSourceResultRow {
+                    accession: accession.clone(),
+                    selected_source_kind: String::new(),
+                    selected_source_url: String::new(),
+                    selected_content_fingerprint: String::new(),
+                    resolved_path: String::new(),
+                    curated_bigbio_status: "resolver_error".into(),
+                    repository_candidate_count: 0,
+                    repository_usable_count: 0,
+                    snapshot_status: "unknown".into(),
+                    unresolved: true,
+                });
+            }
+        }
+    }
+    let selected_sources_path = opts.output_dir.join("sdrf_source_resolution.tsv");
+    let mut writer = WriterBuilder::new()
+        .delimiter(b'\t')
+        .from_path(&selected_sources_path)?;
+    for row in &rows {
+        writer.serialize(row)?;
+    }
+    writer.flush()?;
+    let summary = SdrfResolveSummary {
+        resolver_version: SDRF_SOURCE_RESOLVER_VERSION.into(),
+        accessions_requested: accessions.len(),
+        curated_bigbio_usable: rows
+            .iter()
+            .filter(|r| r.selected_source_kind == "curated_bigbio")
+            .count(),
+        repository_submitted_usable: rows
+            .iter()
+            .filter(|r| r.selected_source_kind == "repository_submitted")
+            .count(),
+        snapshot_usable: rows
+            .iter()
+            .filter(|r| r.selected_source_kind == "snapshot_pride_sdrf_api")
+            .count(),
+        unresolved: rows.iter().filter(|r| r.unresolved).count(),
+        selected_sources_tsv: selected_sources_path.display().to_string(),
+        resolved_dir: opts.output_dir.join("resolved").display().to_string(),
+    };
+    fs::write(
+        opts.output_dir.join("sdrf_source_resolution_summary.json"),
+        serde_json::to_string_pretty(&summary)?,
+    )?;
+    Ok(summary)
+}
+
 fn existing_sdrf_relation_hint(headers: &[String], rows: &[Vec<String>]) -> String {
     let Some(data_idx) = header_first_index(headers, "comment[data file]") else {
         return "uncertain".into();
@@ -857,10 +1336,19 @@ fn build_evidence(opts: &SdrfAnnotateOptions, accession: &str) -> Result<Dataset
         .snapshot_dir
         .join("files")
         .join(format!("{accession}.json"));
-    let existing_sdrf = opts
+    let snapshot_sdrf = opts
         .snapshot_dir
         .join("sdrf")
         .join(format!("{accession}.sdrf.tsv"));
+    let resolved_sdrf = opts
+        .resolved_sdrf_dir
+        .as_ref()
+        .map(|dir| dir.join(format!("{accession}.sdrf.tsv")));
+    let existing_sdrf = resolved_sdrf
+        .as_ref()
+        .filter(|p| existing_sdrf_is_usable(p))
+        .cloned()
+        .unwrap_or_else(|| snapshot_sdrf.clone());
     if !project_path.is_file() {
         bail!("missing PRIDE project snapshot {}", project_path.display());
     }
@@ -2942,15 +3430,21 @@ pub async fn annotate_sdrf(opts: SdrfAnnotateOptions) -> Result<SdrfAnnotateSumm
     let mut snapshot_sdrf_files = 0usize;
     let mut existing = 0usize;
     for accession in &accessions {
-        let path = opts
+        let snapshot_path = opts
             .snapshot_dir
             .join("sdrf")
             .join(format!("{accession}.sdrf.tsv"));
-        if path.is_file() {
+        if snapshot_path.is_file() {
             snapshot_sdrf_files += 1;
-            if existing_sdrf_is_usable(&path) {
-                existing += 1;
-            }
+        }
+        let resolved_usable = opts
+            .resolved_sdrf_dir
+            .as_ref()
+            .map(|dir| dir.join(format!("{accession}.sdrf.tsv")))
+            .map(|p| existing_sdrf_is_usable(&p))
+            .unwrap_or(false);
+        if resolved_usable || existing_sdrf_is_usable(&snapshot_path) {
+            existing += 1;
         }
     }
     let unusable_snapshot_sdrf = snapshot_sdrf_files.saturating_sub(existing);
@@ -3383,6 +3877,61 @@ mod tests {
             ..Default::default()
         };
         assert!(draft_rows(&proposal, &evidence).is_err());
+    }
+
+    #[test]
+    fn repository_sdrf_candidates_are_extracted_from_file_manifest() {
+        let payload = json!([
+            {"fileName":"study.sdrf.tsv","fileCategory":{"value":"OTHER"},"publicFileLocations":[{"name":"FTP Protocol","value":"ftp://ftp.pride.ebi.ac.uk/path/study.sdrf.tsv"}]},
+            {"fileName":"cell.raw","fileCategory":{"value":"RAW"}}
+        ]);
+        let rows = extract_sdrf_file_candidates(&payload);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].0, "study.sdrf.tsv");
+        assert!(rows[0].1.ends_with("study.sdrf.tsv"));
+    }
+
+    #[test]
+    fn ftp_sdrf_source_url_is_normalized_to_https() {
+        assert_eq!(
+            normalize_download_url("ftp://ftp.pride.ebi.ac.uk/pride/x.sdrf.tsv").as_deref(),
+            Some("https://ftp.pride.ebi.ac.uk/pride/x.sdrf.tsv")
+        );
+    }
+
+    #[test]
+    fn sdrf_source_precedence_prefers_curated_then_repository() {
+        let mk = |kind: &str, usable: bool| SdrfSourceCandidateAudit {
+            source_kind: kind.into(),
+            source_url: String::new(),
+            status: "usable".into(),
+            usable,
+            local_path: String::new(),
+            content_fingerprint: String::new(),
+            bytes: 0,
+            note: String::new(),
+        };
+        let candidates = vec![
+            mk("snapshot_pride_sdrf_api", true),
+            mk("repository_submitted", true),
+            mk("curated_bigbio", true),
+        ];
+        assert_eq!(
+            select_sdrf_source_candidate(&candidates)
+                .unwrap()
+                .source_kind,
+            "curated_bigbio"
+        );
+        let candidates = vec![
+            mk("snapshot_pride_sdrf_api", true),
+            mk("repository_submitted", true),
+        ];
+        assert_eq!(
+            select_sdrf_source_candidate(&candidates)
+                .unwrap()
+                .source_kind,
+            "repository_submitted"
+        );
     }
 
     #[test]

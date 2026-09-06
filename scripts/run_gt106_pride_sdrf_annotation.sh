@@ -22,6 +22,7 @@ OLLAMA_URL="${OLLAMA_URL:-http://localhost:11434/api/generate}"
 TIMEOUT="${TIMEOUT:-1200}"
 BINARY="${BINARY:-$ROOT/target/release/pride-scp}"
 FORCE="${FORCE:-0}"
+RESOLVED_SDRF_DIR="${RESOLVED_SDRF_DIR:-}"
 COHORT_MODE="${COHORT_MODE:-all}"
 LIST_ONLY="${LIST_ONLY:-0}"
 
@@ -30,7 +31,7 @@ case "$COHORT_MODE" in
   *) echo "invalid COHORT_MODE=$COHORT_MODE (expected all, missing-sdrf, or existing-sdrf)" >&2; exit 2 ;;
 esac
 MODE_TAG="${COHORT_MODE//-/_}"
-OUT="${OUT:-$ROOT/data/sdrf_annotation_gt106_pride_v023_${MODE_TAG}}"
+OUT="${OUT:-$ROOT/data/sdrf_annotation_gt106_pride_v024_${MODE_TAG}}"
 
 [[ -f "$GT_MASTER" ]] || { echo "missing GT master: $GT_MASTER" >&2; exit 2; }
 [[ -d "$SNAPSHOT" ]] || { echo "missing snapshot: $SNAPSHOT" >&2; exit 2; }
@@ -258,6 +259,9 @@ args=(
   --ollama-url "$OLLAMA_URL"
   --timeout "$TIMEOUT"
 )
+if [[ -n "$RESOLVED_SDRF_DIR" ]]; then
+  args+=(--resolved-sdrf-dir "$RESOLVED_SDRF_DIR")
+fi
 if [[ "$FORCE" == "1" ]]; then
   args+=(--force)
 fi

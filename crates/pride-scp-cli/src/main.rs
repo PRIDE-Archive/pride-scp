@@ -12,7 +12,8 @@ use pride_scp_index::{
     DEFAULT_PROJECT_PAGE_SIZE, DEFAULT_PROTEOMECENTRAL_PROXI_API, DEFAULT_REGISTRY_PAGE_SIZE,
 };
 use pride_scp_sdrf::{
-    annotate_sdrf, SdrfAnnotateOptions, DEFAULT_OLLAMA_URL as DEFAULT_SDRF_OLLAMA_URL,
+    annotate_sdrf, resolve_sdrf_sources, SdrfAnnotateOptions, SdrfResolveOptions,
+    DEFAULT_OLLAMA_URL as DEFAULT_SDRF_OLLAMA_URL,
 };
 use std::path::PathBuf;
 use std::time::Instant;
@@ -222,6 +223,23 @@ enum Command {
         #[arg(long, default_value = "weak")]
         min_tier: String,
     },
+    /// Resolve usable SDRF sources for PRIDE accessions into a provenance-labelled local cache.
+    /// Community-curated BigBio SDRFs are preferred over original repository SDRFs;
+    /// header-only PRIDE API cache responses are never selected.
+    SdrfResolve {
+        #[arg(long = "accession")]
+        accessions: Vec<String>,
+        #[arg(long)]
+        accessions_file: Option<PathBuf>,
+        #[arg(long, default_value = "data/snapshot")]
+        snapshot: PathBuf,
+        #[arg(long, default_value = "data/sdrf_sources")]
+        output: PathBuf,
+        #[arg(long, default_value_t = 120)]
+        timeout: u64,
+        #[arg(long)]
+        force: bool,
+    },
     /// Generate provenance-tracked SDRF-Proteomics single-cell drafts from PRIDE
     /// repository metadata, existing annotations, and manuscript-derived evidence.
     SdrfAnnotate {
@@ -248,6 +266,10 @@ enum Command {
         /// Additional extracted manuscript text/HTML/XML file(s). Repeat as needed.
         #[arg(long = "manuscript-text")]
         manuscript_text: Vec<PathBuf>,
+        /// Optional `resolved/` directory produced by `pride-scp sdrf-resolve`.
+        /// Usable files here take precedence over the PRIDE SDRF API cache.
+        #[arg(long)]
+        resolved_sdrf_dir: Option<PathBuf>,
         #[arg(long, default_value = "data/sdrf_annotation")]
         output: PathBuf,
         #[arg(long, default_value = "qwen2.5:3b")]
@@ -494,6 +516,31 @@ async fn main() -> Result<()> {
             })?;
             println!("{}", serde_json::to_string_pretty(&summary)?);
         }
+        Command::SdrfResolve {
+            accessions,
+            accessions_file,
+            snapshot,
+            output,
+            timeout,
+            force,
+        } => {
+            log::info!(
+                "command=sdrf-resolve snapshot={} output={}",
+                snapshot.display(),
+                output.display()
+            );
+            let summary = resolve_sdrf_sources(SdrfResolveOptions {
+                snapshot_dir: snapshot,
+                output_dir: output,
+                accessions,
+                accessions_file,
+                timeout_seconds: timeout,
+                force,
+                progress,
+            })
+            .await?;
+            println!("{}", serde_json::to_string_pretty(&summary)?);
+        }
         Command::SdrfAnnotate {
             accessions,
             accessions_file,
@@ -501,6 +548,7 @@ async fn main() -> Result<()> {
             annotations_dir,
             publication_manifest,
             manuscript_text,
+            resolved_sdrf_dir,
             output,
             model,
             ollama_url,
@@ -526,6 +574,7 @@ async fn main() -> Result<()> {
                 output_dir: output,
                 accessions,
                 accessions_file,
+                resolved_sdrf_dir,
                 model,
                 ollama_url,
                 timeout_seconds: timeout,
