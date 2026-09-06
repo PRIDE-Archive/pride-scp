@@ -20,7 +20,7 @@ pub const SINGLE_CELL_TEMPLATE_VERSION: &str = "1.0.0";
 pub const SINGLE_CELL_TEMPLATE_URL: &str =
     "https://github.com/bigbio/sdrf-templates/blob/main/single-cell/1.0.0/single-cell.yaml";
 pub const SDRF_SPEC_URL: &str = "https://sdrf.quantms.org/specification.html";
-pub const GENERATOR_VERSION: &str = "pride-scp-sdrf-v0.2.1";
+pub const GENERATOR_VERSION: &str = "pride-scp-sdrf-v0.2.2";
 pub const DEFAULT_OLLAMA_URL: &str = "http://localhost:11434/api/generate";
 
 // The linked single-cell template is work-in-progress. Generated drafts pin the
@@ -1251,6 +1251,26 @@ fn proposal_target_fields(evidence: &DatasetEvidence) -> BTreeSet<String> {
     out
 }
 
+fn deterministic_existing_sdrf_proposal(evidence: &DatasetEvidence) -> Option<SdrfProposal> {
+    if evidence.existing_sdrf_path.is_empty() {
+        return None;
+    }
+    let targets = proposal_target_fields(evidence);
+    if !targets.is_empty() {
+        return None;
+    }
+    let mut proposal = SdrfProposal::default();
+    if let Ok((headers, rows)) = read_existing_sdrf_table(Path::new(&evidence.existing_sdrf_path)) {
+        proposal.relation_mode = existing_sdrf_relation_hint(&headers, &rows);
+    }
+    if proposal.relation_mode.trim().is_empty() {
+        proposal.relation_mode = "uncertain".into();
+    }
+    proposal.confidence = "deterministic_existing_sdrf".into();
+    proposal.notes = "No missing dataset-level target fields required Ollama extraction; existing SDRF values were preserved and validated deterministically.".into();
+    Some(proposal)
+}
+
 fn evidence_relevant_to_field(field: &str, item: &EvidenceItem) -> bool {
     let label = item.source_label.to_ascii_lowercase();
     let text = item.text.to_ascii_lowercase();
@@ -2276,11 +2296,18 @@ fn merge_existing_sdrf(
 fn draft_rows(
     proposal: &SdrfProposal,
     evidence: &DatasetEvidence,
-) -> (Vec<String>, Vec<Vec<String>>, String) {
+) -> Result<(Vec<String>, Vec<Vec<String>>, String)> {
+    // Existing SDRF content is authoritative row-relationship evidence. Never
+    // silently fall back to a filename-derived skeleton if an existing SDRF was
+    // detected: that can destroy a valid sample↔file/channel mapping while still
+    // looking like a successful enrichment run. Surface the parse/merge error.
     if !evidence.existing_sdrf_path.is_empty() {
-        if let Ok(merged) = merge_existing_sdrf(proposal, evidence) {
-            return merged;
-        }
+        return merge_existing_sdrf(proposal, evidence).with_context(|| {
+            format!(
+                "preserve/enrich existing SDRF {}",
+                evidence.existing_sdrf_path
+            )
+        });
     }
     let include_uri = evidence.raw_files.iter().any(|f| !f.file_uri.is_empty());
     let headers = headers_for(proposal, include_uri);
@@ -2449,7 +2476,7 @@ fn draft_rows(
         );
         rows.push(row);
     }
-    (headers, rows, mode.to_string())
+    Ok((headers, rows, mode.to_string()))
 }
 
 fn validate_draft(
@@ -2700,13 +2727,24 @@ async fn annotate_one(opts: &SdrfAnnotateOptions, accession: &str) -> Result<Res
     }
     fs::write(&evidence_path, serde_json::to_string_pretty(&evidence)?)?;
 
-    let mut proposal = call_ollama(opts, &evidence).await?;
-    // Preserve the model response verbatim, then construct a provenance-safe proposal.
-    // Unsupported assertions are downgraded to reserved values instead of aborting
-    // the entire accession; every repair is surfaced in the review/audit outputs.
+    let (mut proposal, ollama_used) =
+        if let Some(proposal) = deterministic_existing_sdrf_proposal(&evidence) {
+            (proposal, false)
+        } else {
+            (call_ollama(opts, &evidence).await?, true)
+        };
+    // Preserve the model response verbatim when Ollama was used, then construct a
+    // provenance-safe proposal. Existing SDRFs that already provide every target
+    // field skip Ollama entirely and are validated deterministically.
     let raw_proposal_path = proposal_path.with_file_name(format!("{accession}.ollama.raw.json"));
-    fs::write(&raw_proposal_path, serde_json::to_string_pretty(&proposal)?)?;
-    let mut provenance_issues = repair_proposal_provenance(&mut proposal, &evidence);
+    if ollama_used {
+        fs::write(&raw_proposal_path, serde_json::to_string_pretty(&proposal)?)?;
+    }
+    let mut provenance_issues = if ollama_used {
+        repair_proposal_provenance(&mut proposal, &evidence)
+    } else {
+        Vec::new()
+    };
     if !evidence.existing_sdrf_path.is_empty() {
         if let Ok((headers, rows)) =
             read_existing_sdrf_table(Path::new(&evidence.existing_sdrf_path))
@@ -2730,7 +2768,7 @@ async fn annotate_one(opts: &SdrfAnnotateOptions, accession: &str) -> Result<Res
     let proposal_repair_count = provenance_issues.len();
     let existing = !evidence.existing_sdrf_path.is_empty();
 
-    let (headers, rows, generation_mode) = draft_rows(&proposal, &evidence);
+    let (headers, rows, generation_mode) = draft_rows(&proposal, &evidence)?;
     write_sdrf(&draft_path, &headers, &rows)?;
     let mut issues = provenance_issues;
     issues.extend(validate_draft(&headers, &rows, &evidence));
@@ -2757,7 +2795,7 @@ async fn annotate_one(opts: &SdrfAnnotateOptions, accession: &str) -> Result<Res
         template_url: SINGLE_CELL_TEMPLATE_URL.into(), specification_url: SDRF_SPEC_URL.into(),
         existing_sdrf_present: existing, generation_mode: generation_mode.clone(), relation_mode: proposal.relation_mode.clone(),
         raw_file_count: evidence.raw_files.len(), evidence_item_count: evidence.evidence.len(), manuscript_source_count: evidence.manuscript_sources.len(),
-        annotation_source_count: evidence.annotation_sources.len(), ollama_model: opts.model.clone(), ollama_used: true,
+        annotation_source_count: evidence.annotation_sources.len(), ollama_model: opts.model.clone(), ollama_used,
         draft_path: draft_path.display().to_string(), proposal_path: proposal_path.display().to_string(), evidence_path: evidence_path.display().to_string(),
         review_path: review_path.display().to_string(), validation_issue_count: issues.len(), validation_error_count: errors, proposal_repair_count, locally_valid,
         completeness_status: completeness.into(),
@@ -2951,7 +2989,7 @@ mod tests {
             confidence: "high".into(),
             notes: String::new(),
         };
-        let (headers, rows, _) = draft_rows(&proposal, &evidence);
+        let (headers, rows, _) = draft_rows(&proposal, &evidence).unwrap();
         assert!(headers.contains(&SC_CELL_IDENTIFIER.to_string()));
         let idx = headers
             .iter()
@@ -2984,7 +3022,7 @@ mod tests {
             single_cell_isolation_method: "FACS".into(),
             ..Default::default()
         };
-        let (headers, rows, _) = draft_rows(&proposal, &evidence);
+        let (headers, rows, _) = draft_rows(&proposal, &evidence).unwrap();
         let issues = validate_draft(&headers, &rows, &evidence);
         assert!(issues
             .iter()
@@ -3255,6 +3293,56 @@ mod tests {
         assert!(issues
             .iter()
             .any(|x| x.code == "no_data_rows" && x.level == "error"));
+    }
+
+    #[test]
+    fn existing_sdrf_draft_never_silently_falls_back_to_skeleton() {
+        let evidence = DatasetEvidence {
+            accession: "PXD999999".into(),
+            project_json_path: String::new(),
+            files_json_path: String::new(),
+            existing_sdrf_path: "/definitely/missing/existing.sdrf.tsv".into(),
+            raw_files: vec![RawFile {
+                file_name: "run.raw".into(),
+                file_uri: String::new(),
+                category: "RAW".into(),
+            }],
+            evidence: vec![],
+            manuscript_sources: vec![],
+            annotation_sources: vec![],
+        };
+        let proposal = SdrfProposal {
+            relation_mode: "uncertain".into(),
+            ..Default::default()
+        };
+        assert!(draft_rows(&proposal, &evidence).is_err());
+    }
+
+    #[test]
+    fn complete_existing_sdrf_can_skip_ollama() {
+        let root = tmp();
+        fs::create_dir_all(&root).unwrap();
+        let existing = root.join("existing.sdrf.tsv");
+        fs::write(&existing,
+            concat!(
+                "source name\tcharacteristics[organism]\tcharacteristics[organism part]\tcharacteristics[disease]\tcharacteristics[cell type]\tcharacteristics[sample type]\tcharacteristics[single cell isolation protocol]\tcharacteristics[cell identifier]\tcharacteristics[individual]\tcomment[sample preparation batch]\tcharacteristics[cells per well]\tassay name\ttechnology type\tcomment[proteomics data acquisition method]\tcomment[label]\tcomment[instrument]\tcomment[cleavage agent details]\tcomment[fraction identifier]\tcomment[technical replicate]\tcomment[data file]\tcomment[carrier channel]\tcomment[reference channel]\n",
+                "cell1\thomo sapiens\tnot applicable\tnormal\tHeLa\tsingle cell\tcellenONE\tcell1\tdonor1\tbatch1\t1\tassay1\tproteomic profiling by mass spectrometry\tdata-dependent acquisition\tlabel free sample\tOrbitrap\tTrypsin\t1\t1\trun.raw\tnot applicable\tnot applicable\n"
+            )
+        ).unwrap();
+        let evidence = DatasetEvidence {
+            accession: "PXD999999".into(),
+            project_json_path: String::new(),
+            files_json_path: String::new(),
+            existing_sdrf_path: existing.display().to_string(),
+            raw_files: vec![],
+            evidence: vec![],
+            manuscript_sources: vec![],
+            annotation_sources: vec![],
+        };
+        assert!(proposal_target_fields(&evidence).is_empty());
+        let proposal = deterministic_existing_sdrf_proposal(&evidence).unwrap();
+        assert_eq!(proposal.relation_mode, "one_cell_per_data_file");
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]

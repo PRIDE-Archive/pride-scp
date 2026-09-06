@@ -30,7 +30,7 @@ case "$COHORT_MODE" in
   *) echo "invalid COHORT_MODE=$COHORT_MODE (expected all, missing-sdrf, or existing-sdrf)" >&2; exit 2 ;;
 esac
 MODE_TAG="${COHORT_MODE//-/_}"
-OUT="${OUT:-$ROOT/data/sdrf_annotation_gt106_pride_v021_${MODE_TAG}}"
+OUT="${OUT:-$ROOT/data/sdrf_annotation_gt106_pride_v022_${MODE_TAG}}"
 
 [[ -f "$GT_MASTER" ]] || { echo "missing GT master: $GT_MASTER" >&2; exit 2; }
 [[ -d "$SNAPSHOT" ]] || { echo "missing snapshot: $SNAPSHOT" >&2; exit 2; }
@@ -44,6 +44,7 @@ COHORT_META="$OUT/gt106_pride_cohort_selection.json"
 
 python - "$GT_MASTER" "$SNAPSHOT" "$COHORT_MODE" "$ALL_ACCESSIONS" "$ACCESSIONS" "$COHORT_META" <<'PY'
 import csv, json, re, sys
+from collections import Counter
 from pathlib import Path
 src, snapshot, mode, all_out, selected_out, meta = sys.argv[1:]
 src = Path(src); snapshot = Path(snapshot); all_out = Path(all_out); selected_out = Path(selected_out); meta = Path(meta)
@@ -61,7 +62,7 @@ acc_fields = [f for f in fields if f.lower().strip() in {
     'accession','dataset_accession','repository_accession','pxd','pxd_accession'
 }]
 
-def is_pride(row):
+def is_pride_gt_label(row):
     if repo_fields:
         vals = [str(row.get(f,'')).strip().lower() for f in repo_fields]
         return any(v == 'pride' or v.startswith('pride ') for v in vals)
@@ -78,17 +79,88 @@ def accession(row):
             return m.group(0).upper()
     return None
 
-all_accs = sorted({a for r in rows if is_pride(r) for a in [accession(r)] if a})
-if len(all_accs) != 106:
-    raise SystemExit(f"expected 106 PRIDE GT accessions, extracted {len(all_accs)}; repository fields={repo_fields}, accession fields={acc_fields}")
+def registry_host(acc):
+    path = snapshot / 'registry' / 'projects' / f'{acc}.json'
+    if not path.is_file():
+        return ''
+    try:
+        obj = json.loads(path.read_text())
+    except Exception:
+        return ''
+    return str(obj.get('registryHostingRepository') or '').strip()
+
+def source_host(acc):
+    if (snapshot / 'projects' / f'{acc}.json').is_file():
+        return 'PRIDE'
+    return registry_host(acc) or 'unknown'
 
 def has_sdrf(acc):
-    return (snapshot / 'sdrf' / f'{acc}.sdrf.tsv').is_file() and (snapshot / 'sdrf' / f'{acc}.sdrf.tsv').stat().st_size > 0
+    p = snapshot / 'sdrf' / f'{acc}.sdrf.tsv'
+    return p.is_file() and p.stat().st_size > 0
 
-existing = [a for a in all_accs if has_sdrf(a)]
-missing = [a for a in all_accs if not has_sdrf(a)]
+def sdrf_source_class(acc):
+    p = snapshot / 'sdrf' / f'{acc}.sdrf.tsv'
+    if not p.is_file() or p.stat().st_size == 0:
+        return 'missing'
+    try:
+        with p.open(newline='', encoding='utf-8-sig', errors='replace') as fh:
+            r = csv.reader(fh, delimiter='\t')
+            header = [x.strip().lower() for x in next(r)]
+            try:
+                j = header.index('comment[sdrf annotation tool]')
+            except ValueError:
+                return 'repository_or_unknown'
+            vals = []
+            for i, row in enumerate(r):
+                if j < len(row) and row[j].strip():
+                    vals.append(row[j].strip().lower())
+                if i >= 50:
+                    break
+        text = ' | '.join(vals)
+        if 'manual curation' in text or 'bigbio' in text:
+            return 'community_curated'
+        if 'hamlet' in text or 'agentic' in text:
+            return 'agentic'
+        if 'pride-scp' in text:
+            return 'pride_scp_generated'
+        return 'repository_or_unknown'
+    except Exception:
+        return 'unclassified'
+
+all_accs = sorted({a for r in rows if is_pride_gt_label(r) for a in [accession(r)] if a})
+if len(all_accs) != 106:
+    raise SystemExit(f"expected 106 GT rows labelled PRIDE, extracted {len(all_accs)}; repository fields={repo_fields}, accession fields={acc_fields}")
+
+inventory = []
+for acc in all_accs:
+    host = source_host(acc)
+    inventory.append({
+        'accession': acc,
+        'gt_repository_label': 'PRIDE',
+        'source_resolved_hosting_repository': host,
+        'primary_pride_project_snapshot': 'yes' if host == 'PRIDE' else 'no',
+        'sdrf_present': 'yes' if has_sdrf(acc) else 'no',
+        'sdrf_source_class_content_heuristic': sdrf_source_class(acc),
+    })
+
+inventory_path = meta.parent / 'gt106_pride_sdrf_source_inventory.tsv'
+with inventory_path.open('w', newline='') as fh:
+    w = csv.DictWriter(fh, fieldnames=list(inventory[0]), delimiter='\t')
+    w.writeheader(); w.writerows(inventory)
+
+resolved_pride = [r['accession'] for r in inventory if r['source_resolved_hosting_repository'] == 'PRIDE']
+non_pride = [r for r in inventory if r['source_resolved_hosting_repository'] != 'PRIDE']
+non_pride_path = meta.parent / 'gt106_non_pride_or_unresolved_accessions.tsv'
+with non_pride_path.open('w', newline='') as fh:
+    w = csv.DictWriter(fh, fieldnames=['accession','gt_repository_label','source_resolved_hosting_repository'], delimiter='\t')
+    w.writeheader()
+    for r in non_pride:
+        w.writerow({k:r[k] for k in w.fieldnames})
+
+existing = [a for a in resolved_pride if has_sdrf(a)]
+missing = [a for a in resolved_pride if not has_sdrf(a)]
 if mode == 'all':
-    selected = all_accs
+    selected = resolved_pride
 elif mode == 'missing-sdrf':
     selected = missing
 elif mode == 'existing-sdrf':
@@ -96,26 +168,35 @@ elif mode == 'existing-sdrf':
 else:
     raise SystemExit(f'unsupported mode {mode}')
 
-all_out.write_text("\n".join(all_accs) + "\n")
+all_out.write_text("\n".join(resolved_pride) + "\n")
 selected_out.write_text(("\n".join(selected) + "\n") if selected else "")
+source_counts = Counter(r['sdrf_source_class_content_heuristic'] for r in inventory if r['accession'] in resolved_pride and r['sdrf_present']=='yes')
 meta.write_text(json.dumps({
-    "cohort": "frozen_GT196_PRIDE_subset",
+    "cohort": "frozen_GT196_rows_labelled_PRIDE_resolved_against_source_snapshot",
     "cohort_mode": mode,
-    "all_pride_gt_accessions": len(all_accs),
+    "gt_rows_labelled_pride": len(all_accs),
+    "source_resolved_primary_pride_accessions": len(resolved_pride),
+    "source_resolved_non_pride_or_unresolved": len(non_pride),
     "existing_sdrf_accessions": len(existing),
     "missing_sdrf_accessions": len(missing),
     "selected_accessions": len(selected),
+    "existing_sdrf_source_class_counts": dict(sorted(source_counts.items())),
     "gt_master": str(src),
     "snapshot": str(snapshot),
-    "gt_use": "accession_selection_only",
+    "gt_use": "accession_cohort_seed_only",
     "runtime_sdrf_gt_metadata_used": False,
     "runtime_sdrf_gt_labels_used": False,
-    "note": "GT selects the known PRIDE SCP cohort only. SDRF field values and provenance come from PRIDE, deposited SDRF, pipeline annotations, and publication/manuscript evidence."
+    "source_inventory": str(inventory_path),
+    "non_pride_or_unresolved_inventory": str(non_pride_path),
+    "note": "The frozen GT repository label is not treated as source truth. Runtime scope is restricted to accessions present in the primary PRIDE snapshot; registry hostingRepository is used to explain mismatches. SDRF fields never come from GT. SDRF source class is a content heuristic from comment[sdrf annotation tool], not authoritative repository provenance."
 }, indent=2) + "\n")
-print(f"GT106 SDRF cohort: all={len(all_accs)} existing_sdrf={len(existing)} missing_sdrf={len(missing)} selected={len(selected)} mode={mode}")
+print(f"GT-labelled PRIDE rows={len(all_accs)}; source-resolved primary PRIDE={len(resolved_pride)}; non-PRIDE/unresolved={len(non_pride)}")
+print(f"primary PRIDE SDRF: existing={len(existing)} missing={len(missing)} selected={len(selected)} mode={mode}")
 print(f"  selected -> {selected_out}")
+print(f"  source inventory -> {inventory_path}")
+if non_pride:
+    print("  deferred non-PRIDE/unresolved -> " + ", ".join(f"{r['accession']}({r['source_resolved_hosting_repository']})" for r in non_pride))
 PY
-
 cat "$COHORT_META"
 
 if [[ "$LIST_ONLY" == "1" ]]; then
