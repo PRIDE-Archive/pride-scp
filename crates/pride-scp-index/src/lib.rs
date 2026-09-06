@@ -3,10 +3,10 @@ use pride_scp_core::{
     first_string_for_keys, flatten_json_strings, make_progress_bar, make_spinner,
     read_nonempty_lines, write_json,
 };
-use reqwest::{header::RETRY_AFTER, Client, StatusCode};
+use reqwest::{header::RETRY_AFTER, Client, StatusCode, Url};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -19,6 +19,9 @@ pub const DEFAULT_PROJECT_PAGE_SIZE: usize = 100;
 pub const DEFAULT_PROTEOMECENTRAL_PROXI_API: &str =
     "https://proteomecentral.proteomexchange.org/api/proxi/v0.1";
 pub const DEFAULT_REGISTRY_PAGE_SIZE: usize = 100;
+pub const DEFAULT_MASSIVE_QUERY_DATASETS_API: &str =
+    "https://massive.ucsd.edu/ProteoSAFe/QueryDatasets";
+pub const DEFAULT_MASSIVE_PAGE_SIZE: usize = 100;
 
 #[derive(Debug, Clone)]
 pub struct SnapshotOptions {
@@ -97,6 +100,50 @@ pub struct RegistrySnapshotSummary {
     pub normalized_records_written: usize,
     pub stale_normalized_records_removed: usize,
     pub native_aliases_observed: usize,
+    pub enumeration_termination: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct MassiveNativeSnapshotOptions {
+    /// Existing unified snapshot root. Native MassIVE records are written below
+    /// `native/massive/` and never replace primary PRIDE or ProteomeCentral records.
+    pub snapshot_dir: PathBuf,
+    /// MassIVE public dataset table endpoint (`QueryDatasets`).
+    pub query_endpoint: String,
+    /// JSON query passed to MassIVE. `{}` requests the public dataset table without filters.
+    pub query_json: String,
+    pub timeout_seconds: u64,
+    pub retries: usize,
+    pub user_agent: String,
+    pub page_size: usize,
+    /// Safety cap. Hitting the cap is an error rather than a valid partial snapshot.
+    pub max_pages: usize,
+    /// Abort if this many consecutive populated pages add no new native MSV accessions.
+    pub max_stagnant_pages: usize,
+    pub force: bool,
+    pub progress: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct MassiveNativeSnapshotSummary {
+    pub query_endpoint: String,
+    pub query_json: String,
+    pub page_size: usize,
+    pub pages_fetched: usize,
+    pub pages_cached: usize,
+    pub datasets_seen: usize,
+    pub datasets_with_msv_accession: usize,
+    pub unique_msv_accessions: usize,
+    pub pxd_aliases_from_registry: usize,
+    pub native_records_with_pxd_alias: usize,
+    pub native_only_records: usize,
+    pub normalized_records_written: usize,
+    pub stale_normalized_records_removed: usize,
+    pub duplicate_only_pages: usize,
+    /// Number of cached/fetched QueryDatasets pages that required Unicode repair.
+    pub pages_with_unicode_repairs: usize,
+    /// Total invalid UTF-8/surrogate replacements recorded across repaired pages.
+    pub unicode_replacements: usize,
     pub enumeration_termination: String,
 }
 
@@ -597,6 +644,651 @@ fn retry_after_seconds(response: &reqwest::Response) -> Option<u64> {
 
 fn exponential_backoff_seconds(attempt: usize) -> u64 {
     1_u64 << attempt.min(5)
+}
+
+fn is_msv(accession: &str) -> bool {
+    let upper = accession.trim().to_ascii_uppercase();
+    upper.starts_with("MSV") && upper.len() > 3 && upper[3..].chars().all(|c| c.is_ascii_digit())
+}
+
+fn massive_msv_accessions(value: &Value) -> Vec<String> {
+    let mut strings = Vec::new();
+    flatten_json_strings(value, &mut strings);
+    strings
+        .iter()
+        .flat_map(|text| accession_tokens(text))
+        .filter(|token| is_msv(token))
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
+fn massive_dataset_entries(value: &Value) -> Vec<&Value> {
+    if let Some(items) = value.as_array() {
+        if items
+            .iter()
+            .any(|item| !massive_msv_accessions(item).is_empty())
+        {
+            return items.iter().collect();
+        }
+        for child in items {
+            let nested = massive_dataset_entries(child);
+            if !nested.is_empty() {
+                return nested;
+            }
+        }
+    }
+
+    for key in [
+        "datasets",
+        "results",
+        "rows",
+        "items",
+        "content",
+        "data",
+        "blockData",
+        "filteredList",
+    ] {
+        if let Some(child) = value.get(key) {
+            if let Some(items) = child.as_array() {
+                if items
+                    .iter()
+                    .any(|item| !massive_msv_accessions(item).is_empty())
+                {
+                    return items.iter().collect();
+                }
+            }
+            let nested = massive_dataset_entries(child);
+            if !nested.is_empty() {
+                return nested;
+            }
+        }
+    }
+
+    if let Some(map) = value.as_object() {
+        for child in map.values() {
+            let nested = massive_dataset_entries(child);
+            if !nested.is_empty() {
+                return nested;
+            }
+        }
+    }
+    Vec::new()
+}
+
+fn massive_positional_title(value: &Value) -> String {
+    let Some(items) = value.as_array() else {
+        return String::new();
+    };
+    for item in items {
+        let Some(text) = item.as_str() else {
+            continue;
+        };
+        let trimmed = text.trim();
+        let upper = trimmed.to_ascii_uppercase();
+        if trimmed.len() < 5
+            || is_msv(&upper)
+            || is_pxd(&upper)
+            || trimmed.starts_with("http://")
+            || trimmed.starts_with("https://")
+            || trimmed.starts_with("ftp://")
+        {
+            continue;
+        }
+        return trimmed.to_string();
+    }
+    String::new()
+}
+
+fn massive_registry_alias_map(snapshot_dir: &Path) -> Result<HashMap<String, BTreeSet<String>>> {
+    let path = snapshot_dir
+        .join("registry")
+        .join("registry_accessions.tsv");
+    if !path.is_file() {
+        return Ok(HashMap::new());
+    }
+    let text = std::fs::read_to_string(&path)
+        .with_context(|| format!("read registry alias crosswalk {}", path.display()))?;
+    let mut lines = text.lines();
+    let Some(header) = lines.next() else {
+        return Ok(HashMap::new());
+    };
+    let headers = header.split('\t').collect::<Vec<_>>();
+    let pxd_idx = headers.iter().position(|x| *x == "pxd_accession");
+    let native_idx = headers.iter().position(|x| *x == "native_accessions");
+    let (Some(pxd_idx), Some(native_idx)) = (pxd_idx, native_idx) else {
+        return Ok(HashMap::new());
+    };
+    let mut out: HashMap<String, BTreeSet<String>> = HashMap::new();
+    for line in lines {
+        let cols = line.split('\t').collect::<Vec<_>>();
+        let Some(pxd) = cols.get(pxd_idx).map(|x| x.trim().to_ascii_uppercase()) else {
+            continue;
+        };
+        if !is_pxd(&pxd) {
+            continue;
+        }
+        let Some(native_text) = cols.get(native_idx) else {
+            continue;
+        };
+        for token in accession_tokens(native_text).filter(|x| is_msv(x)) {
+            out.entry(token).or_default().insert(pxd.clone());
+        }
+    }
+    Ok(out)
+}
+
+fn normalized_massive_dataset(accession: &str, dataset: &Value, pxd_aliases: &[String]) -> Value {
+    let mut title = first_string_for_keys(
+        dataset,
+        &[
+            "title",
+            "datasetTitle",
+            "dataset_title",
+            "title_input",
+            "name",
+        ],
+    );
+    if title.is_empty() {
+        title = massive_positional_title(dataset);
+    }
+    let description = first_string_for_keys(
+        dataset,
+        &[
+            "description",
+            "datasetDescription",
+            "dataset_description",
+            "description_input",
+            "projectDescription",
+        ],
+    );
+    serde_json::json!({
+        "accession": accession,
+        "projectAccession": accession,
+        "title": title,
+        "description": description,
+        "sourceRepository": "MassIVE",
+        "nativeSource": "MassIVE QueryDatasets",
+        "nativeAccession": accession,
+        "pxdAliases": pxd_aliases,
+        "massiveNativeRecord": dataset,
+    })
+}
+
+pub async fn massive_native_snapshot(
+    opts: MassiveNativeSnapshotOptions,
+) -> Result<MassiveNativeSnapshotSummary> {
+    let started = Instant::now();
+    let root = opts.snapshot_dir.join("native").join("massive");
+    let pages_dir = root.join("pages");
+    let projects_dir = root.join("projects");
+    tokio::fs::create_dir_all(&pages_dir)
+        .await
+        .with_context(|| format!("create {}", pages_dir.display()))?;
+    tokio::fs::create_dir_all(&projects_dir)
+        .await
+        .with_context(|| format!("create {}", projects_dir.display()))?;
+
+    let client = Client::builder()
+        .connect_timeout(Duration::from_secs(20))
+        .timeout(Duration::from_secs(opts.timeout_seconds.max(1)))
+        .user_agent(&opts.user_agent)
+        .build()
+        .context("build MassIVE HTTP client")?;
+
+    let page_size = opts.page_size.max(1);
+    let alias_map = massive_registry_alias_map(&opts.snapshot_dir)?;
+    let mut summary = MassiveNativeSnapshotSummary {
+        query_endpoint: opts.query_endpoint.clone(),
+        query_json: opts.query_json.clone(),
+        page_size,
+        pxd_aliases_from_registry: alias_map.values().map(|x| x.len()).sum(),
+        ..Default::default()
+    };
+    let mut seen = BTreeSet::new();
+    let mut rows = Vec::new();
+    let spinner = make_spinner("enumerating native MassIVE public datasets", opts.progress);
+    let mut page_number = 0usize;
+    let mut stagnant_pages = 0usize;
+
+    loop {
+        if opts.max_pages > 0 && page_number >= opts.max_pages {
+            return Err(anyhow!(
+                "MassIVE enumeration incomplete: reached --max-pages {} before an end-of-list response",
+                opts.max_pages
+            ));
+        }
+        if page_number > 1_000_000 {
+            return Err(anyhow!(
+                "aborting MassIVE enumeration after implausibly many pages"
+            ));
+        }
+
+        let offset = page_number.saturating_mul(page_size);
+        let mut url = Url::parse(&opts.query_endpoint)
+            .with_context(|| format!("parse MassIVE QueryDatasets URL {}", opts.query_endpoint))?;
+        url.query_pairs_mut()
+            .append_pair("pageSize", &page_size.to_string())
+            .append_pair("offset", &offset.to_string())
+            .append_pair("query", &opts.query_json);
+        let page_path = pages_dir.join(format!("page_{page_number:06}.json"));
+        let state = fetch_cached_json_tolerant(
+            &client,
+            url.as_str(),
+            &page_path,
+            opts.force,
+            opts.retries,
+            true,
+        )
+        .await
+        .with_context(|| format!("enumerate MassIVE page {} from {}", page_number, url))?;
+        match state {
+            FetchState::Fetched => summary.pages_fetched += 1,
+            FetchState::Cached => summary.pages_cached += 1,
+            FetchState::NotFound => {
+                summary.enumeration_termination = "not_found_page".to_string();
+                break;
+            }
+        }
+
+        let value: Value = pride_scp_core::read_json(&page_path)
+            .with_context(|| format!("read MassIVE page {}", page_path.display()))?;
+        let entries = massive_dataset_entries(&value);
+        if entries.is_empty() {
+            if page_number == 0 {
+                return Err(anyhow!(
+                    "MassIVE QueryDatasets first page contained no detectable MSV dataset rows; inspect {} and endpoint/query contract",
+                    page_path.display()
+                ));
+            }
+            summary.enumeration_termination = "empty_page".to_string();
+            break;
+        }
+        summary.datasets_seen += entries.len();
+        let mut page_new = 0usize;
+        let mut page_msv = 0usize;
+        for dataset in &entries {
+            let msvs = massive_msv_accessions(dataset);
+            if msvs.is_empty() {
+                continue;
+            }
+            summary.datasets_with_msv_accession += 1;
+            page_msv += msvs.len();
+            for accession in msvs {
+                if !seen.insert(accession.clone()) {
+                    continue;
+                }
+                page_new += 1;
+                let pxd_aliases = alias_map
+                    .get(&accession)
+                    .cloned()
+                    .unwrap_or_default()
+                    .into_iter()
+                    .collect::<Vec<_>>();
+                if pxd_aliases.is_empty() {
+                    summary.native_only_records += 1;
+                } else {
+                    summary.native_records_with_pxd_alias += 1;
+                }
+                let normalized = normalized_massive_dataset(&accession, dataset, &pxd_aliases);
+                let path = projects_dir.join(format!("{accession}.json"));
+                if opts.force || !path.is_file() {
+                    write_json(&path, &normalized).with_context(|| {
+                        format!("write native MassIVE record {}", path.display())
+                    })?;
+                    summary.normalized_records_written += 1;
+                }
+                let title = first_string_for_keys(&normalized, &["title"])
+                    .replace('\t', " ")
+                    .replace('\n', " ");
+                rows.push(format!(
+                    "{}\t{}\t{}\t{}",
+                    accession,
+                    pxd_aliases.join("; "),
+                    path.display(),
+                    title,
+                ));
+            }
+        }
+
+        if page_number == 0 && page_msv == 0 {
+            return Err(anyhow!(
+                "MassIVE QueryDatasets first page had rows but zero MSV accessions; inspect response shape in {}",
+                page_path.display()
+            ));
+        }
+        if page_new == 0 {
+            stagnant_pages += 1;
+            summary.duplicate_only_pages += 1;
+        } else {
+            stagnant_pages = 0;
+        }
+        if opts.max_stagnant_pages > 0 && stagnant_pages >= opts.max_stagnant_pages {
+            return Err(anyhow!(
+                "MassIVE enumeration stalled: {} consecutive populated pages added no new MSV accessions; endpoint may be ignoring offset",
+                stagnant_pages
+            ));
+        }
+
+        spinner.set_message(format!(
+            "MassIVE page {} | datasets={} unique_msv={}",
+            page_number,
+            summary.datasets_seen,
+            seen.len()
+        ));
+
+        if entries.len() < page_size {
+            summary.enumeration_termination = "short_page".to_string();
+            break;
+        }
+        page_number += 1;
+    }
+
+    summary.unique_msv_accessions = seen.len();
+    let mut stale = Vec::new();
+    if projects_dir.is_dir() {
+        for entry in std::fs::read_dir(&projects_dir)? {
+            let path = entry?.path();
+            let Some(accession) = path
+                .file_stem()
+                .and_then(|x| x.to_str())
+                .map(str::trim)
+                .map(str::to_ascii_uppercase)
+            else {
+                continue;
+            };
+            if is_msv(&accession) && !seen.contains(&accession) {
+                stale.push(path);
+            }
+        }
+    }
+    for path in stale {
+        std::fs::remove_file(&path)
+            .with_context(|| format!("remove stale native MassIVE record {}", path.display()))?;
+        summary.stale_normalized_records_removed += 1;
+    }
+
+    let (repaired_pages, unicode_replacements) = massive_unicode_repair_totals(&pages_dir)?;
+    summary.pages_with_unicode_repairs = repaired_pages;
+    summary.unicode_replacements = unicode_replacements;
+
+    rows.sort();
+    let mut crosswalk_lines =
+        vec!["msv_accession\tpxd_aliases\tproject_json_path\tdataset_title".to_string()];
+    crosswalk_lines.extend(rows);
+    std::fs::write(
+        root.join("massive_accessions.tsv"),
+        crosswalk_lines.join("\n") + "\n",
+    )?;
+    std::fs::write(
+        root.join("accessions.txt"),
+        seen.iter().cloned().collect::<Vec<_>>().join("\n") + "\n",
+    )?;
+    write_json(&root.join("massive_summary.json"), &summary)?;
+    spinner.finish_with_message(format!(
+        "MassIVE native snapshot complete | {} native datasets",
+        summary.unique_msv_accessions
+    ));
+    log::info!(
+        "MassIVE native snapshot complete in {:.1}s: datasets={} unique_msv={} native_only={} with_pxd_alias={}",
+        started.elapsed().as_secs_f64(),
+        summary.datasets_seen,
+        summary.unique_msv_accessions,
+        summary.native_only_records,
+        summary.native_records_with_pxd_alias,
+    );
+    Ok(summary)
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct JsonUnicodeRepairMeta {
+    parse_error: String,
+    unicode_replacements: usize,
+    raw_response_path: String,
+}
+
+fn is_hex_digit(byte: u8) -> bool {
+    byte.is_ascii_hexdigit()
+}
+
+fn parse_u16_hex(bytes: &[u8]) -> Option<u16> {
+    if bytes.len() != 4 || !bytes.iter().copied().all(is_hex_digit) {
+        return None;
+    }
+    let text = std::str::from_utf8(bytes).ok()?;
+    u16::from_str_radix(text, 16).ok()
+}
+
+fn unicode_escape_is_active(bytes: &[u8], slash_index: usize) -> bool {
+    if bytes.get(slash_index) != Some(&b'\\') || bytes.get(slash_index + 1) != Some(&b'u') {
+        return false;
+    }
+    let mut preceding = 0usize;
+    let mut cursor = slash_index;
+    while cursor > 0 && bytes[cursor - 1] == b'\\' {
+        preceding += 1;
+        cursor -= 1;
+    }
+    preceding % 2 == 0
+}
+
+/// Repair only malformed Unicode at the JSON decoding boundary.
+///
+/// MassIVE occasionally emits a lone UTF-16 surrogate escape inside an otherwise valid
+/// QueryDatasets JSON page. serde_json rejects the complete page. This routine replaces only
+/// invalid UTF-8 input or unpaired active `\\uXXXX` surrogate escapes with U+FFFD while leaving
+/// valid surrogate pairs and escaped literal backslashes untouched.
+fn repair_invalid_json_unicode(bytes: &[u8]) -> (Vec<u8>, usize) {
+    let decoded = String::from_utf8_lossy(bytes);
+    let mut replacements = if matches!(&decoded, std::borrow::Cow::Owned(_)) {
+        decoded.matches('\u{FFFD}').count()
+    } else {
+        0
+    };
+    let mut out = decoded.as_bytes().to_vec();
+    let mut i = 0usize;
+    while i + 5 < out.len() {
+        if !unicode_escape_is_active(&out, i) {
+            i += 1;
+            continue;
+        }
+        let Some(code) = parse_u16_hex(&out[i + 2..i + 6]) else {
+            i += 1;
+            continue;
+        };
+        if (0xD800..=0xDBFF).contains(&code) {
+            let has_low = i + 11 < out.len()
+                && unicode_escape_is_active(&out, i + 6)
+                && parse_u16_hex(&out[i + 8..i + 12])
+                    .map(|low| (0xDC00..=0xDFFF).contains(&low))
+                    .unwrap_or(false);
+            if has_low {
+                i += 12;
+                continue;
+            }
+            out[i + 2..i + 6].copy_from_slice(b"FFFD");
+            replacements += 1;
+            i += 6;
+            continue;
+        }
+        if (0xDC00..=0xDFFF).contains(&code) {
+            out[i + 2..i + 6].copy_from_slice(b"FFFD");
+            replacements += 1;
+            i += 6;
+            continue;
+        }
+        i += 6;
+    }
+    (out, replacements)
+}
+
+fn massive_page_sidecar(path: &Path, suffix: &str) -> PathBuf {
+    let stem = path.file_stem().and_then(|x| x.to_str()).unwrap_or("page");
+    path.with_file_name(format!("{stem}.{suffix}.json"))
+}
+
+fn massive_unicode_repair_totals(pages_dir: &Path) -> Result<(usize, usize)> {
+    if !pages_dir.is_dir() {
+        return Ok((0, 0));
+    }
+    let mut pages = 0usize;
+    let mut replacements = 0usize;
+    for entry in std::fs::read_dir(pages_dir)? {
+        let path = entry?.path();
+        let Some(name) = path.file_name().and_then(|x| x.to_str()) else {
+            continue;
+        };
+        if !name.ends_with(".repair.json") {
+            continue;
+        }
+        let meta: JsonUnicodeRepairMeta = pride_scp_core::read_json(&path)
+            .with_context(|| format!("read MassIVE Unicode repair metadata {}", path.display()))?;
+        pages += 1;
+        replacements += meta.unicode_replacements;
+    }
+    Ok((pages, replacements))
+}
+
+async fn fetch_cached_json_tolerant(
+    client: &Client,
+    url: &str,
+    path: &Path,
+    force: bool,
+    retries: usize,
+    allow_not_found: bool,
+) -> Result<FetchState> {
+    if path.is_file() && !force {
+        return Ok(FetchState::Cached);
+    }
+    if let Some(parent) = path.parent() {
+        tokio::fs::create_dir_all(parent)
+            .await
+            .with_context(|| format!("create {}", parent.display()))?;
+    }
+
+    let attempts = retries.saturating_add(1);
+    let mut last_error = String::new();
+    for attempt in 0..attempts {
+        let mut retry_after = None;
+        match client.get(url).send().await {
+            Ok(response) => {
+                let status = response.status();
+                retry_after = retry_after_seconds(&response);
+                if allow_not_found && status == StatusCode::NOT_FOUND {
+                    return Ok(FetchState::NotFound);
+                }
+                if !status.is_success() {
+                    last_error = format!("HTTP {status}");
+                } else {
+                    match response.bytes().await {
+                        Ok(bytes) => {
+                            let mut repair_used = false;
+                            let final_bytes = match serde_json::from_slice::<Value>(&bytes) {
+                                Ok(_) => bytes.to_vec(),
+                                Err(parse_error) => {
+                                    let (repaired, replacements) =
+                                        repair_invalid_json_unicode(&bytes);
+                                    if replacements == 0 {
+                                        last_error =
+                                            format!("invalid JSON response: {parse_error}");
+                                        if attempt + 1 < attempts {
+                                            let seconds = exponential_backoff_seconds(attempt);
+                                            sleep(Duration::from_secs(seconds)).await;
+                                            continue;
+                                        }
+                                        break;
+                                    }
+                                    if let Err(repaired_error) =
+                                        serde_json::from_slice::<Value>(&repaired)
+                                    {
+                                        last_error = format!(
+                                            "invalid JSON response: {parse_error}; Unicode repair ({replacements} replacement(s)) still invalid: {repaired_error}"
+                                        );
+                                        if attempt + 1 < attempts {
+                                            let seconds = exponential_backoff_seconds(attempt);
+                                            sleep(Duration::from_secs(seconds)).await;
+                                            continue;
+                                        }
+                                        break;
+                                    }
+
+                                    repair_used = true;
+                                    let raw_path = massive_page_sidecar(path, "raw");
+                                    let repair_path = massive_page_sidecar(path, "repair");
+                                    tokio::fs::write(&raw_path, &bytes).await.with_context(
+                                        || {
+                                            format!(
+                                                "write malformed MassIVE raw page {}",
+                                                raw_path.display()
+                                            )
+                                        },
+                                    )?;
+                                    write_json(
+                                        &repair_path,
+                                        &JsonUnicodeRepairMeta {
+                                            parse_error: parse_error.to_string(),
+                                            unicode_replacements: replacements,
+                                            raw_response_path: raw_path.display().to_string(),
+                                        },
+                                    )?;
+                                    log::warn!(
+                                        "MassIVE JSON Unicode repair: {} replacement(s); raw response preserved at {}",
+                                        replacements,
+                                        raw_path.display()
+                                    );
+                                    repaired
+                                }
+                            };
+
+                            if !repair_used {
+                                for suffix in ["raw", "repair"] {
+                                    let sidecar = massive_page_sidecar(path, suffix);
+                                    if sidecar.is_file() {
+                                        let _ = tokio::fs::remove_file(sidecar).await;
+                                    }
+                                }
+                            }
+
+                            let tmp = path.with_extension(format!(
+                                "{}.part",
+                                path.extension().and_then(|x| x.to_str()).unwrap_or("tmp")
+                            ));
+                            tokio::fs::write(&tmp, &final_bytes)
+                                .await
+                                .with_context(|| format!("write {}", tmp.display()))?;
+                            tokio::fs::rename(&tmp, path).await.with_context(|| {
+                                format!("rename {} -> {}", tmp.display(), path.display())
+                            })?;
+                            return Ok(FetchState::Fetched);
+                        }
+                        Err(error) => {
+                            last_error = format!("read response body: {error:#}");
+                        }
+                    }
+                }
+            }
+            Err(error) => {
+                last_error = format!("send request: {error:#}");
+            }
+        }
+
+        if attempt + 1 < attempts {
+            let seconds = retry_after.unwrap_or_else(|| exponential_backoff_seconds(attempt));
+            log::warn!(
+                "HTTP retry {}/{} in {}s: {} ({})",
+                attempt + 1,
+                attempts - 1,
+                seconds,
+                url,
+                last_error
+            );
+            sleep(Duration::from_secs(seconds)).await;
+        }
+    }
+
+    Err(anyhow!(
+        "request failed after {attempts} attempt(s): {last_error}"
+    ))
 }
 
 async fn fetch_cached(
@@ -1851,5 +2543,65 @@ mod tests {
     fn positional_array_parser_does_not_promote_pxd_embedded_in_free_text() {
         let dataset = json!(["MSV000012345", "Reanalysis of PXD047101", "MassIVE"]);
         assert!(registry_pxd_accessions(&dataset).is_empty());
+    }
+
+    #[test]
+    fn massive_querydatasets_parser_accepts_object_and_positional_rows() {
+        let value = json!({
+            "rows": [
+                {"dataset_id": "MSV000012345", "title": "Single-cell proteomics"},
+                ["MSV000067890", "Another dataset", "public"]
+            ]
+        });
+        let entries = massive_dataset_entries(&value);
+        assert_eq!(entries.len(), 2);
+        assert_eq!(massive_msv_accessions(entries[0]), vec!["MSV000012345"]);
+        assert_eq!(massive_msv_accessions(entries[1]), vec!["MSV000067890"]);
+    }
+
+    #[test]
+    fn normalized_massive_record_preserves_native_identity_and_pxd_aliases() {
+        let dataset = json!({
+            "dataset_id": "MSV000093434",
+            "title": "Single cell proteomics and epiproteomics",
+            "description": "Single cells were isolated by FACS"
+        });
+        let normalized =
+            normalized_massive_dataset("MSV000093434", &dataset, &["PXD047101".to_string()]);
+        assert_eq!(normalized["accession"], "MSV000093434");
+        assert_eq!(normalized["sourceRepository"], "MassIVE");
+        assert_eq!(normalized["pxdAliases"][0], "PXD047101");
+        assert_eq!(
+            normalized["title"],
+            "Single cell proteomics and epiproteomics"
+        );
+    }
+
+    #[test]
+    fn massive_json_unicode_repair_replaces_lone_high_surrogate() {
+        let raw = br#"{"rows":[{"dataset_id":"MSV000012345","description":"bad \uD800 text"}]}"#;
+        assert!(serde_json::from_slice::<Value>(raw).is_err());
+        let (repaired, replacements) = repair_invalid_json_unicode(raw);
+        assert_eq!(replacements, 1);
+        let value: Value = serde_json::from_slice(&repaired).expect("repaired JSON");
+        assert_eq!(value["rows"][0]["description"], "bad � text");
+    }
+
+    #[test]
+    fn massive_json_unicode_repair_preserves_valid_surrogate_pair() {
+        let raw = br#"{"description":"emoji \uD83D\uDE00"}"#;
+        let (repaired, replacements) = repair_invalid_json_unicode(raw);
+        assert_eq!(replacements, 0);
+        let value: Value = serde_json::from_slice(&repaired).expect("valid surrogate pair");
+        assert_eq!(value["description"], "emoji 😀");
+    }
+
+    #[test]
+    fn massive_json_unicode_repair_does_not_touch_escaped_literal_backslash() {
+        let raw = br#"{"description":"literal \\uD800 sequence"}"#;
+        let (repaired, replacements) = repair_invalid_json_unicode(raw);
+        assert_eq!(replacements, 0);
+        let value: Value = serde_json::from_slice(&repaired).expect("literal escape");
+        assert_eq!(value["description"], r"literal \uD800 sequence");
     }
 }

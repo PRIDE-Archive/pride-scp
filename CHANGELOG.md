@@ -244,3 +244,10 @@
 - Added bacterial single-cell branch recognition while protecting `single-cell resolution` and method-only phrases.
 - Added linkage-clean replay and route-index diagnostics; no GT labels are used by the replay itself.
 - Kept the accepted v19-shadow-2.6.1 include/exclude policy unchanged.
+
+## v19-shadow-2.7.1 — 2026-09-03
+
+- Preserve the v19-shadow-2.7 provenance-safe publication router and frozen decision policy.
+- Fix a conservative one-cell-support regression where specific named biological units followed by proteomics wording (for example `single-oocyte proteomics`) were treated like generic title-only `single-cell proteomics` wording.
+- Generic repository `single-cell proteomics` wording still cannot create a biological sample unit by itself.
+- No Qwen prompt/model, Stage05, GT, or affirmative Phi/Gemma behavior changes.
