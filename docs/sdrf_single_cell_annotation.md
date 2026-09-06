@@ -593,3 +593,77 @@ Do not tune the generator until the five-accession baseline has been inspected. 
 baseline should establish which failures are due to RAW/container discovery,
 relationship inference, missing manuscript evidence, field provenance, or genuinely
 unresolved multiplex channel-to-cell mapping.
+
+## v0.3.0 de-novo study-design scaffold
+
+The five-accession v0.2.7 de-novo baseline completed operationally but every study fell
+back to `relation_mode=uncertain` and a generic one-row-per-repository-file skeleton.
+The baseline also showed that the small model often located useful manuscript prose but
+failed to attach field-level provenance, causing concrete values to be downgraded.
+
+v0.3.0 moves experiment structure upstream of the LLM. For source-unresolved/de-novo
+studies, Rust now derives and records a `study_design` scaffold inside the evidence JSON:
+
+```text
+relation_mode_hint
+relation_confidence
+relation_evidence_refs
+repository_file_mode
+direct_acquisition_files
+wrapped_acquisition_files
+generic_archive_files
+generic_archive_file_names
+notes
+```
+
+The relation scaffold is intentionally conservative and source-derived. It recognizes:
+
+- single-cell + TMT/TMTpro/iTRAQ/carrier evidence as multiplexed;
+- explicit single-cell + few-cell/small-pool evidence as mixed;
+- single-cell + label-free evidence as one-cell-per-data-file;
+- specific single muscle-fiber/blastomere/neuron/oocyte evidence without multiplex
+  evidence as a medium-confidence one-cell-per-data-file hint;
+- everything else as uncertain.
+
+A non-uncertain relation hint is applied deterministically after Ollama provenance repair
+and carries the evidence refs that triggered the rule. GT labels are never consulted.
+
+Repository file structure is classified separately. Direct RAW/vendor files and wrapped
+vendor acquisitions such as `.d.zip` are distinguished from generic `.rar`/`.zip`/archive
+containers. Generic archives remain visible in the draft/review, but the accession is
+explicitly marked `incomplete_repository_archive_contents_mapping` when those archives are
+the only repository-side files; their names are not treated as proof of one acquisition
+per archive.
+
+v0.3.0 also adds bounded provenance recovery for small-model outputs. If a concrete
+proposed value has no valid refs, Rust may retain it only when that exact value occurs
+verbatim in evidence already classified as relevant to the same field. The recovered
+refs and repair are written to the review TSV. This does not permit semantic borrowing
+between fields and does not apply to numeric identifiers or relation mode.
+
+Semantic guards were tightened at the same time:
+
+- capillary electrophoresis alone is not an MS acquisition method;
+- analysis software remains invalid as isolation/acquisition/instrument metadata;
+- carrier/reference channel values must actually describe carrier/reference channels;
+- microaspiration, patch-clamp-guided sampling, micropipette/capillary microsampling,
+  manual dissection and microdissection are recognized as possible single-cell isolation
+  evidence.
+
+For deterministic `one_cell_per_data_file` drafts, `comment[fraction identifier]` and
+`comment[technical replicate]` default to `1` when no numeric value is supplied, because
+each generated source is a unique single-cell acquisition in that specific mapping mode.
+Multiplexed/mixed/uncertain designs remain unresolved until channel/sample structure is
+reconstructed.
+
+Run the same frozen five-accession comparison cohort with:
+
+```bash
+./scripts/run_gt105_pride_sdrf_denovo_scaffold_pilot.sh
+```
+
+The important comparison against v0.2.7 is the study-design scaffold and relation mode,
+not simply the number of locally-valid SDRFs. The expected architectural outcome is that
+label-free single-cell studies can advance to one-cell-per-file drafts, TMT studies stay
+explicitly multiplexed, mixed/few-cell studies stay mixed, and generic repository archives
+are flagged as containers instead of silently being treated as biological runs.
