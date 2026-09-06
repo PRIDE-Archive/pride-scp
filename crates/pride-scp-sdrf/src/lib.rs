@@ -22,6 +22,7 @@ pub const SINGLE_CELL_TEMPLATE_URL: &str =
 pub const SDRF_SPEC_URL: &str = "https://sdrf.quantms.org/specification.html";
 pub const GENERATOR_VERSION: &str = "pride-scp-sdrf-v0.2.4";
 pub const SDRF_SOURCE_RESOLVER_VERSION: &str = "pride-scp-sdrf-source-resolver-v0.1";
+pub const SDRF_AUDITOR_VERSION: &str = "pride-scp-sdrf-auditor-v0.1";
 pub const DEFAULT_OLLAMA_URL: &str = "http://localhost:11434/api/generate";
 
 // The linked single-cell template is work-in-progress. Generated drafts pin the
@@ -85,6 +86,65 @@ struct SdrfSourceAudit {
     selected_local_path: String,
     selected_content_fingerprint: String,
     candidates: Vec<SdrfSourceCandidateAudit>,
+}
+
+#[derive(Debug, Clone)]
+pub struct SdrfAuditOptions {
+    pub snapshot_dir: PathBuf,
+    pub resolved_sdrf_dir: PathBuf,
+    pub output_dir: PathBuf,
+    pub accessions: Vec<String>,
+    pub accessions_file: Option<PathBuf>,
+    pub progress: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SdrfAuditSummary {
+    pub auditor_version: String,
+    pub accessions_requested: usize,
+    pub audited: usize,
+    pub errors: usize,
+    pub locally_valid: usize,
+    pub requires_review: usize,
+    pub curated_bigbio: usize,
+    pub repository_submitted: usize,
+    pub other_source: usize,
+    pub results_tsv: String,
+    pub unresolved_accessions_file: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct SdrfResolvedAudit {
+    accession: String,
+    auditor_version: String,
+    source_kind: String,
+    sdrf_path: String,
+    row_count: usize,
+    raw_file_count: usize,
+    relation_mode: String,
+    locally_valid: bool,
+    validation_error_count: usize,
+    validation_warning_count: usize,
+    missing_target_fields: Vec<String>,
+    validation_issues: Vec<ValidationIssue>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct SdrfAuditResultRow {
+    accession: String,
+    status: String,
+    source_kind: String,
+    rows: usize,
+    raw_files: usize,
+    relation_mode: String,
+    locally_valid: bool,
+    validation_errors: usize,
+    validation_warnings: usize,
+    missing_target_fields: usize,
+    missing_target_field_names: String,
+    sdrf_path: String,
+    review_path: String,
+    error: String,
 }
 
 #[derive(Debug, Clone)]
@@ -3362,6 +3422,224 @@ async fn annotate_one(opts: &SdrfAnnotateOptions, accession: &str) -> Result<Res
     })
 }
 
+fn resolved_source_kind(resolved_sdrf_dir: &Path, accession: &str) -> String {
+    let Some(root) = resolved_sdrf_dir.parent() else {
+        return "resolved_external".into();
+    };
+    let audit_path = root
+        .join("audit")
+        .join(format!("{accession}.sdrf_source_audit.json"));
+    let Ok(text) = fs::read_to_string(audit_path) else {
+        return "resolved_external".into();
+    };
+    let Ok(value) = serde_json::from_str::<Value>(&text) else {
+        return "resolved_external".into();
+    };
+    value
+        .get("selected_source_kind")
+        .and_then(Value::as_str)
+        .filter(|x| !x.trim().is_empty())
+        .unwrap_or("resolved_external")
+        .to_string()
+}
+
+fn audit_raw_files(snapshot_dir: &Path, accession: &str) -> Result<Vec<RawFile>> {
+    let path = snapshot_dir.join("files").join(format!("{accession}.json"));
+    let value = load_json(&path)
+        .with_context(|| format!("load PRIDE file inventory for SDRF audit {accession}"))?;
+    Ok(extract_raw_files(&value))
+}
+
+fn write_validation_review(path: &Path, issues: &[ValidationIssue]) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    write_review(path, issues)
+}
+
+fn audit_resolved_one(opts: &SdrfAuditOptions, accession: &str) -> Result<SdrfAuditResultRow> {
+    let sdrf_path = opts.resolved_sdrf_dir.join(format!("{accession}.sdrf.tsv"));
+    if !existing_sdrf_is_usable(&sdrf_path) {
+        bail!(
+            "resolved SDRF missing or unusable: {} ({})",
+            sdrf_path.display(),
+            existing_sdrf_status(&sdrf_path)
+        );
+    }
+    let raw_files = audit_raw_files(&opts.snapshot_dir, accession)?;
+    let (headers, rows) = read_existing_sdrf_table(&sdrf_path)?;
+    let source_kind = resolved_source_kind(&opts.resolved_sdrf_dir, accession);
+    let evidence = DatasetEvidence {
+        accession: accession.into(),
+        project_json_path: String::new(),
+        files_json_path: opts
+            .snapshot_dir
+            .join("files")
+            .join(format!("{accession}.json"))
+            .display()
+            .to_string(),
+        existing_sdrf_path: sdrf_path.display().to_string(),
+        raw_files,
+        evidence: Vec::new(),
+        manuscript_sources: Vec::new(),
+        annotation_sources: Vec::new(),
+    };
+    let relation_mode = existing_sdrf_relation_hint(&headers, &rows);
+    let issues = validate_draft(&headers, &rows, &evidence);
+    let errors = issues.iter().filter(|x| x.level == "error").count();
+    let warnings = issues.iter().filter(|x| x.level == "warning").count();
+    let missing = proposal_target_fields(&evidence)
+        .into_iter()
+        .collect::<Vec<_>>();
+    let locally_valid = errors == 0;
+    let review_path = opts
+        .output_dir
+        .join("review")
+        .join(format!("{accession}.sdrf.review.tsv"));
+    write_validation_review(&review_path, &issues)?;
+    let audit = SdrfResolvedAudit {
+        accession: accession.into(),
+        auditor_version: SDRF_AUDITOR_VERSION.into(),
+        source_kind: source_kind.clone(),
+        sdrf_path: sdrf_path.display().to_string(),
+        row_count: rows.len(),
+        raw_file_count: evidence.raw_files.len(),
+        relation_mode: relation_mode.clone(),
+        locally_valid,
+        validation_error_count: errors,
+        validation_warning_count: warnings,
+        missing_target_fields: missing.clone(),
+        validation_issues: issues,
+    };
+    let audit_path = opts
+        .output_dir
+        .join("audit")
+        .join(format!("{accession}.sdrf.audit.json"));
+    if let Some(parent) = audit_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(&audit_path, serde_json::to_string_pretty(&audit)?)?;
+    Ok(SdrfAuditResultRow {
+        accession: accession.into(),
+        status: "audited".into(),
+        source_kind,
+        rows: rows.len(),
+        raw_files: evidence.raw_files.len(),
+        relation_mode,
+        locally_valid,
+        validation_errors: errors,
+        validation_warnings: warnings,
+        missing_target_fields: missing.len(),
+        missing_target_field_names: missing.join(";"),
+        sdrf_path: sdrf_path.display().to_string(),
+        review_path: review_path.display().to_string(),
+        error: String::new(),
+    })
+}
+
+pub fn audit_sdrf_sources(opts: SdrfAuditOptions) -> Result<SdrfAuditSummary> {
+    let accessions = collect_accessions_values(&opts.accessions, opts.accessions_file.as_deref())?;
+    fs::create_dir_all(&opts.output_dir)?;
+    let mut rows = Vec::new();
+    let mut unresolved = Vec::new();
+    for (i, accession) in accessions.iter().enumerate() {
+        if opts.progress {
+            eprintln!("[{}/{}] {}", i + 1, accessions.len(), accession);
+        }
+        match audit_resolved_one(&opts, accession) {
+            Ok(row) => {
+                if opts.progress {
+                    eprintln!(
+                        "  -> {} rows={} valid={} errors={} missing_fields={}",
+                        row.source_kind,
+                        row.rows,
+                        row.locally_valid,
+                        row.validation_errors,
+                        row.missing_target_fields
+                    );
+                }
+                rows.push(row);
+            }
+            Err(err) => {
+                if opts.progress {
+                    eprintln!("  -> audit error: {err:#}");
+                }
+                unresolved.push(accession.clone());
+                rows.push(SdrfAuditResultRow {
+                    accession: accession.clone(),
+                    status: "error".into(),
+                    source_kind: String::new(),
+                    rows: 0,
+                    raw_files: 0,
+                    relation_mode: String::new(),
+                    locally_valid: false,
+                    validation_errors: 0,
+                    validation_warnings: 0,
+                    missing_target_fields: 0,
+                    missing_target_field_names: String::new(),
+                    sdrf_path: String::new(),
+                    review_path: String::new(),
+                    error: format!("{err:#}"),
+                });
+            }
+        }
+    }
+    let results_path = opts.output_dir.join("sdrf_audit_results.tsv");
+    let mut writer = WriterBuilder::new()
+        .delimiter(b'\t')
+        .from_path(&results_path)?;
+    for row in &rows {
+        writer.serialize(row)?;
+    }
+    writer.flush()?;
+    let unresolved_path = opts.output_dir.join("audit_unresolved_accessions.txt");
+    fs::write(
+        &unresolved_path,
+        if unresolved.is_empty() {
+            String::new()
+        } else {
+            format!("{}\n", unresolved.join("\n"))
+        },
+    )?;
+    let summary = SdrfAuditSummary {
+        auditor_version: SDRF_AUDITOR_VERSION.into(),
+        accessions_requested: accessions.len(),
+        audited: rows.iter().filter(|r| r.status == "audited").count(),
+        errors: rows.iter().filter(|r| r.status == "error").count(),
+        locally_valid: rows
+            .iter()
+            .filter(|r| r.status == "audited" && r.locally_valid)
+            .count(),
+        requires_review: rows
+            .iter()
+            .filter(|r| r.status == "audited" && (!r.locally_valid || r.missing_target_fields > 0))
+            .count(),
+        curated_bigbio: rows
+            .iter()
+            .filter(|r| r.source_kind == "curated_bigbio")
+            .count(),
+        repository_submitted: rows
+            .iter()
+            .filter(|r| r.source_kind == "repository_submitted")
+            .count(),
+        other_source: rows
+            .iter()
+            .filter(|r| {
+                r.status == "audited"
+                    && r.source_kind != "curated_bigbio"
+                    && r.source_kind != "repository_submitted"
+            })
+            .count(),
+        results_tsv: results_path.display().to_string(),
+        unresolved_accessions_file: unresolved_path.display().to_string(),
+    };
+    fs::write(
+        opts.output_dir.join("sdrf_audit_summary.json"),
+        serde_json::to_string_pretty(&summary)?,
+    )?;
+    Ok(summary)
+}
+
 pub async fn annotate_sdrf(opts: SdrfAnnotateOptions) -> Result<SdrfAnnotateSummary> {
     let accessions = collect_accessions(&opts)?;
     if accessions.len() > 1 && !opts.manuscript_text_paths.is_empty() {
@@ -4002,6 +4280,32 @@ mod tests {
         .unwrap();
         let paths = publication_paths_for_accession(&manifest, "PXD123456").unwrap();
         assert_eq!(paths, vec![text_path]);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn audit_missing_fields_preserves_resolved_not_applicable_values() {
+        let root = tmp();
+        fs::create_dir_all(root.join("resolved")).unwrap();
+        let p = root.join("resolved").join("PXD999999.sdrf.tsv");
+        fs::write(&p,
+            "source name\tcharacteristics[organism]\tcharacteristics[organism part]\tcharacteristics[disease]\tcharacteristics[cell type]\tassay name\ttechnology type\tcomment[proteomics data acquisition method]\tcomment[label]\tcomment[instrument]\tcomment[cleavage agent details]\tcomment[fraction identifier]\tcomment[technical replicate]\tcomment[data file]\tcharacteristics[sample type]\tcharacteristics[single cell isolation protocol]\tcharacteristics[cell identifier]\tcharacteristics[individual]\tcomment[sample preparation batch]\tcharacteristics[cells per well]\tcomment[carrier channel]\tcomment[reference channel]\ncell1\thomo sapiens\tnot applicable\tnormal\thela cell\trun1\tproteomic profiling by mass spectrometry\tdata-dependent acquisition\tlabel free sample\torbitrap\ttrypsin\t1\t1\tcell1.raw\tsingle cell\tmanual picking\tcell1\tnot applicable\tnot applicable\t1\tnot applicable\tnot applicable\n"
+        ).unwrap();
+        let evidence = DatasetEvidence {
+            accession: "PXD999999".into(),
+            project_json_path: String::new(),
+            files_json_path: String::new(),
+            existing_sdrf_path: p.display().to_string(),
+            raw_files: vec![RawFile {
+                file_name: "cell1.raw".into(),
+                file_uri: String::new(),
+                category: "RAW".into(),
+            }],
+            evidence: vec![],
+            manuscript_sources: vec![],
+            annotation_sources: vec![],
+        };
+        assert!(proposal_target_fields(&evidence).is_empty());
         let _ = fs::remove_dir_all(root);
     }
 }

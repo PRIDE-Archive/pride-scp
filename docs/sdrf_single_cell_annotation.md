@@ -494,3 +494,23 @@ RESOLVED_SDRF_DIR=data/sdrf_source_resolution_gt105_pride_v024/resolved \
 Do not run the full annotation batch until the source-resolution inventory is reviewed.
 The immediate goal is to quantify how many of the 105 source-resolved PRIDE datasets are
 already covered by curated/repository SDRFs and how many genuinely require de-novo work.
+
+## Deterministic resolved-SDRF audit (v0.2.5)
+
+After `sdrf-resolve`, do **not** send every resolved SDRF back through Ollama. The
+`sdrf-audit` subcommand validates the selected local SDRF exactly as resolved,
+compares its `comment[data file]` values against the PRIDE RAW inventory, derives
+its one-cell/multiplexed relationship where possible, and reports the dataset-level
+fields that would still need bounded enrichment. It never modifies the SDRF and
+never invokes Ollama.
+
+For the GT-seeded source-resolved PRIDE cohort, use:
+
+```bash
+./scripts/run_gt105_pride_sdrf_audit.sh
+```
+
+The wrapper also materializes `resolved_accessions.txt` and
+`unresolved_accessions.txt` directly from `sdrf_source_resolution.tsv`. The latter
+is the only cohort eligible for de-novo manuscript-assisted reconstruction unless
+an audited resolved SDRF is explicitly selected for gap filling.

@@ -12,8 +12,8 @@ use pride_scp_index::{
     DEFAULT_PROJECT_PAGE_SIZE, DEFAULT_PROTEOMECENTRAL_PROXI_API, DEFAULT_REGISTRY_PAGE_SIZE,
 };
 use pride_scp_sdrf::{
-    annotate_sdrf, resolve_sdrf_sources, SdrfAnnotateOptions, SdrfResolveOptions,
-    DEFAULT_OLLAMA_URL as DEFAULT_SDRF_OLLAMA_URL,
+    annotate_sdrf, audit_sdrf_sources, resolve_sdrf_sources, SdrfAnnotateOptions, SdrfAuditOptions,
+    SdrfResolveOptions, DEFAULT_OLLAMA_URL as DEFAULT_SDRF_OLLAMA_URL,
 };
 use std::path::PathBuf;
 use std::time::Instant;
@@ -239,6 +239,21 @@ enum Command {
         timeout: u64,
         #[arg(long)]
         force: bool,
+    },
+    /// Deterministically audit already-resolved SDRFs without invoking Ollama.
+    /// Reports validator errors/warnings and target fields that would still need enrichment.
+    SdrfAudit {
+        #[arg(long = "accession")]
+        accessions: Vec<String>,
+        #[arg(long)]
+        accessions_file: Option<PathBuf>,
+        #[arg(long, default_value = "data/snapshot")]
+        snapshot: PathBuf,
+        /// `resolved/` directory produced by `pride-scp sdrf-resolve`.
+        #[arg(long)]
+        resolved_sdrf_dir: PathBuf,
+        #[arg(long, default_value = "data/sdrf_audit")]
+        output: PathBuf,
     },
     /// Generate provenance-tracked SDRF-Proteomics single-cell drafts from PRIDE
     /// repository metadata, existing annotations, and manuscript-derived evidence.
@@ -539,6 +554,29 @@ async fn main() -> Result<()> {
                 progress,
             })
             .await?;
+            println!("{}", serde_json::to_string_pretty(&summary)?);
+        }
+        Command::SdrfAudit {
+            accessions,
+            accessions_file,
+            snapshot,
+            resolved_sdrf_dir,
+            output,
+        } => {
+            log::info!(
+                "command=sdrf-audit snapshot={} resolved={} output={}",
+                snapshot.display(),
+                resolved_sdrf_dir.display(),
+                output.display()
+            );
+            let summary = audit_sdrf_sources(SdrfAuditOptions {
+                snapshot_dir: snapshot,
+                resolved_sdrf_dir,
+                output_dir: output,
+                accessions,
+                accessions_file,
+                progress,
+            })?;
             println!("{}", serde_json::to_string_pretty(&summary)?);
         }
         Command::SdrfAnnotate {
