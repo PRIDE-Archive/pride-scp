@@ -564,3 +564,32 @@ The audit output now includes separate repository linkage metrics and priority c
 `locally_valid` means the Rust structural/template checks passed **excluding repository-file
 linkage**. It is still not a substitute for final `sdrf-pipelines`/PRIDE SDRF Validator
 validation before submission.
+
+## Bounded de-novo baseline pilot after resolved-SDRF audit
+
+After the v0.2.6 deterministic audit, the resolved-SDRF lane is held stable while the
+source-unresolved PRIDE subset is evaluated separately. Before changing prompts or
+reconstruction logic again, run a five-accession de-novo baseline:
+
+```bash
+./scripts/run_gt105_pride_sdrf_denovo_pilot.sh
+```
+
+The pilot is intentionally heterogeneous:
+
+- `PXD001641` — early single-muscle-fiber proteomics;
+- `PXD004174` — label-free single Xenopus blastomeres;
+- `PXD028040` — patch-clamp single-neuron proteomics;
+- `PXD029320` — multiplexed TMT single-cell proteomics;
+- `PXD042367` — single/few-cell spatial tissue proteomics.
+
+These accessions must already be present in
+`data/sdrf_audit_gt105_pride_v026/unresolved_accessions.txt`; the wrapper aborts if the
+accepted source-resolution/audit state no longer classifies any pilot accession as
+unresolved. GT remains an evaluation/cohort seed only and is never used for SDRF field
+values.
+
+Do not tune the generator until the five-accession baseline has been inspected. The
+baseline should establish which failures are due to RAW/container discovery,
+relationship inference, missing manuscript evidence, field provenance, or genuinely
+unresolved multiplex channel-to-cell mapping.
