@@ -20,7 +20,7 @@ pub const SINGLE_CELL_TEMPLATE_VERSION: &str = "1.0.0";
 pub const SINGLE_CELL_TEMPLATE_URL: &str =
     "https://github.com/bigbio/sdrf-templates/blob/main/single-cell/1.0.0/single-cell.yaml";
 pub const SDRF_SPEC_URL: &str = "https://sdrf.quantms.org/specification.html";
-pub const GENERATOR_VERSION: &str = "pride-scp-sdrf-v0.1";
+pub const GENERATOR_VERSION: &str = "pride-scp-sdrf-v0.1.1";
 pub const DEFAULT_OLLAMA_URL: &str = "http://localhost:11434/api/generate";
 
 // The linked single-cell template is work-in-progress. Generated drafts pin the
@@ -859,7 +859,7 @@ RULES:\n\
 3. relation_mode means the biological sample-to-RAW-file design: one_cell_per_data_file, multiplexed_cells_per_data_file, mixed, or uncertain. Be conservative.\n\
 4. sample_type is the dominant target sample class, not a claim that every row has that type.\n\
 5. For label, acquisition method, instrument and cleavage agent, prefer terminology already present in PRIDE/manuscript evidence.\n\
-6. Every non-reserved proposed value must cite one or more E#### refs in evidence_refs. Reserved values may have an empty ref list.\n\
+6. Every non-reserved proposed value must cite one or more E#### refs in evidence_refs. Reserved values may have an empty ref list. relation_mode=uncertain is explicitly non-assertive and may have no evidence refs.\n\
 7. Do not infer a per-cell identifier from a filename here; Rust may do that deterministically only when relation_mode is one_cell_per_data_file.\n\
 8. Dataset-level fields (organism part, disease, cell type, individual, batch, factors) may vary across samples. Return a concrete value only if the evidence supports that the same value applies to all target single-cell samples; otherwise use 'not available'.\n\
 9. Factor proposals are review hints only in v0.1 because per-row factor assignments are not yet reconstructed safely.\n\
@@ -901,7 +901,6 @@ async fn call_ollama(
     }
     let proposal: SdrfProposal =
         serde_json::from_str(raw).context("parse structured Ollama SDRF proposal")?;
-    validate_proposal_refs(&proposal, evidence)?;
     Ok(proposal)
 }
 
@@ -953,7 +952,8 @@ fn validate_proposal_refs(proposal: &SdrfProposal, evidence: &DatasetEvidence) -
             || matches!(
                 lower.as_str(),
                 "not available" | "not applicable" | "pooled"
-            );
+            )
+            || (field == "relation_mode" && lower == "uncertain");
         if !reserved
             && proposal
                 .evidence_refs
@@ -1477,7 +1477,10 @@ async fn annotate_one(opts: &SdrfAnnotateOptions, accession: &str) -> Result<Res
     fs::write(&evidence_path, serde_json::to_string_pretty(&evidence)?)?;
 
     let proposal = call_ollama(opts, &evidence).await?;
+    // Persist the parsed model proposal before semantic evidence-reference validation.
+    // This keeps failed batch items diagnosable without weakening provenance checks.
     fs::write(&proposal_path, serde_json::to_string_pretty(&proposal)?)?;
+    validate_proposal_refs(&proposal, &evidence)?;
     let existing = !evidence.existing_sdrf_path.is_empty();
 
     let (headers, rows, generation_mode) = draft_rows(&proposal, &evidence);
@@ -1739,6 +1742,47 @@ mod tests {
         assert!(pxds.contains("PXD123456"));
         assert!(pxds.contains("PXD654321"));
         assert_eq!(pxds.len(), 2);
+    }
+
+    #[test]
+    fn uncertain_relation_mode_is_non_assertive_and_needs_no_evidence_ref() {
+        let evidence = DatasetEvidence {
+            accession: "PXD999999".into(),
+            project_json_path: String::new(),
+            files_json_path: String::new(),
+            existing_sdrf_path: String::new(),
+            raw_files: vec![],
+            evidence: vec![],
+            manuscript_sources: vec![],
+            annotation_sources: vec![],
+        };
+        let proposal = SdrfProposal {
+            relation_mode: "uncertain".into(),
+            ..Default::default()
+        };
+        validate_proposal_refs(&proposal, &evidence).unwrap();
+    }
+
+    #[test]
+    fn asserted_relation_mode_still_requires_evidence_ref() {
+        let evidence = DatasetEvidence {
+            accession: "PXD999999".into(),
+            project_json_path: String::new(),
+            files_json_path: String::new(),
+            existing_sdrf_path: String::new(),
+            raw_files: vec![],
+            evidence: vec![],
+            manuscript_sources: vec![],
+            annotation_sources: vec![],
+        };
+        let proposal = SdrfProposal {
+            relation_mode: "one_cell_per_data_file".into(),
+            ..Default::default()
+        };
+        let err = validate_proposal_refs(&proposal, &evidence)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("relation_mode"));
     }
 
     #[test]

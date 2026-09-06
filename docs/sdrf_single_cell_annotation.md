@@ -209,3 +209,25 @@ The first smoke is successful when a representative label-free / one-cell-per-RA
 - a locally-valid draft when evidence is actually sufficient.
 
 Multiplexed designs are expected to remain incomplete in v0.1 until channel↔cell mapping support is implemented.
+
+## v0.1.1 batch robustness
+
+`pride-scp-sdrf-v0.1.1` fixes the first live smoke finding:
+
+- `relation_mode=uncertain` is a non-assertive fallback and therefore does not require an evidence reference;
+- asserted relation modes (`one_cell_per_data_file`, `multiplexed_cells_per_data_file`, `mixed`) still require provenance;
+- parsed Ollama proposals are persisted before evidence-reference validation, so a failed item remains diagnosable;
+- batch runs remain accession-isolated: one error is recorded under `errors/` and does not abort other accessions;
+- rerunning without `--force` reuses successful v0.1.1 audits while retrying accessions that never reached an audit.
+
+### Frozen GT106 PRIDE reconstruction cohort
+
+For the specific reconstruction experiment on the 106 known PRIDE SCP accessions:
+
+```bash
+./scripts/run_gt106_pride_sdrf_annotation.sh
+```
+
+The wrapper reads the frozen GT master only to derive the 106 PRIDE accession identifiers. It writes the selected cohort and a machine-readable provenance statement into the output directory. GT labels, GT curation annotations, canonical-study mappings, and GT metadata are not passed to SDRF generation.
+
+This is appropriate for reconstructing SDRFs for a known evaluation/reference cohort; it must not be confused with GT-independent catalogue discovery.
