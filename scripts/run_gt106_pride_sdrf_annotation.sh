@@ -30,7 +30,7 @@ case "$COHORT_MODE" in
   *) echo "invalid COHORT_MODE=$COHORT_MODE (expected all, missing-sdrf, or existing-sdrf)" >&2; exit 2 ;;
 esac
 MODE_TAG="${COHORT_MODE//-/_}"
-OUT="${OUT:-$ROOT/data/sdrf_annotation_gt106_pride_v022_${MODE_TAG}}"
+OUT="${OUT:-$ROOT/data/sdrf_annotation_gt106_pride_v023_${MODE_TAG}}"
 
 [[ -f "$GT_MASTER" ]] || { echo "missing GT master: $GT_MASTER" >&2; exit 2; }
 [[ -d "$SNAPSHOT" ]] || { echo "missing snapshot: $SNAPSHOT" >&2; exit 2; }
@@ -94,14 +94,44 @@ def source_host(acc):
         return 'PRIDE'
     return registry_host(acc) or 'unknown'
 
-def has_sdrf(acc):
-    p = snapshot / 'sdrf' / f'{acc}.sdrf.tsv'
-    return p.is_file() and p.stat().st_size > 0
-
-def sdrf_source_class(acc):
+def sdrf_status(acc):
     p = snapshot / 'sdrf' / f'{acc}.sdrf.tsv'
     if not p.is_file() or p.stat().st_size == 0:
         return 'missing'
+    try:
+        with p.open(newline='', encoding='utf-8-sig', errors='replace') as fh:
+            r = csv.reader(fh, delimiter='\t')
+            try:
+                header = [x.strip().lower() for x in next(r)]
+            except StopIteration:
+                return 'empty_file'
+            rows = [row for row in r if any(str(x).strip() for x in row)]
+    except Exception:
+        return 'unreadable'
+    if not rows:
+        return 'header_only'
+    try:
+        j = header.index('comment[data file]')
+    except ValueError:
+        return 'missing_data_file_column'
+    mapped = False
+    for row in rows:
+        if j >= len(row):
+            continue
+        value = row[j].strip().lower()
+        if value and value not in {'not available', 'not applicable'}:
+            mapped = True
+            break
+    return 'usable' if mapped else 'no_mapped_data_rows'
+
+def has_usable_sdrf(acc):
+    return sdrf_status(acc) == 'usable'
+
+def sdrf_source_class(acc):
+    p = snapshot / 'sdrf' / f'{acc}.sdrf.tsv'
+    status = sdrf_status(acc)
+    if status != 'usable':
+        return f'unusable_{status}'
     try:
         with p.open(newline='', encoding='utf-8-sig', errors='replace') as fh:
             r = csv.reader(fh, delimiter='\t')
@@ -139,7 +169,9 @@ for acc in all_accs:
         'gt_repository_label': 'PRIDE',
         'source_resolved_hosting_repository': host,
         'primary_pride_project_snapshot': 'yes' if host == 'PRIDE' else 'no',
-        'sdrf_present': 'yes' if has_sdrf(acc) else 'no',
+        'sdrf_file_present': 'yes' if (snapshot / 'sdrf' / f'{acc}.sdrf.tsv').is_file() else 'no',
+        'sdrf_status': sdrf_status(acc),
+        'sdrf_usable': 'yes' if has_usable_sdrf(acc) else 'no',
         'sdrf_source_class_content_heuristic': sdrf_source_class(acc),
     })
 
@@ -157,8 +189,8 @@ with non_pride_path.open('w', newline='') as fh:
     for r in non_pride:
         w.writerow({k:r[k] for k in w.fieldnames})
 
-existing = [a for a in resolved_pride if has_sdrf(a)]
-missing = [a for a in resolved_pride if not has_sdrf(a)]
+existing = [a for a in resolved_pride if has_usable_sdrf(a)]
+missing = [a for a in resolved_pride if not has_usable_sdrf(a)]
 if mode == 'all':
     selected = resolved_pride
 elif mode == 'missing-sdrf':
@@ -170,15 +202,22 @@ else:
 
 all_out.write_text("\n".join(resolved_pride) + "\n")
 selected_out.write_text(("\n".join(selected) + "\n") if selected else "")
-source_counts = Counter(r['sdrf_source_class_content_heuristic'] for r in inventory if r['accession'] in resolved_pride and r['sdrf_present']=='yes')
+source_counts = Counter(r['sdrf_source_class_content_heuristic'] for r in inventory if r['accession'] in resolved_pride and r['sdrf_usable']=='yes')
+status_counts = Counter(r['sdrf_status'] for r in inventory if r['accession'] in resolved_pride)
+snapshot_files = sum(r['sdrf_file_present'] == 'yes' for r in inventory if r['accession'] in resolved_pride)
+unusable_files = sum(r['sdrf_file_present'] == 'yes' and r['sdrf_usable'] != 'yes' for r in inventory if r['accession'] in resolved_pride)
 meta.write_text(json.dumps({
     "cohort": "frozen_GT196_rows_labelled_PRIDE_resolved_against_source_snapshot",
     "cohort_mode": mode,
     "gt_rows_labelled_pride": len(all_accs),
     "source_resolved_primary_pride_accessions": len(resolved_pride),
     "source_resolved_non_pride_or_unresolved": len(non_pride),
+    "snapshot_sdrf_files_detected": snapshot_files,
     "existing_sdrf_accessions": len(existing),
+    "unusable_snapshot_sdrf_accessions": unusable_files,
+    "missing_or_unusable_sdrf_accessions": len(missing),
     "missing_sdrf_accessions": len(missing),
+    "sdrf_status_counts": dict(sorted(status_counts.items())),
     "selected_accessions": len(selected),
     "existing_sdrf_source_class_counts": dict(sorted(source_counts.items())),
     "gt_master": str(src),
@@ -188,10 +227,10 @@ meta.write_text(json.dumps({
     "runtime_sdrf_gt_labels_used": False,
     "source_inventory": str(inventory_path),
     "non_pride_or_unresolved_inventory": str(non_pride_path),
-    "note": "The frozen GT repository label is not treated as source truth. Runtime scope is restricted to accessions present in the primary PRIDE snapshot; registry hostingRepository is used to explain mismatches. SDRF fields never come from GT. SDRF source class is a content heuristic from comment[sdrf annotation tool], not authoritative repository provenance."
+    "note": "The frozen GT repository label is not treated as source truth. Runtime scope is restricted to accessions present in the primary PRIDE snapshot; registry hostingRepository is used to explain mismatches. SDRF fields never come from GT. A snapshot SDRF file is considered usable only when it contains at least one mapped comment[data file] row; header-only/API-wrapper responses are treated as unusable. SDRF source class is a content heuristic from comment[sdrf annotation tool], not authoritative repository provenance."
 }, indent=2) + "\n")
 print(f"GT-labelled PRIDE rows={len(all_accs)}; source-resolved primary PRIDE={len(resolved_pride)}; non-PRIDE/unresolved={len(non_pride)}")
-print(f"primary PRIDE SDRF: existing={len(existing)} missing={len(missing)} selected={len(selected)} mode={mode}")
+print(f"primary PRIDE SDRF: snapshot_files={snapshot_files} usable={len(existing)} unusable_files={unusable_files} missing_or_unusable={len(missing)} selected={len(selected)} mode={mode}")
 print(f"  selected -> {selected_out}")
 print(f"  source inventory -> {inventory_path}")
 if non_pride:

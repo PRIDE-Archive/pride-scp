@@ -20,7 +20,7 @@ pub const SINGLE_CELL_TEMPLATE_VERSION: &str = "1.0.0";
 pub const SINGLE_CELL_TEMPLATE_URL: &str =
     "https://github.com/bigbio/sdrf-templates/blob/main/single-cell/1.0.0/single-cell.yaml";
 pub const SDRF_SPEC_URL: &str = "https://sdrf.quantms.org/specification.html";
-pub const GENERATOR_VERSION: &str = "pride-scp-sdrf-v0.2.2";
+pub const GENERATOR_VERSION: &str = "pride-scp-sdrf-v0.2.3";
 pub const DEFAULT_OLLAMA_URL: &str = "http://localhost:11434/api/generate";
 
 // The linked single-cell template is work-in-progress. Generated drafts pin the
@@ -68,7 +68,12 @@ pub struct SdrfAnnotateSummary {
     pub accessions_requested: usize,
     pub successful: usize,
     pub errors: usize,
+    /// Usable existing SDRFs with at least one mapped data-file row.
     pub existing_sdrf_detected: usize,
+    #[serde(default)]
+    pub snapshot_sdrf_files_detected: usize,
+    #[serde(default)]
+    pub unusable_snapshot_sdrf_detected: usize,
     pub drafts_written: usize,
     pub locally_valid_drafts: usize,
     pub incomplete_drafts: usize,
@@ -523,6 +528,43 @@ fn header_first_index(headers: &[String], name: &str) -> Option<usize> {
     headers.iter().position(|h| h == name)
 }
 
+/// Classify a cached SDRF response by whether it contains a usable sample-to-data mapping.
+///
+/// The PRIDE `/files/sdrf/{PXD}` endpoint historically returns a non-empty response for
+/// many accessions that do not actually have SDRF data rows. A cache file therefore must
+/// never be considered an existing SDRF based on file existence/size alone.
+fn existing_sdrf_status(path: &Path) -> String {
+    if !path.is_file() {
+        return "missing".into();
+    }
+    let Ok((headers, rows)) = read_existing_sdrf_table(path) else {
+        return "unreadable".into();
+    };
+    if rows.is_empty() {
+        return "header_only".into();
+    }
+    let Some(data_idx) = header_first_index(&headers, "comment[data file]") else {
+        return "missing_data_file_column".into();
+    };
+    let has_mapped_data_row = rows.iter().any(|row| {
+        let Some(value) = row.get(data_idx) else {
+            return false;
+        };
+        let value = value.trim();
+        !value.is_empty()
+            && !value.eq_ignore_ascii_case("not available")
+            && !value.eq_ignore_ascii_case("not applicable")
+    });
+    if !has_mapped_data_row {
+        return "no_mapped_data_rows".into();
+    }
+    "usable".into()
+}
+
+fn existing_sdrf_is_usable(path: &Path) -> bool {
+    existing_sdrf_status(path) == "usable"
+}
+
 fn existing_sdrf_relation_hint(headers: &[String], rows: &[Vec<String>]) -> String {
     let Some(data_idx) = header_first_index(headers, "comment[data file]") else {
         return "uncertain".into();
@@ -836,10 +878,11 @@ fn build_evidence(opts: &SdrfAnnotateOptions, accession: &str) -> Result<Dataset
     }
 
     let mut evidence = Vec::new();
-    // Existing SDRF is the highest-value source because it already encodes the
-    // sample-to-file relationship. Parse it structurally; never flatten its raw
-    // TSV lines into an LLM prompt.
-    if existing_sdrf.is_file() {
+    // Existing SDRF is the highest-value source only when it contains a real
+    // sample-to-data mapping. The PRIDE SDRF endpoint can yield header-only cache
+    // files, so file existence alone must never activate the preservation path.
+    let usable_existing_sdrf = existing_sdrf_is_usable(&existing_sdrf);
+    if usable_existing_sdrf {
         add_existing_sdrf_evidence(
             &mut evidence,
             &existing_sdrf,
@@ -971,8 +1014,7 @@ fn build_evidence(opts: &SdrfAnnotateOptions, accession: &str) -> Result<Dataset
         accession: accession.to_string(),
         project_json_path: project_path.display().to_string(),
         files_json_path: files_path.display().to_string(),
-        existing_sdrf_path: existing_sdrf
-            .is_file()
+        existing_sdrf_path: usable_existing_sdrf
             .then(|| existing_sdrf.display().to_string())
             .unwrap_or_default(),
         raw_files,
@@ -2897,17 +2939,21 @@ pub async fn annotate_sdrf(opts: SdrfAnnotateOptions) -> Result<SdrfAnnotateSumm
     writer.flush()?;
     let successful = rows.iter().filter(|r| r.status != "error").count();
     let errors = rows.len() - successful;
+    let mut snapshot_sdrf_files = 0usize;
     let mut existing = 0usize;
     for accession in &accessions {
-        if opts
+        let path = opts
             .snapshot_dir
             .join("sdrf")
-            .join(format!("{accession}.sdrf.tsv"))
-            .is_file()
-        {
-            existing += 1;
+            .join(format!("{accession}.sdrf.tsv"));
+        if path.is_file() {
+            snapshot_sdrf_files += 1;
+            if existing_sdrf_is_usable(&path) {
+                existing += 1;
+            }
         }
     }
+    let unusable_snapshot_sdrf = snapshot_sdrf_files.saturating_sub(existing);
     let locally_valid = rows.iter().filter(|r| r.locally_valid).count();
     let accessions_with_provenance_repairs = rows.iter().filter(|r| r.proposal_repairs > 0).count();
     let provenance_repairs = rows.iter().map(|r| r.proposal_repairs).sum();
@@ -2920,6 +2966,8 @@ pub async fn annotate_sdrf(opts: SdrfAnnotateOptions) -> Result<SdrfAnnotateSumm
         successful,
         errors,
         existing_sdrf_detected: existing,
+        snapshot_sdrf_files_detected: snapshot_sdrf_files,
+        unusable_snapshot_sdrf_detected: unusable_snapshot_sdrf,
         drafts_written: successful,
         locally_valid_drafts: locally_valid,
         incomplete_drafts: successful.saturating_sub(locally_valid),
@@ -3335,6 +3383,30 @@ mod tests {
             ..Default::default()
         };
         assert!(draft_rows(&proposal, &evidence).is_err());
+    }
+
+    #[test]
+    fn header_only_snapshot_sdrf_is_not_usable_existing_sdrf() {
+        let dir = tmp();
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("header_only.sdrf.tsv");
+        fs::write(&path, "source name\tcomment[data file]\n").unwrap();
+        assert_eq!(existing_sdrf_status(&path), "header_only");
+        assert!(!existing_sdrf_is_usable(&path));
+    }
+
+    #[test]
+    fn mapped_snapshot_sdrf_is_usable_existing_sdrf() {
+        let dir = tmp();
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("mapped.sdrf.tsv");
+        fs::write(
+            &path,
+            "source name\tcomment[data file]\ncell_1\tcell_1.raw\n",
+        )
+        .unwrap();
+        assert_eq!(existing_sdrf_status(&path), "usable");
+        assert!(existing_sdrf_is_usable(&path));
     }
 
     #[test]
