@@ -3,6 +3,7 @@ members = [
     "crates/pride-scp-core",
     "crates/pride-scp-index",
     "crates/pride-scp-discovery",
+    "crates/pride-scp-sdrf",
     "crates/pride-scp-cli",
 ]
 resolver = "2"

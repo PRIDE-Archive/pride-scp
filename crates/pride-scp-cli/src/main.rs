@@ -11,6 +11,9 @@ use pride_scp_index::{
     DEFAULT_MASSIVE_PAGE_SIZE, DEFAULT_MASSIVE_QUERY_DATASETS_API, DEFAULT_PRIDE_API,
     DEFAULT_PROJECT_PAGE_SIZE, DEFAULT_PROTEOMECENTRAL_PROXI_API, DEFAULT_REGISTRY_PAGE_SIZE,
 };
+use pride_scp_sdrf::{
+    annotate_sdrf, SdrfAnnotateOptions, DEFAULT_OLLAMA_URL as DEFAULT_SDRF_OLLAMA_URL,
+};
 use std::path::PathBuf;
 use std::time::Instant;
 
@@ -218,6 +221,54 @@ enum Command {
         output: PathBuf,
         #[arg(long, default_value = "weak")]
         min_tier: String,
+    },
+    /// Generate provenance-tracked SDRF-Proteomics single-cell drafts from PRIDE
+    /// repository metadata, existing annotations, and manuscript-derived evidence.
+    SdrfAnnotate {
+        /// One or more PRIDE accessions to annotate. May be combined with --accessions-file.
+        #[arg(long = "accession")]
+        accessions: Vec<String>,
+        /// File containing PRIDE accessions (one per line; CSV/TSV first column also accepted).
+        #[arg(long)]
+        accessions_file: Option<PathBuf>,
+        /// Existing PRIDE snapshot containing projects/, files/, and sdrf/.
+        #[arg(long, default_value = "data/snapshot")]
+        snapshot: PathBuf,
+        /// Existing Stage04 annotation tree. Manuscript-derived semantic evidence is reused
+        /// when provenance files are available.
+        #[arg(long, default_value = "work/python/pride_scp_annotations/annotations")]
+        annotations_dir: PathBuf,
+        /// Publication-content manifest from the existing pipeline. Text/HTML/XML content
+        /// paths are read directly; PDFs continue to use upstream extraction/semantic evidence.
+        #[arg(
+            long,
+            default_value = "work/python/pride_candidate_publications_with_content.tsv"
+        )]
+        publication_manifest: PathBuf,
+        /// Additional extracted manuscript text/HTML/XML file(s). Repeat as needed.
+        #[arg(long = "manuscript-text")]
+        manuscript_text: Vec<PathBuf>,
+        #[arg(long, default_value = "data/sdrf_annotation")]
+        output: PathBuf,
+        #[arg(long, default_value = "qwen2.5:3b")]
+        model: String,
+        #[arg(long, default_value = DEFAULT_SDRF_OLLAMA_URL)]
+        ollama_url: String,
+        /// Ollama request timeout. Large manuscript evidence packets may require several minutes.
+        #[arg(long, default_value_t = 1200)]
+        timeout: u64,
+        /// Maximum evidence records passed to the model after provenance-aware extraction.
+        #[arg(long, default_value_t = 160)]
+        max_evidence_items: usize,
+        /// Maximum total evidence characters retained for one dataset.
+        #[arg(long, default_value_t = 80_000)]
+        max_evidence_chars: usize,
+        /// Maximum RAW filenames shown to Ollama. The complete inventory is still used
+        /// deterministically when the SDRF draft is serialized.
+        #[arg(long, default_value_t = 200)]
+        max_files_in_prompt: usize,
+        #[arg(long)]
+        force: bool,
     },
 }
 
@@ -441,6 +492,50 @@ async fn main() -> Result<()> {
                 min_tier,
                 progress,
             })?;
+            println!("{}", serde_json::to_string_pretty(&summary)?);
+        }
+        Command::SdrfAnnotate {
+            accessions,
+            accessions_file,
+            snapshot,
+            annotations_dir,
+            publication_manifest,
+            manuscript_text,
+            output,
+            model,
+            ollama_url,
+            timeout,
+            max_evidence_items,
+            max_evidence_chars,
+            max_files_in_prompt,
+            force,
+        } => {
+            log::info!(
+                "command=sdrf-annotate snapshot={} output={} model={}",
+                snapshot.display(),
+                output.display(),
+                model
+            );
+            let summary = annotate_sdrf(SdrfAnnotateOptions {
+                snapshot_dir: snapshot,
+                annotations_dir,
+                publication_manifest: publication_manifest
+                    .is_file()
+                    .then_some(publication_manifest),
+                manuscript_text_paths: manuscript_text,
+                output_dir: output,
+                accessions,
+                accessions_file,
+                model,
+                ollama_url,
+                timeout_seconds: timeout,
+                max_evidence_items,
+                max_evidence_chars,
+                max_files_in_prompt,
+                force,
+                progress,
+            })
+            .await?;
             println!("{}", serde_json::to_string_pretty(&summary)?);
         }
     }

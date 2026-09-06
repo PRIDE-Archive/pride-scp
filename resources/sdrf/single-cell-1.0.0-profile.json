@@ -1,0 +1,24 @@
+{
+  "profile": "bigbio-single-cell-1.0.0-github-main-observed-2026-09-06",
+  "specification_version": "v1.1.0",
+  "single_cell_template_version": "1.0.0",
+  "specification_url": "https://sdrf.quantms.org/specification.html",
+  "template_url": "https://github.com/bigbio/sdrf-templates/blob/main/single-cell/1.0.0/single-cell.yaml",
+  "generated_header_profile": {
+    "required_single_cell_columns": [
+      "characteristics[single cell isolation protocol]",
+      "characteristics[cell identifier]"
+    ],
+    "recommended_single_cell_columns": [
+      "characteristics[sample type]",
+      "characteristics[individual]",
+      "comment[sample preparation batch]",
+      "characteristics[cells per well]"
+    ],
+    "optional_multiplex_columns": [
+      "comment[carrier channel]",
+      "comment[reference channel]"
+    ]
+  },
+  "note": "The single-cell template is work in progress. Generated drafts pin the column profile shown by the rendered specification/GitHub view observed 2026-09-06 and must be revalidated against the live template before submission."
+}
