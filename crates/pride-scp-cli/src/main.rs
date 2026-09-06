@@ -258,14 +258,14 @@ enum Command {
         #[arg(long, default_value_t = 1200)]
         timeout: u64,
         /// Maximum evidence records passed to the model after provenance-aware extraction.
-        #[arg(long, default_value_t = 160)]
+        #[arg(long, default_value_t = 128)]
         max_evidence_items: usize,
         /// Maximum total evidence characters retained for one dataset.
-        #[arg(long, default_value_t = 80_000)]
+        #[arg(long, default_value_t = 60_000)]
         max_evidence_chars: usize,
         /// Maximum RAW filenames shown to Ollama. The complete inventory is still used
         /// deterministically when the SDRF draft is serialized.
-        #[arg(long, default_value_t = 200)]
+        #[arg(long, default_value_t = 64)]
         max_files_in_prompt: usize,
         #[arg(long)]
         force: bool,

@@ -250,3 +250,57 @@ Batch testing across the GT106 PRIDE cohort showed that small local LLMs frequen
 - structural/template incompleteness remains a validation error in the SDRF draft, but does not abort the accession.
 
 This is intentionally fail-safe: unsupported model assertions are discarded, never silently accepted. True operational failures (Ollama timeout, malformed JSON, unreadable source files) remain accession errors.
+
+## v0.2.0 existing-SDRF-first evidence architecture
+
+The v0.1.2 smoke showed a deeper failure mode: all five representative accessions already
+had deposited SDRFs, but the generator flattened those files into generic LLM evidence and
+then regenerated a new skeleton. Repository file-record metadata also leaked into the prompt,
+causing values such as `PRIDE`, `fileCategory`, and `publicFileLocations` to be proposed as
+biology.
+
+`pride-scp-sdrf-v0.2.0` changes the architecture rather than adding more post-hoc cleanup:
+
+1. **Existing SDRF is first-class structured input.** Headers and rows are parsed as TSV.
+   Existing sample-to-file relationships and deposited core MS values are preserved.
+2. **Single-cell enrichment is additive.** Missing single-cell columns are appended and only
+   missing/reserved cells are candidates for evidence-grounded completion.
+3. **Repository transport metadata is not LLM evidence.** The file manifest is used
+   deterministically for RAW inventory and URIs, but fields such as `fileCategory`,
+   `publicFileLocations`, repository labels, and download URLs are excluded from metadata
+   extraction prompts.
+4. **Existing SDRF values are summarized structurally.** The model sees bounded unique values
+   for relevant SDRF columns and a deterministic relationship summary rather than raw TSV rows.
+5. **Existing SDRF relationship hints can override the model.** When deposited rows prove
+   one-cell-per-file or multiplexed sample-to-file structure, the deterministic relation is
+   authoritative and is recorded as a provenance repair warning.
+6. **The correct SDRF metadata column is used:** `comment[sdrf annotation tool]`.
+7. **Sample type stays ontology/CV-oriented.** The local preflight no longer treats values
+   outside a small hard-coded list as fatal; uncommon values are deferred to the official
+   `sdrf-pipelines` ontology validation.
+8. Prompt size defaults are reduced for small local models: 128 evidence items, 60k evidence
+   characters, and 64 RAW filenames. The complete RAW inventory is still used deterministically.
+
+### Existing SDRF merge behavior
+
+For a deposited SDRF, the output preserves existing values for organism, source/assay names,
+acquisition, label, instrument, cleavage, fraction, technical replicate, and data-file mapping.
+The generator may fill missing dataset-level values only when the Ollama proposal is
+provenance-backed. It may derive a cell identifier from an existing `source name` only when
+existing SDRF structure/provenance establishes a one-cell-per-file relationship or the row is
+already explicitly marked `single cell`.
+
+Carrier/reference/control rows are not forced into cell identifiers. When their role is already
+known, the cell identifier/isolation concepts use the applicable reserved values rather than
+inventing a cell.
+
+### Recommended v0.2 smoke
+
+First rerun the five accessions that exposed the v0.1 evidence problem. A successful v0.2 smoke
+should show `generation_mode=enriched_existing_sdrf` and substantially fewer repeated core-MS
+validation errors because the deposited SDRF values are preserved.
+
+Then separately test accessions with **no deposited SDRF**. This is important because existing
+SDRF enrichment and de-novo SDRF reconstruction are distinct scientific problems. Generate the
+missing-SDRF list from the GT106 cohort locally and smoke-test a few of those before starting the
+full 106-accession batch.

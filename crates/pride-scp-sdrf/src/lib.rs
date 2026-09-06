@@ -20,7 +20,7 @@ pub const SINGLE_CELL_TEMPLATE_VERSION: &str = "1.0.0";
 pub const SINGLE_CELL_TEMPLATE_URL: &str =
     "https://github.com/bigbio/sdrf-templates/blob/main/single-cell/1.0.0/single-cell.yaml";
 pub const SDRF_SPEC_URL: &str = "https://sdrf.quantms.org/specification.html";
-pub const GENERATOR_VERSION: &str = "pride-scp-sdrf-v0.1.2";
+pub const GENERATOR_VERSION: &str = "pride-scp-sdrf-v0.2.0";
 pub const DEFAULT_OLLAMA_URL: &str = "http://localhost:11434/api/generate";
 
 // The linked single-cell template is work-in-progress. Generated drafts pin the
@@ -408,20 +408,40 @@ fn extract_raw_files(value: &Value) -> Vec<RawFile> {
     map.into_values().collect()
 }
 
-fn relevant_metadata_text(path: &str, text: &str) -> bool {
-    let hay = format!(
-        "{} {}",
-        path.to_ascii_lowercase(),
-        text.to_ascii_lowercase()
-    );
+fn relevant_sdrf_metadata_path(path: &str) -> bool {
+    let p = path.to_ascii_lowercase();
+    // Repository transport/file-record fields are provenance, never biological values.
+    if [
+        "publicfilelocations",
+        "filecategory",
+        "downloadlink",
+        "downloadurl",
+        "repository",
+        "submission",
+        "submitter",
+        "filelist",
+        "files.",
+        "file.",
+    ]
+    .iter()
+    .any(|noise| p.contains(noise))
+    {
+        return false;
+    }
     [
-        "single",
-        "cell",
-        "sample",
+        "title",
+        "description",
         "organism",
+        "species",
         "tissue",
+        "organism part",
         "disease",
+        "cell type",
+        "celltype",
+        "sample type",
+        "sampletype",
         "instrument",
+        "acquisition",
         "quant",
         "label",
         "tmt",
@@ -434,18 +454,20 @@ fn relevant_metadata_text(path: &str, text: &str) -> bool {
         "facs",
         "cellenone",
         "nanopots",
-        "nano",
         "batch",
         "replicate",
         "carrier",
         "reference",
         "channel",
         "protocol",
-        "description",
-        "title",
+        "single cell",
+        "single_cell",
+        "individual",
+        "cells per well",
+        "cells_per_well",
     ]
     .iter()
-    .any(|term| hay.contains(term))
+    .any(|term| p.contains(term))
 }
 
 fn add_json_evidence(
@@ -459,7 +481,7 @@ fn add_json_evidence(
     let mut leaves = Vec::new();
     json_string_leaves(value, "", &mut leaves);
     for (path, text) in leaves {
-        if relevant_metadata_text(&path, &text) {
+        if relevant_sdrf_metadata_path(&path) {
             push_evidence(
                 items,
                 kind,
@@ -470,6 +492,195 @@ fn add_json_evidence(
             );
         }
     }
+}
+
+fn normalize_header(value: &str) -> String {
+    value.trim().to_ascii_lowercase()
+}
+
+fn read_existing_sdrf_table(path: &Path) -> Result<(Vec<String>, Vec<Vec<String>>)> {
+    let mut reader = ReaderBuilder::new()
+        .delimiter(b'\t')
+        .flexible(true)
+        .from_path(path)
+        .with_context(|| format!("read existing SDRF {}", path.display()))?;
+    let headers = reader
+        .headers()?
+        .iter()
+        .map(normalize_header)
+        .collect::<Vec<_>>();
+    let mut rows = Vec::new();
+    for rec in reader.records() {
+        let rec = rec?;
+        let mut row = rec.iter().map(|x| x.trim().to_string()).collect::<Vec<_>>();
+        row.resize(headers.len(), String::new());
+        rows.push(row);
+    }
+    Ok((headers, rows))
+}
+
+fn header_first_index(headers: &[String], name: &str) -> Option<usize> {
+    headers.iter().position(|h| h == name)
+}
+
+fn existing_sdrf_relation_hint(headers: &[String], rows: &[Vec<String>]) -> String {
+    let Some(data_idx) = header_first_index(headers, "comment[data file]") else {
+        return "uncertain".into();
+    };
+    let cell_idx = header_first_index(headers, SC_CELL_IDENTIFIER);
+    let sample_type_idx = header_first_index(headers, SC_SAMPLE_TYPE);
+    let label_idx = header_first_index(headers, "comment[label]");
+    let mut per_file_rows: BTreeMap<String, usize> = BTreeMap::new();
+    let mut per_file_cells: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    let mut per_file_labels: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    for row in rows {
+        if data_idx >= row.len() {
+            continue;
+        }
+        let file = row[data_idx].trim();
+        if file.is_empty() || file.eq_ignore_ascii_case("not available") {
+            continue;
+        }
+        *per_file_rows.entry(file.to_string()).or_default() += 1;
+        if let Some(j) = cell_idx {
+            if j < row.len() {
+                let v = row[j].trim();
+                let low = v.to_ascii_lowercase();
+                if !v.is_empty()
+                    && ![
+                        "not available",
+                        "not applicable",
+                        "carrier",
+                        "reference",
+                        "empty",
+                    ]
+                    .contains(&low.as_str())
+                {
+                    per_file_cells
+                        .entry(file.to_string())
+                        .or_default()
+                        .insert(v.to_string());
+                }
+            }
+        }
+        if let Some(j) = label_idx {
+            if j < row.len() {
+                let v = row[j].trim();
+                if !v.is_empty() && !v.eq_ignore_ascii_case("not available") {
+                    per_file_labels
+                        .entry(file.to_string())
+                        .or_default()
+                        .insert(v.to_string());
+                }
+            }
+        }
+    }
+    let has_multi_cells = per_file_cells.values().any(|x| x.len() > 1);
+    let has_multi_labels = per_file_labels.values().any(|x| x.len() > 1);
+    let has_multi_rows = per_file_rows.values().any(|&n| n > 1);
+    if has_multi_cells || (has_multi_rows && has_multi_labels) {
+        return "multiplexed_cells_per_data_file".into();
+    }
+    if !per_file_cells.is_empty() && per_file_cells.values().all(|x| x.len() == 1) {
+        return "one_cell_per_data_file".into();
+    }
+    if let Some(j) = sample_type_idx {
+        let target_rows = rows
+            .iter()
+            .filter(|r| j < r.len() && r[j].trim().eq_ignore_ascii_case("single cell"))
+            .count();
+        if target_rows > 0 && !has_multi_rows {
+            return "one_cell_per_data_file".into();
+        }
+    }
+    "uncertain".into()
+}
+
+fn add_existing_sdrf_evidence(
+    items: &mut Vec<EvidenceItem>,
+    path: &Path,
+    max_items: usize,
+    max_chars: usize,
+) -> Result<()> {
+    let (headers, rows) = read_existing_sdrf_table(path)?;
+    let relation = existing_sdrf_relation_hint(&headers, &rows);
+    let data_files = header_first_index(&headers, "comment[data file]")
+        .map(|j| {
+            rows.iter()
+                .filter_map(|r| r.get(j))
+                .filter(|v| !v.trim().is_empty())
+                .collect::<BTreeSet<_>>()
+                .len()
+        })
+        .unwrap_or(0);
+    push_evidence(
+        items,
+        "existing_sdrf_structured",
+        "existing_sdrf:relationship_summary",
+        format!(
+            "existing SDRF rows={}; unique data files={}; deterministic relation hint={relation}",
+            rows.len(),
+            data_files
+        ),
+        max_items,
+        max_chars,
+    );
+    let wanted = [
+        "source name",
+        "characteristics[organism]",
+        "characteristics[organism part]",
+        "characteristics[disease]",
+        "characteristics[cell type]",
+        "characteristics[biological replicate]",
+        "assay name",
+        "comment[proteomics data acquisition method]",
+        "comment[label]",
+        "comment[instrument]",
+        "comment[cleavage agent details]",
+        "comment[fraction identifier]",
+        "comment[technical replicate]",
+        SC_SAMPLE_TYPE,
+        SC_ISOLATION_METHOD,
+        SC_CELL_IDENTIFIER,
+        SC_PREP_BATCH,
+        SC_CELLS_PER_WELL,
+        SC_CARRIER_CHANNEL,
+        SC_REFERENCE_CHANNEL,
+    ];
+    for name in wanted {
+        let Some(j) = header_first_index(&headers, name) else {
+            continue;
+        };
+        let mut vals = BTreeSet::new();
+        for row in &rows {
+            let Some(v) = row.get(j) else {
+                continue;
+            };
+            let v = v.trim();
+            if v.is_empty() {
+                continue;
+            }
+            vals.insert(v.to_string());
+            if vals.len() >= 12 {
+                break;
+            }
+        }
+        if vals.is_empty() {
+            continue;
+        }
+        push_evidence(
+            items,
+            "existing_sdrf_structured",
+            format!("existing_sdrf:{name}"),
+            format!(
+                "{name} values: {}",
+                vals.into_iter().collect::<Vec<_>>().join(" | ")
+            ),
+            max_items,
+            max_chars,
+        );
+    }
+    Ok(())
 }
 
 fn read_text_evidence(path: &Path, max_chars: usize) -> Result<String> {
@@ -625,19 +836,25 @@ fn build_evidence(opts: &SdrfAnnotateOptions, accession: &str) -> Result<Dataset
     }
 
     let mut evidence = Vec::new();
+    // Existing SDRF is the highest-value source because it already encodes the
+    // sample-to-file relationship. Parse it structurally; never flatten its raw
+    // TSV lines into an LLM prompt.
+    if existing_sdrf.is_file() {
+        add_existing_sdrf_evidence(
+            &mut evidence,
+            &existing_sdrf,
+            opts.max_evidence_items,
+            opts.max_evidence_chars,
+        )?;
+    }
+    // Project metadata may contain biological/acquisition facts. File-list JSON is
+    // deliberately excluded from LLM evidence: fields such as fileCategory and
+    // publicFileLocations describe repository transport, not biology.
     add_json_evidence(
         &mut evidence,
         "pride_project",
         "project",
         &project,
-        opts.max_evidence_items,
-        opts.max_evidence_chars,
-    );
-    add_json_evidence(
-        &mut evidence,
-        "pride_files",
-        "files",
-        &files,
         opts.max_evidence_items,
         opts.max_evidence_chars,
     );
@@ -699,21 +916,6 @@ fn build_evidence(opts: &SdrfAnnotateOptions, accession: &str) -> Result<Dataset
                 opts.max_evidence_items,
                 opts.max_evidence_chars,
             );
-        }
-    }
-
-    if existing_sdrf.is_file() {
-        if let Ok(text) = fs::read_to_string(&existing_sdrf) {
-            for (i, line) in text.lines().take(120).enumerate() {
-                push_evidence(
-                    &mut evidence,
-                    "existing_sdrf",
-                    format!("sdrf:line={}", i + 1),
-                    line,
-                    opts.max_evidence_items,
-                    opts.max_evidence_chars,
-                );
-            }
         }
     }
 
@@ -816,7 +1018,7 @@ fn proposal_schema() -> Value {
             "organism_part": {"type":"string","maxLength":160},
             "disease": {"type":"string","maxLength":160},
             "cell_type": {"type":"string","maxLength":160},
-            "sample_type": {"type":"string","enum":["single cell","carrier","reference","empty","negative control","bulk control","not applicable","not available"]},
+            "sample_type": {"type":"string","maxLength":160},
             "single_cell_isolation_method": {"type":"string","maxLength":160},
             "individual": {"type":"string","maxLength":160},
             "sample_preparation_batch": {"type":"string","maxLength":160},
@@ -870,7 +1072,10 @@ RULES:\n\
 7. Do not infer a per-cell identifier from a filename here; Rust may do that deterministically only when relation_mode is one_cell_per_data_file.\n\
 8. Dataset-level fields (organism part, disease, cell type, individual, batch, factors) may vary across samples. Return a concrete value only if the evidence supports that the same value applies to all target single-cell samples; otherwise use 'not available'.\n\
 9. Factor proposals are review hints only in v0.1 because per-row factor assignments are not yet reconstructed safely.\n\
-10. This is a draft annotation pass. Uncertainty is preferable to hallucination.\n\n\
+10. Repository provenance labels (for example PRIDE, fileCategory, publicFileLocations, FTP/HTTP locations) are NEVER biological or SDRF values. Do not copy provenance/source labels into metadata fields.\n\
+11. Existing SDRF structured evidence has highest priority for values already deposited by submitters. Preserve it unless stronger evidence demonstrates it is missing, not that it is wrong.\n\
+12. Factors must describe biological/experimental study variables only. Never propose repository/file bookkeeping fields as factors.\n\
+13. This is a draft annotation pass. Uncertainty is preferable to hallucination.\n\n\
 RAW FILE COUNT: {nfiles}\nRAW FILE SAMPLE (max {max_files}):\n{files}\n\nEVIDENCE:\n{ev}",
         acc = evidence.accession,
         nfiles = evidence.raw_files.len(),
@@ -1256,7 +1461,7 @@ fn headers_for(_proposal: &SdrfProposal, include_file_uri: bool) -> Vec<String> 
         SC_REFERENCE_CHANNEL.to_string(),
         "comment[sdrf version]".to_string(),
         "comment[sdrf template]".to_string(),
-        "comment[annotation tool]".to_string(),
+        "comment[sdrf annotation tool]".to_string(),
     ]);
     // Factor candidates are retained in the Ollama proposal for human review,
     // but v0.1 does not serialize them because per-row factor assignments are
@@ -1264,10 +1469,313 @@ fn headers_for(_proposal: &SdrfProposal, include_file_uri: bool) -> Vec<String> 
     h
 }
 
+fn is_missing_cell_value(value: &str) -> bool {
+    let v = value.trim();
+    v.is_empty() || v.eq_ignore_ascii_case("not available")
+}
+
+fn concrete_proposal_value(value: &str) -> Option<String> {
+    if proposal_value_is_reserved("", value) {
+        return None;
+    }
+    let v = value.trim();
+    (!v.is_empty()).then(|| v.to_string())
+}
+
+fn append_header(headers: &mut Vec<String>, rows: &mut [Vec<String>], name: &str) -> usize {
+    if let Some(i) = header_first_index(headers, name) {
+        return i;
+    }
+    headers.push(name.to_string());
+    for row in rows.iter_mut() {
+        row.push(String::new());
+    }
+    headers.len() - 1
+}
+
+fn set_missing(row: &mut [String], idx: Option<usize>, value: Option<String>) {
+    let (Some(j), Some(value)) = (idx, value) else {
+        return;
+    };
+    if j < row.len() && is_missing_cell_value(&row[j]) {
+        row[j] = value;
+    }
+}
+
+fn data_file_basename(value: &str) -> String {
+    let trimmed = value.trim().trim_matches('"');
+    let tail = trimmed
+        .rsplit(|c| c == '/' || c == '\\')
+        .next()
+        .unwrap_or(trimmed);
+    tail.to_string()
+}
+
+fn merge_existing_sdrf(
+    proposal: &SdrfProposal,
+    evidence: &DatasetEvidence,
+) -> Result<(Vec<String>, Vec<Vec<String>>, String)> {
+    let path = Path::new(&evidence.existing_sdrf_path);
+    let (mut headers, mut rows) = read_existing_sdrf_table(path)?;
+    let original_header_count = headers.len();
+
+    for required in [
+        "source name",
+        "characteristics[organism]",
+        "characteristics[organism part]",
+        "characteristics[disease]",
+        "characteristics[cell type]",
+        "characteristics[biological replicate]",
+        "assay name",
+        "technology type",
+        "comment[proteomics data acquisition method]",
+        "comment[label]",
+        "comment[instrument]",
+        "comment[cleavage agent details]",
+        "comment[fraction identifier]",
+        "comment[technical replicate]",
+        "comment[data file]",
+        SC_SAMPLE_TYPE,
+        SC_ISOLATION_METHOD,
+        SC_CELL_IDENTIFIER,
+        SC_INDIVIDUAL,
+        SC_PREP_BATCH,
+        SC_CELLS_PER_WELL,
+        SC_CARRIER_CHANNEL,
+        SC_REFERENCE_CHANNEL,
+        "comment[sdrf version]",
+        "comment[sdrf annotation tool]",
+    ] {
+        append_header(&mut headers, &mut rows, required);
+    }
+
+    let existing_has_sc_template = headers.iter().enumerate().any(|(j, h)| {
+        h == "comment[sdrf template]"
+            && rows.iter().any(|r| {
+                r.get(j)
+                    .map_or(false, |v| v.to_ascii_lowercase().contains("single-cell"))
+            })
+    });
+    let sc_template_idx = if existing_has_sc_template {
+        None
+    } else {
+        headers.push("comment[sdrf template]".to_string());
+        for row in rows.iter_mut() {
+            row.push(String::new());
+        }
+        Some(headers.len() - 1)
+    };
+
+    let relation = proposal.relation_mode.as_str();
+    let raw_uri: BTreeMap<String, String> = evidence
+        .raw_files
+        .iter()
+        .map(|f| (f.file_name.clone(), f.file_uri.clone()))
+        .collect();
+    let include_uri = raw_uri.values().any(|x| !x.is_empty());
+    let uri_idx = if include_uri {
+        Some(append_header(&mut headers, &mut rows, "comment[file uri]"))
+    } else {
+        None
+    };
+    let idx = |name: &str| header_first_index(&headers, name);
+
+    let source_idx = idx("source name");
+    let data_idx = idx("comment[data file]");
+    let sample_type_idx = idx(SC_SAMPLE_TYPE);
+    let cell_idx = idx(SC_CELL_IDENTIFIER);
+    let isolation_idx = idx(SC_ISOLATION_METHOD);
+    let cells_idx = idx(SC_CELLS_PER_WELL);
+
+    for row in rows.iter_mut() {
+        set_missing(
+            row,
+            idx("characteristics[organism]"),
+            concrete_proposal_value(&proposal.organism),
+        );
+        set_missing(
+            row,
+            idx("characteristics[organism part]"),
+            concrete_proposal_value(&proposal.organism_part),
+        );
+        set_missing(
+            row,
+            idx("characteristics[disease]"),
+            concrete_proposal_value(&proposal.disease),
+        );
+        set_missing(
+            row,
+            idx("characteristics[cell type]"),
+            concrete_proposal_value(&proposal.cell_type),
+        );
+        set_missing(
+            row,
+            idx("comment[proteomics data acquisition method]"),
+            concrete_proposal_value(&proposal.proteomics_data_acquisition_method),
+        );
+        set_missing(
+            row,
+            idx("comment[label]"),
+            concrete_proposal_value(&proposal.label),
+        );
+        set_missing(
+            row,
+            idx("comment[instrument]"),
+            concrete_proposal_value(&proposal.instrument),
+        );
+        set_missing(
+            row,
+            idx("comment[cleavage agent details]"),
+            concrete_proposal_value(&proposal.cleavage_agent_details),
+        );
+        if proposal
+            .fraction_identifier
+            .trim()
+            .chars()
+            .all(|c| c.is_ascii_digit())
+        {
+            set_missing(
+                row,
+                idx("comment[fraction identifier]"),
+                Some(proposal.fraction_identifier.trim().to_string()),
+            );
+        }
+        if proposal
+            .technical_replicate
+            .trim()
+            .chars()
+            .all(|c| c.is_ascii_digit())
+        {
+            set_missing(
+                row,
+                idx("comment[technical replicate]"),
+                Some(proposal.technical_replicate.trim().to_string()),
+            );
+        }
+        set_missing(
+            row,
+            idx(SC_INDIVIDUAL),
+            concrete_proposal_value(&proposal.individual),
+        );
+        set_missing(
+            row,
+            idx(SC_PREP_BATCH),
+            concrete_proposal_value(&proposal.sample_preparation_batch),
+        );
+        set_missing(
+            row,
+            idx(SC_CARRIER_CHANNEL),
+            concrete_proposal_value(&proposal.carrier_channel),
+        );
+        set_missing(
+            row,
+            idx(SC_REFERENCE_CHANNEL),
+            concrete_proposal_value(&proposal.reference_channel),
+        );
+
+        let current_sample_type = sample_type_idx
+            .and_then(|j| row.get(j))
+            .map(|x| x.trim().to_ascii_lowercase())
+            .unwrap_or_default();
+        if current_sample_type.is_empty() || current_sample_type == "not available" {
+            if relation == "one_cell_per_data_file" {
+                if let Some(j) = sample_type_idx {
+                    row[j] = "single cell".into();
+                }
+            }
+        }
+        let sample_type = sample_type_idx
+            .and_then(|j| row.get(j))
+            .map(|x| x.trim().to_ascii_lowercase())
+            .unwrap_or_default();
+        if let Some(j) = isolation_idx {
+            if is_missing_cell_value(&row[j]) {
+                if [
+                    "carrier",
+                    "reference",
+                    "empty",
+                    "bulk control",
+                    "negative control",
+                ]
+                .contains(&sample_type.as_str())
+                {
+                    row[j] = "not applicable".into();
+                } else if let Some(v) =
+                    concrete_proposal_value(&proposal.single_cell_isolation_method)
+                {
+                    row[j] = v;
+                }
+            }
+        }
+        if let Some(j) = cells_idx {
+            if is_missing_cell_value(&row[j]) && sample_type == "single cell" {
+                row[j] = "1".into();
+            }
+        }
+        if let Some(j) = cell_idx {
+            if is_missing_cell_value(&row[j]) {
+                if sample_type == "carrier" {
+                    row[j] = "carrier".into();
+                } else if sample_type == "reference" {
+                    row[j] = "reference".into();
+                } else if sample_type == "empty" {
+                    row[j] = "empty".into();
+                } else if ["bulk control", "negative control"].contains(&sample_type.as_str()) {
+                    row[j] = "not applicable".into();
+                } else if relation == "one_cell_per_data_file" || sample_type == "single cell" {
+                    if let Some(src_j) = source_idx {
+                        let src = row.get(src_j).cloned().unwrap_or_default();
+                        if !src.trim().is_empty() && !src.eq_ignore_ascii_case("not available") {
+                            row[j] = safe_identifier_from_file(&src);
+                        }
+                    }
+                }
+            }
+        }
+        if let Some(j) = idx("technology type") {
+            if is_missing_cell_value(&row[j]) {
+                row[j] = "proteomic profiling by mass spectrometry".into();
+            }
+        }
+        if let Some(j) = idx("comment[sdrf version]") {
+            row[j] = SDRF_SPEC_VERSION.into();
+        }
+        if let Some(j) = idx("comment[sdrf annotation tool]") {
+            row[j] = format!("pride-scp-sdrf {GENERATOR_VERSION}");
+        }
+        if let Some(j) = sc_template_idx {
+            row[j] = format!("single-cell v{SINGLE_CELL_TEMPLATE_VERSION}");
+        }
+        if let (Some(data_j), Some(uri_j)) = (data_idx, uri_idx) {
+            let file = row
+                .get(data_j)
+                .map(|x| data_file_basename(x))
+                .unwrap_or_default();
+            if is_missing_cell_value(&row[uri_j]) {
+                if let Some(uri) = raw_uri.get(&file).filter(|x| !x.is_empty()) {
+                    row[uri_j] = uri.clone();
+                }
+            }
+        }
+    }
+
+    let mode = if headers.len() > original_header_count {
+        "enriched_existing_sdrf"
+    } else {
+        "validated_existing_sdrf"
+    };
+    Ok((headers, rows, mode.into()))
+}
+
 fn draft_rows(
     proposal: &SdrfProposal,
     evidence: &DatasetEvidence,
 ) -> (Vec<String>, Vec<Vec<String>>, String) {
+    if !evidence.existing_sdrf_path.is_empty() {
+        if let Ok(merged) = merge_existing_sdrf(proposal, evidence) {
+            return merged;
+        }
+    }
     let include_uri = evidence.raw_files.iter().any(|f| !f.file_uri.is_empty());
     let headers = headers_for(proposal, include_uri);
     let idx: HashMap<&str, usize> = headers
@@ -1430,7 +1938,7 @@ fn draft_rows(
         );
         set(
             &mut row,
-            "comment[annotation tool]",
+            "comment[sdrf annotation tool]",
             GENERATOR_VERSION.to_string(),
         );
         rows.push(row);
@@ -1486,19 +1994,25 @@ fn validate_draft(
             });
         }
     }
-    let valid_files: BTreeSet<&str> = evidence
+    let valid_files: BTreeSet<String> = evidence
         .raw_files
         .iter()
-        .map(|f| f.file_name.as_str())
+        .map(|f| data_file_basename(&f.file_name))
         .collect();
     let cell_id =
         Regex::new(r"^[A-Za-z0-9_.-]+$|^(?:carrier|reference|empty|not applicable)$").unwrap();
     let sample_types = [
+        "study sample",
         "single cell",
-        "carrier",
         "reference",
-        "empty",
+        "bridge",
+        "carrier",
         "negative control",
+        "positive control",
+        "calibrator",
+        "plate control",
+        "quality control sample",
+        "empty",
         "bulk control",
         "not applicable",
         "not available",
@@ -1547,21 +2061,13 @@ fn validate_draft(
         if let Some(&j) = index.get(SC_SAMPLE_TYPE) {
             let v = row[j].trim().to_ascii_lowercase();
             if !sample_types.contains(&v.as_str()) {
-                issues.push(ValidationIssue {
-                    level: "error".into(),
-                    code: "sample_type_invalid_or_unresolved".into(),
-                    row: ri + 1,
-                    column: SC_SAMPLE_TYPE.into(),
-                    message: format!(
-                        "sample type is not in the pinned single-cell template: {}",
-                        row[j]
-                    ),
-                });
+                issues.push(ValidationIssue { level: "warning".into(), code: "sample_type_requires_cv_validation".into(), row: ri + 1, column: SC_SAMPLE_TYPE.into(), message: format!("sample type is not in the local common-value set; defer ontology/CV validation to sdrf-pipelines: {}", row[j]) });
             }
         }
         if let Some(&j) = index.get("comment[data file]") {
             let v = row[j].trim();
-            if !valid_files.contains(v) {
+            let base = data_file_basename(v);
+            if !valid_files.contains(&base) {
                 issues.push(ValidationIssue {
                     level: "error".into(),
                     code: "data_file_not_in_pride_raw_inventory".into(),
@@ -1685,7 +2191,25 @@ async fn annotate_one(opts: &SdrfAnnotateOptions, accession: &str) -> Result<Res
     // the entire accession; every repair is surfaced in the review/audit outputs.
     let raw_proposal_path = proposal_path.with_file_name(format!("{accession}.ollama.raw.json"));
     fs::write(&raw_proposal_path, serde_json::to_string_pretty(&proposal)?)?;
-    let provenance_issues = repair_proposal_provenance(&mut proposal, &evidence);
+    let mut provenance_issues = repair_proposal_provenance(&mut proposal, &evidence);
+    if !evidence.existing_sdrf_path.is_empty() {
+        if let Ok((headers, rows)) =
+            read_existing_sdrf_table(Path::new(&evidence.existing_sdrf_path))
+        {
+            let hint = existing_sdrf_relation_hint(&headers, &rows);
+            if hint != "uncertain" && proposal.relation_mode != hint {
+                let previous = proposal.relation_mode.clone();
+                proposal.relation_mode = hint.clone();
+                provenance_issues.push(ValidationIssue {
+                    level: "warning".into(),
+                    code: "relation_mode_determined_from_existing_sdrf".into(),
+                    row: 0,
+                    column: "relation_mode".into(),
+                    message: format!("deterministic existing-SDRF relationship evidence changed relation_mode from '{previous}' to '{hint}'"),
+                });
+            }
+        }
+    }
     fs::write(&proposal_path, serde_json::to_string_pretty(&proposal)?)?;
     validate_proposal_refs(&proposal, &evidence)?;
     let proposal_repair_count = provenance_issues.len();
@@ -1698,8 +2222,10 @@ async fn annotate_one(opts: &SdrfAnnotateOptions, accession: &str) -> Result<Res
     write_review(&review_path, &issues)?;
     let errors = issues.iter().filter(|x| x.level == "error").count();
     let locally_valid = errors == 0;
-    let completeness = if existing {
-        "draft_generated_existing_sdrf_present_requires_merge_review"
+    let completeness = if existing && locally_valid {
+        "existing_sdrf_enriched_locally_valid"
+    } else if existing {
+        "existing_sdrf_enriched_requires_review"
     } else if proposal.relation_mode == "one_cell_per_data_file" && locally_valid {
         "locally_valid_draft"
     } else if proposal.relation_mode != "one_cell_per_data_file" {
@@ -2057,6 +2583,82 @@ mod tests {
         assert_eq!(proposal.organism, "not available");
         assert_eq!(proposal.disease, "not available");
         validate_proposal_refs(&proposal, &evidence).unwrap();
+    }
+
+    #[test]
+    fn structured_existing_sdrf_relation_detects_multiplexing() {
+        let headers = vec![
+            "source name".into(),
+            "comment[data file]".into(),
+            SC_CELL_IDENTIFIER.into(),
+            "comment[label]".into(),
+        ];
+        let rows = vec![
+            vec![
+                "cell1".into(),
+                "run.raw".into(),
+                "cell1".into(),
+                "TMT126".into(),
+            ],
+            vec![
+                "cell2".into(),
+                "run.raw".into(),
+                "cell2".into(),
+                "TMT127N".into(),
+            ],
+        ];
+        assert_eq!(
+            existing_sdrf_relation_hint(&headers, &rows),
+            "multiplexed_cells_per_data_file"
+        );
+    }
+
+    #[test]
+    fn existing_sdrf_merge_preserves_core_values_and_adds_single_cell_columns() {
+        let root = tmp();
+        fs::create_dir_all(&root).unwrap();
+        let existing = root.join("existing.sdrf.tsv");
+        fs::write(&existing,
+            "source name\tcharacteristics[organism]\tassay name\ttechnology type\tcomment[proteomics data acquisition method]\tcomment[label]\tcomment[instrument]\tcomment[cleavage agent details]\tcomment[fraction identifier]\tcomment[technical replicate]\tcomment[data file]\ncell_A\thomo sapiens\tassay_A\tproteomic profiling by mass spectrometry\tData-dependent acquisition\tlabel free sample\tOrbitrap\tNT=Trypsin;AC=MS:1001251\t1\t1\tcell_A.raw\n"
+        ).unwrap();
+        let evidence = DatasetEvidence {
+            accession: "PXD999999".into(),
+            project_json_path: String::new(),
+            files_json_path: String::new(),
+            existing_sdrf_path: existing.display().to_string(),
+            raw_files: vec![RawFile {
+                file_name: "cell_A.raw".into(),
+                file_uri: "ftp://x/cell_A.raw".into(),
+                category: "RAW".into(),
+            }],
+            evidence: vec![],
+            manuscript_sources: vec![],
+            annotation_sources: vec![],
+        };
+        let proposal = SdrfProposal {
+            relation_mode: "one_cell_per_data_file".into(),
+            single_cell_isolation_method: "cellenONE".into(),
+            ..Default::default()
+        };
+        let (headers, rows, mode) = merge_existing_sdrf(&proposal, &evidence).unwrap();
+        assert_eq!(mode, "enriched_existing_sdrf");
+        let org = header_first_index(&headers, "characteristics[organism]").unwrap();
+        let cell = header_first_index(&headers, SC_CELL_IDENTIFIER).unwrap();
+        let iso = header_first_index(&headers, SC_ISOLATION_METHOD).unwrap();
+        let frac = header_first_index(&headers, "comment[fraction identifier]").unwrap();
+        assert_eq!(rows[0][org], "homo sapiens");
+        assert_eq!(rows[0][cell], "cell_A");
+        assert_eq!(rows[0][iso], "cellenONE");
+        assert_eq!(rows[0][frac], "1");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn repository_transport_paths_are_not_llm_metadata_evidence() {
+        assert!(!relevant_sdrf_metadata_path("publicFileLocations[0].name"));
+        assert!(!relevant_sdrf_metadata_path("fileCategory.value"));
+        assert!(relevant_sdrf_metadata_path("organisms[0].name"));
+        assert!(relevant_sdrf_metadata_path("instruments[0].name"));
     }
 
     #[test]
