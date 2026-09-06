@@ -460,22 +460,23 @@ pub fn discover(opts: DiscoverOptions) -> Result<DiscoverySummary> {
     // snapshot/projects so duplicate registry metadata cannot perturb the accepted
     // score/tier of existing PRIDE candidates.
     let registry_project_dir = opts.snapshot_dir.join("registry").join("projects");
-    let mut registry_project_paths = if source_scope.includes_registry() && registry_project_dir.is_dir() {
-        std::fs::read_dir(&registry_project_dir)
-            .with_context(|| format!("read {}", registry_project_dir.display()))?
-            .filter_map(|entry| entry.ok().map(|x| x.path()))
-            .filter(|path| path.extension().and_then(|x| x.to_str()) == Some("json"))
-            .filter(|path| {
-                path.file_stem()
-                    .and_then(|x| x.to_str())
-                    .map(str::to_ascii_uppercase)
-                    .map(|accession| !primary_accessions.contains(&accession))
-                    .unwrap_or(false)
-            })
-            .collect::<Vec<_>>()
-    } else {
-        Vec::new()
-    };
+    let mut registry_project_paths =
+        if source_scope.includes_registry() && registry_project_dir.is_dir() {
+            std::fs::read_dir(&registry_project_dir)
+                .with_context(|| format!("read {}", registry_project_dir.display()))?
+                .filter_map(|entry| entry.ok().map(|x| x.path()))
+                .filter(|path| path.extension().and_then(|x| x.to_str()) == Some("json"))
+                .filter(|path| {
+                    path.file_stem()
+                        .and_then(|x| x.to_str())
+                        .map(str::to_ascii_uppercase)
+                        .map(|accession| !primary_accessions.contains(&accession))
+                        .unwrap_or(false)
+                })
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
     registry_project_paths.sort();
 
     // Scan every native MassIVE record, including records with a trusted PXD alias.
@@ -489,15 +490,16 @@ pub fn discover(opts: DiscoverOptions) -> Result<DiscoverySummary> {
         .join("native")
         .join("massive")
         .join("projects");
-    let mut native_massive_paths = if source_scope.includes_native_massive() && native_massive_dir.is_dir() {
-        std::fs::read_dir(&native_massive_dir)
-            .with_context(|| format!("read {}", native_massive_dir.display()))?
-            .filter_map(|entry| entry.ok().map(|x| x.path()))
-            .filter(|path| path.extension().and_then(|x| x.to_str()) == Some("json"))
-            .collect::<Vec<_>>()
-    } else {
-        Vec::new()
-    };
+    let mut native_massive_paths =
+        if source_scope.includes_native_massive() && native_massive_dir.is_dir() {
+            std::fs::read_dir(&native_massive_dir)
+                .with_context(|| format!("read {}", native_massive_dir.display()))?
+                .filter_map(|entry| entry.ok().map(|x| x.path()))
+                .filter(|path| path.extension().and_then(|x| x.to_str()) == Some("json"))
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
     native_massive_paths.sort();
 
     let primary_projects_scanned = primary_project_paths.len();
@@ -1746,8 +1748,14 @@ mod tests {
         assert!(!candidates.iter().any(|row| row.accession == "PXD900031"));
 
         let audit = read_candidate_tsv(&out.join("project_discovery_audit.tsv")).unwrap();
-        let pxd = audit.iter().find(|row| row.accession == "PXD900031").unwrap();
-        let msv = audit.iter().find(|row| row.accession == "MSV000900031").unwrap();
+        let pxd = audit
+            .iter()
+            .find(|row| row.accession == "PXD900031")
+            .unwrap();
+        let msv = audit
+            .iter()
+            .find(|row| row.accession == "MSV000900031")
+            .unwrap();
         assert_eq!(pxd.score, 0);
         assert!(msv.score > 0);
 
