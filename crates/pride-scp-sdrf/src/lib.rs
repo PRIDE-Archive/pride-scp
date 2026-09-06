@@ -1192,7 +1192,19 @@ fn field_existing_header(field: &str) -> Option<&'static str> {
 
 fn concrete_table_value(value: &str) -> bool {
     let v = value.trim();
-    !v.is_empty() && canonical_reserved_alias(v).is_none()
+    if v.is_empty() {
+        return false;
+    }
+    match canonical_reserved_alias(v) {
+        // `not available` is unresolved and may still benefit from bounded
+        // evidence-backed enrichment. `not applicable` and `pooled` are
+        // deliberate SDRF states, not missing values, so they must not force
+        // an otherwise complete existing SDRF back through Ollama.
+        Some("not available") => false,
+        Some("not applicable") | Some("pooled") => true,
+        Some(_) => false,
+        None => true,
+    }
 }
 
 fn proposal_target_fields(evidence: &DatasetEvidence) -> BTreeSet<String> {
@@ -3212,6 +3224,13 @@ mod tests {
         assert!(!relevant_sdrf_metadata_path("fileCategory.value"));
         assert!(relevant_sdrf_metadata_path("organisms[0].name"));
         assert!(relevant_sdrf_metadata_path("instruments[0].name"));
+    }
+
+    #[test]
+    fn existing_sdrf_resolved_reserved_values_do_not_trigger_ollama() {
+        assert!(!concrete_table_value("not available"));
+        assert!(concrete_table_value("not applicable"));
+        assert!(concrete_table_value("pooled"));
     }
 
     #[test]
