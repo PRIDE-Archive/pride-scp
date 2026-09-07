@@ -17,7 +17,7 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Iterable, Iterator
 
-AUDITOR_VERSION = "pride-scp-sdrf-mapping-auditor-v0.3"
+AUDITOR_VERSION = "pride-scp-sdrf-mapping-auditor-v0.4"
 
 # TMTpro order is a superset useful for expanding explicit textual ranges. TMT6/10 tokens
 # remain valid members of this sequence; we never infer a chemistry-specific suffix that was
@@ -250,6 +250,26 @@ def local_clause(text: str, start: int, end: int, max_flank: int = 260) -> tuple
     right = min(right_real) if right_real else min(len(text), end + max_flank)
     return text[left:right], left
 
+
+def reporter_role_segment(text: str, start: int, end: int, max_flank: int = 260) -> tuple[str, int]:
+    """Return a reporter-local role-binding segment tolerant of PDF hard line breaks.
+
+    Normalized two-column PDF text can insert a newline (and even a short fragment from the
+    adjacent column) inside one grammatical reporter-role statement.  A newline therefore
+    cannot be a hard role boundary.  Keep strong sentence punctuation as the boundary and let
+    ``nearest_role`` additionally stop at the neighboring reporter token.  This remains much
+    narrower than the old broad context fallback while recovering real statements such as
+    ``TMT-131 ... which served as <interleaved text>\nthe multiplexing carrier``.
+    """
+    lo = max(0, start - max_flank)
+    hi = min(len(text), end + max_flank)
+    left_candidates = [text.rfind(sep, lo, start) for sep in [".", ";"]]
+    left = max(left_candidates) + 1
+    right_candidates = [text.find(sep, end, hi) for sep in [".", ";"]]
+    right_real = [x for x in right_candidates if x >= 0]
+    right = min(right_real) if right_real else hi
+    return text[left:right], left
+
 def role_set(text: str) -> set[str]:
     return {name for name, pat in ROLE_PATTERNS.items() if pat.search(text)}
 
@@ -325,7 +345,13 @@ def collect_hits(source_kind: str, source_label: str, source_ref: str, text: str
         token = m.group(0).lower()
         if not token.startswith("tmt") and not channel_context_re.search(clause):
             continue
-        nearest = nearest_role(clause, m.start() - offset, m.end() - offset, radius=180)
+        binding_segment, binding_offset = reporter_role_segment(text, m.start(), m.end(), 260)
+        nearest = nearest_role(
+            binding_segment,
+            m.start() - binding_offset,
+            m.end() - binding_offset,
+            radius=180,
+        )
         roles = [nearest] if nearest else []
         hits.append(ContextHit(source_kind, source_label, source_ref, [ch], roles, ctx))
     return hits
@@ -634,6 +660,23 @@ def self_test() -> None:
         "protein digest, which served as the multiplexing carrier."
     )
     hits = collect_hits("publication_fulltext", "PXD028040", "PXD028040-main-text", text)
+    roles, amb = channel_roles_from_hits(hits)
+    assert roles["128"] == {"single_cell"}, (roles, hits)
+    assert roles["131"] == {"carrier"}, (roles, hits)
+    assert not amb
+
+    # PXD028040 normalized-PDF regression: the text extractor can interleave a fragment from
+    # the adjacent column and place a hard line break between ``served as`` and the role.
+    # Newline must not terminate reporter-role binding when the role remains before the next
+    # reporter token and within the bounded role radius.
+    text = (
+        "TMT-128-tagged tissue protein digest as the analyte, which experiments. "
+        "Future enhancements may benefit from closer alignment. "
+        "TMT-131-tagged tissue protein digest, which served as reasonably well-obtainable "
+        "from a small population of pure DA by\nthe multiplexing carrier. "
+        "All samples were suspended in background digest."
+    )
+    hits = collect_hits("publication_fulltext", "PXD028040", "PXD028040-normalized-pdf", text)
     roles, amb = channel_roles_from_hits(hits)
     assert roles["128"] == {"single_cell"}, (roles, hits)
     assert roles["131"] == {"carrier"}, (roles, hits)

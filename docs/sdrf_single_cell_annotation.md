@@ -1074,3 +1074,34 @@ now satisfy a narrow explicit evidence contract: one explicit analytical/single-
 channel per RAW plus an explicit carrier channel, with an optional explicit reference channel. A
 general multi-single-cell-per-RAW generator remains out of scope until run/sample/channel mappings
 are explicit.
+
+## v0.4.2c: PDF-layout-tolerant reporter-role binding
+
+The real v0.4.2b nine-accession recheck correctly recovered PXD028040's analytical reporter
+(`TMT-128`) but still failed to recover its explicit carrier (`TMT-131`). Inspection of the
+normalized publication text showed that this was not missing evidence. Two-column PDF extraction
+inserted a hard newline and unrelated adjacent-column words between `TMT-131 ... which served as`
+and `the multiplexing carrier`.
+
+v0.4.2c remains non-generative. Auditor v0.4 adds a dedicated reporter-role binding segment that
+interprets PDF hard line breaks as soft whitespace while retaining periods/semicolons and the next
+reporter token as hard boundaries. This is deliberately narrower than a broad context fallback:
+roles still cannot leak across another reporter token or into a following sentence.
+
+The source-derived regression includes the observed PXD028040 extraction form and requires:
+
+```text
+TMT-128 -> analytical/single-cell
+TMT-131 -> carrier
+ambiguous -> none
+```
+
+Run the nine true multiplex-supported studies with:
+
+```bash
+./scripts/run_gt105_pride_sdrf_mapping_role_recheck_v042c.sh
+```
+
+No deterministic reporter-row generator should be implemented unless the user's real local corpus
+passes the PXD028040 regression and at least one accession satisfies
+`single_analytical_channel_per_run` from explicit public evidence.
