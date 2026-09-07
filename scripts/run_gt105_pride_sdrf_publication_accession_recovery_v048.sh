@@ -183,6 +183,13 @@ for r in recovered:
 pub_acc={norm(r.get('accession')).upper() for r in list(chosen.values()) if norm(r.get('publication_status'))=='publication_found'}
 for r in base:
     acc=norm(r.get('accession')).upper(); k=key(r)
+    d=doi(r.get('publication_doi') or r.get('resolved_doi'))
+    p=norm(r.get('publication_pmid') or r.get('resolved_pmid')).lower()
+    rejected = (d and (acc,'doi',d) in reject_ids) or (p and (acc,'pmid',p) in reject_ids)
+    if rejected:
+        rr=dict(r); rr['publication_quarantine_reason']='historical_local_source_matches_quarantined_publication_identity'
+        quarantine.append(rr)
+        continue
     if k in chosen:
         merged=dict(chosen[k])
         for field, value in r.items():

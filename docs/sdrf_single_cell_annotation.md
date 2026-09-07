@@ -1565,3 +1565,98 @@ A recovered full-text publication is still only an evidence source.  Reporter-ro
 blocked unless the refreshed corpus exposes explicit source-grounded reporter roles and run/sample
 relationships.  If publication text improves but no explicit mapping contract emerges, the next step
 is accession-specific supplementary/source recovery rather than a broader generic parser.
+
+## v0.4.9: local-first publication corpus reconciliation across all 105 PRIDE accessions
+
+The real v0.4.8 run improved publication-text coverage for the residual eight multiplex studies to
+7/8 and correctly quarantined the incompatible current-PRIDE publication association for PXD069039.
+However, that iteration also highlighted a source-ordering issue: the repository already contains a
+large manually curated/local manuscript corpus under `manual_pdfs/`, the Stage-02 managed PDF cache,
+and normalized Stage-03 text caches.  Later bounded SDRF wrappers generally preserved those sources
+only when they were already represented by an earlier manifest.  They did not re-index the complete
+local corpus before initiating publication recovery.
+
+v0.4.9 makes local publication evidence explicit and auditable before any further network recovery.
+`scripts/sdrf_local_publication_corpus_reconcile.py` is deliberately network-free.  For the accepted
+105-primary-PRIDE cohort it reconciles, in order:
+
+```text
+manual_pdfs/manual_pdf_manifest.tsv
+manual_pdfs/PXDxxxxxx.pdf
+validated existing Stage-02 / legacy publication PDFs
+validated existing normalized publication-content text
+trustworthy historical/current publication-manifest metadata
+```
+
+The wrapper derives the 105-accession cohort from the accepted v0.3.1 full-run source-grounded
+checkpoint rather than reopening GT196/GT179.  GT metadata/labels are not read by this phase.
+
+### Local source safety
+
+A local file is not allowed to bypass an accepted publication quarantine.  v0.4.9 imports quarantine
+identifiers from prior recovery outputs and also hashes local PDF/text content.  A manual/cache file
+whose exact content matches a quarantined publication remains quarantined even if it is named by the
+PXD accession.  This protects the local-first path from reintroducing the PXD069039 incompatible
+Arabidopsis publication through an older cached/manual copy.
+
+Explicit `manual_pdf_manifest.tsv` mappings have highest source priority, followed by accession-named
+manual PDFs.  Existing manifest metadata is merged onto those files when publication identity is
+already known.  DOI/PMID-named managed PDF/text caches are then matched through publication identity.
+Metadata-only manifest rows remain visible but are not treated as local manuscript content.
+
+Selected local PDFs without an existing normalized text file are extracted locally into the v0.4.9
+output.  The reconciler does **not** invoke Stage 01, Stage 02 network download, Stage 03 PMC fallback,
+Europe PMC, Crossref, or any other network service.
+
+Run:
+
+```bash
+./scripts/run_gt105_pride_sdrf_local_publication_corpus_reconcile_v049.sh
+```
+
+Expected output root:
+
+```text
+data/sdrf_local_publication_corpus_reconcile_gt105_pride_v049/
+```
+
+Key outputs:
+
+```text
+local_publication_corpus_summary.json
+local_publication_source_inventory.tsv
+local_publication_candidate_rows.tsv
+local_publication_manifest_selected.tsv
+local_publication_manifest_all.tsv
+local_publication_quarantine.tsv
+external_recovery_needed.txt
+metadata_only_accessions.txt
+unresolved_accessions.txt
+```
+
+`local_publication_source_inventory.tsv` is the authoritative per-accession local-source audit.  It
+records whether each accession resolves through an explicit manual mapping, accession-named manual
+PDF, validated cached PDF, cached normalized text, metadata-only publication row, quarantine-only
+state, or no local source.
+
+The wrapper also reruns the **non-generative** reporter/mapping audit for the eight residual true
+multiplex studies using only the reconciled selected local corpus.  This is a diagnostic comparison:
+it determines whether publication evidence already present locally was missed by the recent v0.4.x
+manifests.  It does not authorize reporter-row generation by itself.
+
+After v0.4.9, external publication recovery should be restricted to
+`external_recovery_needed.txt` rather than re-querying every accession.  A locally resolved and
+non-quarantined publication should not be searched/downloaded again during routine SDRF annotation.
+
+### v0.4.8 quarantine merge hotfix carried with v0.4.9
+
+The real v0.4.8 output exposed one additional merge defect: the refreshed PXD069039 PRIDE row was
+correctly quarantined, but the merge subsequently preserved the older local-PDF-backed v0.4.1 row
+for the same quarantined DOI.  Stage 03 therefore still materialized the incompatible Arabidopsis
+paper and the reporter audit reported `pub_text=1` for PXD069039.
+
+v0.4.9 also patches `run_gt105_pride_sdrf_publication_accession_recovery_v048.sh` so historical/base
+manifest rows whose DOI/PMID matches an accepted quarantine identity are quarantined instead of
+being re-added through the local-PDF preservation path.  The local-first reconciler independently
+reapplies the same quarantine and adds local-content hash checks, so the bad publication cannot
+re-enter through either route.
