@@ -1397,3 +1397,23 @@ If these criteria pass, PXD028040 should move out of the reporter/file-mapping l
 narrow template-vocabulary exception state with completeness
 `incomplete_template_isolation_method_gap`.  Do not substitute `manual picking`, FACS, or another
 allowed isolation value merely to mark the accession locally valid.
+
+## v0.4.6 residual multiplex support-asset audit
+
+After the accepted PXD028040 v0.4.5 reconstruction, PXD028040 is no longer an unresolved
+reporter/file-mapping case. All 16 repository RAWs have explicit source-grounded workbook mappings;
+its remaining blocker is the single-cell isolation vocabulary gap for patch-clamp microaspiration.
+
+The active true-multiplex reconstruction cohort is therefore the eight remaining accessions selected
+from the accepted v0.4.2c `multiplex_supported` audit after excluding PXD028040.
+
+`scripts/sdrf_multiplex_support_asset_audit.py` and
+`scripts/run_gt105_pride_sdrf_multiplex_support_asset_audit_v046.sh` perform the next bounded,
+non-generative source audit. They inventory repository support files, download only small public
+non-RAW design/metadata/readme/SDRF/tabular assets, and surface explicit reporter roles, channel
+numbers, single-cell semantics, run/file linkage, sample identifiers, and replicate semantics.
+
+Chemistry-only hits and filename-only words remain diagnostic. They never authorize SDRF row
+serialization. The audit is intended to identify which of the remaining eight accessions has a
+PXD028040-like deposited design source that can support the next deterministic reconstruction, and
+which accessions instead require publication/source recovery.
