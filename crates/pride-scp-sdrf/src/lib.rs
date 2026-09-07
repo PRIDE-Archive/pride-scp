@@ -4428,6 +4428,26 @@ fn validate_draft(
     )
 }
 
+fn validate_annotation_draft(
+    headers: &[String],
+    rows: &[Vec<String>],
+    evidence: &DatasetEvidence,
+    existing_sdrf: bool,
+) -> Vec<ValidationIssue> {
+    let policy = if existing_sdrf {
+        // A resolved/community/repository SDRF is authoritative for its logical
+        // data-file names. The local PRIDE snapshot may expose vendor containers
+        // or archive wrappers instead, so repository linkage remains visible as
+        // a warning but must not make an otherwise-valid preserved SDRF invalid.
+        DataFileValidationPolicy::AuditSnapshotInventory
+    } else {
+        // PRIDE-SCP generated rows must remain strict: every asserted data-file
+        // mapping must be grounded in the repository inventory.
+        DataFileValidationPolicy::EnforceSnapshotInventory
+    };
+    validate_draft_with_policy(headers, rows, evidence, policy)
+}
+
 fn write_sdrf(path: &Path, headers: &[String], rows: &[Vec<String>]) -> Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
@@ -4609,7 +4629,9 @@ async fn annotate_one(opts: &SdrfAnnotateOptions, accession: &str) -> Result<Res
             &headers, &rows, &evidence,
         ));
     } else {
-        issues.extend(validate_draft(&headers, &rows, &evidence));
+        issues.extend(validate_annotation_draft(
+            &headers, &rows, &evidence, existing,
+        ));
     }
     write_review(&review_path, &issues)?;
     let errors = issues.iter().filter(|x| x.level == "error").count();
@@ -5911,6 +5933,68 @@ mod tests {
             &evidence,
             DataFileValidationPolicy::AuditSnapshotInventory,
         );
+        assert!(!issues
+            .iter()
+            .any(|x| x.code == "data_file_not_in_pride_snapshot_inventory" && x.level == "error"));
+        assert!(
+            issues
+                .iter()
+                .any(|x| x.code == "data_file_not_in_pride_snapshot_inventory"
+                    && x.level == "warning")
+        );
+    }
+
+    #[test]
+    fn resolved_existing_annotation_repository_filename_mismatch_is_warning_not_error() {
+        let headers = vec![
+            "source name".into(),
+            "characteristics[organism]".into(),
+            "assay name".into(),
+            "technology type".into(),
+            "comment[proteomics data acquisition method]".into(),
+            "comment[label]".into(),
+            "comment[instrument]".into(),
+            "comment[cleavage agent details]".into(),
+            "comment[fraction identifier]".into(),
+            "comment[technical replicate]".into(),
+            "comment[data file]".into(),
+            SC_SAMPLE_TYPE.into(),
+            SC_ISOLATION_METHOD.into(),
+            SC_CELL_IDENTIFIER.into(),
+        ];
+        let rows = vec![vec![
+            "cell1".into(),
+            "homo sapiens".into(),
+            "run1".into(),
+            "proteomic profiling by mass spectrometry".into(),
+            "data-dependent acquisition".into(),
+            "label free sample".into(),
+            "Orbitrap".into(),
+            "Trypsin".into(),
+            "1".into(),
+            "1".into(),
+            "logical_run.d".into(),
+            "single cell".into(),
+            "FACS".into(),
+            "cell1".into(),
+        ]];
+        let evidence = DatasetEvidence {
+            accession: "PXD999999".into(),
+            project_json_path: String::new(),
+            files_json_path: String::new(),
+            existing_sdrf_path: "/resolved/PXD999999.sdrf.tsv".into(),
+            raw_files: vec![RawFile {
+                file_name: "submission_bundle.tar.gz".into(),
+                file_uri: String::new(),
+                category: "RAW".into(),
+            }],
+            study_design: StudyDesignScaffold::default(),
+            metadata_scaffold: DeterministicMetadataScaffold::default(),
+            evidence: vec![],
+            manuscript_sources: vec![],
+            annotation_sources: vec![],
+        };
+        let issues = validate_annotation_draft(&headers, &rows, &evidence, true);
         assert!(!issues
             .iter()
             .any(|x| x.code == "data_file_not_in_pride_snapshot_inventory" && x.level == "error"));

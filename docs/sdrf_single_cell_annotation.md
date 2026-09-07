@@ -767,3 +767,42 @@ The desired result is not that every study becomes validator-clean. Instead:
 - unsupported real isolation methods should be identified as template gaps rather than coerced;
 - generic archives should remain explicitly unresolved until their internal acquisition mapping is
   available.
+
+## Post-full-run recovery triage (v0.3.1 linkage-policy hotfix)
+
+A completed annotation batch should be triaged before additional reconstruction work.
+Resolved/community SDRFs and newly generated SDRFs deliberately use different repository-file
+validation policies:
+
+- **resolved/existing SDRF**: logical `comment[data file]` values are preserved; mismatches against
+  the local PRIDE snapshot are repository-linkage **warnings** (`AuditSnapshotInventory`), not schema
+  errors;
+- **PRIDE-SCP generated SDRF**: asserted data-file mappings remain strict and must link to the local
+  PRIDE inventory (`EnforceSnapshotInventory`).
+
+This matches the standalone `sdrf-audit` semantics and prevents enrichment from making a previously
+valid curated SDRF invalid solely because the local PRIDE manifest exposes an archive/container or
+otherwise incomplete filename inventory.
+
+Use the generic post-run triage helper to split a completed annotation run into recovery lanes:
+
+```bash
+python scripts/sdrf_postrun_triage.py \
+  --annotation-results data/sdrf_annotation/sdrf_annotation_results.tsv \
+  --resolved-audit-results data/sdrf_audit/sdrf_audit_results.tsv \
+  --output data/sdrf_recovery_triage
+```
+
+The helper writes `sdrf_recovery_triage.tsv`, a JSON summary, and one accession list per lane:
+
+- `ready`
+- `resolved_linkage_validation_regression`
+- `existing_structural_review`
+- `denovo_required_metadata`
+- `denovo_template_gap`
+- `denovo_mapping`
+- `denovo_archive`
+- `other_incomplete`
+
+The triage tool is GT-agnostic; evaluation cohorts may be supplied externally, but no GT metadata is
+used to classify or repair SDRF content.
