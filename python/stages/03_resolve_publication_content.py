@@ -29,6 +29,7 @@ import requests
 
 from pride_scp_pipeline_common import (
     build_session,
+    extract_pdf_text,
     normalize_doi,
     pmc_idconv_lookup,
     publication_filename,
@@ -39,7 +40,7 @@ from pride_scp_pipeline_common import (
     write_tsv,
 )
 
-CONTENT_PATCH_VERSION = "pride-scp-v0.1.7"
+CONTENT_PATCH_VERSION = "pride-scp-v0.1.8"
 _thread_local = threading.local()
 
 CONTENT_FIELDS = [
@@ -66,6 +67,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--contact-email", default="")
     parser.add_argument("--user-agent", default="PRIDE-SCP-publication-content/1.7")
     parser.add_argument("--force", action="store_true")
+    parser.add_argument(
+        "--accessions-file",
+        default="",
+        help="Optional text file restricting resolution to these PXD accessions.",
+    )
     return parser.parse_args()
 
 
@@ -296,7 +302,7 @@ def empty_result(status: str, error: str, trace: list[dict[str, Any]] | None = N
     }
 
 
-def pdf_content_result(row):
+def pdf_content_result(row, *, content_dir: Path, force: bool):
     status = text_value(row.get("pdf_status")).lower()
     path_text = text_value(row.get("pdf_path"))
     if status not in {"downloaded", "already_exists"} or not path_text:
@@ -304,22 +310,64 @@ def pdf_content_result(row):
     path = Path(path_text)
     if not validate_pdf_path(path):
         return None
+
+    _, _, text_path = content_paths(row, content_dir)
+    trace = [{"source": "Stage02_PDF", "status": "validated", "path": str(path)}]
+    text = ""
+    backend = ""
+    extraction_error = ""
+
+    if not force and validate_text_path(text_path):
+        try:
+            text = text_path.read_text(encoding="utf-8")
+            backend = "cached_pdf_text"
+            trace.append({
+                "source": "PDF_text_cache",
+                "status": "reused",
+                "path": str(text_path.resolve()),
+                "characters": len(text),
+            })
+        except (OSError, UnicodeError) as exc:
+            extraction_error = f"cached PDF text unreadable: {type(exc).__name__}: {exc}"
+            text = ""
+
+    if not text:
+        text, backend, extraction_error = extract_pdf_text(path)
+        if len(text.strip()) >= 500:
+            text_path.parent.mkdir(parents=True, exist_ok=True)
+            text_path.write_text(text, encoding="utf-8")
+            trace.append({
+                "source": "PDF_text_extraction",
+                "status": "extracted",
+                "backend": backend,
+                "path": str(text_path.resolve()),
+                "characters": len(text),
+            })
+        else:
+            trace.append({
+                "source": "PDF_text_extraction",
+                "status": "unavailable",
+                "backend": backend,
+                "error": extraction_error or f"extracted text too short ({len(text.strip())} chars)",
+            })
+            text = ""
+
     return {
         "publication_content_status": "available",
         "publication_content_kind": "pdf",
         "publication_content_path": str(path.resolve()),
         "publication_content_source": "pdf:" + (text_value(row.get("pdf_source")) or "resolved"),
-        "publication_content_error": "",
-        "publication_content_chars": "",
+        "publication_content_error": "" if text else extraction_error,
+        "publication_content_chars": len(text) if text else "",
         "publication_content_xml_path": "",
         "publication_content_html_path": "",
-        "publication_content_text_path": "",
-        "publication_content_trace": json.dumps([{"source": "Stage02_PDF", "status": "validated", "path": str(path)}], ensure_ascii=False),
+        "publication_content_text_path": str(text_path.resolve()) if text else "",
+        "publication_content_trace": json.dumps(trace, ensure_ascii=False),
     }
 
 
 def resolve_content(row, *, content_dir, user_agent, timeout, contact_email, force):
-    pdf = pdf_content_result(row)
+    pdf = pdf_content_result(row, content_dir=content_dir, force=force)
     if pdf is not None:
         return pdf
     if text_value(row.get("publication_status")) != "publication_found":
@@ -418,6 +466,16 @@ def resolve_content(row, *, content_dir, user_agent, timeout, contact_email, for
 def main() -> None:
     args = parse_args()
     rows = read_tsv(Path(args.input_tsv))
+    if args.accessions_file:
+        allowed = {
+            line.strip().upper()
+            for line in Path(args.accessions_file).read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        }
+        rows = [
+            row for row in rows
+            if text_value(row.get("accession")).upper() in allowed
+        ]
     content_dir = Path(args.content_dir)
     output = Path(args.output)
 

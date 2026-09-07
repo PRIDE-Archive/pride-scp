@@ -854,3 +854,19 @@ The v0.3.3 five-accession residual rescue still produced empty deterministic iso
 v0.3.4 separates *source priority* from *prompt size* for de-novo datasets. When direct manuscript sources are available and there is no usable existing SDRF, a bounded quarter of the evidence packet (capped at 24 items and 12,000 characters) is reserved for manuscript keyword windows. Existing/resolved SDRFs keep the full preservation-first evidence budget unchanged.
 
 The manuscript scan itself remains bounded at 2,000,000 characters and the Ollama packet remains bounded by the user-provided evidence limits. The new rescue wrapper prints manuscript-source and manuscript-evidence-item counts so routing failures are directly observable.
+
+## PDF-backed publication text materialization (v0.3.5 pipeline integration)
+
+The SDRF Rust crate intentionally does not parse PDFs.  Publication-content Stage 03 now
+materializes normalized text for validated PDF-backed rows and records that path in
+`publication_content_text_path`, while retaining the PDF itself as the canonical
+`publication_content_path` used by the established Stage-04 annotation pipeline.
+
+This closes an interface gap where a publication was available as a PDF but the SDRF
+manuscript scanner saw zero usable text sources.  PDF extraction is performed upstream
+with local fallbacks (PyMuPDF, `pdftotext`, then `pypdf`); OCR is still outside this
+path and must remain an explicit/manual operation when ordinary text extraction fails.
+
+For bounded recovery runs, Stage 03 accepts `--accessions-file` so only the requested
+accessions are re-materialized.  The original publication manifest is never modified;
+a derived manifest is written and supplied to `pride-scp sdrf-annotate`.

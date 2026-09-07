@@ -7,6 +7,8 @@ import csv
 import hashlib
 import json
 import re
+import shutil
+import subprocess
 import time
 from pathlib import Path
 from typing import Any, Iterable, Optional
@@ -279,6 +281,87 @@ def validate_pdf_path(path: Path) -> bool:
     with path.open("rb") as handle:
         head = handle.read(1024)
     return looks_like_pdf_bytes(head)
+
+
+_PDF_LIGATURES = str.maketrans({
+    "\ufb00": "ff",
+    "\ufb01": "fi",
+    "\ufb02": "fl",
+    "\ufb03": "ffi",
+    "\ufb04": "ffl",
+})
+
+
+def normalize_pdf_text(text: str) -> str:
+    """Normalize PDF-extracted text while preserving paragraph/page structure."""
+    text = (text or "").translate(_PDF_LIGATURES).replace("\x00", "")
+    lines = []
+    for line in text.splitlines():
+        line = re.sub(r"[ \t]+", " ", line).rstrip()
+        lines.append(line)
+    return "\n".join(lines).strip()
+
+
+def extract_pdf_text(path: Path) -> tuple[str, str, str]:
+    """Extract PDF text with deterministic local fallbacks.
+
+    Returns ``(text, backend, error)``.  This helper deliberately performs only
+    local extraction; OCR remains a separate/manual concern.  It is shared by
+    publication-content materialization so downstream Rust consumers can scan
+    normalized text rather than implementing PDF parsing themselves.
+    """
+    errors: list[str] = []
+
+    try:
+        import fitz  # type: ignore
+
+        pages = []
+        with fitz.open(path) as doc:
+            for page in doc:
+                pages.append(normalize_pdf_text(page.get_text("text", sort=True) or ""))
+        text = "\n\n".join(x for x in pages if x).strip()
+        if text:
+            return text + "\n", "pymupdf", ""
+    except Exception as exc:
+        errors.append(f"PyMuPDF: {type(exc).__name__}: {exc}")
+
+    exe = shutil.which("pdftotext")
+    if exe:
+        try:
+            proc = subprocess.run(
+                [exe, "-enc", "UTF-8", "-layout", str(path), "-"],
+                check=False,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            if proc.returncode == 0:
+                raw = proc.stdout.decode("utf-8", "replace")
+                pages = [normalize_pdf_text(x) for x in raw.split("\f")]
+                text = "\n\n".join(x for x in pages if x).strip()
+                if text:
+                    return text + "\n", "pdftotext", ""
+            else:
+                errors.append(
+                    f"pdftotext: exit={proc.returncode}: "
+                    + proc.stderr.decode("utf-8", "replace")[:500]
+                )
+        except Exception as exc:
+            errors.append(f"pdftotext: {type(exc).__name__}: {exc}")
+    else:
+        errors.append("pdftotext: command unavailable")
+
+    try:
+        from pypdf import PdfReader  # type: ignore
+
+        reader = PdfReader(str(path))
+        pages = [normalize_pdf_text(page.extract_text() or "") for page in reader.pages]
+        text = "\n\n".join(x for x in pages if x).strip()
+        if text:
+            return text + "\n", "pypdf", ""
+    except Exception as exc:
+        errors.append(f"pypdf: {type(exc).__name__}: {exc}")
+
+    return "", "", " | ".join(errors)
 
 
 
