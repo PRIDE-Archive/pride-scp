@@ -1164,3 +1164,52 @@ The next deterministic generator is permitted only after the deposited design ro
 which biological single-neuron samples map to which RAW acquisitions and that the accepted
 TMT-128 analytical/TMT-131 carrier layout applies to those specific rows. Filename semantics alone
 must never authorize SDRF rows or biological identities.
+
+## v0.4.3b: structured experimental-design semantic audit
+
+The real v0.4.3a PXD028040 run-scope audit found one deposited experimental-design workbook with 21
+parsed rows, but only one of the 16 RAW basenames appeared exactly in the workbook. None of the seven
+RAW filenames containing both TMT and single-neuron semantics had an exact support-row match.
+Therefore exact-basename matching is not an adequate representation of the workbook's linkage
+scheme, but filename semantics alone are still insufficient to authorize SDRF rows.
+
+v0.4.3b remains non-generative. `scripts/sdrf_reporter_design_semantic_audit.py` preserves workbook
+sheet, column and cell structure and tests only bounded source-grounded run identifiers:
+
+1. exact deposited RAW basename/stem; then
+2. an explicit acquisition date plus explicit `SCxx` run code occurring in both the deposited RAW
+   basename and the deposited workbook row.
+
+A date+SC match is only a candidate **run-to-design-row** link. It does not establish a biological
+sample identity by itself. TMT/single-neuron words in filenames are diagnostic only and cannot create
+a workbook match. Multiple workbook rows with the same structured key remain ambiguous.
+
+The audit also records whether each candidate row explicitly contains sample/neuron semantics, TMT
+semantics, replicate terms, reporter 128/131 values, or analyte/carrier role language and emits the
+adjacent workbook rows for source review. Generation stays blocked until the relevant candidate rows
+explicitly establish biological sample and replicate semantics.
+
+Run:
+
+```bash
+./scripts/run_gt105_pride_sdrf_reporter_design_semantic_audit_v043b.sh
+```
+
+Expected output root:
+
+```text
+data/sdrf_reporter_design_semantic_audit_gt105_pride_v043b/
+```
+
+Key outputs:
+
+```text
+audit/sdrf_reporter_design_semantic_audit_summary.json
+audit/design_rows_structured.tsv
+audit/raw_design_candidates.tsv
+audit/header_candidates.json
+audit/candidate_row_contexts.json
+```
+
+No SDRF generator should consume these candidates automatically. The next implementation decision
+must be based on the real workbook rows printed by the bounded audit.
