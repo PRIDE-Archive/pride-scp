@@ -1105,3 +1105,62 @@ Run the nine true multiplex-supported studies with:
 No deterministic reporter-row generator should be implemented unless the user's real local corpus
 passes the PXD028040 regression and at least one accession satisfies
 `single_analytical_channel_per_run` from explicit public evidence.
+
+## v0.4.3a: reporter run/file-scope audit before any row generation
+
+The real v0.4.2c reporter-role rerun accepted PXD028040 as the first high-confidence narrow
+reporter-layout candidate:
+
+```text
+mapping_class = single_analytical_channel_per_run
+analytical/single-cell channel = 128
+carrier channel = 131
+ambiguous channels = none
+```
+
+That result establishes reporter **roles**, not yet reporter **row scope**. PXD028040 contains many
+RAW files from different technical and biological phases of the study. A deterministic generator
+must therefore not apply the 128/131 layout to every deposited RAW simply because the publication
+contains that chemistry.
+
+v0.4.3a remains non-generative and introduces `scripts/sdrf_reporter_run_scope_audit.py`. For the
+single accepted narrow-contract candidate it:
+
+- reads the current repository file snapshot;
+- discovers small deposited experimental-design/metadata support files from explicit repository
+  filenames rather than guessing paths;
+- downloads only those small public support files when a repository URI is available;
+- parses `.xlsx` content with Python's standard library (no spreadsheet dependency is added);
+- emits the complete normalized support-table rows for source review;
+- cross-references exact deposited RAW basenames/stems against support-table rows;
+- inventories filename-level TMT/single-neuron hints only as diagnostics, never as sample truth;
+- separately verifies that the publication contains a scoped 128/131 single-cell context; and
+- leaves the reporter-row generator gate at `manual_design_row_review_required` even when exact file
+  matches exist.
+
+Run:
+
+```bash
+./scripts/run_gt105_pride_sdrf_reporter_run_scope_audit_v043a.sh
+```
+
+Expected output root:
+
+```text
+data/sdrf_reporter_run_scope_audit_gt105_pride_v043a/
+```
+
+Key outputs:
+
+```text
+audit/sdrf_reporter_run_scope_audit_summary.json
+audit/support_file_status.json
+audit/support_rows.tsv
+audit/raw_support_matches.tsv
+audit/publication_scope_contexts.json
+```
+
+The next deterministic generator is permitted only after the deposited design rows themselves show
+which biological single-neuron samples map to which RAW acquisitions and that the accepted
+TMT-128 analytical/TMT-131 carrier layout applies to those specific rows. Filename semantics alone
+must never authorize SDRF rows or biological identities.
