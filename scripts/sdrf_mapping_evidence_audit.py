@@ -17,7 +17,7 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Iterable, Iterator
 
-AUDITOR_VERSION = "pride-scp-sdrf-mapping-auditor-v0.2"
+AUDITOR_VERSION = "pride-scp-sdrf-mapping-auditor-v0.3"
 
 # TMTpro order is a superset useful for expanding explicit textual ranges. TMT6/10 tokens
 # remain valid members of this sequence; we never infer a chemistry-specific suffix that was
@@ -43,7 +43,8 @@ ROLE_PATTERNS = {
     "blank": re.compile(r"(?i)\b(?:blank|empty|unused|not\s+used|left\s+empty|control\s+wells?)\b"),
     "single_cell": re.compile(
         r"(?i)\b(?:single[- ]cells?(?:\s+(?:samples?|proteomes?|channels?|wells?))?|"
-        r"analytical\s+channel|single[- ]cell\s+signal|single[- ]cell\s+channels?)\b"
+        r"analytical\s+channel|analyte(?:\s+(?:channel|sample|digest|proteome))?|"
+        r"single[- ]cell\s+signal|single[- ]cell\s+channels?)\b"
     ),
 }
 
@@ -71,13 +72,13 @@ NONISOBARIC_RE = re.compile(
 ROLE_WORD = {
     "carrier": r"carrier(?:\s+(?:proteome|sample|channel|cells?))?|boost(?:ing)?\s+channel",
     "reference": r"(?:reference|bridge)(?:\s+(?:proteome|sample|channel))?|normalization\s+channel",
-    "single_cell": r"(?:single[- ]cells?(?:\s+(?:samples?|proteomes?|channels?|wells?))?|analytical\s+channel|single[- ]cell\s+channel)",
+    "single_cell": r"(?:single[- ]cells?(?:\s+(?:samples?|proteomes?|channels?|wells?))?|analytical\s+channel|analyte(?:\s+(?:channel|sample|digest|proteome))?|single[- ]cell\s+channel)",
     "blank": r"(?:blank|empty|unused|not\s+used|left\s+empty|control\s+wells?)",
 }
 ROLE_ALT = "|".join(f"(?P<{k}>{v})" for k, v in ROLE_WORD.items())
 ROLE_RE = re.compile(rf"(?i)\b(?:{ROLE_ALT})\b")
-RESPECTIVE_ROLE_RE = re.compile(r"(?i)\b(analytical|carrier|reference|bridge|blank|single[- ]cell)\b")
-RESPECTIVE_ROLE_MAP = {"analytical":"single_cell","carrier":"carrier","reference":"reference","bridge":"reference","blank":"blank","single-cell":"single_cell","single cell":"single_cell"}
+RESPECTIVE_ROLE_RE = re.compile(r"(?i)\b(analytical|analyte|carrier|reference|bridge|blank|single[- ]cell)\b")
+RESPECTIVE_ROLE_MAP = {"analytical":"single_cell","analyte":"single_cell","carrier":"carrier","reference":"reference","bridge":"reference","blank":"blank","single-cell":"single_cell","single cell":"single_cell"}
 
 def normalize_role_match(m: re.Match[str]) -> str | None:
     for role in ROLE_WORD:
@@ -254,18 +255,38 @@ def role_set(text: str) -> set[str]:
 
 
 def nearest_role(text: str, start: int, end: int, radius: int = 150) -> str | None:
-    center = (start + end) / 2
-    candidates: list[tuple[float, int, str]] = []
+    """Bind a role locally without crossing a neighboring reporter token.
+
+    Reporter prose usually describes a channel immediately after the token (for example
+    ``TMT-128 ... as the analyte``).  Prefer that following role within the current
+    reporter segment; only fall back to a preceding role when no following role exists.
+    This prevents PXD028040's TMT-131 from inheriting the preceding TMT-128 analyte role.
+    """
     priority = {"carrier": 0, "reference": 1, "blank": 2, "single_cell": 3}
-    lo, hi = max(0, start - radius), min(len(text), end + radius)
+    channel_matches = list(CHANNEL_TOKEN_RE.finditer(text))
+    prev_end = max((m.end() for m in channel_matches if m.end() <= start), default=0)
+    next_start = min((m.start() for m in channel_matches if m.start() >= end), default=len(text))
+
+    after: list[tuple[float, int, str]] = []
+    after_lo = end
+    after_hi = min(len(text), end + radius, next_start)
     for role, pat in ROLE_PATTERNS.items():
-        for m in pat.finditer(text, lo, hi):
-            distance = abs(((m.start() + m.end()) / 2) - center)
-            candidates.append((distance, priority[role], role))
-    if not candidates:
-        return None
-    candidates.sort()
-    return candidates[0][2]
+        for m in pat.finditer(text, after_lo, after_hi):
+            after.append((float(m.start() - end), priority[role], role))
+    if after:
+        after.sort()
+        return after[0][2]
+
+    before: list[tuple[float, int, str]] = []
+    before_lo = max(0, start - radius, prev_end)
+    before_hi = start
+    for role, pat in ROLE_PATTERNS.items():
+        for m in pat.finditer(text, before_lo, before_hi):
+            before.append((float(start - m.end()), priority[role], role))
+    if before:
+        before.sort()
+        return before[0][2]
+    return None
 
 
 def classify_role_for_context(text: str) -> str | None:
@@ -356,9 +377,14 @@ def channel_roles_from_hits(hits: list[ContextHit]) -> tuple[dict[str, set[str]]
         if len(hit.channels) > 1 and "single_cell" in role_names and "blank" in role_names:
             ambiguous.update(hit.channels)
             continue
-        primary = hit.roles[0] if len(hit.roles) == 1 else classify_role_for_context(hit.text)
-        if primary is None:
+        # Reporter roles must be locally bound to the channel mention.  Do not fall back to
+        # the entire context window: in real papers a nearby carrier discussion can otherwise
+        # relabel an unbound analytical channel (PXD028040 v0.4.1 regression).
+        if len(hit.roles) != 1:
+            if hit.roles:
+                ambiguous.update(hit.channels)
             continue
+        primary = hit.roles[0]
         if len(hit.channels) > 1 and primary == "single_cell":
             # Explicit "single cells were labeled with A through B" is a usable global
             # single-cell channel range unless the same context also says controls/blank.
@@ -390,7 +416,7 @@ def mapping_classification(
     analytical_phrase = any(
         len(h.channels) == 1
         and "single_cell" in h.roles
-        and re.search(r"(?i)\banalytical\s+channel\b", h.text)
+        and re.search(r"(?i)\b(?:analytical\s+channel|analyte(?:\s+(?:channel|sample|digest|proteome))?)\b", h.text)
         for h in hits
     )
     if len(single) == 1 and carrier and not ambiguous and analytical_phrase:
@@ -599,6 +625,41 @@ def self_test() -> None:
     assert roles["126"] == {"carrier"}, (roles, hits)
     assert roles["127N"] == {"reference"}, (roles, hits)
     assert not amb
+
+    # PXD028040 real-corpus regression: the publication describes TMT-128 as the analyte
+    # and TMT-131 as the multiplexing carrier. v0.4.1 treated both as carrier because the
+    # broad context fallback overrode the unrecognized analyte role.
+    text = (
+        "TMT-128-tagged tissue protein digest as the analyte, with TMT-131-tagged tissue "
+        "protein digest, which served as the multiplexing carrier."
+    )
+    hits = collect_hits("publication_fulltext", "PXD028040", "PXD028040-main-text", text)
+    roles, amb = channel_roles_from_hits(hits)
+    assert roles["128"] == {"single_cell"}, (roles, hits)
+    assert roles["131"] == {"carrier"}, (roles, hits)
+    assert not amb
+
+    # Preserve the PDF line-break form seen around a hyphenated TMT reporter token.
+    text = (
+        "TMT-128-tagged digest (analytical channel) and TMT-\n131-tagged digest "
+        "(carrier channel, used for signal enhancement)."
+    )
+    hits = collect_hits("publication_fulltext", "PXD028040", "PXD028040-SI", text)
+    roles, amb = channel_roles_from_hits(hits)
+    assert roles["128"] == {"single_cell"}, (roles, hits)
+    assert roles["131"] == {"carrier"}, (roles, hits)
+    assert not amb
+
+    # An unbound reporter mention must stay unresolved rather than inherit a carrier role
+    # merely because the carrier is discussed elsewhere in the surrounding context.
+    text = (
+        "A single-neuron digest was tagged with TMT-128 and mixed with TMT-131-tagged tissue. "
+        "The tissue proteome was used as a multiplexing carrier."
+    )
+    hits = collect_hits("publication_fulltext", "PXD028040", "PXD028040-unbound", text)
+    roles, amb = channel_roles_from_hits(hits)
+    assert "128" not in roles, (roles, hits)
+    assert "128" not in amb, (roles, amb, hits)
 
     # Dataset-level TMT from a separate benchmark must not automatically make the
     # single-cell branch multiplexed.

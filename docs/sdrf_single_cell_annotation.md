@@ -1013,3 +1013,64 @@ data/sdrf_mapping_relation_recheck_gt105_pride_v041/
 Important outputs are the refreshed and merged publication manifests plus the v0.2 audit inventory.
 Only accessions that remain `multiplex_supported` and have explicit channel-role evidence should be
 considered for the first deterministic multiplex row generator.
+
+## v0.4.2: branch-scoped relation scaffold and real-corpus reporter-role repair
+
+The accepted v0.4.1 relation recheck separated the former 17-member mapping lane into nine true
+multiplex-supported studies, four high-confidence false multiplex relation candidates, two studies
+with unlinked dataset-level isobaric evidence, and two relation/source rechecks. v0.4.2 keeps row
+generation disabled and makes two bounded corrections.
+
+### Rust relation scoping
+
+For de-novo study design, `multiplexed_cells_per_data_file` is now asserted only when true isobaric
+reporter evidence (TMT/TMTpro/iTRAQ or explicit reporter/carrier/reference-channel evidence) is
+locally linked to the single-cell branch in sentence-scale evidence. Dataset-level chemistry in a
+separate sub-study remains diagnostic but no longer establishes sample-to-file cardinality.
+`plexDIA` and the lexical substring `plex` are not treated as isobaric reporter chemistry.
+
+If the scoped deterministic scaffold remains `uncertain`, a de-novo Ollama proposal is not allowed
+to restore `multiplexed_cells_per_data_file` from unscoped evidence. Such a proposal is downgraded
+to `uncertain`. An unresolved non-multiplex scaffold reports
+`sample_to_file_relation_unresolved`; `sample_to_channel_mapping_unresolved` is reserved for
+scaffolds that actually support reporter multiplexing.
+
+The four-accession acceptance rerun is:
+
+```bash
+./scripts/run_gt105_pride_sdrf_relation_scope_recheck_v042.sh
+```
+
+It reuses the v0.4.1 materialized publication manifest and reruns only PXD004892, PXD017755,
+PXD035339, and PXD056528. Becoming locally valid is not required for acceptance; the required
+behavior is removal of an unsupported reporter-multiplex blocker and exposure of the true remaining
+file-role/metadata state.
+
+### Reporter-role parser repair
+
+PXD028040 is the mandatory real-corpus regression. Its public article uses `TMT-128 ... as the
+analyte` and `TMT-131 ... carrier`, while the supplementary Methods also describe the TMT-128 digest
+as the analytical channel and the TMT-131 digest as the carrier channel. The v0.4.1 auditor did not
+recognize `analyte` as the analytical/single-cell role and could then apply a broad-context fallback
+that assigned an otherwise-unbound channel to a nearby carrier role.
+
+Auditor v0.3 therefore:
+
+- recognizes `analyte` as an analytical/single-cell reporter-role synonym;
+- binds role phrases locally to each reporter token, preferring a following role phrase before a
+  preceding one;
+- removes the broad-context role fallback that could relabel an unbound reporter;
+- retains PDF line-break/hyphenation and reporter-token normalization protections; and
+- treats an unbound reporter as unresolved rather than guessing its role.
+
+Rerun only the nine v0.4.1 `multiplex_supported` accessions with:
+
+```bash
+./scripts/run_gt105_pride_sdrf_mapping_role_recheck_v042.sh
+```
+
+This remains non-generative. A subsequent reporter-row generator is allowed only if real accessions
+now satisfy a narrow explicit evidence contract: one explicit analytical/single-cell reporter
+channel per RAW plus an explicit carrier channel, with an optional explicit reference channel. A
+general multi-single-cell-per-RAW generator remains out of scope until run/sample/channel mappings
+are explicit.

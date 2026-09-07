@@ -20,7 +20,7 @@ pub const SINGLE_CELL_TEMPLATE_VERSION: &str = "1.0.0";
 pub const SINGLE_CELL_TEMPLATE_URL: &str =
     "https://github.com/bigbio/sdrf-templates/blob/main/single-cell/1.0.0/single-cell.yaml";
 pub const SDRF_SPEC_URL: &str = "https://sdrf.quantms.org/specification.html";
-pub const GENERATOR_VERSION: &str = "pride-scp-sdrf-v0.3.6";
+pub const GENERATOR_VERSION: &str = "pride-scp-sdrf-v0.4.2";
 const MANUSCRIPT_SCAN_MAX_CHARS: usize = 2_000_000;
 const MANUSCRIPT_EVIDENCE_MAX_RESERVED_ITEMS: usize = 24;
 const MANUSCRIPT_EVIDENCE_MAX_RESERVED_CHARS: usize = 12_000;
@@ -1745,6 +1745,121 @@ fn evidence_hay(item: &EvidenceItem) -> String {
     format!("{} {}", item.source_label, item.text).to_ascii_lowercase()
 }
 
+fn relation_text_has_word(text: &str, word: &str) -> bool {
+    text.split(|c: char| !c.is_ascii_alphanumeric())
+        .any(|token| token == word)
+}
+
+fn relation_text_has_single_branch(text: &str) -> bool {
+    [
+        "single-cell",
+        "single cell",
+        "single neuron",
+        "single neurons",
+        "single oocyte",
+        "single oocytes",
+        "single zygote",
+        "single zygotes",
+        "single blastomere",
+        "single blastomeres",
+        "single muscle fiber",
+        "single muscle fibre",
+        "single fiber",
+        "single fibre",
+    ]
+    .iter()
+    .any(|term| text.contains(term))
+}
+
+fn relation_text_has_isobaric_reporter_evidence(text: &str) -> bool {
+    [
+        "tmtpro",
+        "tmt pro",
+        "tandem mass tag",
+        "itraq",
+        "carrier channel",
+        "carrier proteome",
+        "carrier sample",
+        "reference channel",
+        "reporter channel",
+        "isobaric",
+    ]
+    .iter()
+    .any(|term| text.contains(term))
+        || relation_text_has_word(text, "tmt")
+}
+
+fn relation_text_has_nonisobaric_acquisition(text: &str) -> bool {
+    [
+        "label-free",
+        "label free",
+        "data-independent",
+        "data independent",
+        "dia-pasef",
+        "diapasef",
+        "ce-ms",
+        "ce ms",
+        "capillary electrophoresis",
+        "maldi",
+        "top-down",
+        "top down",
+        "direct injection",
+    ]
+    .iter()
+    .any(|term| text.contains(term))
+        || relation_text_has_word(text, "dia")
+}
+
+fn relation_scope_evidence(
+    evidence: &[EvidenceItem],
+) -> (Vec<String>, Vec<String>, Vec<String>, Vec<String>) {
+    let mut linked_isobaric = BTreeSet::new();
+    let mut linked_nonisobaric = BTreeSet::new();
+    let mut dataset_only_isobaric = BTreeSet::new();
+    let mut plexdia = BTreeSet::new();
+
+    for item in evidence {
+        let text = item.text.to_ascii_lowercase();
+        if text.contains("plexdia") || text.contains("plex dia") {
+            plexdia.insert(item.id.clone());
+        }
+
+        // Mirror the accepted v0.4.1 relation auditor: use a sentence-ish
+        // previous/current/next neighborhood so PDF line wrapping is tolerated,
+        // while evidence from unrelated sub-studies elsewhere in a deposit cannot
+        // make a single-cell branch look isobarically multiplexed.
+        let chunks = text
+            .split(|c| matches!(c, '.' | ';' | '\n'))
+            .filter(|chunk| !chunk.trim().is_empty())
+            .collect::<Vec<_>>();
+        for i in 0..chunks.len() {
+            let start = i.saturating_sub(1);
+            let end = (i + 2).min(chunks.len());
+            let neighborhood = chunks[start..end].join(" ");
+            let has_single = relation_text_has_single_branch(&neighborhood);
+            let has_isobaric = relation_text_has_isobaric_reporter_evidence(&neighborhood);
+            let has_nonisobaric = relation_text_has_nonisobaric_acquisition(&neighborhood);
+
+            if has_isobaric && has_single {
+                linked_isobaric.insert(item.id.clone());
+            } else if has_isobaric {
+                dataset_only_isobaric.insert(item.id.clone());
+            }
+            if has_nonisobaric && has_single {
+                linked_nonisobaric.insert(item.id.clone());
+            }
+        }
+    }
+
+    let bounded = |set: BTreeSet<String>| set.into_iter().take(8).collect::<Vec<_>>();
+    (
+        bounded(linked_isobaric),
+        bounded(linked_nonisobaric),
+        bounded(dataset_only_isobaric),
+        bounded(plexdia),
+    )
+}
+
 fn refs_for_predicate<F>(evidence: &[EvidenceItem], field: &str, predicate: F) -> Vec<String>
 where
     F: Fn(&str) -> bool,
@@ -2079,20 +2194,23 @@ fn infer_study_design_scaffold(
             "single egg",
         ],
     );
-    let multiplex_refs = evidence_refs_containing(
+    // Dataset-level chemistry is retained as diagnostic evidence, but it no longer
+    // asserts a multiplex relation by itself. In particular, lexical `plex` and
+    // plexDIA are not isobaric-reporter evidence.
+    let isobaric_refs = evidence_refs_containing(
         evidence,
         &[
             "tmtpro",
             "tmt pro",
             "tmt ",
             "tmt-",
+            "tandem mass tag",
             "itraq",
             "carrier channel",
             "carrier proteome",
             "reference channel",
-            "plexdia",
-            "multiplexed single-cell",
-            "multiplexed single cell",
+            "reporter channel",
+            "isobaric",
         ],
     );
     let label_free_refs = evidence_refs_containing(
@@ -2121,60 +2239,66 @@ fn infer_study_design_scaffold(
             "single egg",
         ],
     );
+    let (linked_isobaric_refs, linked_nonisobaric_refs, _dataset_only_isobaric_refs, plexdia_refs) =
+        relation_scope_evidence(evidence);
 
     let mut relation_evidence_refs = Vec::new();
-    let (relation_mode_hint, relation_confidence, note) =
-        if !single_refs.is_empty() && !multiplex_refs.is_empty() {
-            relation_evidence_refs.extend(single_refs.iter().cloned());
-            relation_evidence_refs.extend(multiplex_refs.iter().cloned());
-            (
-                "multiplexed_cells_per_data_file",
-                "high",
-                "single-cell and isobaric multiplex/carrier evidence co-occur",
-            )
-        } else if !single_refs.is_empty() && !few_cell_refs.is_empty() {
-            relation_evidence_refs.extend(single_refs.iter().cloned());
-            relation_evidence_refs.extend(few_cell_refs.iter().cloned());
-            (
-                "mixed",
-                "medium",
-                "single-cell and explicit few-cell/small-pool evidence co-occur",
-            )
-        } else if !single_refs.is_empty() && !label_free_refs.is_empty() {
-            relation_evidence_refs.extend(single_refs.iter().cloned());
-            relation_evidence_refs.extend(label_free_refs.iter().cloned());
-            (
-                "one_cell_per_data_file",
-                "high",
-                "single-cell and label-free evidence co-occur without multiplex evidence",
-            )
-        } else if !specific_single_refs.is_empty() && multiplex_refs.is_empty() {
-            relation_evidence_refs.extend(specific_single_refs.iter().cloned());
-            (
-                "one_cell_per_data_file",
-                "medium",
-                "specific single-sample evidence is present without multiplex evidence",
-            )
-        } else {
-            (
-                "uncertain",
-                "low",
-                "evidence does not safely determine sample-to-data-file cardinality",
-            )
-        };
+    let (relation_mode_hint, relation_confidence, note) = if !linked_isobaric_refs.is_empty() {
+        relation_evidence_refs.extend(linked_isobaric_refs.iter().cloned());
+        (
+            "multiplexed_cells_per_data_file",
+            "high",
+            "isobaric reporter/carrier evidence is locally linked to the single-cell branch",
+        )
+    } else if !single_refs.is_empty() && !few_cell_refs.is_empty() {
+        relation_evidence_refs.extend(single_refs.iter().cloned());
+        relation_evidence_refs.extend(few_cell_refs.iter().cloned());
+        (
+            "mixed",
+            "medium",
+            "single-cell and explicit few-cell/small-pool evidence co-occur",
+        )
+    } else if !linked_nonisobaric_refs.is_empty() {
+        relation_evidence_refs.extend(linked_nonisobaric_refs.iter().cloned());
+        (
+            "one_cell_per_data_file",
+            "high",
+            "non-isobaric acquisition evidence is locally linked to the single-cell branch",
+        )
+    } else if !single_refs.is_empty() && !label_free_refs.is_empty() && isobaric_refs.is_empty() {
+        relation_evidence_refs.extend(single_refs.iter().cloned());
+        relation_evidence_refs.extend(label_free_refs.iter().cloned());
+        (
+            "one_cell_per_data_file",
+            "high",
+            "single-cell and label-free evidence co-occur without isobaric reporter evidence",
+        )
+    } else if !specific_single_refs.is_empty()
+        && isobaric_refs.is_empty()
+        && plexdia_refs.is_empty()
+    {
+        relation_evidence_refs.extend(specific_single_refs.iter().cloned());
+        (
+            "one_cell_per_data_file",
+            "medium",
+            "specific single-sample evidence is present without isobaric reporter or plexDIA evidence",
+        )
+    } else {
+        (
+            "uncertain",
+            "low",
+            "evidence does not safely determine sample-to-data-file cardinality at single-cell branch scope",
+        )
+    };
     relation_evidence_refs.sort();
     relation_evidence_refs.dedup();
     relation_evidence_refs.truncate(8);
 
     let multiplex_chemistry_hint =
         if evidence_refs_containing(evidence, &["tmtpro", "tmt pro"]).is_empty() {
-            if evidence_refs_containing(evidence, &["tmt ", "tmt-"]).is_empty() {
+            if evidence_refs_containing(evidence, &["tmt ", "tmt-", "tandem mass tag"]).is_empty() {
                 if evidence_refs_containing(evidence, &["itraq"]).is_empty() {
-                    if evidence_refs_containing(evidence, &["plexdia"]).is_empty() {
-                        String::new()
-                    } else {
-                        "plexDIA".into()
-                    }
+                    String::new()
                 } else {
                     "iTRAQ".into()
                 }
@@ -2184,7 +2308,7 @@ fn infer_study_design_scaffold(
         } else {
             "TMTpro".into()
         };
-    let mut multiplex_evidence_refs = multiplex_refs.clone();
+    let mut multiplex_evidence_refs = isobaric_refs.clone();
     multiplex_evidence_refs.sort();
     multiplex_evidence_refs.dedup();
     multiplex_evidence_refs.truncate(8);
@@ -2821,10 +2945,10 @@ fn evidence_relevant_to_field(field: &str, item: &EvidenceItem) -> bool {
             "single nucleus",
             "single-nucleus",
             "tmt",
-            "plex",
+            "itraq",
             "carrier",
             "reference channel",
-            "channel",
+            "reporter channel",
             "multiplex",
         ],
         "organism" => &[
@@ -4681,7 +4805,7 @@ fn validate_incomplete_mapping_scaffold(
                 evidence.study_design.generic_archive_files
             ),
         )
-    } else {
+    } else if evidence.study_design.relation_mode_hint == "multiplexed_cells_per_data_file" {
         (
             "sample_to_channel_mapping_unresolved",
             format!(
@@ -4689,6 +4813,15 @@ fn validate_incomplete_mapping_scaffold(
                 evidence.study_design.relation_mode_hint,
                 evidence.study_design.multiplex_chemistry_hint,
                 evidence.study_design.multiplex_mapping_status
+            ),
+        )
+    } else {
+        (
+            "sample_to_file_relation_unresolved",
+            format!(
+                "{} design remains unresolved at single-cell branch scope (chemistry='{}'); sample-to-file relationships are intentionally not fabricated",
+                evidence.study_design.relation_mode_hint,
+                evidence.study_design.multiplex_chemistry_hint
             ),
         )
     };
@@ -4883,6 +5016,23 @@ async fn annotate_one(opts: &SdrfAnnotateOptions, accession: &str) -> Result<Res
                 ),
             });
         }
+    } else if evidence.existing_sdrf_path.is_empty()
+        && evidence.study_design.relation_mode_hint == "uncertain"
+        && proposal.relation_mode == "multiplexed_cells_per_data_file"
+    {
+        // A de-novo model is not allowed to restore the exact false-positive
+        // architecture that the scoped scaffold rejected. Multiplexed reporter
+        // cardinality requires locally linked single-cell/isobaric evidence; a
+        // dataset-level TMT/iTRAQ mention or lexical `plex`/plexDIA is insufficient.
+        proposal.relation_mode = "uncertain".into();
+        proposal.evidence_refs.remove("relation_mode");
+        provenance_issues.push(ValidationIssue {
+            level: "warning".into(),
+            code: "multiplex_relation_rejected_without_scoped_reporter_evidence".into(),
+            row: 0,
+            column: "relation_mode".into(),
+            message: "model-proposed multiplexed_cells_per_data_file was downgraded to uncertain because the deterministic study-design scaffold found no isobaric reporter evidence locally linked to the single-cell branch".into(),
+        });
     }
     provenance_issues.extend(apply_deterministic_metadata_scaffold(
         &mut proposal,
@@ -6508,6 +6658,84 @@ mod tests {
     }
 
     #[test]
+    fn denovo_design_scaffold_does_not_cross_substudy_tmt_into_single_cell_branch() {
+        let raw = vec![RawFile {
+            file_name: "single_cell_01.raw".into(),
+            file_uri: String::new(),
+            category: "RAW".into(),
+        }];
+        let evidence = vec![
+            EvidenceItem {
+                id: "E_SC".into(),
+                source_kind: "manuscript_text".into(),
+                source_label: "single-cell methods".into(),
+                text: "Single-cell proteomics measurements were acquired label-free by data-independent acquisition.".into(),
+            },
+            EvidenceItem {
+                id: "E_BULK".into(),
+                source_kind: "manuscript_text".into(),
+                source_label: "separate bulk validation".into(),
+                text: "A separate bulk validation substudy used iTRAQ labeling for pooled tissue digests.".into(),
+            },
+        ];
+        let design = infer_study_design_scaffold(&raw, &evidence);
+        assert_eq!(design.relation_mode_hint, "one_cell_per_data_file");
+        assert_eq!(design.relation_confidence, "high");
+        assert!(design.relation_evidence_refs.contains(&"E_SC".to_string()));
+        assert!(!design
+            .relation_evidence_refs
+            .contains(&"E_BULK".to_string()));
+        assert_eq!(design.multiplex_chemistry_hint, "iTRAQ");
+    }
+
+    #[test]
+    fn denovo_design_scaffold_plexdia_is_not_isobaric_reporter_evidence() {
+        let raw = vec![RawFile {
+            file_name: "plexdia_01.raw".into(),
+            file_uri: String::new(),
+            category: "RAW".into(),
+        }];
+        let evidence = vec![EvidenceItem {
+            id: "E_PLEXDIA".into(),
+            source_kind: "manuscript_text".into(),
+            source_label: "methods".into(),
+            text: "Single-cell proteomics samples were measured with plexDIA.".into(),
+        }];
+        let design = infer_study_design_scaffold(&raw, &evidence);
+        assert_eq!(design.relation_mode_hint, "uncertain");
+        assert!(design.multiplex_chemistry_hint.is_empty());
+        assert!(design.multiplex_evidence_refs.is_empty());
+    }
+
+    #[test]
+    fn denovo_design_scaffold_dataset_tmt_without_local_single_cell_link_stays_uncertain() {
+        let raw = vec![RawFile {
+            file_name: "sample_01.raw".into(),
+            file_uri: String::new(),
+            category: "RAW".into(),
+        }];
+        let evidence = vec![
+            EvidenceItem {
+                id: "E_SC".into(),
+                source_kind: "manuscript_text".into(),
+                source_label: "single-cell branch".into(),
+                text: "Single-cell proteomics samples were prepared for mass spectrometry.".into(),
+            },
+            EvidenceItem {
+                id: "E_TMT".into(),
+                source_kind: "manuscript_text".into(),
+                source_label: "bulk branch".into(),
+                text: "Bulk tissue digests were labeled with TMTpro for a separate experiment."
+                    .into(),
+            },
+        ];
+        let design = infer_study_design_scaffold(&raw, &evidence);
+        assert_eq!(design.relation_mode_hint, "uncertain");
+        assert_eq!(design.multiplex_chemistry_hint, "TMTpro");
+        assert!(design.relation_evidence_refs.is_empty());
+    }
+
+    #[test]
     fn denovo_design_scaffold_flags_generic_archive_containers() {
         let raw = vec![RawFile {
             file_name: "Figure1_AntigenRetrieval.rar".into(),
@@ -6784,6 +7012,44 @@ mod tests {
         let issues = validate_incomplete_mapping_scaffold(&headers, &rows, &evidence);
         assert_eq!(issues.iter().filter(|x| x.level == "error").count(), 1);
         assert!(issues
+            .iter()
+            .any(|x| x.code == "sample_to_channel_mapping_unresolved"));
+    }
+
+    #[test]
+    fn incomplete_uncertain_scaffold_reports_file_relation_not_channel_mapping() {
+        let proposal = SdrfProposal {
+            relation_mode: "uncertain".into(),
+            ..Default::default()
+        };
+        let evidence = DatasetEvidence {
+            accession: "PXD999998".into(),
+            project_json_path: String::new(),
+            files_json_path: String::new(),
+            existing_sdrf_path: String::new(),
+            raw_files: vec![RawFile {
+                file_name: "a.raw".into(),
+                file_uri: String::new(),
+                category: "RAW".into(),
+            }],
+            study_design: StudyDesignScaffold {
+                relation_mode_hint: "uncertain".into(),
+                multiplex_chemistry_hint: "TMT".into(),
+                multiplex_mapping_status: "not_applicable".into(),
+                ..Default::default()
+            },
+            metadata_scaffold: DeterministicMetadataScaffold::default(),
+            evidence: vec![],
+            manuscript_sources: vec![],
+            annotation_sources: vec![],
+        };
+        let (headers, rows, _) = draft_rows(&proposal, &evidence).unwrap();
+        let issues = validate_incomplete_mapping_scaffold(&headers, &rows, &evidence);
+        assert_eq!(issues.iter().filter(|x| x.level == "error").count(), 1);
+        assert!(issues
+            .iter()
+            .any(|x| x.code == "sample_to_file_relation_unresolved"));
+        assert!(!issues
             .iter()
             .any(|x| x.code == "sample_to_channel_mapping_unresolved"));
     }
