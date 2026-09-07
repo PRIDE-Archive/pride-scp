@@ -1417,3 +1417,82 @@ Chemistry-only hits and filename-only words remain diagnostic. They never author
 serialization. The audit is intended to identify which of the remaining eight accessions has a
 PXD028040-like deposited design source that can support the next deterministic reconstruction, and
 which accessions instead require publication/source recovery.
+
+## v0.4.7: high-specificity residual-multiplex support-asset recheck
+
+The real v0.4.6 eight-accession run is an accepted support-discovery checkpoint, but its semantic
+hit counts are **not** accepted mapping evidence.  The permissive v0.1 scanner selected many
+search/result tables and then matched ordinary proteomics-result vocabulary.  PXD029320 was the
+clearest regression fixture: 66 support candidates produced 15,733 hits, including protein names
+containing phrases such as `solute carrier`, `RUN and SH3 domain-containing protein`, and
+`cell division control protein`, plus bare numbers such as 128/131/132 that were unrelated to
+reporter-channel assignments.  Across the eight-accession cohort v0.4.6 recovered no explicit
+reporter-role hits, so no accession was authorized for row generation.
+
+v0.4.7 keeps the audit non-generative and tightens two independent gates.
+
+### Asset triage
+
+Repository files are classified before semantic scanning.  Explicit experimental-design, metadata,
+sample-map/sheet, run/file-map, channel-layout, reporter-layout, SDRF, manifest and annotation names
+are high-priority support assets.  Readme/methods-like text and non-result workbooks are retained as
+bounded secondary sources.  Search-engine, peptide/protein, PSM, spectral, feature, quantification,
+identification and `realtimesearch` result assets are excluded unless the filename itself explicitly
+identifies a design/metadata source.
+
+The v0.4.7 runner reuses already downloaded v0.4.6 assets when possible, so tightening this gate does
+not require redownloading the prior result-table corpus.
+
+### High-specificity mapping evidence
+
+A number in the 126-135 reporter range is no longer evidence by itself.  It is recognized only when
+prefixed by TMT/TMTpro or locally anchored by reporter/channel/tag/label syntax.  `TMEM131`,
+`C6orf132`, and ordinary numeric result columns therefore cannot create reporter-channel evidence.
+
+Role vocabulary is also context-bounded.  Protein-result phrases such as `solute carrier`,
+`mitochondrial carrier`, `carrier protein`, `RUN and SH3 domain`, and `cell division control protein`
+are explicitly protected false-positive regressions.  Run linkage requires an explicit RAW token or
+phrases such as `RAW file`, `file name`, `run ID/name`, `sample ID/name`, `acquisition`, `batch`, or
+replicate semantics; the bare word `run` is insufficient.
+
+Hits are separated into evidence tiers:
+
+```text
+reporter_role_and_run
+explicit_reporter_role
+single_cell_reporter_layout
+run_or_sample_linkage
+source_triage_only
+```
+
+Only the first four are written to the compact credible-evidence output.  Chemistry-only prose is
+retained as `source_triage_only` for navigation but cannot promote an accession toward SDRF row
+generation.
+
+Run the bounded recheck with:
+
+```bash
+./scripts/run_gt105_pride_sdrf_multiplex_support_asset_recheck_v047.sh
+```
+
+Expected output root:
+
+```text
+data/sdrf_multiplex_support_asset_recheck_gt105_pride_v047/
+```
+
+Key outputs:
+
+```text
+audit/sdrf_multiplex_support_asset_audit_summary.json
+audit/sdrf_multiplex_support_asset_audit.tsv
+audit/support_asset_status.tsv
+audit/support_asset_evidence_hits.tsv
+audit/support_asset_credible_evidence_hits.tsv
+```
+
+A `support_asset_reconstruction_candidate` requires at least one high-specificity support unit that
+contains explicit reporter role(s) and channel(s) together with explicit run/sample linkage.  A
+study with separate role and run evidence remains a review candidate rather than an automatic
+mapping source.  If no accession reaches that gate, the next step is accession-specific source or
+publication recovery, not a broader reporter parser and not a generic multiplex generator.
