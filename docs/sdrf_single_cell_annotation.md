@@ -667,3 +667,103 @@ not simply the number of locally-valid SDRFs. The expected architectural outcome
 label-free single-cell studies can advance to one-cell-per-file drafts, TMT studies stay
 explicitly multiplexed, mixed/few-cell studies stay mixed, and generic repository archives
 are flagged as containers instead of silently being treated as biological runs.
+
+## v0.3.1 template-aware metadata scaffold and mapping-blocker validation
+
+The v0.3.0 five-study pilot successfully fixed the experiment-cardinality problem:
+
+```text
+PXD001641  one_cell_per_data_file
+PXD004174  one_cell_per_data_file
+PXD028040  multiplexed_cells_per_data_file
+PXD029320  multiplexed_cells_per_data_file
+PXD042367  multiplexed_cells_per_data_file + generic_archives_only
+```
+
+That run also showed that the remaining failures are downstream of relation inference. The
+one-cell studies were blocked primarily by `characteristics[single cell isolation protocol]`,
+while multiplexed studies emitted large row-by-row validation error counts even though the
+real blocker is a single unresolved channel/sample mapping problem. Generic `.rar` containers
+have the same issue: their contents must be resolved before final SDRF rows exist.
+
+v0.3.1 keeps the v0.3.0 study-design logic and adds a deterministic `metadata_scaffold` to the
+evidence/audit JSON. The scaffold only fills strongly source-supported facts and records the
+supporting E#### refs. Current deterministic facts include:
+
+- structured PRIDE project organism and instrument values when a human-readable source field is
+  available;
+- label-free annotation for explicitly label-free, non-multiplexed studies;
+- DDA/DIA acquisition mode when explicitly stated;
+- trypsin cleavage when explicitly stated;
+- template-supported single-cell isolation methods derived from explicit methods evidence.
+
+Manuscript keyword windows now include isolation-specific terms such as isolation, dissection,
+tweezers, manual picking, microaspiration, patch clamp, micropipette, capillary microsampling,
+laser capture, and microdissection. This is important for older manuscripts whose relevant
+methods paragraphs do not repeat generic `single-cell proteomics` keywords.
+
+### Template-aware isolation policy
+
+The pinned single-cell 1.0.0 isolation vocabulary is treated as a representation constraint,
+not as permission to invent an approximately similar method. v0.3.1 may map clearly manual
+single-cell dissection/picking evidence to `manual picking`, and recognizes template-supported
+FACS, cellenONE, microfluidics, laser capture microdissection, nanoPOTS, droplet microfluidics,
+and acoustic droplet ejection.
+
+If the experimental evidence instead supports a real method that the pinned template cannot
+represent faithfully (for example patch-clamp-guided microaspiration or capillary microsampling),
+Rust leaves the field unresolved and writes a `template_vocabulary_gap_supported_method` warning
+with the observed method and evidence refs. It must not substitute `manual picking` merely to make
+the validator green.
+
+### Multiplex design scaffold
+
+For multiplexed studies `study_design` now also records:
+
+```text
+multiplex_chemistry_hint
+multiplex_evidence_refs
+carrier_channel_hints
+reference_channel_hints
+multiplex_mapping_status
+```
+
+Channel-role hints are extracted only when a carrier/reference phrase and an explicit TMT-style
+channel number occur together in source evidence. These hints are diagnostics; v0.3.1 still does
+not fabricate per-cell channel rows without a defensible channel-to-sample map.
+
+### Validation of intentionally incomplete mapping scaffolds
+
+Multiplexed/mixed studies and generic archive-only studies do not yet contain final SDRF rows.
+The previous validator therefore produced misleading error storms (for example three errors per
+RAW placeholder row). v0.3.1 validates only the structural scaffold in these modes and emits one
+explicit dataset-level blocking error:
+
+```text
+sample_to_channel_mapping_unresolved
+repository_archive_contents_mapping_unresolved
+```
+
+Strict row-level core/template validation is unchanged for one-cell-per-file drafts and for final
+resolved/existing SDRFs.
+
+Run the frozen five-study comparison with:
+
+```bash
+./scripts/run_gt105_pride_sdrf_denovo_template_aware_pilot.sh
+```
+
+The wrapper deliberately reduces prompt context to 96 evidence items / 45k evidence characters /
+32 repository file names because relation structure and several metadata fields are now resolved
+deterministically. This is intended to reduce the ~49 minute v0.3.0 pilot runtime without dropping
+the newly expanded methods evidence.
+
+The desired result is not that every study becomes validator-clean. Instead:
+
+- the two one-cell studies should either become locally valid or expose a single genuine/template
+  metadata blocker;
+- multiplexed studies should report one mapping blocker rather than hundreds of placeholder-row
+  errors;
+- unsupported real isolation methods should be identified as template gaps rather than coerced;
+- generic archives should remain explicitly unresolved until their internal acquisition mapping is
+  available.

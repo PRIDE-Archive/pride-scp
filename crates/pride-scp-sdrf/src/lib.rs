@@ -20,7 +20,7 @@ pub const SINGLE_CELL_TEMPLATE_VERSION: &str = "1.0.0";
 pub const SINGLE_CELL_TEMPLATE_URL: &str =
     "https://github.com/bigbio/sdrf-templates/blob/main/single-cell/1.0.0/single-cell.yaml";
 pub const SDRF_SPEC_URL: &str = "https://sdrf.quantms.org/specification.html";
-pub const GENERATOR_VERSION: &str = "pride-scp-sdrf-v0.3.0";
+pub const GENERATOR_VERSION: &str = "pride-scp-sdrf-v0.3.1";
 pub const SDRF_SOURCE_RESOLVER_VERSION: &str = "pride-scp-sdrf-source-resolver-v0.1";
 pub const SDRF_AUDITOR_VERSION: &str = "pride-scp-sdrf-auditor-v0.2";
 pub const DEFAULT_OLLAMA_URL: &str = "http://localhost:11434/api/generate";
@@ -255,7 +255,36 @@ struct StudyDesignScaffold {
     generic_archive_files: usize,
     #[serde(default)]
     generic_archive_file_names: Vec<String>,
+    #[serde(default)]
+    multiplex_chemistry_hint: String,
+    #[serde(default)]
+    multiplex_evidence_refs: Vec<String>,
+    #[serde(default)]
+    carrier_channel_hints: Vec<String>,
+    #[serde(default)]
+    reference_channel_hints: Vec<String>,
+    #[serde(default)]
+    multiplex_mapping_status: String,
     notes: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct TemplateCompatibilityGap {
+    field: String,
+    observed_value: String,
+    #[serde(default)]
+    evidence_refs: Vec<String>,
+    reason: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct DeterministicMetadataScaffold {
+    #[serde(default)]
+    values: BTreeMap<String, String>,
+    #[serde(default)]
+    evidence_refs: BTreeMap<String, Vec<String>>,
+    #[serde(default)]
+    template_gaps: Vec<TemplateCompatibilityGap>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -267,6 +296,8 @@ struct DatasetEvidence {
     raw_files: Vec<RawFile>,
     #[serde(default)]
     study_design: StudyDesignScaffold,
+    #[serde(default)]
+    metadata_scaffold: DeterministicMetadataScaffold,
     evidence: Vec<EvidenceItem>,
     manuscript_sources: Vec<String>,
     annotation_sources: Vec<String>,
@@ -354,6 +385,8 @@ struct DatasetAudit {
     relation_mode: String,
     #[serde(default)]
     study_design: StudyDesignScaffold,
+    #[serde(default)]
+    metadata_scaffold: DeterministicMetadataScaffold,
     raw_file_count: usize,
     evidence_item_count: usize,
     manuscript_source_count: usize,
@@ -1391,7 +1424,7 @@ fn read_text_evidence(path: &Path, max_chars: usize) -> Result<String> {
 
 fn manuscript_keyword_windows(text: &str, max_windows: usize) -> Vec<String> {
     let re = Regex::new(
-        r"(?i)single[- ]cell|single[- ]nucle|cellenone|facs|nanopots|tmt|carrier|reference channel|label[- ]free|dia|dda|orbitrap|tims?tof|astral|trypsin|proteom",
+        r"(?i)single[- ]cell|single[- ]nucle|single muscle fib(?:er|re)|blastomere|single neuron|cellenone|facs|flow cytometr|sort(?:ed|ing)?|nanopots|tmt|carrier|reference channel|label[- ]free|dia|dda|data[- ]dependent|data[- ]independent|orbitrap|q exactive|tims?tof|astral|trypsin|proteom|isolat(?:e|ed|ion)|dissect(?:ed|ion)?|tweezer|manual pick|microaspirat|patch[- ]clamp|micropipette|capillary microsampling|laser capture|microdissection",
     )
     .unwrap();
     let normalized = text.replace('\r', "\n");
@@ -1538,6 +1571,268 @@ fn evidence_refs_containing(evidence: &[EvidenceItem], terms: &[&str]) -> Vec<St
     refs
 }
 
+fn evidence_hay(item: &EvidenceItem) -> String {
+    format!("{} {}", item.source_label, item.text).to_ascii_lowercase()
+}
+
+fn refs_for_predicate<F>(evidence: &[EvidenceItem], field: &str, predicate: F) -> Vec<String>
+where
+    F: Fn(&str) -> bool,
+{
+    let mut refs = Vec::new();
+    for item in evidence {
+        if !evidence_relevant_to_field(field, item) {
+            continue;
+        }
+        let hay = evidence_hay(item);
+        if predicate(&hay) {
+            refs.push(item.id.clone());
+            if refs.len() >= 8 {
+                break;
+            }
+        }
+    }
+    refs
+}
+
+fn channel_hints_from_evidence(evidence: &[EvidenceItem], role_terms: &[&str]) -> Vec<String> {
+    let channel_re = Regex::new(r"(?i)\b(?:tmt(?:pro)?[- ]?)?(12[6-9]|13[0-5])([nc])?\b").unwrap();
+    let mut out = BTreeSet::new();
+    for item in evidence {
+        let hay = evidence_hay(item);
+        if !role_terms.iter().any(|term| hay.contains(term)) {
+            continue;
+        }
+        for cap in channel_re.captures_iter(&item.text) {
+            let Some(number) = cap.get(1) else { continue };
+            let suffix = cap
+                .get(2)
+                .map(|m| m.as_str().to_ascii_uppercase())
+                .unwrap_or_default();
+            out.insert(format!("{}{}", number.as_str(), suffix));
+            if out.len() >= 8 {
+                break;
+            }
+        }
+    }
+    out.into_iter().collect()
+}
+
+fn structured_project_value(
+    evidence: &[EvidenceItem],
+    label_terms: &[&str],
+) -> Option<(String, Vec<String>)> {
+    for item in evidence {
+        if item.source_kind != "pride_project" {
+            continue;
+        }
+        let label = item.source_label.to_ascii_lowercase();
+        if !label_terms.iter().any(|term| label.contains(term)) {
+            continue;
+        }
+        if label.contains("accession")
+            || label.contains("url")
+            || label.contains("uri")
+            || label.contains("cvlabel")
+            || label.ends_with(".id")
+        {
+            continue;
+        }
+        let nameish = label.contains(".name")
+            || label.contains("scientificname")
+            || label.ends_with("species")
+            || label.ends_with("organism")
+            || label.ends_with("instrument");
+        if !nameish {
+            continue;
+        }
+        let value = item.text.trim();
+        if value.is_empty()
+            || value.starts_with("http://")
+            || value.starts_with("https://")
+            || value.to_ascii_lowercase().starts_with("ncbitaxon:")
+            || value.to_ascii_lowercase().starts_with("ms:")
+        {
+            continue;
+        }
+        return Some((value.to_string(), vec![item.id.clone()]));
+    }
+    None
+}
+
+fn metadata_scaffold_insert(
+    scaffold: &mut DeterministicMetadataScaffold,
+    field: &str,
+    value: String,
+    refs: Vec<String>,
+) {
+    if value.trim().is_empty() || refs.is_empty() {
+        return;
+    }
+    scaffold.values.insert(field.to_string(), value);
+    scaffold.evidence_refs.insert(field.to_string(), refs);
+}
+
+fn infer_deterministic_metadata_scaffold(
+    evidence: &[EvidenceItem],
+    design: &StudyDesignScaffold,
+) -> DeterministicMetadataScaffold {
+    let mut out = DeterministicMetadataScaffold::default();
+
+    if let Some((value, refs)) = structured_project_value(
+        evidence,
+        &["organism.name", "organisms", "species.name", "species"],
+    ) {
+        metadata_scaffold_insert(&mut out, "organism", value, refs);
+    }
+    if let Some((value, refs)) =
+        structured_project_value(evidence, &["instrument.name", "instruments", "instrument"])
+    {
+        metadata_scaffold_insert(&mut out, "instrument", value, refs);
+    }
+
+    let label_free_refs = refs_for_predicate(evidence, "label", |hay| {
+        ["label-free", "label free", "label‐free", "label–free"]
+            .iter()
+            .any(|term| hay.contains(term))
+    });
+    if !label_free_refs.is_empty() && design.relation_mode_hint != "multiplexed_cells_per_data_file"
+    {
+        metadata_scaffold_insert(
+            &mut out,
+            "label",
+            "NT=label free sample;AC=MS:1002038".into(),
+            label_free_refs,
+        );
+    }
+
+    let dda_refs = refs_for_predicate(evidence, "proteomics_data_acquisition_method", |hay| {
+        hay.contains("data-dependent") || hay.contains("data dependent") || hay.contains(" dda ")
+    });
+    if !dda_refs.is_empty() {
+        metadata_scaffold_insert(
+            &mut out,
+            "proteomics_data_acquisition_method",
+            "NT=data-dependent acquisition;AC=PRIDE:0000627".into(),
+            dda_refs,
+        );
+    } else {
+        let dia_refs = refs_for_predicate(evidence, "proteomics_data_acquisition_method", |hay| {
+            hay.contains("data-independent")
+                || hay.contains("data independent")
+                || hay.contains("dia-pasef")
+                || hay.contains("diapasef")
+                || hay.contains("swath")
+        });
+        if !dia_refs.is_empty() {
+            metadata_scaffold_insert(
+                &mut out,
+                "proteomics_data_acquisition_method",
+                "data-independent acquisition".into(),
+                dia_refs,
+            );
+        }
+    }
+
+    let trypsin_refs = refs_for_predicate(evidence, "cleavage_agent_details", |hay| {
+        hay.contains("trypsin")
+    });
+    if !trypsin_refs.is_empty() {
+        metadata_scaffold_insert(
+            &mut out,
+            "cleavage_agent_details",
+            "trypsin".into(),
+            trypsin_refs,
+        );
+    }
+
+    let isolation_candidates: [(&str, &str, &[&str]); 8] = [
+        (
+            "FACS",
+            "FACS",
+            &["facs", "fluorescence-activated cell sort", "flow cytometr"],
+        ),
+        ("cellenONE", "cellenONE", &["cellenone"]),
+        (
+            "laser capture microdissection",
+            "laser capture microdissection",
+            &["laser capture", " lcm "],
+        ),
+        ("nanoPOTS", "nanoPOTS", &["nanopots"]),
+        (
+            "droplet microfluidics",
+            "droplet microfluidics",
+            &["droplet microfluid"],
+        ),
+        (
+            "acoustic droplet ejection",
+            "acoustic droplet ejection",
+            &["acoustic droplet"],
+        ),
+        ("microfluidics", "microfluidics", &["microfluid"]),
+        (
+            "manual picking",
+            "manual picking",
+            &[
+                "manual picking",
+                "individually transferred",
+                "using tweezers",
+                "dissect single",
+                "single blastomeres from the embryo",
+            ],
+        ),
+    ];
+    let mut isolation_set = false;
+    for (_observed, template_value, terms) in isolation_candidates {
+        let refs = refs_for_predicate(evidence, "single_cell_isolation_method", |hay| {
+            terms.iter().any(|term| hay.contains(term))
+        });
+        if !refs.is_empty() {
+            metadata_scaffold_insert(
+                &mut out,
+                "single_cell_isolation_method",
+                template_value.to_string(),
+                refs,
+            );
+            isolation_set = true;
+            break;
+        }
+    }
+    if !isolation_set {
+        let unsupported = [
+            (
+                "patch-clamp-guided microaspiration",
+                &[
+                    "patch clamp",
+                    "patch-clamp",
+                    "patch clamp probe",
+                    "neuronal soma",
+                    "microaspirat",
+                ] as &[&str],
+            ),
+            (
+                "capillary microsampling",
+                &["capillary microsampling", "in situ subcellular", "aspirat"] as &[&str],
+            ),
+        ];
+        for (observed, terms) in unsupported {
+            let refs = refs_for_predicate(evidence, "single_cell_isolation_method", |hay| {
+                terms.iter().any(|term| hay.contains(term))
+            });
+            if !refs.is_empty() {
+                out.template_gaps.push(TemplateCompatibilityGap {
+                    field: "single_cell_isolation_method".into(),
+                    observed_value: observed.into(),
+                    evidence_refs: refs,
+                    reason: "the pinned single-cell 1.0.0 isolation-method vocabulary does not contain a faithful term for this experimentally supported sampling method; do not substitute a false allowed value".into(),
+                });
+                break;
+            }
+        }
+    }
+    out
+}
+
 fn infer_study_design_scaffold(
     raw_files: &[RawFile],
     evidence: &[EvidenceItem],
@@ -1668,6 +1963,52 @@ fn infer_study_design_scaffold(
     relation_evidence_refs.dedup();
     relation_evidence_refs.truncate(8);
 
+    let multiplex_chemistry_hint =
+        if evidence_refs_containing(evidence, &["tmtpro", "tmt pro"]).is_empty() {
+            if evidence_refs_containing(evidence, &["tmt ", "tmt-"]).is_empty() {
+                if evidence_refs_containing(evidence, &["itraq"]).is_empty() {
+                    if evidence_refs_containing(evidence, &["plexdia"]).is_empty() {
+                        String::new()
+                    } else {
+                        "plexDIA".into()
+                    }
+                } else {
+                    "iTRAQ".into()
+                }
+            } else {
+                "TMT".into()
+            }
+        } else {
+            "TMTpro".into()
+        };
+    let mut multiplex_evidence_refs = multiplex_refs.clone();
+    multiplex_evidence_refs.sort();
+    multiplex_evidence_refs.dedup();
+    multiplex_evidence_refs.truncate(8);
+    let carrier_channel_hints = channel_hints_from_evidence(
+        evidence,
+        &[
+            "carrier channel",
+            "carrier proteome",
+            "carrier sample",
+            "carrier cells",
+        ],
+    );
+    let reference_channel_hints = channel_hints_from_evidence(
+        evidence,
+        &["reference channel", "reference sample", "bridge channel"],
+    );
+    let multiplex_mapping_status = if relation_mode_hint == "multiplexed_cells_per_data_file" {
+        if carrier_channel_hints.is_empty() && reference_channel_hints.is_empty() {
+            "chemistry_detected_channel_mapping_unresolved"
+        } else {
+            "channel_role_hints_detected_mapping_unresolved"
+        }
+    } else {
+        "not_applicable"
+    }
+    .to_string();
+
     StudyDesignScaffold {
         relation_mode_hint: relation_mode_hint.to_string(),
         relation_confidence: relation_confidence.to_string(),
@@ -1677,6 +2018,11 @@ fn infer_study_design_scaffold(
         wrapped_acquisition_files,
         generic_archive_files,
         generic_archive_file_names,
+        multiplex_chemistry_hint,
+        multiplex_evidence_refs,
+        carrier_channel_hints,
+        reference_channel_hints,
+        multiplex_mapping_status,
         notes: note.to_string(),
     }
 }
@@ -1853,6 +2199,7 @@ fn build_evidence(opts: &SdrfAnnotateOptions, accession: &str) -> Result<Dataset
     }
 
     let study_design = infer_study_design_scaffold(&raw_files, &evidence);
+    let metadata_scaffold = infer_deterministic_metadata_scaffold(&evidence, &study_design);
 
     Ok(DatasetEvidence {
         accession: accession.to_string(),
@@ -1863,6 +2210,7 @@ fn build_evidence(opts: &SdrfAnnotateOptions, accession: &str) -> Result<Dataset
             .unwrap_or_default(),
         raw_files,
         study_design,
+        metadata_scaffold,
         evidence,
         manuscript_sources,
         annotation_sources,
@@ -1981,7 +2329,11 @@ PRECOMPUTED STUDY-DESIGN SCAFFOLD (deterministic Rust; do not contradict a non-u
 - relation_mode_hint: {relation_hint}\n\
 - relation_confidence: {relation_confidence}\n\
 - repository_file_mode: {repository_file_mode}\n\
-- design_note: {design_note}\n\n\
+- design_note: {design_note}\n\
+- multiplex_chemistry_hint: {multiplex_chemistry}\n\
+- multiplex_mapping_status: {multiplex_mapping_status}\n\
+- carrier_channel_hints: {carrier_hints}\n\
+- reference_channel_hints: {reference_hints}\n\n\
 TARGET FIELDS: {target_list}\n\
 LOCKED/ALREADY-STRUCTURED FIELDS: {locked_list}\n\n\
 RULES:\n\
@@ -1990,7 +2342,7 @@ RULES:\n\
 3. If a TARGET field is not supported by its own evidence section, return exactly 'not available' (or relation_mode='uncertain').\n\
 4. Every concrete TARGET value must cite one or more E#### refs from that SAME field section.\n\
 5. relation_mode means sample-to-RAW design: one_cell_per_data_file, multiplexed_cells_per_data_file, mixed, or uncertain. Do not infer it merely from the phrase 'single-cell'.\n\
-6. single_cell_isolation_method must be a cell-isolation/sampling method such as FACS, cellenONE, microfluidics, laser capture microdissection, manual picking/dissection, patch-clamp-guided microaspiration, capillary microsampling, nanoPOTS, droplet microfluidics, or acoustic droplet ejection. Software such as MaxQuant is never an isolation method.\n\
+6. For single_cell_isolation_method, use only a method faithfully represented by the pinned template vocabulary (for example FACS, cellenONE, microfluidics, laser capture microdissection, manual picking, nanoPOTS, droplet microfluidics, or acoustic droplet ejection). If the evidence instead supports a method such as patch-clamp aspiration or capillary microsampling that the pinned vocabulary cannot represent faithfully, return 'not available'; Rust records the template-compatibility gap separately. Software such as MaxQuant is never an isolation method.\n\
 7. proteomics_data_acquisition_method describes MS acquisition (for example DDA, DIA, diaPASEF, PRM), not analysis/search software.\n\
 8. instrument is the mass spectrometer/instrument, not software.\n\
 9. Do not infer a per-cell identifier from filenames here. Rust constructs identifiers only when the row relationship is deterministically supported.\n\
@@ -2006,6 +2358,10 @@ FIELD-SPECIFIC EVIDENCE:\n{sections}",
         relation_confidence = evidence.study_design.relation_confidence.as_str(),
         repository_file_mode = evidence.study_design.repository_file_mode.as_str(),
         design_note = evidence.study_design.notes.as_str(),
+        multiplex_chemistry = evidence.study_design.multiplex_chemistry_hint.as_str(),
+        multiplex_mapping_status = evidence.study_design.multiplex_mapping_status.as_str(),
+        carrier_hints = if evidence.study_design.carrier_channel_hints.is_empty() { "none".into() } else { evidence.study_design.carrier_channel_hints.join(", ") },
+        reference_hints = if evidence.study_design.reference_channel_hints.is_empty() { "none".into() } else { evidence.study_design.reference_channel_hints.join(", ") },
         nfiles = evidence.raw_files.len(),
     )
 }
@@ -2125,7 +2481,31 @@ fn proposal_target_fields(evidence: &DatasetEvidence) -> BTreeSet<String> {
         "reference_channel",
     ];
     if evidence.existing_sdrf_path.is_empty() {
-        return fields.iter().map(|x| x.to_string()).collect();
+        let mut out: BTreeSet<String> = fields.iter().map(|x| x.to_string()).collect();
+        if evidence.study_design.relation_mode_hint != "uncertain" {
+            out.remove("relation_mode");
+        }
+        if evidence.study_design.relation_mode_hint == "one_cell_per_data_file" {
+            for field in [
+                "sample_type",
+                "cells_per_well",
+                "fraction_identifier",
+                "technical_replicate",
+                "carrier_channel",
+                "reference_channel",
+            ] {
+                out.remove(field);
+            }
+        }
+        for field in evidence.metadata_scaffold.values.keys() {
+            out.remove(field);
+        }
+        // If the real isolation/sampling method is known but cannot be represented
+        // by the pinned template vocabulary, another LLM pass cannot safely fix it.
+        for gap in &evidence.metadata_scaffold.template_gaps {
+            out.remove(&gap.field);
+        }
+        return out;
     }
     let Ok((headers, rows)) = read_existing_sdrf_table(Path::new(&evidence.existing_sdrf_path))
     else {
@@ -2429,15 +2809,8 @@ fn obviously_invalid_field_value(field: &str, value: &str) -> bool {
             "laser capture",
             "lcm",
             "manual picking",
-            "manual dissection",
-            "microdissection",
-            "microaspirat",
-            "patch clamp",
-            "patch-clamp",
-            "micropipette",
-            "capillary microsampling",
             "nanopots",
-            "droplet",
+            "droplet microfluid",
             "acoustic droplet",
         ]
         .iter()
@@ -2658,7 +3031,12 @@ fn repair_proposal_provenance(
     ) {
         if field != "relation_mode" {
             if let Some(canonical) = canonical_reserved_alias(value) {
-                if value.trim() != canonical {
+                if value.trim().is_empty() {
+                    // Empty strings are a routine structured-output omission, not a
+                    // scientifically meaningful repair. Normalize silently so repair
+                    // counts reflect substantive model/evidence problems.
+                    *value = canonical.to_string();
+                } else if value.trim() != canonical {
                     let original = value.clone();
                     *value = canonical.to_string();
                     issues.push(ValidationIssue {
@@ -2892,6 +3270,98 @@ fn repair_proposal_provenance(
         }
     }
 
+    issues
+}
+
+fn apply_metadata_scaffold_field(
+    field: &str,
+    slot: &mut String,
+    scaffold: &DeterministicMetadataScaffold,
+    proposal_refs: &mut BTreeMap<String, Vec<String>>,
+    issues: &mut Vec<ValidationIssue>,
+) {
+    let Some(value) = scaffold.values.get(field) else {
+        return;
+    };
+    if concrete_proposal_value(slot).is_some() {
+        return;
+    }
+    *slot = value.clone();
+    if let Some(refs) = scaffold.evidence_refs.get(field) {
+        proposal_refs.insert(field.to_string(), refs.clone());
+    }
+    issues.push(ValidationIssue {
+        level: "warning".into(),
+        code: "proposal_field_determined_from_metadata_scaffold".into(),
+        row: 0,
+        column: field.into(),
+        message: format!(
+            "deterministic structured/manuscript evidence supplied '{}' for {}",
+            value, field
+        ),
+    });
+}
+
+fn apply_deterministic_metadata_scaffold(
+    proposal: &mut SdrfProposal,
+    evidence: &DatasetEvidence,
+) -> Vec<ValidationIssue> {
+    let mut issues = Vec::new();
+    apply_metadata_scaffold_field(
+        "organism",
+        &mut proposal.organism,
+        &evidence.metadata_scaffold,
+        &mut proposal.evidence_refs,
+        &mut issues,
+    );
+    apply_metadata_scaffold_field(
+        "instrument",
+        &mut proposal.instrument,
+        &evidence.metadata_scaffold,
+        &mut proposal.evidence_refs,
+        &mut issues,
+    );
+    apply_metadata_scaffold_field(
+        "label",
+        &mut proposal.label,
+        &evidence.metadata_scaffold,
+        &mut proposal.evidence_refs,
+        &mut issues,
+    );
+    apply_metadata_scaffold_field(
+        "proteomics_data_acquisition_method",
+        &mut proposal.proteomics_data_acquisition_method,
+        &evidence.metadata_scaffold,
+        &mut proposal.evidence_refs,
+        &mut issues,
+    );
+    apply_metadata_scaffold_field(
+        "cleavage_agent_details",
+        &mut proposal.cleavage_agent_details,
+        &evidence.metadata_scaffold,
+        &mut proposal.evidence_refs,
+        &mut issues,
+    );
+    apply_metadata_scaffold_field(
+        "single_cell_isolation_method",
+        &mut proposal.single_cell_isolation_method,
+        &evidence.metadata_scaffold,
+        &mut proposal.evidence_refs,
+        &mut issues,
+    );
+
+    for gap in &evidence.metadata_scaffold.template_gaps {
+        issues.push(ValidationIssue {
+            level: "warning".into(),
+            code: "template_vocabulary_gap_supported_method".into(),
+            row: 0,
+            column: gap.field.clone(),
+            message: format!(
+                "evidence supports '{}' but it cannot be represented faithfully by the pinned single-cell template vocabulary: {}",
+                gap.observed_value, gap.reason
+            ),
+        });
+    }
     issues
 }
 
@@ -3860,6 +4330,86 @@ fn validate_draft_with_policy(
     issues
 }
 
+fn validate_incomplete_mapping_scaffold(
+    headers: &[String],
+    rows: &[Vec<String>],
+    evidence: &DatasetEvidence,
+) -> Vec<ValidationIssue> {
+    let mut issues = Vec::new();
+    if rows.is_empty() {
+        issues.push(ValidationIssue {
+            level: "error".into(),
+            code: "no_data_rows".into(),
+            row: 0,
+            column: String::new(),
+            message: "incomplete mapping scaffold contains no repository-file rows".into(),
+        });
+        return issues;
+    }
+    let required_headers = [
+        "source name",
+        "assay name",
+        "technology type",
+        "comment[data file]",
+    ];
+    let index: HashMap<&str, usize> = headers
+        .iter()
+        .enumerate()
+        .map(|(i, h)| (h.as_str(), i))
+        .collect();
+    for header in required_headers {
+        if !index.contains_key(header) {
+            issues.push(ValidationIssue {
+                level: "error".into(),
+                code: "missing_scaffold_column".into(),
+                row: 0,
+                column: header.into(),
+                message: format!(
+                    "mapping scaffold is missing required structural column: {header}"
+                ),
+            });
+        }
+    }
+    for (ri, row) in rows.iter().enumerate() {
+        if row.len() != headers.len() {
+            issues.push(ValidationIssue {
+                level: "error".into(),
+                code: "row_width_mismatch".into(),
+                row: ri + 1,
+                column: String::new(),
+                message: format!("row has {} fields; expected {}", row.len(), headers.len()),
+            });
+        }
+    }
+    let (code, message) = if evidence.study_design.repository_file_mode == "generic_archives_only" {
+        (
+            "repository_archive_contents_mapping_unresolved",
+            format!(
+                "{} generic repository archive/container file(s) must be resolved to canonical acquisitions before SDRF rows can be finalized",
+                evidence.study_design.generic_archive_files
+            ),
+        )
+    } else {
+        (
+            "sample_to_channel_mapping_unresolved",
+            format!(
+                "{} design detected (chemistry='{}', mapping_status='{}'); per-channel/per-sample SDRF rows are intentionally not fabricated",
+                evidence.study_design.relation_mode_hint,
+                evidence.study_design.multiplex_chemistry_hint,
+                evidence.study_design.multiplex_mapping_status
+            ),
+        )
+    };
+    issues.push(ValidationIssue {
+        level: "error".into(),
+        code: code.into(),
+        row: 0,
+        column: SC_CELL_IDENTIFIER.into(),
+        message,
+    });
+    issues
+}
+
 fn validate_draft(
     headers: &[String],
     rows: &[Vec<String>],
@@ -4021,6 +4571,10 @@ async fn annotate_one(opts: &SdrfAnnotateOptions, accession: &str) -> Result<Res
             });
         }
     }
+    provenance_issues.extend(apply_deterministic_metadata_scaffold(
+        &mut proposal,
+        &evidence,
+    ));
     fs::write(&proposal_path, serde_json::to_string_pretty(&proposal)?)?;
     validate_proposal_refs(&proposal, &evidence)?;
     let proposal_repair_count = provenance_issues.len();
@@ -4042,7 +4596,16 @@ async fn annotate_one(opts: &SdrfAnnotateOptions, accession: &str) -> Result<Res
             ),
         });
     }
-    issues.extend(validate_draft(&headers, &rows, &evidence));
+    if !existing
+        && (proposal.relation_mode != "one_cell_per_data_file"
+            || evidence.study_design.repository_file_mode == "generic_archives_only")
+    {
+        issues.extend(validate_incomplete_mapping_scaffold(
+            &headers, &rows, &evidence,
+        ));
+    } else {
+        issues.extend(validate_draft(&headers, &rows, &evidence));
+    }
     write_review(&review_path, &issues)?;
     let errors = issues.iter().filter(|x| x.level == "error").count();
     let locally_valid = errors == 0;
@@ -4056,6 +4619,13 @@ async fn annotate_one(opts: &SdrfAnnotateOptions, accession: &str) -> Result<Res
         "locally_valid_draft"
     } else if proposal.relation_mode != "one_cell_per_data_file" {
         "incomplete_sample_to_file_or_channel_mapping"
+    } else if evidence
+        .metadata_scaffold
+        .template_gaps
+        .iter()
+        .any(|gap| gap.field == "single_cell_isolation_method")
+    {
+        "incomplete_template_isolation_method_gap"
     } else {
         "incomplete_required_metadata"
     };
@@ -4068,6 +4638,7 @@ async fn annotate_one(opts: &SdrfAnnotateOptions, accession: &str) -> Result<Res
         template_url: SINGLE_CELL_TEMPLATE_URL.into(), specification_url: SDRF_SPEC_URL.into(),
         existing_sdrf_present: existing, generation_mode: generation_mode.clone(), relation_mode: proposal.relation_mode.clone(),
         study_design: evidence.study_design.clone(),
+        metadata_scaffold: evidence.metadata_scaffold.clone(),
         raw_file_count: evidence.raw_files.len(), evidence_item_count: evidence.evidence.len(), manuscript_source_count: evidence.manuscript_sources.len(),
         annotation_source_count: evidence.annotation_sources.len(), ollama_model: opts.model.clone(), ollama_used,
         draft_path: draft_path.display().to_string(), proposal_path: proposal_path.display().to_string(), evidence_path: evidence_path.display().to_string(),
@@ -4281,6 +4852,7 @@ fn audit_resolved_one(opts: &SdrfAuditOptions, accession: &str) -> Result<SdrfAu
         existing_sdrf_path: sdrf_path.display().to_string(),
         raw_files,
         study_design: StudyDesignScaffold::default(),
+        metadata_scaffold: DeterministicMetadataScaffold::default(),
         evidence: Vec::new(),
         manuscript_sources: Vec::new(),
         annotation_sources: Vec::new(),
@@ -4674,6 +5246,7 @@ mod tests {
                 category: "RAW".into(),
             }],
             study_design: StudyDesignScaffold::default(),
+            metadata_scaffold: DeterministicMetadataScaffold::default(),
             evidence: vec![],
             manuscript_sources: vec![],
             annotation_sources: vec![],
@@ -4721,6 +5294,7 @@ mod tests {
             files_json_path: String::new(),
             existing_sdrf_path: String::new(),
             study_design: StudyDesignScaffold::default(),
+            metadata_scaffold: DeterministicMetadataScaffold::default(),
             raw_files: vec![RawFile {
                 file_name: "plex01.raw".into(),
                 file_uri: String::new(),
@@ -4760,6 +5334,7 @@ mod tests {
             files_json_path: String::new(),
             existing_sdrf_path: String::new(),
             study_design: StudyDesignScaffold::default(),
+            metadata_scaffold: DeterministicMetadataScaffold::default(),
             raw_files: vec![],
             evidence: vec![],
             manuscript_sources: vec![],
@@ -4780,6 +5355,7 @@ mod tests {
             files_json_path: String::new(),
             existing_sdrf_path: String::new(),
             study_design: StudyDesignScaffold::default(),
+            metadata_scaffold: DeterministicMetadataScaffold::default(),
             raw_files: vec![],
             evidence: vec![],
             manuscript_sources: vec![],
@@ -4805,6 +5381,7 @@ mod tests {
             files_json_path: String::new(),
             existing_sdrf_path: String::new(),
             study_design: StudyDesignScaffold::default(),
+            metadata_scaffold: DeterministicMetadataScaffold::default(),
             raw_files: vec![],
             evidence: vec![EvidenceItem {
                 id: "E0001".into(),
@@ -4839,6 +5416,7 @@ mod tests {
             files_json_path: String::new(),
             existing_sdrf_path: String::new(),
             study_design: StudyDesignScaffold::default(),
+            metadata_scaffold: DeterministicMetadataScaffold::default(),
             raw_files: vec![],
             evidence: vec![],
             manuscript_sources: vec![],
@@ -4948,6 +5526,7 @@ mod tests {
                 category: "RAW".into(),
             }],
             study_design: StudyDesignScaffold::default(),
+            metadata_scaffold: DeterministicMetadataScaffold::default(),
             evidence: vec![],
             manuscript_sources: vec![],
             annotation_sources: vec![],
@@ -4999,6 +5578,7 @@ mod tests {
             files_json_path: String::new(),
             existing_sdrf_path: existing.display().to_string(),
             study_design: StudyDesignScaffold::default(),
+            metadata_scaffold: DeterministicMetadataScaffold::default(),
             raw_files: vec![],
             evidence: vec![],
             manuscript_sources: vec![],
@@ -5056,6 +5636,7 @@ mod tests {
             files_json_path: String::new(),
             existing_sdrf_path: String::new(),
             study_design: StudyDesignScaffold::default(),
+            metadata_scaffold: DeterministicMetadataScaffold::default(),
             raw_files: vec![],
             evidence: vec![],
             manuscript_sources: vec![],
@@ -5081,6 +5662,7 @@ mod tests {
                 category: "RAW".into(),
             }],
             study_design: StudyDesignScaffold::default(),
+            metadata_scaffold: DeterministicMetadataScaffold::default(),
             evidence: vec![],
             manuscript_sources: vec![],
             annotation_sources: vec![],
@@ -5188,6 +5770,7 @@ mod tests {
             files_json_path: String::new(),
             existing_sdrf_path: existing.display().to_string(),
             study_design: StudyDesignScaffold::default(),
+            metadata_scaffold: DeterministicMetadataScaffold::default(),
             raw_files: vec![],
             evidence: vec![],
             manuscript_sources: vec![],
@@ -5233,6 +5816,7 @@ mod tests {
             files_json_path: String::new(),
             existing_sdrf_path: p.display().to_string(),
             study_design: StudyDesignScaffold::default(),
+            metadata_scaffold: DeterministicMetadataScaffold::default(),
             raw_files: vec![RawFile {
                 file_name: "cell1.raw".into(),
                 file_uri: String::new(),
@@ -5291,6 +5875,7 @@ mod tests {
                 category: "RAW".into(),
             }],
             study_design: StudyDesignScaffold::default(),
+            metadata_scaffold: DeterministicMetadataScaffold::default(),
             evidence: vec![],
             manuscript_sources: vec![],
             annotation_sources: vec![],
@@ -5325,6 +5910,7 @@ mod tests {
                 category: "RAW".into(),
             }],
             study_design: StudyDesignScaffold::default(),
+            metadata_scaffold: DeterministicMetadataScaffold::default(),
             evidence: vec![],
             manuscript_sources: vec![],
             annotation_sources: vec![],
@@ -5411,6 +5997,7 @@ mod tests {
                 category: "RAW".into(),
             }],
             study_design: StudyDesignScaffold::default(),
+            metadata_scaffold: DeterministicMetadataScaffold::default(),
             evidence: vec![],
             manuscript_sources: vec![],
             annotation_sources: vec![],
@@ -5545,6 +6132,7 @@ mod tests {
             existing_sdrf_path: String::new(),
             raw_files: vec![],
             study_design: StudyDesignScaffold::default(),
+            metadata_scaffold: DeterministicMetadataScaffold::default(),
             evidence: vec![EvidenceItem {
                 id: "E0001".into(),
                 source_kind: "manuscript_text".into(),
@@ -5583,10 +6171,137 @@ mod tests {
     }
 
     #[test]
-    fn microaspiration_is_allowed_as_single_cell_isolation_evidence() {
-        assert!(!obviously_invalid_field_value(
+    fn microaspiration_is_evidence_relevant_but_not_a_template_value() {
+        let item = EvidenceItem {
+            id: "E0001".into(),
+            source_kind: "manuscript_text".into(),
+            source_label: "methods".into(),
+            text: "A portion of the neuronal soma was collected by patch-clamp guided microaspiration.".into(),
+        };
+        assert!(evidence_relevant_to_field(
+            "single_cell_isolation_method",
+            &item
+        ));
+        assert!(obviously_invalid_field_value(
             "single_cell_isolation_method",
             "patch-clamp guided microaspiration"
         ));
+    }
+
+    #[test]
+    fn manuscript_windows_capture_manual_isolation_methods() {
+        let text = "Preparation of single muscle fibers\n\nFibers were mechanically dissociated using tweezers and individually transferred to standard tubes.\n\nMass spectrometry followed.";
+        let windows = manuscript_keyword_windows(text, 8);
+        assert!(windows
+            .iter()
+            .any(|w| w.to_ascii_lowercase().contains("individually transferred")));
+    }
+
+    #[test]
+    fn deterministic_scaffold_maps_manual_dissection_to_manual_picking() {
+        let evidence = vec![EvidenceItem {
+            id: "E0001".into(),
+            source_kind: "manuscript_text".into(),
+            source_label: "methods isolation".into(),
+            text: "Fibers were mechanically dissociated using tweezers and individually transferred to standard tubes.".into(),
+        }];
+        let design = StudyDesignScaffold {
+            relation_mode_hint: "one_cell_per_data_file".into(),
+            ..Default::default()
+        };
+        let scaffold = infer_deterministic_metadata_scaffold(&evidence, &design);
+        assert_eq!(
+            scaffold
+                .values
+                .get("single_cell_isolation_method")
+                .map(String::as_str),
+            Some("manual picking")
+        );
+        assert!(scaffold.template_gaps.is_empty());
+    }
+
+    #[test]
+    fn deterministic_scaffold_records_patch_clamp_template_gap() {
+        let evidence = vec![EvidenceItem {
+            id: "E0001".into(),
+            source_kind: "manuscript_text".into(),
+            source_label: "methods isolation".into(),
+            text: "Cells were accessed in whole-cell patch-clamp configuration and a portion of the neuronal soma was aspirated into the patch clamp probe.".into(),
+        }];
+        let design = StudyDesignScaffold {
+            relation_mode_hint: "multiplexed_cells_per_data_file".into(),
+            ..Default::default()
+        };
+        let scaffold = infer_deterministic_metadata_scaffold(&evidence, &design);
+        assert!(!scaffold.values.contains_key("single_cell_isolation_method"));
+        assert_eq!(scaffold.template_gaps.len(), 1);
+        assert_eq!(
+            scaffold.template_gaps[0].observed_value,
+            "patch-clamp-guided microaspiration"
+        );
+    }
+
+    #[test]
+    fn multiplex_scaffold_extracts_carrier_channel_hint() {
+        let raw = vec![RawFile {
+            file_name: "plex.raw".into(),
+            file_uri: String::new(),
+            category: "RAW".into(),
+        }];
+        let evidence = vec![EvidenceItem {
+            id: "E0001".into(),
+            source_kind: "manuscript_text".into(),
+            source_label: "methods".into(),
+            text: "Single cells were labeled with TMTpro and 200 carrier cells were assigned to the 126N carrier channel.".into(),
+        }];
+        let design = infer_study_design_scaffold(&raw, &evidence);
+        assert_eq!(design.multiplex_chemistry_hint, "TMTpro");
+        assert!(design.carrier_channel_hints.contains(&"126N".to_string()));
+        assert_eq!(
+            design.multiplex_mapping_status,
+            "channel_role_hints_detected_mapping_unresolved"
+        );
+    }
+
+    #[test]
+    fn incomplete_multiplex_scaffold_has_one_mapping_error_not_row_error_storm() {
+        let proposal = SdrfProposal {
+            relation_mode: "multiplexed_cells_per_data_file".into(),
+            ..Default::default()
+        };
+        let evidence = DatasetEvidence {
+            accession: "PXD999999".into(),
+            project_json_path: String::new(),
+            files_json_path: String::new(),
+            existing_sdrf_path: String::new(),
+            raw_files: vec![
+                RawFile {
+                    file_name: "a.raw".into(),
+                    file_uri: String::new(),
+                    category: "RAW".into(),
+                },
+                RawFile {
+                    file_name: "b.raw".into(),
+                    file_uri: String::new(),
+                    category: "RAW".into(),
+                },
+            ],
+            study_design: StudyDesignScaffold {
+                relation_mode_hint: "multiplexed_cells_per_data_file".into(),
+                multiplex_chemistry_hint: "TMTpro".into(),
+                multiplex_mapping_status: "chemistry_detected_channel_mapping_unresolved".into(),
+                ..Default::default()
+            },
+            metadata_scaffold: DeterministicMetadataScaffold::default(),
+            evidence: vec![],
+            manuscript_sources: vec![],
+            annotation_sources: vec![],
+        };
+        let (headers, rows, _) = draft_rows(&proposal, &evidence).unwrap();
+        let issues = validate_incomplete_mapping_scaffold(&headers, &rows, &evidence);
+        assert_eq!(issues.iter().filter(|x| x.level == "error").count(), 1);
+        assert!(issues
+            .iter()
+            .any(|x| x.code == "sample_to_channel_mapping_unresolved"));
     }
 }
