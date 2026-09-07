@@ -2459,6 +2459,11 @@ fn concrete_table_value(value: &str) -> bool {
     }
 }
 
+fn study_design_has_assertive_relation_hint(design: &StudyDesignScaffold) -> bool {
+    let hint = design.relation_mode_hint.trim();
+    !hint.is_empty() && hint != "uncertain"
+}
+
 fn proposal_target_fields(evidence: &DatasetEvidence) -> BTreeSet<String> {
     let fields = [
         "relation_mode",
@@ -2482,7 +2487,7 @@ fn proposal_target_fields(evidence: &DatasetEvidence) -> BTreeSet<String> {
     ];
     if evidence.existing_sdrf_path.is_empty() {
         let mut out: BTreeSet<String> = fields.iter().map(|x| x.to_string()).collect();
-        if evidence.study_design.relation_mode_hint != "uncertain" {
+        if study_design_has_assertive_relation_hint(&evidence.study_design) {
             out.remove("relation_mode");
         }
         if evidence.study_design.relation_mode_hint == "one_cell_per_data_file" {
@@ -4547,7 +4552,7 @@ async fn annotate_one(opts: &SdrfAnnotateOptions, accession: &str) -> Result<Res
         }
     }
     if evidence.existing_sdrf_path.is_empty()
-        && evidence.study_design.relation_mode_hint != "uncertain"
+        && study_design_has_assertive_relation_hint(&evidence.study_design)
     {
         let hint = evidence.study_design.relation_mode_hint.clone();
         if proposal.relation_mode != hint {
@@ -5345,6 +5350,26 @@ mod tests {
             ..Default::default()
         };
         validate_proposal_refs(&proposal, &evidence).unwrap();
+    }
+
+    #[test]
+    fn blank_study_design_relation_hint_is_non_assertive() {
+        let design = StudyDesignScaffold::default();
+        assert!(!study_design_has_assertive_relation_hint(&design));
+
+        let evidence = DatasetEvidence {
+            accession: "PXD999999".into(),
+            project_json_path: String::new(),
+            files_json_path: String::new(),
+            existing_sdrf_path: String::new(),
+            study_design: design,
+            metadata_scaffold: DeterministicMetadataScaffold::default(),
+            raw_files: vec![],
+            evidence: vec![],
+            manuscript_sources: vec![],
+            annotation_sources: vec![],
+        };
+        assert!(proposal_target_fields(&evidence).contains("relation_mode"));
     }
 
     #[test]
