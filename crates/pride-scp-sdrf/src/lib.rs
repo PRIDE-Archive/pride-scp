@@ -20,7 +20,7 @@ pub const SINGLE_CELL_TEMPLATE_VERSION: &str = "1.0.0";
 pub const SINGLE_CELL_TEMPLATE_URL: &str =
     "https://github.com/bigbio/sdrf-templates/blob/main/single-cell/1.0.0/single-cell.yaml";
 pub const SDRF_SPEC_URL: &str = "https://sdrf.quantms.org/specification.html";
-pub const GENERATOR_VERSION: &str = "pride-scp-sdrf-v0.3.4";
+pub const GENERATOR_VERSION: &str = "pride-scp-sdrf-v0.3.6";
 const MANUSCRIPT_SCAN_MAX_CHARS: usize = 2_000_000;
 const MANUSCRIPT_EVIDENCE_MAX_RESERVED_ITEMS: usize = 24;
 const MANUSCRIPT_EVIDENCE_MAX_RESERVED_CHARS: usize = 12_000;
@@ -1436,16 +1436,43 @@ fn read_manuscript_for_keyword_scan(path: &Path) -> Result<String> {
 }
 
 fn manuscript_keyword_windows(text: &str, max_windows: usize) -> Vec<String> {
-    fn append_matches(paragraphs: &[&str], re: &Regex, limit: usize, out: &mut Vec<String>) {
+    fn char_boundary_at_or_after(text: &str, mut idx: usize, ceiling: usize) -> usize {
+        idx = idx.min(ceiling).min(text.len());
+        while idx < ceiling.min(text.len()) && !text.is_char_boundary(idx) {
+            idx += 1;
+        }
+        idx
+    }
+
+    fn char_boundary_at_or_before(text: &str, mut idx: usize, floor: usize) -> usize {
+        idx = idx.min(text.len());
+        while idx > floor && !text.is_char_boundary(idx) {
+            idx -= 1;
+        }
+        idx
+    }
+
+    fn append_match_contexts(text: &str, re: &Regex, limit: usize, out: &mut Vec<String>) {
         let mut added = 0usize;
-        for (i, p) in paragraphs.iter().enumerate() {
-            if !re.is_match(p) {
+        let mut last_selected_start: Option<usize> = None;
+        for m in re.find_iter(text) {
+            // PDF text extraction frequently produces one giant single-newline block.
+            // Center evidence on the actual regex match instead of clipping the start
+            // of an arbitrarily large "paragraph" and potentially losing the method.
+            if last_selected_start
+                .map(|prev| m.start().saturating_sub(prev) < 700)
+                .unwrap_or(false)
+            {
                 continue;
             }
-            let start = i.saturating_sub(1);
-            let end = (i + 2).min(paragraphs.len());
-            let joined = paragraphs[start..end].join(" ");
-            let clipped: String = joined
+            let rough_start = m.start().saturating_sub(650);
+            let rough_end = (m.end() + 1_150).min(text.len());
+            let start = char_boundary_at_or_after(text, rough_start, m.start());
+            let end = char_boundary_at_or_before(text, rough_end, m.end());
+            if start >= end {
+                continue;
+            }
+            let clipped: String = text[start..end]
                 .split_whitespace()
                 .collect::<Vec<_>>()
                 .join(" ")
@@ -1455,6 +1482,7 @@ fn manuscript_keyword_windows(text: &str, max_windows: usize) -> Vec<String> {
             if !clipped.is_empty() && !out.contains(&clipped) {
                 out.push(clipped);
                 added += 1;
+                last_selected_start = Some(m.start());
             }
             if added >= limit {
                 break;
@@ -1462,12 +1490,11 @@ fn manuscript_keyword_windows(text: &str, max_windows: usize) -> Vec<String> {
         }
     }
 
-    // Prioritize biological sample/isolation evidence. The earlier single-pass
-    // implementation included very broad terms such as `proteom`, so introductory
-    // paragraphs could consume the entire evidence budget before the Methods section
-    // containing the actual single-cell isolation procedure was reached.
+    // Prioritize biological sample/isolation evidence. Match-centered contexts are
+    // intentionally used instead of blank-line paragraphs because normalized PDF
+    // extraction often preserves only single line breaks.
     let isolation = Regex::new(
-        r"(?i)cellenone|facs|flow cytometr|sort(?:ed|ing)?|manual(?:ly)? (?:pick|dissect)|dissect(?:ed|ion)?|tweezer|individual(?:ly)? (?:transferred|isolated|dissected)|single muscle fib(?:er|re)|single oocyte|single blastomere|single neuron|microaspirat|patch[- ]clamp|micropipette|capillary microsampling|laser capture|microdissect|microwell|384[- ]well|96[- ]well|individual wells?|single cells? were (?:placed|deposited|transferred|sorted)|isolated single fibers?|skinned fibers?",
+        r"(?i)cellenone|facs|flow cytometr|sort(?:ed|ing)?|manual(?:ly)? (?:pick|dissect|isolat)|mechanic(?:al|ally) (?:dissociat|isolat)|dissect(?:ed|ion|ing)?|tweezer|individual(?:ly)? (?:transferred|isolated|dissected)|individual fibers? (?:were )?(?:taken|transferred|isolated)|single muscle fib(?:er|re)|single oocyte|single blastomere|single neuron|microaspirat|patch[- ]clamp|micropipette|capillary microsampling|laser capture|microdissect|microwell|384[- ]well|96[- ]well|individual wells?|single cells? were (?:placed|deposited|transferred|sorted)|isolated single fibers?|skinned fibers?",
     )
     .unwrap();
     let sample_design = Regex::new(
@@ -1483,29 +1510,28 @@ fn manuscript_keyword_windows(text: &str, max_windows: usize) -> Vec<String> {
     )
     .unwrap();
 
-    let normalized = text.replace('\r', "\n");
-    let paragraphs: Vec<&str> = normalized.split("\n\n").collect();
+    let normalized = text.replace('\r', "\n").replace('\u{000c}', "\n");
     let mut out = Vec::new();
     let iso_budget = max_windows.min(10);
-    append_matches(&paragraphs, &isolation, iso_budget, &mut out);
+    append_match_contexts(&normalized, &isolation, iso_budget, &mut out);
     if out.len() < max_windows {
-        append_matches(
-            &paragraphs,
+        append_match_contexts(
+            &normalized,
             &sample_design,
             (max_windows - out.len()).min(7),
             &mut out,
         );
     }
     if out.len() < max_windows {
-        append_matches(
-            &paragraphs,
+        append_match_contexts(
+            &normalized,
             &acquisition,
             (max_windows - out.len()).min(5),
             &mut out,
         );
     }
     if out.len() < max_windows {
-        append_matches(&paragraphs, &broad, max_windows - out.len(), &mut out);
+        append_match_contexts(&normalized, &broad, max_windows - out.len(), &mut out);
     }
     out.truncate(max_windows);
     out
@@ -1817,6 +1843,21 @@ fn metadata_scaffold_insert(
     scaffold.evidence_refs.insert(field.to_string(), refs);
 }
 
+fn manual_picking_evidence(hay: &str) -> bool {
+    hay.contains("manual picking")
+        || hay.contains("manually dissect")
+        || hay.contains("manual dissection")
+        || hay.contains("using tweezers")
+        || hay.contains("fine-tipped tweezers")
+        || hay.contains("fine tipped tweezers")
+        || hay.contains("microdissect")
+        || hay.contains("dissect single")
+        || hay.contains("dissected single")
+        || hay.contains("identify and dissect")
+        || (hay.contains("mechanically dissociated") && hay.contains("tweezer"))
+        || (hay.contains("mechanically dissociated") && hay.contains("individually transferred"))
+}
+
 fn infer_deterministic_metadata_scaffold(
     evidence: &[EvidenceItem],
     design: &StudyDesignScaffold,
@@ -1890,7 +1931,7 @@ fn infer_deterministic_metadata_scaffold(
         );
     }
 
-    let isolation_candidates: [(&str, &str, &[&str]); 8] = [
+    let isolation_candidates: [(&str, &str, &[&str]); 7] = [
         (
             "FACS",
             "FACS",
@@ -1914,28 +1955,6 @@ fn infer_deterministic_metadata_scaffold(
             &["acoustic droplet"],
         ),
         ("microfluidics", "microfluidics", &["microfluid"]),
-        (
-            "manual picking",
-            "manual picking",
-            &[
-                "manual picking",
-                "individually transferred",
-                "using tweezers",
-                "manually dissected",
-                "manual dissection",
-                "single fibers were dissected",
-                "single skeletal muscle fibers were dissected",
-                "isolated mechanically",
-                "dissected in cold",
-                "isolated single fibers",
-                "individual fibers were isolated",
-                "individual fibers were taken",
-                "dissect single",
-                "single blastomeres from the embryo",
-                "isolated by microdissection",
-                "microdissect",
-            ],
-        ),
     ];
     let mut isolation_set = false;
     for (_observed, template_value, terms) in isolation_candidates {
@@ -1951,6 +1970,25 @@ fn infer_deterministic_metadata_scaffold(
             );
             isolation_set = true;
             break;
+        }
+    }
+    if !isolation_set {
+        // `manual picking` requires an explicit manual action or instrumentation
+        // cue. A generic repository statement that a sample was "taken" is not
+        // enough to claim a specific isolation protocol.
+        let manual_refs = refs_for_predicate(
+            evidence,
+            "single_cell_isolation_method",
+            manual_picking_evidence,
+        );
+        if !manual_refs.is_empty() {
+            metadata_scaffold_insert(
+                &mut out,
+                "single_cell_isolation_method",
+                "manual picking".to_string(),
+                manual_refs,
+            );
+            isolation_set = true;
         }
     }
     if !isolation_set {
@@ -2857,6 +2895,7 @@ fn evidence_relevant_to_field(field: &str, item: &EvidenceItem) -> bool {
         "single_cell_isolation_method" => &[
             "isolation",
             "isolated",
+            "isolate",
             "sort",
             "sorting",
             "facs",
@@ -2867,6 +2906,8 @@ fn evidence_relevant_to_field(field: &str, item: &EvidenceItem) -> bool {
             "lcm",
             "manual picking",
             "manual dissection",
+            "manually dissect",
+            "manual isolat",
             "microdissect",
             "microaspirat",
             "patch clamp",
@@ -2877,6 +2918,15 @@ fn evidence_relevant_to_field(field: &str, item: &EvidenceItem) -> bool {
             "nanowell",
             "droplet",
             "acoustic droplet",
+            "tweezer",
+            "individually transferred",
+            "individual fibers were transferred",
+            "mechanically dissociated",
+            "mechanically isolated",
+            "single muscle fiber",
+            "single muscle fibre",
+            "single blastomere",
+            "single oocyte",
         ],
         "individual" => &[
             "individual",
@@ -2972,6 +3022,9 @@ fn evidence_relevant_to_field(field: &str, item: &EvidenceItem) -> bool {
         ],
         _ => &[],
     };
+    if field == "single_cell_isolation_method" && manual_picking_evidence(&hay) {
+        return true;
+    }
     terms.iter().any(|t| hay.contains(t))
 }
 
@@ -4649,6 +4702,7 @@ fn validate_incomplete_mapping_scaffold(
     issues
 }
 
+#[cfg(test)]
 fn validate_draft(
     headers: &[String],
     rows: &[Vec<String>],
@@ -6529,6 +6583,92 @@ mod tests {
             "single_cell_isolation_method",
             "patch-clamp guided microaspiration"
         ));
+    }
+
+    #[test]
+    fn manuscript_windows_center_on_keyword_in_single_newline_pdf_text() {
+        let mut text = String::new();
+        for i in 0..2_000 {
+            text.push_str(&format!(
+                "front matter line {i} describing general proteomics\n"
+            ));
+        }
+        text.push_str("Fibers were mechanically dissociated in ice-cold solution using tweezers and individually transferred to standard tubes.\n");
+        for i in 0..500 {
+            text.push_str(&format!("trailing line {i}\n"));
+        }
+        let windows = manuscript_keyword_windows(&text, 8);
+        assert!(windows.iter().any(|x| {
+            let lower = x.to_ascii_lowercase();
+            lower.contains("using tweezers") && lower.contains("individually transferred")
+        }));
+    }
+
+    #[test]
+    fn manual_picking_relevance_gate_accepts_tweezers_and_individual_transfer() {
+        let item = EvidenceItem {
+            id: "E0001".into(),
+            source_kind: "manuscript_text".into(),
+            source_label: "manuscript:paper.txt:window=1".into(),
+            text: "Fibers were mechanically dissociated using tweezers and individually transferred to standard tubes.".into(),
+        };
+        assert!(evidence_relevant_to_field(
+            "single_cell_isolation_method",
+            &item
+        ));
+        let design = StudyDesignScaffold {
+            relation_mode_hint: "one_cell_per_data_file".into(),
+            relation_confidence: "high".into(),
+            ..Default::default()
+        };
+        let scaffold = infer_deterministic_metadata_scaffold(&[item], &design);
+        assert_eq!(
+            scaffold
+                .values
+                .get("single_cell_isolation_method")
+                .map(String::as_str),
+            Some("manual picking")
+        );
+    }
+
+    #[test]
+    fn blastomere_dissection_maps_to_manual_picking() {
+        let item = EvidenceItem {
+            id: "E0001".into(),
+            source_kind: "manuscript_text".into(),
+            source_label: "manuscript:paper.txt:window=1".into(),
+            text: "Using established cell biological tools and protocols, we reproducibly identify and dissect single D11 blastomeres from the embryo.".into(),
+        };
+        let design = StudyDesignScaffold {
+            relation_mode_hint: "one_cell_per_data_file".into(),
+            relation_confidence: "high".into(),
+            ..Default::default()
+        };
+        let scaffold = infer_deterministic_metadata_scaffold(&[item], &design);
+        assert_eq!(
+            scaffold
+                .values
+                .get("single_cell_isolation_method")
+                .map(String::as_str),
+            Some("manual picking")
+        );
+    }
+
+    #[test]
+    fn repository_description_without_manual_action_does_not_claim_manual_picking() {
+        let item = EvidenceItem {
+            id: "E0001".into(),
+            source_kind: "pride_project".into(),
+            source_label: "project.description".into(),
+            text: "Individual fibers were taken from biopsies and analyzed by single fiber proteomics.".into(),
+        };
+        let design = StudyDesignScaffold {
+            relation_mode_hint: "one_cell_per_data_file".into(),
+            relation_confidence: "medium".into(),
+            ..Default::default()
+        };
+        let scaffold = infer_deterministic_metadata_scaffold(&[item], &design);
+        assert!(!scaffold.values.contains_key("single_cell_isolation_method"));
     }
 
     #[test]

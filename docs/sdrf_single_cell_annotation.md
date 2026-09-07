@@ -870,3 +870,35 @@ path and must remain an explicit/manual operation when ordinary text extraction 
 For bounded recovery runs, Stage 03 accepts `--accessions-file` so only the requested
 accessions are re-materialized.  The original publication manifest is never modified;
 a derived manifest is written and supplied to `pride-scp sdrf-annotate`.
+
+## v0.3.6: match-centered manuscript windows and aligned isolation relevance
+
+The v0.3.5 publication-text rescue proved that direct manuscript text reached the SDRF evidence
+packet for four of five residual studies, but the deterministic isolation scaffold still remained
+empty. Two generic issues were responsible:
+
+1. PDF-to-text output often contains long single-newline blocks instead of blank-line-separated
+   paragraphs. The previous keyword-window code could detect a Methods keyword anywhere in such a
+   block, then clip the *start* of the block and lose the actual matched phrase.
+2. The deterministic manual-isolation mapper recognized cues such as `using tweezers` and
+   `individually transferred`, but the field-relevance gate did not consistently recognize the same
+   vocabulary, so valid evidence could be rejected before reaching the mapper.
+
+v0.3.6 centers each manuscript evidence window on the actual regex match and normalizes both CR and
+form-feed separators. It also aligns the isolation relevance vocabulary with the deterministic
+extractor. `manual picking` remains conservative: an explicit manual action/instrument cue such as
+`tweezers`, manual/micro-dissection, or mechanical dissociation plus individual transfer is required.
+A generic statement that a fiber was merely "taken" or "isolated" is not enough to assert a manual
+picking protocol.
+
+The change does not increase the Ollama evidence budget and reuses the v0.3.5 materialized
+publication-text manifest:
+
+```bash
+./scripts/run_gt105_pride_sdrf_isolation_context_rescue.sh
+```
+
+The wrapper prints the deterministic isolation value, evidence refs, manuscript-source counts and up
+to three isolation-relevant manuscript excerpts per accession. This makes it possible to distinguish
+remaining template/evidence limitations from routing or window-extraction failures without another
+broad generator iteration.
