@@ -1660,3 +1660,86 @@ manifest rows whose DOI/PMID matches an accepted quarantine identity are quarant
 being re-added through the local-PDF preservation path.  The local-first reconciler independently
 reapplies the same quarantine and adds local-content hash checks, so the bad publication cannot
 re-enter through either route.
+
+## v0.5.0: bounded external publication recovery for source-sensitive residuals
+
+The real v0.4.9 local-first reconciliation established an explicit corpus state across all 105
+primary PRIDE accessions:
+
+```text
+67 selected local publication content
+31 manifest-metadata-only publication records
+ 6 unresolved local publication states
+ 1 quarantine-only state (PXD069039)
+```
+
+This produced 38 accessions in `external_recovery_needed.txt`, but publication incompleteness is not
+a current SDRF blocker for every one of those datasets.  v0.5.0 therefore does **not** perform a
+blanket 38-accession web sweep.  It derives a source-sensitive residual union from accepted SDRF
+outputs (remaining true multiplex studies, relation/source-recheck cases, and unresolved
+required-metadata cases) and intersects that union with the v0.4.9 external-recovery queue.
+
+`scripts/sdrf_residual_external_publication_recovery.py` then performs bounded external recovery only
+for that intersection.  Recovery order is:
+
+```text
+known DOI / PMID / publication title
+        -> Europe PMC identity lookup
+exact PXD accession
+        -> Europe PMC reverse lookup
+project title
+        -> review-only fallback unless accession/known identifier corroborates the paper
+```
+
+A candidate publication is accepted only when it has a verifiable source identity:
+
+* exact PXD accession in PMC full text plus project-title identity/compatibility; or
+* a known non-quarantined publication DOI/PMID plus compatible project/publication title.
+
+An exact accession string is **not** sufficient when the article is scientifically incompatible with
+the PRIDE project.  Previously accepted quarantine identifiers remain hard blockers.  This preserves
+the PXD069039 safeguard: the corrected Arabidopsis publication cannot become evidence merely because
+its original article text contained the erroneous PXD069039 string.
+
+Accepted Europe-PMC JATS XML and normalized text are cached immediately in the v0.5.0 output, so the
+same article is not downloaded again by a second content-resolution stage.  The recovery stage also
+inventories supplementary-material and external-data links (including Zenodo references) to support a
+later bounded sample/channel-design recovery iteration.
+
+Run:
+
+```bash
+./scripts/run_gt105_pride_sdrf_residual_external_publication_recovery_v050.sh
+```
+
+Expected output root:
+
+```text
+data/sdrf_residual_external_publication_recovery_gt105_pride_v050/
+```
+
+Key outputs:
+
+```text
+source_sensitive_residual_union.txt
+active_external_recovery_queue.txt
+deferred_external_recovery.txt
+publication_recovery/residual_external_publication_recovery_summary.json
+publication_recovery/publication_recovery_candidates.tsv
+publication_recovery/recovered_publications.tsv
+publication_recovery/combined_publication_manifest.tsv
+publication_recovery/publication_supplementary_links.tsv
+publication_recovery/unresolved_after_external_recovery.txt
+residual_multiplex_audit/sdrf_mapping_evidence_audit.tsv
+relation_source_audit/sdrf_mapping_evidence_audit.tsv
+```
+
+The combined publication manifest preserves the v0.4.9 local-first selections and adds only accepted
+external content for active residuals.  v0.5.0 remains non-generative: it reruns the residual
+multiplex and relation/source auditors but does not write SDRF reporter rows or force missing metadata.
+
+The next implementation must be chosen from the real recovered sources.  If a recovered paper exposes
+supplementary design/sample/channel material, recover only those assets and build a source-grounded
+mapping contract.  If a source-limited required-metadata accession gains a trustworthy publication,
+rerun that accession alone through the existing deterministic annotation scaffold.  Do not reopen
+already-solved reporter or isolation architecture lanes.
