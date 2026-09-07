@@ -806,3 +806,21 @@ The helper writes `sdrf_recovery_triage.tsv`, a JSON summary, and one accession 
 
 The triage tool is GT-agnostic; evaluation cohorts may be supplied externally, but no GT metadata is
 used to classify or repair SDRF content.
+
+## v0.3.2: required-metadata rescue and file-role-aware de-novo rows
+
+The accepted v0.3.1 full PRIDE cohort plus the v0.3.1.2 linkage-policy repair left six de-novo accessions in the `incomplete_required_metadata` lane. Review of those studies showed that this lane contained two distinct problems rather than a single generic missing field:
+
+1. Methods/isolation evidence could occur late in a manuscript and be omitted after broad `proteom` keyword windows consumed the evidence budget.
+2. Some deposits contain true single-cell acquisitions alongside few-cell, bulk-equivalent, blank or QC runs. A dataset-wide `one_cell_per_data_file` hint must not force every repository acquisition to `sample type = single cell`.
+
+v0.3.2 therefore:
+
+- selects manuscript evidence in priority order: isolation/sample-handling windows, sample-design windows, acquisition windows, then broad proteomics context;
+- expands conservative synonym mapping for manual dissection/picking (for example fine-tweezer single-fiber dissection and blastomere microdissection);
+- records a template compatibility gap rather than inventing a vocabulary term when evidence supports a microwell-chip transfer procedure that the pinned isolation vocabulary cannot faithfully encode;
+- classifies obvious repository filenames as `single_cell`, `few_cell`, `blank`, `quality_control`, `bulk`, or `unknown`;
+- retains one-row-per-acquisition mapping where appropriate but assigns non-single rows explicit SDRF roles (`study sample`, `empty`, `quality control sample`, `bulk control`) instead of mislabelling them as single cells;
+- records `study_design.file_role_hint_counts` in every audit for transparent review.
+
+This is intentionally a bounded de-novo change. It does not alter resolved external SDRF preservation semantics and does not infer a biological sample role from opaque filenames when no safe pattern is present.

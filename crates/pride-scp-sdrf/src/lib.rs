@@ -20,7 +20,7 @@ pub const SINGLE_CELL_TEMPLATE_VERSION: &str = "1.0.0";
 pub const SINGLE_CELL_TEMPLATE_URL: &str =
     "https://github.com/bigbio/sdrf-templates/blob/main/single-cell/1.0.0/single-cell.yaml";
 pub const SDRF_SPEC_URL: &str = "https://sdrf.quantms.org/specification.html";
-pub const GENERATOR_VERSION: &str = "pride-scp-sdrf-v0.3.1";
+pub const GENERATOR_VERSION: &str = "pride-scp-sdrf-v0.3.2";
 pub const SDRF_SOURCE_RESOLVER_VERSION: &str = "pride-scp-sdrf-source-resolver-v0.1";
 pub const SDRF_AUDITOR_VERSION: &str = "pride-scp-sdrf-auditor-v0.2";
 pub const DEFAULT_OLLAMA_URL: &str = "http://localhost:11434/api/generate";
@@ -265,6 +265,8 @@ struct StudyDesignScaffold {
     reference_channel_hints: Vec<String>,
     #[serde(default)]
     multiplex_mapping_status: String,
+    #[serde(default)]
+    file_role_hint_counts: BTreeMap<String, usize>,
     notes: String,
 }
 
@@ -1423,34 +1425,78 @@ fn read_text_evidence(path: &Path, max_chars: usize) -> Result<String> {
 }
 
 fn manuscript_keyword_windows(text: &str, max_windows: usize) -> Vec<String> {
-    let re = Regex::new(
-        r"(?i)single[- ]cell|single[- ]nucle|single muscle fib(?:er|re)|blastomere|single neuron|cellenone|facs|flow cytometr|sort(?:ed|ing)?|nanopots|tmt|carrier|reference channel|label[- ]free|dia|dda|data[- ]dependent|data[- ]independent|orbitrap|q exactive|tims?tof|astral|trypsin|proteom|isolat(?:e|ed|ion)|dissect(?:ed|ion)?|tweezer|manual pick|microaspirat|patch[- ]clamp|micropipette|capillary microsampling|laser capture|microdissection",
+    fn append_matches(paragraphs: &[&str], re: &Regex, limit: usize, out: &mut Vec<String>) {
+        let mut added = 0usize;
+        for (i, p) in paragraphs.iter().enumerate() {
+            if !re.is_match(p) {
+                continue;
+            }
+            let start = i.saturating_sub(1);
+            let end = (i + 2).min(paragraphs.len());
+            let joined = paragraphs[start..end].join(" ");
+            let clipped: String = joined
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ")
+                .chars()
+                .take(1800)
+                .collect();
+            if !clipped.is_empty() && !out.contains(&clipped) {
+                out.push(clipped);
+                added += 1;
+            }
+            if added >= limit {
+                break;
+            }
+        }
+    }
+
+    // Prioritize biological sample/isolation evidence. The earlier single-pass
+    // implementation included very broad terms such as `proteom`, so introductory
+    // paragraphs could consume the entire evidence budget before the Methods section
+    // containing the actual single-cell isolation procedure was reached.
+    let isolation = Regex::new(
+        r"(?i)cellenone|facs|flow cytometr|sort(?:ed|ing)?|manual(?:ly)? (?:pick|dissect)|dissect(?:ed|ion)?|tweezer|individual(?:ly)? (?:transferred|isolated|dissected)|single muscle fib(?:er|re)|single oocyte|single blastomere|single neuron|microaspirat|patch[- ]clamp|micropipette|capillary microsampling|laser capture|microdissection|microwell|384[- ]well|96[- ]well|individual wells?|single cells? were (?:placed|deposited|transferred|sorted)|isolated single fibers?|skinned fibers?",
     )
     .unwrap();
+    let sample_design = Regex::new(
+        r"(?i)single[- ]cell|single[- ]nucle|few[- ]cell|\b\d{1,4} cells?\b|bulk|blank|quality control|carrier|reference channel|tmt(?:pro)?|itraq|plexdia|label[- ]free",
+    )
+    .unwrap();
+    let acquisition = Regex::new(
+        r"(?i)dia[- ]pasef|data[- ]independent|data[- ]dependent|\bdda\b|\bdia\b|orbitrap|q exactive|tims?tof|astral|trypsin|lys[- ]?c|acquisition|mass spectrom",
+    )
+    .unwrap();
+    let broad = Regex::new(
+        r"(?i)proteom|single[- ]cell|single muscle fib(?:er|re)|blastomere|oocyte|neuron",
+    )
+    .unwrap();
+
     let normalized = text.replace('\r', "\n");
     let paragraphs: Vec<&str> = normalized.split("\n\n").collect();
     let mut out = Vec::new();
-    for (i, p) in paragraphs.iter().enumerate() {
-        if !re.is_match(p) {
-            continue;
-        }
-        let start = i.saturating_sub(1);
-        let end = (i + 2).min(paragraphs.len());
-        let joined = paragraphs[start..end].join(" ");
-        let clipped: String = joined
-            .split_whitespace()
-            .collect::<Vec<_>>()
-            .join(" ")
-            .chars()
-            .take(1800)
-            .collect();
-        if !clipped.is_empty() && !out.contains(&clipped) {
-            out.push(clipped);
-        }
-        if out.len() >= max_windows {
-            break;
-        }
+    let iso_budget = max_windows.min(10);
+    append_matches(&paragraphs, &isolation, iso_budget, &mut out);
+    if out.len() < max_windows {
+        append_matches(
+            &paragraphs,
+            &sample_design,
+            (max_windows - out.len()).min(7),
+            &mut out,
+        );
     }
+    if out.len() < max_windows {
+        append_matches(
+            &paragraphs,
+            &acquisition,
+            (max_windows - out.len()).min(5),
+            &mut out,
+        );
+    }
+    if out.len() < max_windows {
+        append_matches(&paragraphs, &broad, max_windows - out.len(), &mut out);
+    }
+    out.truncate(max_windows);
     out
 }
 
@@ -1555,6 +1601,93 @@ fn file_name_is_generic_archive(name: &str) -> bool {
     [".rar", ".7z", ".zip", ".tar.gz", ".tgz", ".tar"]
         .iter()
         .any(|ext| lower.ends_with(ext))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RawFileRole {
+    SingleCell,
+    FewCell(usize),
+    Blank,
+    QualityControl,
+    Bulk,
+    Unknown,
+}
+
+fn raw_file_role(name: &str) -> RawFileRole {
+    let lower = name.trim().to_ascii_lowercase();
+    let normalized = lower.replace('-', "_").replace('.', "_").replace(' ', "_");
+
+    if ["blank", "buffer", "wash", "empty", "solvent"]
+        .iter()
+        .any(|term| normalized.contains(term))
+    {
+        return RawFileRole::Blank;
+    }
+    if [
+        "quality_control",
+        "qualitycontrol",
+        "_qc_",
+        "qc_",
+        "_qc",
+        "irt",
+        "standard",
+        "std_",
+    ]
+    .iter()
+    .any(|term| normalized.contains(term))
+    {
+        return RawFileRole::QualityControl;
+    }
+
+    let cells = Regex::new(r"(?i)(?:^|[_-])(\d{1,4})(?:[_-]?cells?)(?:[_-]|$)").unwrap();
+    if let Some(cap) = cells.captures(&normalized) {
+        if let Some(n) = cap.get(1).and_then(|m| m.as_str().parse::<usize>().ok()) {
+            if n == 1 {
+                return RawFileRole::SingleCell;
+            }
+            if n > 1 {
+                return RawFileRole::FewCell(n);
+            }
+        }
+    }
+    if ["singlecell", "single_cell", "1cell", "1_cell"]
+        .iter()
+        .any(|term| normalized.contains(term))
+    {
+        return RawFileRole::SingleCell;
+    }
+
+    let amount = Regex::new(r"(?i)(?:^|[_-])\d+(?:p|n)g(?:[_-]|$)").unwrap();
+    if normalized.contains("bulk")
+        || amount.is_match(&normalized)
+        || ["hela_digest", "proteomix", "reference_digest"]
+            .iter()
+            .any(|term| normalized.contains(term))
+    {
+        return RawFileRole::Bulk;
+    }
+    RawFileRole::Unknown
+}
+
+fn raw_file_role_label(role: RawFileRole) -> &'static str {
+    match role {
+        RawFileRole::SingleCell => "single_cell",
+        RawFileRole::FewCell(_) => "few_cell",
+        RawFileRole::Blank => "blank",
+        RawFileRole::QualityControl => "quality_control",
+        RawFileRole::Bulk => "bulk",
+        RawFileRole::Unknown => "unknown",
+    }
+}
+
+fn raw_file_role_counts(raw_files: &[RawFile]) -> BTreeMap<String, usize> {
+    let mut counts = BTreeMap::new();
+    for file in raw_files {
+        *counts
+            .entry(raw_file_role_label(raw_file_role(&file.file_name)).to_string())
+            .or_insert(0) += 1;
+    }
+    counts
 }
 
 fn evidence_refs_containing(evidence: &[EvidenceItem], terms: &[&str]) -> Vec<String> {
@@ -1777,8 +1910,19 @@ fn infer_deterministic_metadata_scaffold(
                 "manual picking",
                 "individually transferred",
                 "using tweezers",
+                "manually dissected",
+                "manual dissection",
+                "single fibers were dissected",
+                "single skeletal muscle fibers were dissected",
+                "isolated mechanically",
+                "dissected in cold",
+                "isolated single fibers",
+                "individual fibers were isolated",
+                "individual fibers were taken",
                 "dissect single",
                 "single blastomeres from the embryo",
+                "isolated by microdissection",
+                "microdissection",
             ],
         ),
     ];
@@ -1813,6 +1957,16 @@ fn infer_deterministic_metadata_scaffold(
             (
                 "capillary microsampling",
                 &["capillary microsampling", "in situ subcellular", "aspirat"] as &[&str],
+            ),
+            (
+                "microwell-chip single-cell transfer",
+                &[
+                    "microwell chip",
+                    "microwell-chip",
+                    "transferring to the microwells",
+                    "transfer to the microwell",
+                    "single cells into microwells",
+                ] as &[&str],
             ),
         ];
         for (observed, terms) in unsupported {
@@ -2023,6 +2177,7 @@ fn infer_study_design_scaffold(
         carrier_channel_hints,
         reference_channel_hints,
         multiplex_mapping_status,
+        file_role_hint_counts: raw_file_role_counts(raw_files),
         notes: note.to_string(),
     }
 }
@@ -3855,7 +4010,7 @@ fn draft_rows(
     let mut rows = Vec::new();
     let one_per_file = proposal.relation_mode == "one_cell_per_data_file";
     let mode = if one_per_file {
-        "generated_one_cell_per_raw_file"
+        "generated_file_role_aware_one_row_per_raw_file"
     } else if evidence.study_design.repository_file_mode == "generic_archives_only" {
         "generated_archive_container_skeleton"
     } else {
@@ -3864,6 +4019,16 @@ fn draft_rows(
     for (i, file) in evidence.raw_files.iter().enumerate() {
         let mut row = vec!["not available".to_string(); headers.len()];
         let stem = safe_identifier_from_file(&file.file_name);
+        let inferred_role = if one_per_file {
+            raw_file_role(&file.file_name)
+        } else {
+            RawFileRole::Unknown
+        };
+        let effective_role = if one_per_file && inferred_role == RawFileRole::Unknown {
+            RawFileRole::SingleCell
+        } else {
+            inferred_role
+        };
         let source = if one_per_file {
             stem.clone()
         } else {
@@ -3966,26 +4131,51 @@ fn draft_rows(
                 reserved_or(&file.file_uri, "not available"),
             );
         }
-        let sample_type = if one_per_file {
-            "single cell".to_string()
+        let (sample_type, isolation, cell_identifier, cells_per_well) = if one_per_file {
+            match effective_role {
+                RawFileRole::SingleCell | RawFileRole::Unknown => (
+                    "single cell".to_string(),
+                    reserved_or(&proposal.single_cell_isolation_method, "not available"),
+                    stem.clone(),
+                    "1".to_string(),
+                ),
+                RawFileRole::FewCell(n) => (
+                    "study sample".to_string(),
+                    concrete_proposal_value(&proposal.single_cell_isolation_method)
+                        .unwrap_or_else(|| "not applicable".to_string()),
+                    "not applicable".to_string(),
+                    n.to_string(),
+                ),
+                RawFileRole::Blank => (
+                    "empty".to_string(),
+                    "not applicable".to_string(),
+                    "empty".to_string(),
+                    "not applicable".to_string(),
+                ),
+                RawFileRole::QualityControl => (
+                    "quality control sample".to_string(),
+                    "not applicable".to_string(),
+                    "not applicable".to_string(),
+                    "not applicable".to_string(),
+                ),
+                RawFileRole::Bulk => (
+                    "bulk control".to_string(),
+                    "not applicable".to_string(),
+                    "not applicable".to_string(),
+                    "not applicable".to_string(),
+                ),
+            }
         } else {
-            reserved_or(&proposal.sample_type, "not available")
+            (
+                reserved_or(&proposal.sample_type, "not available"),
+                reserved_or(&proposal.single_cell_isolation_method, "not available"),
+                "not available".to_string(),
+                reserved_or(&proposal.cells_per_well, "not available"),
+            )
         };
         set(&mut row, SC_SAMPLE_TYPE, sample_type);
-        set(
-            &mut row,
-            SC_ISOLATION_METHOD,
-            reserved_or(&proposal.single_cell_isolation_method, "not available"),
-        );
-        set(
-            &mut row,
-            SC_CELL_IDENTIFIER,
-            if one_per_file {
-                stem
-            } else {
-                "not available".to_string()
-            },
-        );
+        set(&mut row, SC_ISOLATION_METHOD, isolation);
+        set(&mut row, SC_CELL_IDENTIFIER, cell_identifier);
         set(
             &mut row,
             SC_INDIVIDUAL,
@@ -3996,15 +4186,7 @@ fn draft_rows(
             SC_PREP_BATCH,
             reserved_or(&proposal.sample_preparation_batch, "not available"),
         );
-        set(
-            &mut row,
-            SC_CELLS_PER_WELL,
-            if one_per_file {
-                "1".to_string()
-            } else {
-                reserved_or(&proposal.cells_per_well, "not available")
-            },
-        );
+        set(&mut row, SC_CELLS_PER_WELL, cells_per_well);
         set(
             &mut row,
             SC_CARRIER_CHANNEL,
@@ -4142,6 +4324,15 @@ fn row_explicit_non_single_cell_role(index: &HashMap<&str, usize>, row: &[String
     .contains(&sample_type.as_str())
     {
         return true;
+    }
+    if let Some(value) = index
+        .get(SC_CELLS_PER_WELL)
+        .and_then(|&j| row.get(j))
+        .and_then(|v| v.trim().parse::<usize>().ok())
+    {
+        if value > 1 {
+            return true;
+        }
     }
     index
         .get("characteristics[pooled sample]")
@@ -6412,5 +6603,88 @@ mod tests {
         assert!(issues
             .iter()
             .any(|x| x.code == "sample_to_channel_mapping_unresolved"));
+    }
+
+    #[test]
+    fn manuscript_windows_prioritize_methods_over_generic_proteomics_text() {
+        let mut text = String::new();
+        for i in 0..40 {
+            text.push_str(&format!("Proteomics background paragraph {i} discusses proteome depth and mass spectrometry.\n\n"));
+        }
+        text.push_str("Single muscle fibers were manually dissected using tweezers and individually transferred to separate tubes.\n\n");
+        let windows = manuscript_keyword_windows(&text, 24);
+        assert!(windows.iter().any(|w| {
+            let low = w.to_ascii_lowercase();
+            low.contains("manually dissected") && low.contains("tweezers")
+        }));
+    }
+
+    #[test]
+    fn raw_file_roles_distinguish_single_few_cell_blank_qc_and_bulk() {
+        assert_eq!(raw_file_role("run_1cell_rep1.raw"), RawFileRole::SingleCell);
+        assert_eq!(
+            raw_file_role("run_40cells_rep1.raw"),
+            RawFileRole::FewCell(40)
+        );
+        assert_eq!(raw_file_role("Blank03_S2-H12.d.zip"), RawFileRole::Blank);
+        assert_eq!(
+            raw_file_role("plate_QC_01.raw"),
+            RawFileRole::QualityControl
+        );
+        assert_eq!(raw_file_role("HeLa_250pg_rep1.raw"), RawFileRole::Bulk);
+    }
+
+    #[test]
+    fn one_row_per_file_generation_preserves_non_single_file_roles() {
+        let evidence = DatasetEvidence {
+            accession: "PXD999999".into(),
+            project_json_path: String::new(),
+            files_json_path: String::new(),
+            existing_sdrf_path: String::new(),
+            raw_files: vec![
+                RawFile {
+                    file_name: "sample_1cell.raw".into(),
+                    file_uri: String::new(),
+                    category: "RAW".into(),
+                },
+                RawFile {
+                    file_name: "sample_40cells.raw".into(),
+                    file_uri: String::new(),
+                    category: "RAW".into(),
+                },
+                RawFile {
+                    file_name: "Blank01.raw".into(),
+                    file_uri: String::new(),
+                    category: "RAW".into(),
+                },
+                RawFile {
+                    file_name: "HeLa_250pg.raw".into(),
+                    file_uri: String::new(),
+                    category: "RAW".into(),
+                },
+            ],
+            study_design: StudyDesignScaffold::default(),
+            metadata_scaffold: DeterministicMetadataScaffold::default(),
+            evidence: vec![],
+            manuscript_sources: vec![],
+            annotation_sources: vec![],
+        };
+        let proposal = SdrfProposal {
+            relation_mode: "one_cell_per_data_file".into(),
+            single_cell_isolation_method: "cellenONE".into(),
+            ..Default::default()
+        };
+        let (headers, rows, mode) = draft_rows(&proposal, &evidence).unwrap();
+        assert_eq!(mode, "generated_file_role_aware_one_row_per_raw_file");
+        let idx = |name: &str| header_first_index(&headers, name).unwrap();
+        assert_eq!(rows[0][idx(SC_SAMPLE_TYPE)], "single cell");
+        assert_eq!(rows[0][idx(SC_CELLS_PER_WELL)], "1");
+        assert_eq!(rows[1][idx(SC_SAMPLE_TYPE)], "study sample");
+        assert_eq!(rows[1][idx(SC_CELLS_PER_WELL)], "40");
+        assert_eq!(rows[1][idx(SC_CELL_IDENTIFIER)], "not applicable");
+        assert_eq!(rows[2][idx(SC_SAMPLE_TYPE)], "empty");
+        assert_eq!(rows[2][idx(SC_ISOLATION_METHOD)], "not applicable");
+        assert_eq!(rows[3][idx(SC_SAMPLE_TYPE)], "bulk control");
+        assert_eq!(rows[3][idx(SC_ISOLATION_METHOD)], "not applicable");
     }
 }
