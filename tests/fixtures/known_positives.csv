@@ -1,0 +1,4 @@
+pxd_accession,dataset_title,contains_true_single_cell_ms
+PXD900001,Explicit SCP fixture,yes
+PXD900003,File-manifest-only SCP fixture,yes
+PXD900004,Adjacent benchmark fixture,no
