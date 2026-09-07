@@ -1321,3 +1321,79 @@ deposited design workbook (or another public source) before repository scope is 
 addition, the publication-supported sampling method is patch-clamp-guided microaspiration and the
 pinned single-cell 1.0.0 isolation-method vocabulary has no faithful value for that method.  Do not
 map it to an unrelated allowed isolation term merely to obtain a green validator result.
+
+## v0.4.5: close PXD028040 repository RAW scope without inventing cell identities
+
+The real v0.4.4 run proved the nine-row single-neuron reconstruction but intentionally remained
+repository-scope incomplete because PXD028040 contains seven additional RAW acquisitions.  The
+same deposited workbook resolves those seven rows explicitly by acquisition date + `SCxx` key:
+
+- three rows describe `100 pg of protein digest (diluted whole tissue)` with no explicit reporter
+  assignment in the workbook row; and
+- four rows describe `100 pg of protein digest (diluted whole tissue, tagged with TMT 128)` mixed
+  with `10 ng of protein digest (diluted whole tissue tagged with TMT 131)`.
+
+These rows are method-development/reference material rather than the biological DA-neuron branch.
+They must therefore not inherit `dopaminergic neuron`, a single-cell isolation method, an individual
+identifier, or a cell identifier from the single-neuron proposal.
+
+`scripts/sdrf_reporter_full_design_manifest.py` extends the accepted v0.4.4 manifest to all 16 RAWs.
+Membership is still determined only by the deposited workbook and a unique date+SC run key; filename
+terms do not create a mapping.  The seven pre-single-neuron rows are serialized conservatively as
+`study sample` rows with:
+
+```text
+cell identifier       = not applicable
+biological replicate  = not applicable
+cells per well        = not applicable
+technical replicate   = 1
+```
+
+The `technical replicate=1` value is a structural single-measurement value for each unique source
+alias; the manifest does not invent an unsupported replicate grouping for these development rows.
+The three workbook rows with no explicit reporter assignment retain `comment[label]=not available`
+and `comment[carrier channel]=not applicable`.  The four rows with explicit reporter assignments use
+`TMT128` and `TMT131` exactly as recorded by the workbook.
+
+The Rust explicit-manifest loader now accepts only the two bounded row classes required by this
+source:
+
+```text
+single cell
+study sample  (explicit non-single row with cell identifier/cells-per-well = not applicable)
+```
+
+Single-cell rows keep the stricter requirements from v0.4.4: numeric biological replicate/cell
+count and explicit isobaric carrier.  Non-single study rows must use `not applicable` for biological
+replicate, cells per well, and cell identifier.  Isobaric labels still require an explicit carrier;
+reserved carrier values are allowed only when the row has no explicit isobaric label.
+
+When serializing an explicit non-single row, Rust deliberately sets cell type, single-cell isolation,
+individual, and sample-preparation batch to `not applicable` rather than leaking global single-cell
+metadata into whole-tissue material.  `row_explicit_non_single_cell_role()` recognizes this bounded
+`study sample` form so the local validator does not demand a single-cell isolation method for those
+rows.
+
+Run:
+
+```bash
+./scripts/run_gt105_pride_sdrf_full_repository_mapping_v045.sh
+```
+
+Acceptance requires:
+
+- 16 explicit manifest rows and 16 generated SDRF rows;
+- 9 `single cell` rows preserving the accepted 3-neuron x 3-technical-replicate architecture;
+- 7 non-single `study sample` whole-tissue rows;
+- unique coverage of every PRIDE RAW acquisition;
+- no `explicit_row_mapping_repository_scope_incomplete`;
+- no `sample_to_channel_mapping_unresolved`;
+- no `data_file_not_in_pride_raw_inventory`; and
+- no validation errors other than the nine expected `single_cell_isolation_unresolved` errors for
+  the real patch-clamp microaspiration method that the pinned single-cell 1.0.0 isolation vocabulary
+  cannot faithfully encode.
+
+If these criteria pass, PXD028040 should move out of the reporter/file-mapping lane and into a
+narrow template-vocabulary exception state with completeness
+`incomplete_template_isolation_method_gap`.  Do not substitute `manual picking`, FACS, or another
+allowed isolation value merely to mark the accession locally valid.

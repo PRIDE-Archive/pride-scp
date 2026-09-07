@@ -20,7 +20,7 @@ pub const SINGLE_CELL_TEMPLATE_VERSION: &str = "1.0.0";
 pub const SINGLE_CELL_TEMPLATE_URL: &str =
     "https://github.com/bigbio/sdrf-templates/blob/main/single-cell/1.0.0/single-cell.yaml";
 pub const SDRF_SPEC_URL: &str = "https://sdrf.quantms.org/specification.html";
-pub const GENERATOR_VERSION: &str = "pride-scp-sdrf-v0.4.4";
+pub const GENERATOR_VERSION: &str = "pride-scp-sdrf-v0.4.5";
 const MANUSCRIPT_SCAN_MAX_CHARS: usize = 2_000_000;
 const MANUSCRIPT_EVIDENCE_MAX_RESERVED_ITEMS: usize = 24;
 const MANUSCRIPT_EVIDENCE_MAX_RESERVED_CHARS: usize = 12_000;
@@ -4253,6 +4253,10 @@ fn draft_rows_from_explicit_mappings(
     };
     let mut rows = Vec::with_capacity(mappings.len());
     for mapping in mappings {
+        let single_cell_row = mapping
+            .sample_type
+            .trim()
+            .eq_ignore_ascii_case("single cell");
         let file = evidence
             .raw_files
             .iter()
@@ -4284,7 +4288,11 @@ fn draft_rows_from_explicit_mappings(
         set(
             &mut row,
             "characteristics[cell type]",
-            reserved_or(&proposal.cell_type, "not available"),
+            if single_cell_row {
+                reserved_or(&proposal.cell_type, "not available")
+            } else {
+                "not applicable".to_string()
+            },
         );
         set(
             &mut row,
@@ -4345,7 +4353,11 @@ fn draft_rows_from_explicit_mappings(
         set(
             &mut row,
             SC_ISOLATION_METHOD,
-            reserved_or(&proposal.single_cell_isolation_method, "not available"),
+            if single_cell_row {
+                reserved_or(&proposal.single_cell_isolation_method, "not available")
+            } else {
+                "not applicable".to_string()
+            },
         );
         set(
             &mut row,
@@ -4355,12 +4367,20 @@ fn draft_rows_from_explicit_mappings(
         set(
             &mut row,
             SC_INDIVIDUAL,
-            reserved_or(&proposal.individual, "not available"),
+            if single_cell_row {
+                reserved_or(&proposal.individual, "not available")
+            } else {
+                "not applicable".to_string()
+            },
         );
         set(
             &mut row,
             SC_PREP_BATCH,
-            reserved_or(&proposal.sample_preparation_batch, "not available"),
+            if single_cell_row {
+                reserved_or(&proposal.sample_preparation_batch, "not available")
+            } else {
+                "not applicable".to_string()
+            },
         );
         set(&mut row, SC_CELLS_PER_WELL, mapping.cells_per_well.clone());
         set(
@@ -4710,7 +4730,7 @@ fn load_explicit_row_mappings(
         }
         if !seen_raw.insert(raw_key) {
             bail!(
-                "explicit row mapping {} assigns more than one biological row to RAW {} under the single-analytical-channel contract",
+                "explicit row mapping {} assigns more than one row to RAW {}",
                 accession,
                 row.raw_file
             );
@@ -4731,41 +4751,129 @@ fn load_explicit_row_mappings(
                 row.mapping_key
             );
         }
-        if !cell_id.is_match(row.source_name.trim())
-            || !cell_id.is_match(row.cell_identifier.trim())
-        {
+        let sample_type = row.sample_type.trim().to_ascii_lowercase();
+        let single_cell_row = sample_type == "single cell";
+        let non_single_study_row = sample_type == "study sample";
+        if !single_cell_row && !non_single_study_row {
+            bail!(
+                "explicit row mapping {} RAW {} uses unsupported sample_type for the bounded manifest contract: {}",
+                accession,
+                row.raw_file,
+                row.sample_type
+            );
+        }
+        let cell_identifier_ok = if single_cell_row {
+            cell_id.is_match(row.cell_identifier.trim())
+        } else {
+            row.cell_identifier
+                .trim()
+                .eq_ignore_ascii_case("not applicable")
+        };
+        if !cell_id.is_match(row.source_name.trim()) || !cell_identifier_ok {
             bail!(
                 "explicit row mapping {} RAW {} has non-template-safe source/cell identifier",
                 accession,
                 row.raw_file
             );
         }
-        for (field, value) in [
-            ("biological_replicate", row.biological_replicate.as_str()),
-            ("technical_replicate", row.technical_replicate.as_str()),
-            ("cells_per_well", row.cells_per_well.as_str()),
-        ] {
-            if value.trim().is_empty() || !value.trim().chars().all(|c| c.is_ascii_digit()) {
-                bail!(
-                    "explicit row mapping {} RAW {} requires numeric {}: {}",
-                    accession,
-                    row.raw_file,
-                    field,
-                    value
-                );
-            }
-        }
-        if row.sample_type.trim() != "single cell" {
+        if row.technical_replicate.trim().is_empty()
+            || !row
+                .technical_replicate
+                .trim()
+                .chars()
+                .all(|c| c.is_ascii_digit())
+        {
             bail!(
-                "explicit row mapping {} RAW {} is outside the narrow single-cell manifest contract: sample_type={}",
+                "explicit row mapping {} RAW {} requires numeric technical_replicate: {}",
                 accession,
                 row.raw_file,
-                row.sample_type
+                row.technical_replicate
+            );
+        }
+        if single_cell_row {
+            for (field, value) in [
+                ("biological_replicate", row.biological_replicate.as_str()),
+                ("cells_per_well", row.cells_per_well.as_str()),
+            ] {
+                if value.trim().is_empty() || !value.trim().chars().all(|c| c.is_ascii_digit()) {
+                    bail!(
+                        "explicit row mapping {} RAW {} requires numeric {} for a single-cell row: {}",
+                        accession,
+                        row.raw_file,
+                        field,
+                        value
+                    );
+                }
+            }
+        } else {
+            for (field, value) in [
+                ("biological_replicate", row.biological_replicate.as_str()),
+                ("cells_per_well", row.cells_per_well.as_str()),
+            ] {
+                if !value.trim().eq_ignore_ascii_case("not applicable") {
+                    bail!(
+                        "explicit row mapping {} RAW {} requires '{}'='not applicable' for a non-single-cell study row: {}",
+                        accession,
+                        row.raw_file,
+                        field,
+                        value
+                    );
+                }
+            }
+        }
+        if single_cell_row && row.label.trim().is_empty() {
+            bail!(
+                "explicit row mapping {} RAW {} requires an explicit analytical label",
+                accession,
+                row.raw_file
             );
         }
         if row.label.trim().is_empty() || row.carrier_channel.trim().is_empty() {
             bail!(
-                "explicit row mapping {} RAW {} requires explicit analytical label and carrier channel",
+                "explicit row mapping {} RAW {} requires non-empty label/carrier fields (reserved values are allowed for non-single rows)",
+                accession,
+                row.raw_file
+            );
+        }
+        let is_isobaric = {
+            let label = row.label.to_ascii_lowercase();
+            label.contains("tmt") || label.contains("itraq") || label.contains("isobaric")
+        };
+        if is_isobaric
+            && (row
+                .carrier_channel
+                .trim()
+                .eq_ignore_ascii_case("not applicable")
+                || row
+                    .carrier_channel
+                    .trim()
+                    .eq_ignore_ascii_case("not available"))
+        {
+            bail!(
+                "explicit row mapping {} RAW {} uses an isobaric analytical label without an explicit carrier channel",
+                accession,
+                row.raw_file
+            );
+        }
+        if single_cell_row
+            && (row
+                .carrier_channel
+                .trim()
+                .eq_ignore_ascii_case("not applicable")
+                || row
+                    .carrier_channel
+                    .trim()
+                    .eq_ignore_ascii_case("not available"))
+        {
+            bail!(
+                "explicit row mapping {} RAW {} requires an explicit carrier channel under the single-analytical-channel contract",
+                accession,
+                row.raw_file
+            );
+        }
+        if row.reference_channel.trim().is_empty() {
+            bail!(
+                "explicit row mapping {} RAW {} requires an explicit or reserved reference-channel value",
                 accession,
                 row.raw_file
             );
@@ -4859,6 +4967,21 @@ fn row_explicit_non_single_cell_role(index: &HashMap<&str, usize>, row: &[String
     .contains(&sample_type.as_str())
     {
         return true;
+    }
+    if sample_type == "study sample" {
+        let cells_not_applicable = index
+            .get(SC_CELLS_PER_WELL)
+            .and_then(|&j| row.get(j))
+            .map(|v| v.trim().eq_ignore_ascii_case("not applicable"))
+            .unwrap_or(false);
+        let cell_identifier_not_applicable = index
+            .get(SC_CELL_IDENTIFIER)
+            .and_then(|&j| row.get(j))
+            .map(|v| v.trim().eq_ignore_ascii_case("not applicable"))
+            .unwrap_or(false);
+        if cells_not_applicable && cell_identifier_not_applicable {
+            return true;
+        }
     }
     if let Some(value) = index
         .get(SC_CELLS_PER_WELL)
@@ -5387,7 +5510,7 @@ async fn annotate_one(opts: &SdrfAnnotateOptions, accession: &str) -> Result<Res
             row: 0,
             column: "comment[data file]".into(),
             message: format!(
-                "serialized {} source-grounded biological row(s) from explicit mapping manifest {} (refs: {})",
+                "serialized {} source-grounded row(s) from explicit mapping manifest {} (refs: {})",
                 explicit_mappings.len(),
                 opts.explicit_row_mapping_manifest
                     .as_ref()
@@ -6216,6 +6339,101 @@ mod tests {
         assert_eq!(rows[1][at("comment[technical replicate]")], "2");
         assert_eq!(rows[0][at("comment[label]")], "TMT128");
         assert_eq!(rows[0][at(SC_CARRIER_CHANNEL)], "TMT131");
+        let issues = validate_draft(&headers, &rows, &evidence);
+        assert!(issues.iter().all(|x| x.level != "error"), "{issues:?}");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn explicit_source_grounded_manifest_serializes_non_single_study_rows_without_cell_metadata_leakage(
+    ) {
+        let evidence = DatasetEvidence {
+            accession: "PXD028040".into(),
+            project_json_path: String::new(),
+            files_json_path: String::new(),
+            existing_sdrf_path: String::new(),
+            raw_files: vec![
+                RawFile {
+                    file_name: "2018-08-08_SC02_reference.RAW".into(),
+                    file_uri: "ftp://example/2018-08-08_SC02_reference.RAW".into(),
+                    category: "RAW".into(),
+                },
+                RawFile {
+                    file_name: "2018-08-15_SC02_tmt_reference.RAW".into(),
+                    file_uri: "ftp://example/2018-08-15_SC02_tmt_reference.RAW".into(),
+                    category: "RAW".into(),
+                },
+                RawFile {
+                    file_name: "2018-08-27_SC02.RAW".into(),
+                    file_uri: "ftp://example/2018-08-27_SC02.RAW".into(),
+                    category: "RAW".into(),
+                },
+            ],
+            study_design: StudyDesignScaffold::default(),
+            metadata_scaffold: DeterministicMetadataScaffold::default(),
+            evidence: vec![],
+            manuscript_sources: vec![],
+            annotation_sources: vec![],
+        };
+        let root = tmp();
+        fs::create_dir_all(&root).unwrap();
+        let manifest = root.join("mapping.tsv");
+        fs::write(
+            &manifest,
+            concat!(
+                "accession\traw_file\tsource_name\tcell_identifier\tbiological_replicate\ttechnical_replicate\tsample_type\tcells_per_well\tlabel\tcarrier_channel\treference_channel\tdesign_source\tdesign_ref\tmapping_key\tmapping_confidence\n",
+                "PXD028040\t2018-08-08_SC02_reference.RAW\twhole_tissue_digest_2018_08_08_SC02\tnot applicable\tnot applicable\t1\tstudy sample\tnot applicable\tnot available\tnot applicable\tnot applicable\tChoi_design.xlsx\tSheet2:row6\tdate_sc_run_key\thigh\n",
+                "PXD028040\t2018-08-15_SC02_tmt_reference.RAW\twhole_tissue_digest_2018_08_15_SC02\tnot applicable\tnot applicable\t1\tstudy sample\tnot applicable\tTMT128\tTMT131\tnot applicable\tChoi_design.xlsx\tSheet2:row9\tdate_sc_run_key\thigh\n",
+                "PXD028040\t2018-08-27_SC02.RAW\tDA_neuron_1\tDA_neuron_1\t1\t1\tsingle cell\t1\tTMT128\tTMT131\tnot applicable\tChoi_design.xlsx\tSheet2:row15\tdate_sc_run_key\thigh\n"
+            ),
+        )
+        .unwrap();
+        let mappings =
+            load_explicit_row_mappings(&manifest, "PXD028040", &evidence.raw_files).unwrap();
+        assert_eq!(mappings.len(), 3);
+        let proposal = SdrfProposal {
+            relation_mode: "one_cell_per_data_file".into(),
+            organism: "Mus musculus".into(),
+            organism_part: "substantia nigra pars compacta".into(),
+            disease: "normal".into(),
+            cell_type: "dopaminergic neuron".into(),
+            sample_type: "single cell".into(),
+            single_cell_isolation_method: "manual picking".into(),
+            individual: "mouse_1".into(),
+            sample_preparation_batch: "batch_1".into(),
+            cells_per_well: "1".into(),
+            proteomics_data_acquisition_method: "data-dependent acquisition".into(),
+            label: "TMT128".into(),
+            instrument: "Orbitrap".into(),
+            cleavage_agent_details: "trypsin".into(),
+            fraction_identifier: "1".into(),
+            technical_replicate: "1".into(),
+            carrier_channel: "TMT131".into(),
+            reference_channel: "not applicable".into(),
+            ..Default::default()
+        };
+        let (headers, rows, _) =
+            draft_rows_with_explicit_mappings(&proposal, &evidence, &mappings).unwrap();
+        let at = |name: &str| headers.iter().position(|h| h == name).unwrap();
+        for row in &rows[..2] {
+            assert_eq!(row[at(SC_SAMPLE_TYPE)], "study sample");
+            assert_eq!(row[at("characteristics[cell type]")], "not applicable");
+            assert_eq!(row[at(SC_ISOLATION_METHOD)], "not applicable");
+            assert_eq!(row[at(SC_CELL_IDENTIFIER)], "not applicable");
+            assert_eq!(row[at(SC_INDIVIDUAL)], "not applicable");
+            assert_eq!(row[at(SC_PREP_BATCH)], "not applicable");
+            assert_eq!(row[at(SC_CELLS_PER_WELL)], "not applicable");
+        }
+        assert_eq!(rows[0][at("comment[label]")], "not available");
+        assert_eq!(rows[0][at(SC_CARRIER_CHANNEL)], "not applicable");
+        assert_eq!(rows[1][at("comment[label]")], "TMT128");
+        assert_eq!(rows[1][at(SC_CARRIER_CHANNEL)], "TMT131");
+        assert_eq!(rows[2][at(SC_SAMPLE_TYPE)], "single cell");
+        assert_eq!(
+            rows[2][at("characteristics[cell type]")],
+            "dopaminergic neuron"
+        );
+        assert_eq!(rows[2][at(SC_ISOLATION_METHOD)], "manual picking");
         let issues = validate_draft(&headers, &rows, &evidence);
         assert!(issues.iter().all(|x| x.level != "error"), "{issues:?}");
         let _ = fs::remove_dir_all(root);
