@@ -20,7 +20,8 @@ pub const SINGLE_CELL_TEMPLATE_VERSION: &str = "1.0.0";
 pub const SINGLE_CELL_TEMPLATE_URL: &str =
     "https://github.com/bigbio/sdrf-templates/blob/main/single-cell/1.0.0/single-cell.yaml";
 pub const SDRF_SPEC_URL: &str = "https://sdrf.quantms.org/specification.html";
-pub const GENERATOR_VERSION: &str = "pride-scp-sdrf-v0.3.2";
+pub const GENERATOR_VERSION: &str = "pride-scp-sdrf-v0.3.3";
+const MANUSCRIPT_SCAN_MAX_CHARS: usize = 2_000_000;
 pub const SDRF_SOURCE_RESOLVER_VERSION: &str = "pride-scp-sdrf-source-resolver-v0.1";
 pub const SDRF_AUDITOR_VERSION: &str = "pride-scp-sdrf-auditor-v0.2";
 pub const DEFAULT_OLLAMA_URL: &str = "http://localhost:11434/api/generate";
@@ -1424,6 +1425,14 @@ fn read_text_evidence(path: &Path, max_chars: usize) -> Result<String> {
     Ok(text.chars().take(max_chars).collect())
 }
 
+fn read_manuscript_for_keyword_scan(path: &Path) -> Result<String> {
+    // Source scanning and prompt/evidence budgets are intentionally separate.
+    // The evidence budget limits what reaches Ollama, but must not prevent late
+    // Methods sections from being searched for deterministic metadata. A 2M-char
+    // cap remains bounded while covering normal extracted journal full text.
+    read_text_evidence(path, MANUSCRIPT_SCAN_MAX_CHARS)
+}
+
 fn manuscript_keyword_windows(text: &str, max_windows: usize) -> Vec<String> {
     fn append_matches(paragraphs: &[&str], re: &Regex, limit: usize, out: &mut Vec<String>) {
         let mut added = 0usize;
@@ -1456,7 +1465,7 @@ fn manuscript_keyword_windows(text: &str, max_windows: usize) -> Vec<String> {
     // paragraphs could consume the entire evidence budget before the Methods section
     // containing the actual single-cell isolation procedure was reached.
     let isolation = Regex::new(
-        r"(?i)cellenone|facs|flow cytometr|sort(?:ed|ing)?|manual(?:ly)? (?:pick|dissect)|dissect(?:ed|ion)?|tweezer|individual(?:ly)? (?:transferred|isolated|dissected)|single muscle fib(?:er|re)|single oocyte|single blastomere|single neuron|microaspirat|patch[- ]clamp|micropipette|capillary microsampling|laser capture|microdissection|microwell|384[- ]well|96[- ]well|individual wells?|single cells? were (?:placed|deposited|transferred|sorted)|isolated single fibers?|skinned fibers?",
+        r"(?i)cellenone|facs|flow cytometr|sort(?:ed|ing)?|manual(?:ly)? (?:pick|dissect)|dissect(?:ed|ion)?|tweezer|individual(?:ly)? (?:transferred|isolated|dissected)|single muscle fib(?:er|re)|single oocyte|single blastomere|single neuron|microaspirat|patch[- ]clamp|micropipette|capillary microsampling|laser capture|microdissect|microwell|384[- ]well|96[- ]well|individual wells?|single cells? were (?:placed|deposited|transferred|sorted)|isolated single fibers?|skinned fibers?",
     )
     .unwrap();
     let sample_design = Regex::new(
@@ -1922,7 +1931,7 @@ fn infer_deterministic_metadata_scaffold(
                 "dissect single",
                 "single blastomeres from the embryo",
                 "isolated by microdissection",
-                "microdissection",
+                "microdissect",
             ],
         ),
     ];
@@ -2322,7 +2331,7 @@ fn build_evidence(opts: &SdrfAnnotateOptions, accession: &str) -> Result<Dataset
         if evidence.len() >= opts.max_evidence_items {
             break;
         }
-        match read_text_evidence(&path, opts.max_evidence_chars.min(80_000)) {
+        match read_manuscript_for_keyword_scan(&path) {
             Ok(text) => {
                 manuscript_sources.push(path.display().to_string());
                 for (i, window) in manuscript_keyword_windows(&text, 24)
@@ -2824,7 +2833,7 @@ fn evidence_relevant_to_field(field: &str, item: &EvidenceItem) -> bool {
             "lcm",
             "manual picking",
             "manual dissection",
-            "microdissection",
+            "microdissect",
             "microaspirat",
             "patch clamp",
             "patch-clamp",
@@ -6616,6 +6625,35 @@ mod tests {
         assert!(windows.iter().any(|w| {
             let low = w.to_ascii_lowercase();
             low.contains("manually dissected") && low.contains("tweezers")
+        }));
+    }
+
+    #[test]
+    fn manuscript_scan_finds_isolation_after_large_front_matter() {
+        let path = std::env::temp_dir().join(format!(
+            "pride_scp_sdrf_late_methods_{}_{}.txt",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let mut text = String::new();
+        for _ in 0..7000 {
+            text.push_str(
+                "Background proteomics benchmarking paragraph without isolation details.\n\n",
+            );
+        }
+        text.push_str("Methods\n\nSingle muscle fibers were mechanically dissociated using tweezers and individually transferred to separate tubes.\n");
+        std::fs::write(&path, text).unwrap();
+
+        let scanned = read_manuscript_for_keyword_scan(&path).unwrap();
+        let windows = manuscript_keyword_windows(&scanned, 24);
+        let _ = std::fs::remove_file(&path);
+
+        assert!(windows.iter().any(|w| {
+            let lower = w.to_ascii_lowercase();
+            lower.contains("using tweezers") && lower.contains("individually transferred")
         }));
     }
 

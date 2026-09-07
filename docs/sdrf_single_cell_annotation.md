@@ -824,3 +824,25 @@ v0.3.2 therefore:
 - records `study_design.file_role_hint_counts` in every audit for transparent review.
 
 This is intentionally a bounded de-novo change. It does not alter resolved external SDRF preservation semantics and does not infer a biological sample role from opaque filenames when no safe pattern is present.
+
+## v0.3.3: full-manuscript deterministic metadata scan
+
+The v0.3.2 required-metadata rescue exposed a source-selection bug: manuscript keyword windows were prioritized correctly, but the manuscript reader was still truncated using the same `--max-evidence-chars` budget that limits the final evidence packet sent to Ollama. As a result, late Methods sections could never be searched when they occurred after the first ~60k characters of extracted full text.
+
+v0.3.3 separates **source scanning** from **prompt/evidence budgeting**:
+
+- extracted manuscript text is scanned up to a bounded 2,000,000 characters;
+- isolation/sample-design/acquisition keyword windows are selected from that larger source view;
+- only the selected windows enter the normal bounded evidence packet;
+- `--max-evidence-items` and `--max-evidence-chars` still bound Ollama input and serialized evidence;
+- direct PDF parsing remains out of scope; upstream extracted manuscript text remains authoritative.
+
+This change is designed to recover late Methods evidence such as manual/tweezer single-fiber isolation, blastomere microdissection, or CellenONE cell sorting without increasing the small-LLM context window. It does not relax provenance rules and does not convert an unsupported real isolation procedure into a false template vocabulary value.
+
+Run the residual required-metadata lane with:
+
+```bash
+./scripts/run_gt105_pride_sdrf_fulltext_required_metadata_rescue.sh
+```
+
+The helper derives its accession list from the v0.3.2 results and therefore only reruns accessions still marked `incomplete_required_metadata`.
