@@ -17,7 +17,7 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Iterable, Iterator
 
-AUDITOR_VERSION = "pride-scp-sdrf-mapping-auditor-v0.1"
+AUDITOR_VERSION = "pride-scp-sdrf-mapping-auditor-v0.2"
 
 # TMTpro order is a superset useful for expanding explicit textual ranges. TMT6/10 tokens
 # remain valid members of this sequence; we never infer a chemistry-specific suffix that was
@@ -54,6 +54,105 @@ CHEMISTRY_PATTERNS = [
     ("plexDIA", re.compile(r"(?i)\bplexdia\b")),
 ]
 
+SINGLE_BRANCH_RE = re.compile(
+    r"(?i)\b(?:single[- ]cell|single[- ]cells|single[- ]neuron|single[- ]neurons|"
+    r"single[- ]oocyte|single[- ]oocytes|single[- ]zygote|single[- ]zygotes|"
+    r"single[- ]blastomere|single[- ]blastomeres|single[- ](?:muscle\s+)?fib(?:er|re)s?)\b"
+)
+ISOBARIC_RE = re.compile(
+    r"(?i)\b(?:tmt(?:pro)?|tandem\s+mass\s+tag|itraq|carrier\s+(?:channel|proteome|sample)|"
+    r"reference\s+channel|reporter\s+channel|isobaric)\b"
+)
+NONISOBARIC_RE = re.compile(
+    r"(?i)\b(?:label[- ]free|data[- ]independent|dia(?:-pasef)?|ce[- ]ms(?:/ms)?|"
+    r"capillary\s+electrophoresis|maldi(?:-tof)?|top[- ]down|direct\s+injection)\b"
+)
+
+ROLE_WORD = {
+    "carrier": r"carrier(?:\s+(?:proteome|sample|channel|cells?))?|boost(?:ing)?\s+channel",
+    "reference": r"(?:reference|bridge)(?:\s+(?:proteome|sample|channel))?|normalization\s+channel",
+    "single_cell": r"(?:single[- ]cells?(?:\s+(?:samples?|proteomes?|channels?|wells?))?|analytical\s+channel|single[- ]cell\s+channel)",
+    "blank": r"(?:blank|empty|unused|not\s+used|left\s+empty|control\s+wells?)",
+}
+ROLE_ALT = "|".join(f"(?P<{k}>{v})" for k, v in ROLE_WORD.items())
+ROLE_RE = re.compile(rf"(?i)\b(?:{ROLE_ALT})\b")
+RESPECTIVE_ROLE_RE = re.compile(r"(?i)\b(analytical|carrier|reference|bridge|blank|single[- ]cell)\b")
+RESPECTIVE_ROLE_MAP = {"analytical":"single_cell","carrier":"carrier","reference":"reference","bridge":"reference","blank":"blank","single-cell":"single_cell","single cell":"single_cell"}
+
+def normalize_role_match(m: re.Match[str]) -> str | None:
+    for role in ROLE_WORD:
+        if m.groupdict().get(role):
+            return role
+    return None
+
+def _channel_pattern(name: str) -> str:
+    return rf"(?P<{name}_n>12[6-9]|13[0-5])\s*(?P<{name}_s>[NC])?"
+
+def explicit_respectively_hits(source_kind: str, source_label: str, source_ref: str, text: str) -> list[ContextHit]:
+    """Recover unambiguous two-role/two-channel assignments joined by ``respectively``."""
+    hits: list[ContextHit] = []
+    sentence_re = re.compile(r"[^.;\n]{0,500}\brespectively\b[^.;\n]{0,120}[.;]?", re.I)
+    for sm in sentence_re.finditer(text):
+        sentence = sm.group(0)
+        channel_matches = list(CHANNEL_TOKEN_RE.finditer(sentence))
+        role_matches = list(RESPECTIVE_ROLE_RE.finditer(sentence))
+        if len(channel_matches) != 2 or len(role_matches) < 2:
+            continue
+        roles: list[tuple[int, str]] = []
+        for rm in role_matches:
+            raw = re.sub(r"\s+", " ", rm.group(1).lower())
+            role = RESPECTIVE_ROLE_MAP.get(raw)
+            if role is not None and (not roles or roles[-1][1] != role):
+                roles.append((rm.start(), role))
+        if len(roles) < 2:
+            continue
+        cpos = [m.start() for m in channel_matches]
+        rpos = [x[0] for x in roles[:2]]
+        if not (max(cpos) < min(rpos) or max(rpos) < min(cpos)):
+            continue
+        channels = [_channel(m.group(1), m.group(2)) for m in channel_matches]
+        ctx = context_window(text, sm.start(), sm.end(), 220)
+        for ch, (_, role) in zip(channels, roles[:2]):
+            hits.append(ContextHit(source_kind, source_label, source_ref, [ch], [role], ctx))
+    return hits
+
+def branch_context_counts(texts: Iterable[str]) -> tuple[int, int, int]:
+    linked_iso = 0
+    linked_noniso = 0
+    dataset_iso = 0
+    for text in texts:
+        if not text:
+            continue
+        # Sentence-ish segmentation is intentionally permissive for PDF-extracted text.
+        chunks = re.split(r"(?<=[.;])\s+|\n+", text)
+        for i, chunk in enumerate(chunks):
+            if not chunk.strip():
+                continue
+            neighborhood = " ".join(chunks[max(0, i-1): min(len(chunks), i+2)])
+            has_single = bool(SINGLE_BRANCH_RE.search(neighborhood))
+            has_iso = bool(ISOBARIC_RE.search(neighborhood))
+            has_noniso = bool(NONISOBARIC_RE.search(neighborhood))
+            if has_iso and has_single:
+                linked_iso += 1
+            elif has_iso:
+                dataset_iso += 1
+            if has_noniso and has_single:
+                linked_noniso += 1
+    return linked_iso, linked_noniso, dataset_iso
+
+def relation_recheck(chemistry: str, roles: dict[str, set[str]], ambiguous: set[str], texts: list[str]) -> tuple[str, str, int, int, int]:
+    linked_iso, linked_noniso, dataset_iso = branch_context_counts(texts)
+    explicit_roles = any(rr & {"carrier", "reference", "single_cell"} for rr in roles.values())
+    if explicit_roles or linked_iso > 0:
+        return "multiplex_supported", "high" if explicit_roles else "medium", linked_iso, linked_noniso, dataset_iso
+    if linked_noniso > 0 and (chemistry or dataset_iso > 0):
+        return "substudy_scope_recheck", "high", linked_iso, linked_noniso, dataset_iso
+    if linked_noniso > 0:
+        return "nonisobaric_single_cell_candidate", "high", linked_iso, linked_noniso, dataset_iso
+    if not chemistry and not roles:
+        return "relation_source_recheck", "low", linked_iso, linked_noniso, dataset_iso
+    return "multiplex_unlinked_dataset_evidence", "low", linked_iso, linked_noniso, dataset_iso
+
 
 @dataclass
 class ContextHit:
@@ -83,6 +182,11 @@ class AccessionAudit:
     confidence: str
     candidate_generation_mode: str
     context_hits: int
+    relation_recheck: str
+    relation_confidence: str
+    single_cell_isobaric_contexts: int
+    single_cell_nonisobaric_contexts: int
+    dataset_only_isobaric_contexts: int
     notes: str
 
 
@@ -94,6 +198,8 @@ def extract_channels(text: str) -> list[str]:
     out: list[str] = []
     seen: set[str] = set()
     for m in CHANNEL_TOKEN_RE.finditer(text):
+        if any(lo <= m.start() < hi for lo, hi in respectively_spans):
+            continue
         ch = _channel(m.group(1), m.group(2))
         if ch not in seen:
             out.append(ch)
@@ -172,6 +278,8 @@ def classify_role_for_context(text: str) -> str | None:
 
 def collect_hits(source_kind: str, source_label: str, source_ref: str, text: str) -> list[ContextHit]:
     hits: list[ContextHit] = []
+    hits.extend(explicit_respectively_hits(source_kind, source_label, source_ref, text))
+    respectively_spans = [m.span() for m in re.finditer(r"[^.;\n]{0,500}\brespectively\b[^.;\n]{0,120}[.;]?", text, re.I)]
     channel_context_re = re.compile(r"(?i)\b(?:tmt(?:pro)?|reporter|channel|label(?:ed|led|ing)?)\b")
     # First retain explicit ranges so the audit can distinguish a resolved set of channels
     # from an ambiguous "single-cell and control wells" range.
@@ -185,6 +293,8 @@ def collect_hits(source_kind: str, source_label: str, source_ref: str, text: str
 
     # Then retain individual channel mentions. De-duplicate later at the accession level.
     for m in CHANNEL_TOKEN_RE.finditer(text):
+        if any(lo <= m.start() < hi for lo, hi in respectively_spans):
+            continue
         ch = _channel(m.group(1), m.group(2))
         ctx = context_window(text, m.start(), m.end(), 220)
         clause, offset = local_clause(text, m.start(), m.end(), 260)
@@ -377,6 +487,10 @@ def audit_accession(
         str(design.get("multiplex_chemistry_hint") or ""),
     )
     roles, ambiguous = channel_roles_from_hits(hits)
+    all_texts = [str(x.get("text") or "") for x in evidence_items] + [t for _, t in publication_texts]
+    rel_recheck, rel_conf, linked_iso, linked_noniso, dataset_iso = relation_recheck(
+        chemistry, roles, ambiguous, all_texts
+    )
 
     carrier = sorted(ch for ch, rr in roles.items() if rr == {"carrier"})
     reference = sorted(ch for ch, rr in roles.items() if rr == {"reference"})
@@ -384,6 +498,14 @@ def audit_accession(
     blank = sorted(ch for ch, rr in roles.items() if rr == {"blank"})
     observed = sorted({ch for h in hits for ch in h.channels}, key=lambda c: CHANNEL_INDEX.get(c, 999))
     mapping_class, confidence, generation, note = mapping_classification(chemistry, roles, ambiguous, hits)
+    if rel_recheck in {"substudy_scope_recheck", "nonisobaric_single_cell_candidate"}:
+        mapping_class = "relation_false_positive_candidate"
+        confidence = rel_conf
+        generation = "return_to_nonisobaric_or_mixed_design_lane"
+        note = (
+            "single-cell evidence is locally linked to non-isobaric acquisition while isobaric evidence is absent "
+            "from, or unlinked to, the single-cell branch; re-evaluate the multiplex relation before channel mapping"
+        )
 
     raw_files = evidence_obj.get("raw_files", []) or []
     manuscript_sources = evidence_obj.get("manuscript_sources", []) or []
@@ -404,6 +526,11 @@ def audit_accession(
         confidence=confidence,
         candidate_generation_mode=generation,
         context_hits=len(hits),
+        relation_recheck=rel_recheck,
+        relation_confidence=rel_conf,
+        single_cell_isobaric_contexts=linked_iso,
+        single_cell_nonisobaric_contexts=linked_noniso,
+        dataset_only_isobaric_contexts=dataset_iso,
         notes=note,
     )
     return audit, hits
@@ -415,7 +542,9 @@ def write_tsv(path: Path, rows: list[AccessionAudit]) -> None:
         "accession", "mapping_class", "confidence", "candidate_generation_mode", "chemistry",
         "raw_file_count", "manuscript_source_count", "publication_text_rows", "carrier_channels",
         "reference_channels", "single_cell_channels", "blank_channels", "ambiguous_channels",
-        "observed_channels", "context_hits", "evidence_path", "notes",
+        "observed_channels", "context_hits", "relation_recheck", "relation_confidence",
+        "single_cell_isobaric_contexts", "single_cell_nonisobaric_contexts",
+        "dataset_only_isobaric_contexts", "evidence_path", "notes",
     ]
     with path.open("w", newline="") as fh:
         w = csv.DictWriter(fh, fieldnames=fields, delimiter="\t")
@@ -454,6 +583,38 @@ def self_test() -> None:
     # Respectively is intentionally not solved by this first auditor; the global range must
     # nevertheless remain non-final rather than being fabricated as all single cells.
     assert amb, (roles, amb)
+
+    # Explicit "respectively" grammar must resolve role/channel pairing rather than
+    # assigning both numbers to the nearest carrier/reference word.
+    text = "TMT-128 and TMT-131 were used as analytical and carrier channels, respectively."
+    hits = collect_hits("publication_fulltext", "synthetic", "Sresp1", text)
+    roles, amb = channel_roles_from_hits(hits)
+    assert roles["128"] == {"single_cell"}, (roles, hits)
+    assert roles["131"] == {"carrier"}, (roles, hits)
+    assert not amb
+
+    text = "Carrier and reference channels were labeled with TMTpro126 and TMTpro127N, respectively."
+    hits = collect_hits("publication_fulltext", "synthetic", "Sresp2", text)
+    roles, amb = channel_roles_from_hits(hits)
+    assert roles["126"] == {"carrier"}, (roles, hits)
+    assert roles["127N"] == {"reference"}, (roles, hits)
+    assert not amb
+
+    # Dataset-level TMT from a separate benchmark must not automatically make the
+    # single-cell branch multiplexed.
+    texts = [
+        "Single cells were analyzed label-free by data-independent acquisition.",
+        "In a separate bulk benchmark, pooled samples were TMT labeled for method comparison.",
+    ]
+    rel, conf, li, ln, di = relation_recheck("TMT", {}, set(), texts)
+    assert rel == "substudy_scope_recheck", (rel, conf, li, ln, di)
+    assert conf == "high" and ln > 0 and di > 0
+
+    # Explicit single-cell/carrier TMT context remains multiplex-supported.
+    texts = ["Single-cell samples were multiplexed with TMTpro and analyzed with a carrier channel."]
+    rel, conf, li, ln, di = relation_recheck("TMTpro", {}, set(), texts)
+    assert rel == "multiplex_supported", (rel, conf, li, ln, di)
+    assert li > 0
 
     # Bare numeric counts in single-cell prose are not reporter-channel evidence.
     text = "Single-cell proteomics quantified 128 proteins from individual cells."
@@ -506,10 +667,12 @@ def main() -> int:
 
     write_tsv(out / "sdrf_mapping_evidence_audit.tsv", audits)
     counts = Counter(x.mapping_class for x in audits)
+    relation_counts = Counter(x.relation_recheck for x in audits)
     summary = {
         "auditor_version": AUDITOR_VERSION,
         "accessions": len(audits),
         "mapping_class_counts": dict(sorted(counts.items())),
+        "relation_recheck_counts": dict(sorted(relation_counts.items())),
         "publication_text_accessions": sum(1 for x in audits if x.publication_text_rows > 0),
         "high_confidence_candidates": sum(1 for x in audits if x.confidence == "high"),
         "medium_confidence_candidates": sum(1 for x in audits if x.confidence == "medium"),
@@ -529,7 +692,9 @@ def main() -> int:
             f"{x.accession} class={x.mapping_class} confidence={x.confidence} chemistry={x.chemistry or '-'} "
             f"carrier={x.carrier_channels or '-'} reference={x.reference_channels or '-'} "
             f"single={x.single_cell_channels or '-'} blank={x.blank_channels or '-'} "
-            f"ambiguous={x.ambiguous_channels or '-'} raw={x.raw_file_count} pub_text={x.publication_text_rows}"
+            f"ambiguous={x.ambiguous_channels or '-'} relation={x.relation_recheck}/{x.relation_confidence} "
+            f"linked_iso={x.single_cell_isobaric_contexts} linked_noniso={x.single_cell_nonisobaric_contexts} "
+            f"dataset_iso={x.dataset_only_isobaric_contexts} raw={x.raw_file_count} pub_text={x.publication_text_rows}"
         )
     return 0
 

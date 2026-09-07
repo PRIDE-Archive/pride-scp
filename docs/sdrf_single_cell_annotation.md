@@ -963,3 +963,53 @@ data/sdrf_mapping_evidence_audit_gt105_pride_v040/
 Only mapping classes supported by explicit public evidence should advance to deterministic row
 construction. Ambiguous channel ranges, missing reporter-role assignments, and likely false
 multiplex relation hints remain review/recovery targets rather than being silently completed.
+
+## v0.4.1: refreshed publication evidence and sub-study-scoped relation recheck
+
+The first 17-accession mapping audit found no high- or medium-confidence deterministic mapping
+candidates. Eleven accessions had only chemistry/partial reporter evidence, one had only a carrier
+role hint, and five had no explicit reporter-channel evidence at all. This distribution exposed two
+problems that must be resolved before multiplex row generation:
+
+1. the mapping audit was using the older publication manifest, even though PRIDE publication
+   metadata can change after a dataset is announced; and
+2. the Rust study-design scaffold currently treats dataset-level co-occurrence of `single cell` and
+   TMT/iTRAQ evidence as enough to suggest multiplexing. In mixed deposits, the isobaric experiment
+   can belong to a different sub-study than the single-cell branch.
+
+v0.4.1 remains non-generative. The wrapper refreshes publication associations directly from current
+PRIDE project records using Stage 01, merges those rows with existing local PDF-backed publication
+rows, materializes searchable full text with Stage 03, and reruns the mapping auditor.
+
+The mapping auditor is upgraded to `pride-scp-sdrf-mapping-auditor-v0.2`. It adds:
+
+- deterministic two-channel `respectively` grammar, e.g. `128 and 131 were analytical and carrier
+  channels, respectively`, without assigning both numbers to the nearest role word;
+- branch-scoped relation evidence: isobaric evidence only supports multiplexing when it is locally
+  linked to a single-cell/fiber/oocyte/neuron/blastomere branch or when explicit reporter roles are
+  present;
+- non-isobaric single-cell context detection for label-free/DIA/CE-MS/MALDI/top-down branches;
+- `relation_false_positive_candidate` for datasets where single-cell evidence is locally linked to
+  a non-isobaric workflow while TMT/iTRAQ evidence is absent from, or unlinked to, that branch;
+- explicit relation diagnostics (`linked_iso`, `linked_noniso`, and `dataset_iso`) in the TSV and
+  compact console summary.
+
+This is intentionally conservative. `relation_false_positive_candidate` does not rewrite the SDRF;
+it returns the accession to a non-isobaric/mixed-design review lane so the production generator does
+not invent reporter-channel mappings for a different experiment in the same deposit.
+
+Run:
+
+```bash
+./scripts/run_gt105_pride_sdrf_mapping_relation_recheck.sh
+```
+
+Expected output root:
+
+```text
+data/sdrf_mapping_relation_recheck_gt105_pride_v041/
+```
+
+Important outputs are the refreshed and merged publication manifests plus the v0.2 audit inventory.
+Only accessions that remain `multiplex_supported` and have explicit channel-role evidence should be
+considered for the first deterministic multiplex row generator.
