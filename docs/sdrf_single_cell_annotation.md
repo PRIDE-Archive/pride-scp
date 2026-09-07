@@ -1496,3 +1496,72 @@ contains explicit reporter role(s) and channel(s) together with explicit run/sam
 study with separate role and run evidence remains a review candidate rather than an automatic
 mapping source.  If no accession reaches that gate, the next step is accession-specific source or
 publication recovery, not a broader reporter parser and not a generic multiplex generator.
+
+## v0.4.8: publication-accession reverse recovery for residual multiplex studies
+
+The real v0.4.7 run is an accepted negative repository-support checkpoint.  After strict result-table
+triage, none of the eight residual `multiplex_supported` accessions had a high-value repository
+experimental-design/sample-map/channel-layout asset.  The active evidence source therefore moves from
+PRIDE support files to publication/source recovery; the reporter generator remains unchanged and no
+row generation is authorized by this phase.
+
+A web/source spot check exposed a second generic failure mode in the older publication manifest:
+publication metadata can be stale, absent, or incorrect even when a full-text paper is publicly
+available.  Examples include publications whose data-availability text contains PXD029320,
+PXD034370, PXD041328/PXD048347, PXD041399, PXD045500, and PXD073405.  Conversely, an exact accession
+string is not sufficient by itself: corrected or erroneous accession citations can point at a
+biologically unrelated article.
+
+v0.4.8 adds `scripts/sdrf_publication_accession_recovery.py`.  It performs a bounded Europe PMC reverse
+lookup for each residual multiplex accession and requires all of the following before creating a
+recovered publication-manifest row:
+
+1. the exact PXD accession is verified in the candidate PMC full text;
+2. the candidate is compatible with the current PRIDE project title, **or** its DOI/PMID matches a
+   current PRIDE publication association;
+3. only the strongest compatible article is retained for downstream Stage-03 materialization.
+
+An exact-accession article with strong project-title mismatch is retained as a rejected diagnostic.
+If the same DOI/PMID is currently attached to the PRIDE project, the v0.4.8 wrapper quarantines that
+publication association rather than allowing it to become SDRF evidence.  This is specifically a
+source-integrity guard; it does not use GT metadata and it does not substitute another publication by
+similarity alone.
+
+Run the bounded recovery with:
+
+```bash
+./scripts/run_gt105_pride_sdrf_publication_accession_recovery_v048.sh
+```
+
+The wrapper:
+
+1. derives the eight residual multiplex accessions from the accepted v0.4.2c relation audit;
+2. refreshes current PRIDE publication metadata with Stage 01;
+3. reverse-resolves exact accession mentions through Europe PMC;
+4. merges accepted recovered publications with useful historical local-PDF rows;
+5. quarantines directly contradicted current-PRIDE publication identifiers;
+6. materializes full text through the existing Stage-03 contract;
+7. reruns the non-generative reporter-role/mapping auditor.
+
+Expected output root:
+
+```text
+data/sdrf_multiplex_publication_accession_recovery_gt105_pride_v048/
+```
+
+Key outputs:
+
+```text
+publication_recovery/publication_accession_recovery_summary.json
+publication_recovery/publication_accession_recovery_candidates.tsv
+publication_recovery/recovered_publications.tsv
+publication_manifest_quarantine.tsv
+publication_manifest_with_text.tsv
+audit/sdrf_mapping_evidence_audit_summary.json
+audit/sdrf_mapping_evidence_audit.tsv
+```
+
+A recovered full-text publication is still only an evidence source.  Reporter-row generation remains
+blocked unless the refreshed corpus exposes explicit source-grounded reporter roles and run/sample
+relationships.  If publication text improves but no explicit mapping contract emerges, the next step
+is accession-specific supplementary/source recovery rather than a broader generic parser.
