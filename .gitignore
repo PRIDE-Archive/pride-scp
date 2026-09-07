@@ -1,17 +1,50 @@
+# Rust / Python build products
 /target/
 /.venv/
 __pycache__/
 *.pyc
+
+# Runtime data and generated pipeline state
 /data/
 /work/
 /publication_pdfs/
 /pride_scp_annotations/
 /pride_scp_catalogue/
 /pride_scp_qc_review*/
-.env
-.DS_Store
+
+# Local manuscript/reference material
 /manual_pdfs/*.pdf
 /manual_pdfs/**/*.pdf
+/manual_pdfs/manual_pdf_manifest.tsv
+/gpt/
+/benchmarks/
+/pride_scp_gpt_reference_mapped/
+/python/STAGE_SOURCES.sha256
+
+# Evaluation / historical experiment helpers that are intentionally local-only
+/python/evaluation/
+/scripts/run_gt196_*.sh
+/scripts/run_massive_native_m2_*.sh
+/scripts/extract_pride_pdf_review_bundle.py
+/python/recall/*publication_content*_smoke.py
+
+# Handoffs, run notes, overlay manifests, and local source archives
 PRIDE_SCP_HANDOFF*
 PRIDE_SCP_NEW_CONVERSATION*
+V0.1.*_NOTES.md
+RUN_*.md
+*_REPORT.md
+PATCH_MANIFEST.sha256
+archive_*.sh
+*.tar.gz
 *.tar.gz.part*
+*.part*
+*.zip
+
+# Local repository-maintenance archive if a user explicitly puts one in-tree
+/.local/
+/.local-archive/
+
+# Secrets / OS noise
+.env
+.DS_Store

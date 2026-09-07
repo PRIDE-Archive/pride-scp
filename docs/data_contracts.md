@@ -1,128 +1,122 @@
 # Data contracts
 
-## Primary PRIDE snapshot
+Generated runtime state lives under `data/` or `work/` and is intentionally not
+tracked by Git.
+
+## PRIDE snapshot
 
 ```text
 data/snapshot/
   accessions.txt
-  project_pages/page_XXXXXX.json
+  project_pages/
   projects/PXD....json
   files/PXD....json
   sdrf/PXD....sdrf.tsv
-  errors/{project,files,sdrf}/PXD....json
+  errors/
   snapshot_summary.json
 ```
 
-Raw PRIDE API responses are cached and are not rewritten by discovery.
+The repository/API SDRF cache is raw source state. A cache file existing does
+not imply that it contains usable SDRF rows.
 
-## ProteomeCentral registry supplement
-
-Iteration 2 adds a separate supplemental registry cache under the same snapshot
-root:
+## Registry supplement
 
 ```text
 data/snapshot/registry/
-  pages/page_XXXXXX.json
-  projects/PXD....json
+  pages/
+  projects/
   accessions.txt
   registry_accessions.tsv
   registry_summary.json
 ```
 
-`registry-snapshot` enumerates the ProteomeCentral PROXI `/datasets` endpoint
-and records every dataset that exposes a PXD identifier in the alias crosswalk.
-A normalized project JSON is materialized only when that PXD is absent from the
-primary PRIDE snapshot, avoiding a second 40k-record metadata copy. Supplemental
-normalized records retain the original PROXI dataset object plus:
+Records preserve hosting repository, PXD aliases, and native accessions.
 
-- `accession` / `projectAccession`: normalized PXD alias;
-- `registrySource`: `ProteomeCentral PROXI`;
-- `registryHostingRepository`: inferred repository label when available;
-- `registryNativeAccessions`: native repository accessions such as `MSV...`;
-- normalized `title` and `description` fields used by discovery.
-
-`registry_accessions.tsv` is the explicit alias/provenance crosswalk:
+## Native MassIVE
 
 ```text
-pxd_accession
-hosting_repository
-native_accessions
-present_in_primary_snapshot
-registry_json_path
-dataset_title
+data/snapshot/native/massive/
+  pages/
+  projects/MSV....json
+  accessions.txt
+  massive_accessions.tsv
+  massive_summary.json
 ```
 
-The registry is **supplemental, not a second scoring copy of PRIDE**. Discovery
-uses `registry/projects/PXD....json` only when the same PXD is absent from the
-primary `projects/` directory. This preserves accepted PRIDE scores/tiers while
-recovering cross-repository PXD aliases.
-
-Registry alias parsing is structure-aware. PXD values may occur inside nested
-PROXI wrappers or ontology/CV terms, so identifier contexts are traversed
-recursively. PXD strings appearing only in free-text descriptions are not
-promoted to aliases. A non-empty first registry page that yields zero structured
-PXD aliases is a hard schema error; this prevents a long crawl from silently
-emitting an empty registry index.
-
-A successful registry enumeration reconciles `registry/projects/` against the
-current supplemental alias set and removes stale generated JSON records. If an
-explicit `--max-pages` cap is reached before the API signals the end of the
-listing, `registry-snapshot` fails rather than emitting a silently incomplete
-registry index. `registry_summary.json` reports both normalized records written
-and stale normalized records removed.
+Native identity is preserved even when a PXD alias exists.
 
 ## Discovery
 
-`project_discovery_audit.tsv` contains every scanned project-like record,
-including score=0 records, so missed positives can be traced.
-`candidates.tsv` is the compact positive-signal bridge. `candidates.jsonl`
-additionally contains all evidence hits and excerpts.
+Typical discovery output:
 
-`discovery_summary.json` now distinguishes:
+```text
+data/discovery*/
+  candidates.tsv
+  candidates.jsonl
+  project_discovery_audit.tsv
+  discovery_summary.json
+```
 
-- `projects_scanned`: primary + registry supplements;
-- `primary_projects_scanned`: materialized PRIDE projects;
-- `registry_supplements_scanned`: PXD aliases absent from the primary PRIDE
-  snapshot and therefore admitted from ProteomeCentral;
-- positive/candidate/tier counts.
-
-Key candidate fields:
-
-- `accession`
-- `score`
-- `tier`: `strong`, `possible`, `weak`
-- `positive_lanes`
-- `positive_labels`
-- `negative_context_labels`
-- source paths
-- JSONL `hits[]` with lane, label, term, weight, excerpt
-
-For registry-only aliases, `project_json_path` points into
-`snapshot/registry/projects/`, where the native accession and hosting-repository
-provenance are preserved.
-
-The default `--min-score 1` is deliberately recall-oriented.
-
-## Recall benchmark
-
-A benchmark CSV needs `pxd_accession` (or `accession`). If it contains
-`contains_true_single_cell_ms` or `expected_positive`, only truthy rows are
-counted as positives. Frozen GT-style tables may instead use
-`reference_decision=include`, and `recall-audit` can optionally filter by
-`hosting_repository`.
-
-GT data is evaluation-only. It is not an input to `snapshot`,
-`registry-snapshot`, or `discover`.
+Candidate JSONL contains the source evidence that triggered retention.
 
 ## Python bridge
 
-`export-python` writes:
+`export-python` writes a stable bridge such as:
 
 ```text
-data/python_bridge/candidate_accessions.txt
-data/python_bridge/candidate_manifest.tsv
-data/python_bridge/semantic_candidates.jsonl
+data/python_bridge/
+  candidate_accessions.txt
+  candidate_manifest.tsv
+  semantic_candidates.jsonl
 ```
 
-The current Python Stage 01 accepts the accession list, and Stage 04 should be
-run with `--all-valid-pdfs` so Stage 03 does not become a hard gate again.
+## SDRF source resolution
+
+```text
+data/sdrf_sources/
+  cache/PXD.../
+  resolved/PXD....sdrf.tsv
+  audit/PXD....sdrf_source_audit.json
+  sdrf_source_resolution.tsv
+  sdrf_source_resolution_summary.json
+```
+
+Each selected source records source kind, URL, local path, usability status,
+and deterministic content fingerprint.
+
+## SDRF deterministic audit
+
+```text
+data/sdrf_audit/
+  sdrf_audit_results.tsv
+  sdrf_audit_summary.json
+  review/PXD....sdrf.review.tsv
+```
+
+Important audit dimensions include structural validity, relation mode, missing
+metadata, and repository-linkage status.
+
+## SDRF annotation/reconstruction
+
+```text
+data/sdrf_annotation/
+  evidence/PXD....evidence.json
+  proposals/PXD....ollama.raw.json
+  proposals/PXD....ollama.json
+  sdrf/PXD....sdrf.tsv
+  review/PXD....sdrf.review.tsv
+  audit/PXD....sdrf.audit.json
+  errors/
+  sdrf_annotation_results.tsv
+  sdrf_annotation_summary.json
+```
+
+The completed accession audit JSON is the resumability boundary. If its
+version/spec/template identity matches the current generator, a later batch run
+may reuse that accession without repeating Ollama work.
+
+## Reference/GT data
+
+Frozen reference collections are evaluation-only. Keep them outside the
+production data flow and out of Git. Evaluation scripts may compare generated
+outputs with those files after production inference is complete.
