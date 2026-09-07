@@ -846,3 +846,11 @@ Run the residual required-metadata lane with:
 ```
 
 The helper derives its accession list from the v0.3.2 results and therefore only reruns accessions still marked `incomplete_required_metadata`.
+
+## v0.3.4: reserve de-novo evidence budget for direct manuscript Methods windows
+
+The v0.3.3 five-accession residual rescue still produced empty deterministic isolation scaffolds even after scanning up to 2,000,000 manuscript characters. Inspection showed that the manuscript loop could be starved before it ran: project metadata plus existing annotation/semantic JSON could fill the entire `max_evidence_items` / `max_evidence_chars` packet.
+
+v0.3.4 separates *source priority* from *prompt size* for de-novo datasets. When direct manuscript sources are available and there is no usable existing SDRF, a bounded quarter of the evidence packet (capped at 24 items and 12,000 characters) is reserved for manuscript keyword windows. Existing/resolved SDRFs keep the full preservation-first evidence budget unchanged.
+
+The manuscript scan itself remains bounded at 2,000,000 characters and the Ollama packet remains bounded by the user-provided evidence limits. The new rescue wrapper prints manuscript-source and manuscript-evidence-item counts so routing failures are directly observable.

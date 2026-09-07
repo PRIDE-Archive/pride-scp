@@ -20,8 +20,10 @@ pub const SINGLE_CELL_TEMPLATE_VERSION: &str = "1.0.0";
 pub const SINGLE_CELL_TEMPLATE_URL: &str =
     "https://github.com/bigbio/sdrf-templates/blob/main/single-cell/1.0.0/single-cell.yaml";
 pub const SDRF_SPEC_URL: &str = "https://sdrf.quantms.org/specification.html";
-pub const GENERATOR_VERSION: &str = "pride-scp-sdrf-v0.3.3";
+pub const GENERATOR_VERSION: &str = "pride-scp-sdrf-v0.3.4";
 const MANUSCRIPT_SCAN_MAX_CHARS: usize = 2_000_000;
+const MANUSCRIPT_EVIDENCE_MAX_RESERVED_ITEMS: usize = 24;
+const MANUSCRIPT_EVIDENCE_MAX_RESERVED_CHARS: usize = 12_000;
 pub const SDRF_SOURCE_RESOLVER_VERSION: &str = "pride-scp-sdrf-source-resolver-v0.1";
 pub const SDRF_AUDITOR_VERSION: &str = "pride-scp-sdrf-auditor-v0.2";
 pub const DEFAULT_OLLAMA_URL: &str = "http://localhost:11434/api/generate";
@@ -2191,6 +2193,31 @@ fn infer_study_design_scaffold(
     }
 }
 
+fn pre_manuscript_evidence_caps(
+    usable_existing_sdrf: bool,
+    has_manuscript_sources: bool,
+    max_items: usize,
+    max_chars: usize,
+) -> (usize, usize) {
+    // Existing/resolved SDRFs are preservation-first and may legitimately consume
+    // the evidence budget. For de-novo reconstruction, however, reserve a bounded
+    // quarter of the packet for direct manuscript windows so project/annotation
+    // JSON cannot starve the deterministic Methods/isolation scaffold.
+    if usable_existing_sdrf || !has_manuscript_sources {
+        return (max_items, max_chars);
+    }
+    let reserved_items = (max_items / 4)
+        .min(MANUSCRIPT_EVIDENCE_MAX_RESERVED_ITEMS)
+        .min(max_items.saturating_sub(1));
+    let reserved_chars = (max_chars / 4)
+        .min(MANUSCRIPT_EVIDENCE_MAX_RESERVED_CHARS)
+        .min(max_chars.saturating_sub(1));
+    (
+        max_items.saturating_sub(reserved_items).max(1),
+        max_chars.saturating_sub(reserved_chars).max(1),
+    )
+}
+
 fn build_evidence(opts: &SdrfAnnotateOptions, accession: &str) -> Result<DatasetEvidence> {
     let project_path = opts
         .snapshot_dir
@@ -2229,17 +2256,36 @@ fn build_evidence(opts: &SdrfAnnotateOptions, accession: &str) -> Result<Dataset
         );
     }
 
+    let mut manuscript_paths = Vec::new();
+    if let Some(manifest) = &opts.publication_manifest {
+        manuscript_paths.extend(publication_paths_for_accession(manifest, accession)?);
+    }
+    manuscript_paths.extend(
+        opts.manuscript_text_paths
+            .iter()
+            .filter(|p| p.is_file())
+            .cloned(),
+    );
+    manuscript_paths.sort();
+    manuscript_paths.dedup();
+
     let mut evidence = Vec::new();
     // Existing SDRF is the highest-value source only when it contains a real
     // sample-to-data mapping. The PRIDE SDRF endpoint can yield header-only cache
     // files, so file existence alone must never activate the preservation path.
     let usable_existing_sdrf = existing_sdrf_is_usable(&existing_sdrf);
+    let (pre_manuscript_max_items, pre_manuscript_max_chars) = pre_manuscript_evidence_caps(
+        usable_existing_sdrf,
+        !manuscript_paths.is_empty(),
+        opts.max_evidence_items,
+        opts.max_evidence_chars,
+    );
     if usable_existing_sdrf {
         add_existing_sdrf_evidence(
             &mut evidence,
             &existing_sdrf,
-            opts.max_evidence_items,
-            opts.max_evidence_chars,
+            pre_manuscript_max_items,
+            pre_manuscript_max_chars,
         )?;
     }
     // Project metadata may contain biological/acquisition facts. File-list JSON is
@@ -2250,13 +2296,13 @@ fn build_evidence(opts: &SdrfAnnotateOptions, accession: &str) -> Result<Dataset
         "pride_project",
         "project",
         &project,
-        opts.max_evidence_items,
-        opts.max_evidence_chars,
+        pre_manuscript_max_items,
+        pre_manuscript_max_chars,
     );
 
     let mut annotation_sources = Vec::new();
     for path in annotation_json_paths(&opts.annotations_dir, accession)? {
-        if evidence.len() >= opts.max_evidence_items {
+        if evidence.len() >= pre_manuscript_max_items {
             break;
         }
         let Ok(value) = load_json(&path) else {
@@ -2296,8 +2342,8 @@ fn build_evidence(opts: &SdrfAnnotateOptions, accession: &str) -> Result<Dataset
                     .unwrap_or("annotation.json")
             ),
             &value,
-            opts.max_evidence_items,
-            opts.max_evidence_chars,
+            pre_manuscript_max_items,
+            pre_manuscript_max_chars,
         );
         // Stage04 annotations point to manuscript-derived semantic evidence. Only
         // route a bundle when its explicit PXD list is compatible with this target.
@@ -2308,24 +2354,12 @@ fn build_evidence(opts: &SdrfAnnotateOptions, accession: &str) -> Result<Dataset
                 "manuscript_semantic_evidence",
                 "stage04_semantic",
                 &bundle,
-                opts.max_evidence_items,
-                opts.max_evidence_chars,
+                pre_manuscript_max_items,
+                pre_manuscript_max_chars,
             );
         }
     }
 
-    let mut manuscript_paths = Vec::new();
-    if let Some(manifest) = &opts.publication_manifest {
-        manuscript_paths.extend(publication_paths_for_accession(manifest, accession)?);
-    }
-    manuscript_paths.extend(
-        opts.manuscript_text_paths
-            .iter()
-            .filter(|p| p.is_file())
-            .cloned(),
-    );
-    manuscript_paths.sort();
-    manuscript_paths.dedup();
     let mut manuscript_sources = Vec::new();
     for path in manuscript_paths {
         if evidence.len() >= opts.max_evidence_items {
@@ -6655,6 +6689,42 @@ mod tests {
             let lower = w.to_ascii_lowercase();
             lower.contains("using tweezers") && lower.contains("individually transferred")
         }));
+    }
+
+    #[test]
+    fn denovo_evidence_budget_reserves_room_for_manuscript_windows() {
+        let (items, chars) = pre_manuscript_evidence_caps(false, true, 128, 60_000);
+        assert_eq!(items, 104);
+        assert_eq!(chars, 48_000);
+        let mut evidence = Vec::new();
+        for i in 0..items {
+            push_evidence(
+                &mut evidence,
+                "existing_annotation",
+                format!("annotation:{i}"),
+                "single-cell proteomics annotation evidence",
+                items,
+                chars,
+            );
+        }
+        assert_eq!(evidence.len(), items);
+        push_evidence(
+            &mut evidence,
+            "manuscript_text",
+            "manuscript:paper.txt:window=1",
+            "Single muscle fibers were mechanically dissociated using tweezers and individually transferred.",
+            128,
+            60_000,
+        );
+        assert!(evidence.iter().any(|x| x.source_kind == "manuscript_text"));
+    }
+
+    #[test]
+    fn existing_sdrf_evidence_budget_is_not_reduced_by_manuscript_reservation() {
+        assert_eq!(
+            pre_manuscript_evidence_caps(true, true, 128, 60_000),
+            (128, 60_000)
+        );
     }
 
     #[test]
