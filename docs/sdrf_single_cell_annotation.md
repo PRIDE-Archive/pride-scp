@@ -902,3 +902,64 @@ The wrapper prints the deterministic isolation value, evidence refs, manuscript-
 to three isolation-relevant manuscript excerpts per accession. This makes it possible to distinguish
 remaining template/evidence limitations from routing or window-extraction failures without another
 broad generator iteration.
+
+## v0.4.0: mapping-evidence audit before multiplex row reconstruction
+
+The v0.3.6 isolation-context rescue closes the generic required-metadata lane as an architecture
+problem. The accepted cohort state after combining the v0.3.1.2 full-run repair, the v0.3.2 rescue,
+and the v0.3.6 rescue is:
+
+```text
+68 locally valid / ready
+17 sample/file/channel mapping
+13 repository archive-content mapping
+ 6 existing-SDRF structural review
+ 1 source-limited required metadata
+---
+105 primary PRIDE accessions
+```
+
+The mapping lane is intentionally audited before generating multiplex rows. A valid multiplex SDRF
+may require multiple biological rows to share a RAW file, with reporter-channel labels identifying
+the actual single-cell samples and `comment[carrier channel]` / `comment[reference channel]`
+recording set-level roles. Generating those rows from chemistry alone would fabricate sample
+identities.
+
+`scripts/sdrf_mapping_evidence_audit.py` is therefore a non-generative evidence auditor. It:
+
+- inventories explicit TMT/TMTpro reporter-channel mentions from existing SDRF evidence packets;
+- additionally scans normalized publication full text materialized by Stage 03;
+- distinguishes carrier, reference/bridge, single-cell/analytical, blank/control and ambiguous
+  channel roles;
+- expands explicit reporter-channel ranges only when the endpoints are directly stated;
+- keeps mixed `single-cell and control` ranges ambiguous rather than treating every channel as a
+  cell;
+- identifies the special one-analytical-channel-plus-carrier design that can potentially support one
+  biological row per RAW without fabricating additional cells;
+- flags chemistry-only or channel-evidence-free accessions for source enrichment or relation-mode
+  re-evaluation.
+
+The auditor does **not** write SDRFs and does **not** use GT metadata. Run the current 17-accession
+mapping lane with:
+
+```bash
+./scripts/run_gt105_pride_sdrf_mapping_evidence_audit.sh
+```
+
+The wrapper derives the 15 original `denovo_mapping` accessions from the v0.3.1.2 triage and adds
+accessions that moved into the mapping lane during v0.3.6. It materializes publication text for the
+combined lane, then writes:
+
+```text
+data/sdrf_mapping_evidence_audit_gt105_pride_v040/
+  mapping_accessions.txt
+  publication_manifest_with_text.tsv
+  audit/sdrf_mapping_evidence_audit_summary.json
+  audit/sdrf_mapping_evidence_audit.tsv
+  audit/contexts/PXD*.mapping_contexts.json
+  audit/<mapping_class>.txt
+```
+
+Only mapping classes supported by explicit public evidence should advance to deterministic row
+construction. Ambiguous channel ranges, missing reporter-role assignments, and likely false
+multiplex relation hints remain review/recovery targets rather than being silently completed.
