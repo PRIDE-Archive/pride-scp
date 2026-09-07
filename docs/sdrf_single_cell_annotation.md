@@ -1213,3 +1213,111 @@ audit/candidate_row_contexts.json
 
 No SDRF generator should consume these candidates automatically. The next implementation decision
 must be based on the real workbook rows printed by the bounded audit.
+
+## v0.4.4: source-grounded explicit row mapping for the first narrow multiplex design
+
+The real v0.4.3b PXD028040 workbook review closes the biological/run-scope evidence gap.  The
+single worksheet contains an explicit `Application for single neuron analysis` section followed by
+nine design rows.  Those rows describe three biological neurons (`DA neuron #1`, `#2`, and `#3`),
+each measured as technical replicate measurements 1-3.  Every row explicitly states approximately
+100 pg of neuron digest tagged with TMT 128 together with approximately 10 ng of diluted tissue
+digest tagged with TMT 131.
+
+This also corrects the filename-derived diagnostic cohort from v0.4.3b.  Two source-supported
+single-neuron acquisitions do not contain `single_neuron` in their RAW filename:
+
+```text
+2018-08-27_SC02.RAW
+2018-09-04_SC05_10_ng_tmt.RAW
+```
+
+Therefore v0.4.4 does **not** use filename TMT/single-neuron words to select biological runs.
+`scripts/sdrf_reporter_design_manifest.py` derives membership from the deposited workbook section,
+requires each design row to contain one explicit date+SC run key, one explicit DA-neuron identity,
+one explicit technical-replicate measurement, an explicit TMT128 neuron digest and an explicit
+TMT131 tissue digest, and then requires that date+SC key to identify exactly one repository RAW.
+The observed workbook contract is frozen at three biological samples x three technical replicates =
+nine authorized rows.  Any source-layout change fails closed for manual review.
+
+The manifest written by the script is provenance-rich and contains only source-supported row facts:
+
+```text
+accession
+raw_file
+source_name
+cell_identifier
+biological_replicate
+technical_replicate
+sample_type
+cells_per_well
+label
+carrier_channel
+reference_channel
+design_source
+design_ref
+mapping_key
+mapping_confidence
+```
+
+For PXD028040, the deterministic normalization is:
+
+```text
+DA neuron #1 -> source/cell identifier DA_neuron_1 -> biological replicate 1
+DA neuron #2 -> source/cell identifier DA_neuron_2 -> biological replicate 2
+DA neuron #3 -> source/cell identifier DA_neuron_3 -> biological replicate 3
+technical replicate measurement N -> comment[technical replicate] = N
+neuron digest tagged with TMT 128 -> comment[label] = TMT128
+tissue digest tagged with TMT 131 -> comment[carrier channel] = TMT131
+no reference channel stated -> comment[reference channel] = not applicable
+```
+
+The Rust annotator adds `--explicit-row-mapping-manifest`.  This is a generic source-grounded row
+serialization path; it does not hard-code PXD028040.  A manifest row is accepted only when its RAW
+file is present in the PRIDE snapshot, its mapping confidence is high, its source key is an allowed
+explicit key (`exact_raw_name` or `date_sc_run_key`), its source/cell identifiers are template-safe,
+its replicate/cell counts are numeric, its row is a single-cell row, and its analytical label,
+carrier channel and design provenance are explicit.  Duplicate biological assignments to the same
+RAW are rejected under this one-analytical-channel-per-run contract.
+
+When explicit mappings exist, Rust serializes only those biological rows and validates them with the
+normal strict generated-SDRF policy.  It no longer emits the synthetic
+`sample_to_channel_mapping_unresolved` blocker merely because the study relation remains
+`multiplexed_cells_per_data_file`.  The audit records the mapping-manifest path and row count, and
+the review TSV records a `source_grounded_explicit_row_mapping_applied` provenance warning.
+
+An explicit manifest is not allowed to silently make a mixed deposit look complete.  If fewer RAW
+files are source-mapped than exist in the PRIDE repository inventory, Rust emits the blocking error
+`explicit_row_mapping_repository_scope_incomplete` and completeness status
+`incomplete_explicit_row_mapping_repository_scope`.  This allows the nine PXD028040 biological
+reporter rows to be accepted as a deterministic mapping reconstruction without prematurely adding
+the accession to the locally-valid count while seven development/control RAWs remain role-unresolved.
+
+This is intentionally **not** a general TMT/TMTpro multi-cell generator.  It supports the narrow
+architecture in which one explicitly identified analytical single-cell channel is represented by
+one biological row per RAW and the explicit carrier is recorded as set/run metadata.  Unrelated
+PXD028040 development/control RAWs are not forced into the reconstructed single-neuron branch.
+
+Run the bounded reconstruction with:
+
+```bash
+./scripts/run_gt105_pride_sdrf_explicit_mapping_reconstruction_v044.sh
+```
+
+The wrapper first regenerates and validates the nine-row source manifest, then reruns only
+PXD028040 through Rust.  Acceptance requires:
+
+- exactly nine generated SDRF biological rows;
+- exactly three source/cell identities, each with technical replicates 1, 2 and 3;
+- every row linked to a repository RAW by the deposited design's unique date+SC key;
+- `comment[label]=TMT128` and `comment[carrier channel]=TMT131` on all nine rows;
+- no `sample_to_channel_mapping_unresolved` error;
+- no `data_file_not_in_pride_raw_inventory` error; and
+- generation mode `generated_source_grounded_explicit_row_mapping` with nine audited manifest rows.
+
+For the first v0.4.4 run, PXD028040 is expected to remain outside the locally-valid count because the
+manifest intentionally covers the nine source-proven single-neuron acquisitions while seven
+development/control RAWs remain outside that branch.  Those seven must be role-mapped from the same
+deposited design workbook (or another public source) before repository scope is complete.  In
+addition, the publication-supported sampling method is patch-clamp-guided microaspiration and the
+pinned single-cell 1.0.0 isolation-method vocabulary has no faithful value for that method.  Do not
+map it to an unrelated allowed isolation term merely to obtain a green validator result.

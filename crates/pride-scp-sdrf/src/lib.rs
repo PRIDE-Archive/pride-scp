@@ -20,7 +20,7 @@ pub const SINGLE_CELL_TEMPLATE_VERSION: &str = "1.0.0";
 pub const SINGLE_CELL_TEMPLATE_URL: &str =
     "https://github.com/bigbio/sdrf-templates/blob/main/single-cell/1.0.0/single-cell.yaml";
 pub const SDRF_SPEC_URL: &str = "https://sdrf.quantms.org/specification.html";
-pub const GENERATOR_VERSION: &str = "pride-scp-sdrf-v0.4.2";
+pub const GENERATOR_VERSION: &str = "pride-scp-sdrf-v0.4.4";
 const MANUSCRIPT_SCAN_MAX_CHARS: usize = 2_000_000;
 const MANUSCRIPT_EVIDENCE_MAX_RESERVED_ITEMS: usize = 24;
 const MANUSCRIPT_EVIDENCE_MAX_RESERVED_CHARS: usize = 12_000;
@@ -196,6 +196,10 @@ pub struct SdrfAnnotateOptions {
     /// Optional directory populated by `sdrf-resolve`. A usable `{PXD}.sdrf.tsv`
     /// here takes precedence over the PRIDE snapshot SDRF cache.
     pub resolved_sdrf_dir: Option<PathBuf>,
+    /// Optional source-grounded row-mapping manifest. When rows exist for an accession,
+    /// deterministic serialization uses those explicit sample/run/channel relationships
+    /// instead of the generic de-novo mapping scaffold.
+    pub explicit_row_mapping_manifest: Option<PathBuf>,
     pub model: String,
     pub ollama_url: String,
     pub timeout_seconds: u64,
@@ -244,6 +248,25 @@ struct RawFile {
     file_name: String,
     file_uri: String,
     category: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ExplicitRowMapping {
+    accession: String,
+    raw_file: String,
+    source_name: String,
+    cell_identifier: String,
+    biological_replicate: String,
+    technical_replicate: String,
+    sample_type: String,
+    cells_per_well: String,
+    label: String,
+    carrier_channel: String,
+    reference_channel: String,
+    design_source: String,
+    design_ref: String,
+    mapping_key: String,
+    mapping_confidence: String,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -406,6 +429,10 @@ struct DatasetAudit {
     validation_error_count: usize,
     #[serde(default)]
     proposal_repair_count: usize,
+    #[serde(default)]
+    explicit_row_mapping_manifest: String,
+    #[serde(default)]
+    explicit_row_mapping_rows: usize,
     locally_valid: bool,
     completeness_status: String,
     template_drift_note: String,
@@ -4204,9 +4231,176 @@ fn merge_existing_sdrf(
     Ok((headers, rows, mode.into()))
 }
 
-fn draft_rows(
+fn draft_rows_from_explicit_mappings(
     proposal: &SdrfProposal,
     evidence: &DatasetEvidence,
+    mappings: &[ExplicitRowMapping],
+) -> Result<(Vec<String>, Vec<Vec<String>>, String)> {
+    if mappings.is_empty() {
+        bail!("explicit row-mapping generation requires at least one mapping row");
+    }
+    let include_uri = evidence.raw_files.iter().any(|f| !f.file_uri.is_empty());
+    let headers = headers_for(proposal, include_uri);
+    let idx: HashMap<&str, usize> = headers
+        .iter()
+        .enumerate()
+        .map(|(i, h)| (h.as_str(), i))
+        .collect();
+    let set = |row: &mut Vec<String>, name: &str, value: String| {
+        if let Some(&j) = idx.get(name) {
+            row[j] = value;
+        }
+    };
+    let mut rows = Vec::with_capacity(mappings.len());
+    for mapping in mappings {
+        let file = evidence
+            .raw_files
+            .iter()
+            .find(|f| f.file_name.eq_ignore_ascii_case(mapping.raw_file.trim()))
+            .ok_or_else(|| {
+                anyhow!(
+                    "explicit row mapping references RAW file absent from PRIDE snapshot: {}",
+                    mapping.raw_file
+                )
+            })?;
+        let mut row = vec!["not available".to_string(); headers.len()];
+        let stem = safe_identifier_from_file(&file.file_name);
+        set(&mut row, "source name", mapping.source_name.clone());
+        set(
+            &mut row,
+            "characteristics[organism]",
+            reserved_or(&proposal.organism, "not available"),
+        );
+        set(
+            &mut row,
+            "characteristics[organism part]",
+            reserved_or(&proposal.organism_part, "not available"),
+        );
+        set(
+            &mut row,
+            "characteristics[disease]",
+            reserved_or(&proposal.disease, "not available"),
+        );
+        set(
+            &mut row,
+            "characteristics[cell type]",
+            reserved_or(&proposal.cell_type, "not available"),
+        );
+        set(
+            &mut row,
+            "characteristics[biological replicate]",
+            mapping.biological_replicate.clone(),
+        );
+        set(&mut row, "assay name", stem);
+        set(
+            &mut row,
+            "technology type",
+            "proteomic profiling by mass spectrometry".to_string(),
+        );
+        set(
+            &mut row,
+            "comment[proteomics data acquisition method]",
+            reserved_or(
+                &proposal.proteomics_data_acquisition_method,
+                "not available",
+            ),
+        );
+        set(&mut row, "comment[label]", mapping.label.clone());
+        set(
+            &mut row,
+            "comment[instrument]",
+            reserved_or(&proposal.instrument, "not available"),
+        );
+        set(
+            &mut row,
+            "comment[cleavage agent details]",
+            reserved_or(&proposal.cleavage_agent_details, "not available"),
+        );
+        let fraction_value = proposal.fraction_identifier.trim();
+        let fraction_identifier =
+            if !fraction_value.is_empty() && fraction_value.chars().all(|c| c.is_ascii_digit()) {
+                fraction_value.to_string()
+            } else {
+                "1".to_string()
+            };
+        set(
+            &mut row,
+            "comment[fraction identifier]",
+            fraction_identifier,
+        );
+        set(
+            &mut row,
+            "comment[technical replicate]",
+            mapping.technical_replicate.clone(),
+        );
+        set(&mut row, "comment[data file]", file.file_name.clone());
+        if include_uri {
+            set(
+                &mut row,
+                "comment[file uri]",
+                reserved_or(&file.file_uri, "not available"),
+            );
+        }
+        set(&mut row, SC_SAMPLE_TYPE, mapping.sample_type.clone());
+        set(
+            &mut row,
+            SC_ISOLATION_METHOD,
+            reserved_or(&proposal.single_cell_isolation_method, "not available"),
+        );
+        set(
+            &mut row,
+            SC_CELL_IDENTIFIER,
+            mapping.cell_identifier.clone(),
+        );
+        set(
+            &mut row,
+            SC_INDIVIDUAL,
+            reserved_or(&proposal.individual, "not available"),
+        );
+        set(
+            &mut row,
+            SC_PREP_BATCH,
+            reserved_or(&proposal.sample_preparation_batch, "not available"),
+        );
+        set(&mut row, SC_CELLS_PER_WELL, mapping.cells_per_well.clone());
+        set(
+            &mut row,
+            SC_CARRIER_CHANNEL,
+            mapping.carrier_channel.clone(),
+        );
+        set(
+            &mut row,
+            SC_REFERENCE_CHANNEL,
+            reserved_or(&mapping.reference_channel, "not applicable"),
+        );
+        set(
+            &mut row,
+            "comment[sdrf version]",
+            SDRF_SPEC_VERSION.to_string(),
+        );
+        set(
+            &mut row,
+            "comment[sdrf template]",
+            format!("single-cell v{SINGLE_CELL_TEMPLATE_VERSION}"),
+        );
+        set(
+            &mut row,
+            "comment[sdrf annotation tool]",
+            GENERATOR_VERSION.to_string(),
+        );
+        rows.push(row);
+    }
+    Ok((
+        headers,
+        rows,
+        "generated_source_grounded_explicit_row_mapping".to_string(),
+    ))
+}
+
+fn draft_rows_with_explicit_mappings(
+    proposal: &SdrfProposal,
+    evidence: &DatasetEvidence,
+    explicit_mappings: &[ExplicitRowMapping],
 ) -> Result<(Vec<String>, Vec<Vec<String>>, String)> {
     // Existing SDRF content is authoritative row-relationship evidence. Never
     // silently fall back to a filename-derived skeleton if an existing SDRF was
@@ -4219,6 +4413,9 @@ fn draft_rows(
                 evidence.existing_sdrf_path
             )
         });
+    }
+    if !explicit_mappings.is_empty() {
+        return draft_rows_from_explicit_mappings(proposal, evidence, explicit_mappings);
     }
     let include_uri = evidence.raw_files.iter().any(|f| !f.file_uri.is_empty());
     let headers = headers_for(proposal, include_uri);
@@ -4437,6 +4634,13 @@ fn draft_rows(
     Ok((headers, rows, mode.to_string()))
 }
 
+fn draft_rows(
+    proposal: &SdrfProposal,
+    evidence: &DatasetEvidence,
+) -> Result<(Vec<String>, Vec<Vec<String>>, String)> {
+    draft_rows_with_explicit_mappings(proposal, evidence, &[])
+}
+
 fn normalized_data_file_aliases(value: &str) -> BTreeSet<String> {
     let mut aliases = BTreeSet::new();
     let base = data_file_basename(value)
@@ -4465,6 +4669,117 @@ fn raw_inventory_aliases(raw_files: &[RawFile]) -> BTreeSet<String> {
         .iter()
         .flat_map(|f| normalized_data_file_aliases(&f.file_name))
         .collect()
+}
+
+fn load_explicit_row_mappings(
+    path: &Path,
+    accession: &str,
+    raw_files: &[RawFile],
+) -> Result<Vec<ExplicitRowMapping>> {
+    let mut reader = ReaderBuilder::new()
+        .delimiter(b'\t')
+        .from_path(path)
+        .with_context(|| format!("read explicit row-mapping manifest {}", path.display()))?;
+    let raw_inventory: BTreeSet<String> = raw_files
+        .iter()
+        .map(|f| f.file_name.trim().to_ascii_lowercase())
+        .collect();
+    let cell_id = Regex::new(r"^[A-Za-z0-9_.-]+$").unwrap();
+    let mut out = Vec::new();
+    let mut seen_raw = BTreeSet::new();
+    for row in reader.deserialize::<ExplicitRowMapping>() {
+        let mut row =
+            row.with_context(|| format!("parse explicit row-mapping manifest {}", path.display()))?;
+        let Some(row_accession) = norm_accession(&row.accession) else {
+            bail!(
+                "explicit row mapping contains invalid accession: {}",
+                row.accession
+            );
+        };
+        if row_accession != accession {
+            continue;
+        }
+        row.accession = row_accession;
+        let raw_key = row.raw_file.trim().to_ascii_lowercase();
+        if !raw_inventory.contains(&raw_key) {
+            bail!(
+                "explicit row mapping {} references RAW file absent from snapshot: {}",
+                accession,
+                row.raw_file
+            );
+        }
+        if !seen_raw.insert(raw_key) {
+            bail!(
+                "explicit row mapping {} assigns more than one biological row to RAW {} under the single-analytical-channel contract",
+                accession,
+                row.raw_file
+            );
+        }
+        if row.mapping_confidence.trim() != "high" {
+            bail!(
+                "explicit row mapping {} RAW {} is not high confidence: {}",
+                accession,
+                row.raw_file,
+                row.mapping_confidence
+            );
+        }
+        if !["exact_raw_name", "date_sc_run_key"].contains(&row.mapping_key.trim()) {
+            bail!(
+                "explicit row mapping {} RAW {} uses unsupported source key: {}",
+                accession,
+                row.raw_file,
+                row.mapping_key
+            );
+        }
+        if !cell_id.is_match(row.source_name.trim())
+            || !cell_id.is_match(row.cell_identifier.trim())
+        {
+            bail!(
+                "explicit row mapping {} RAW {} has non-template-safe source/cell identifier",
+                accession,
+                row.raw_file
+            );
+        }
+        for (field, value) in [
+            ("biological_replicate", row.biological_replicate.as_str()),
+            ("technical_replicate", row.technical_replicate.as_str()),
+            ("cells_per_well", row.cells_per_well.as_str()),
+        ] {
+            if value.trim().is_empty() || !value.trim().chars().all(|c| c.is_ascii_digit()) {
+                bail!(
+                    "explicit row mapping {} RAW {} requires numeric {}: {}",
+                    accession,
+                    row.raw_file,
+                    field,
+                    value
+                );
+            }
+        }
+        if row.sample_type.trim() != "single cell" {
+            bail!(
+                "explicit row mapping {} RAW {} is outside the narrow single-cell manifest contract: sample_type={}",
+                accession,
+                row.raw_file,
+                row.sample_type
+            );
+        }
+        if row.label.trim().is_empty() || row.carrier_channel.trim().is_empty() {
+            bail!(
+                "explicit row mapping {} RAW {} requires explicit analytical label and carrier channel",
+                accession,
+                row.raw_file
+            );
+        }
+        if row.design_source.trim().is_empty() || row.design_ref.trim().is_empty() {
+            bail!(
+                "explicit row mapping {} RAW {} requires source provenance",
+                accession,
+                row.raw_file
+            );
+        }
+        out.push(row);
+    }
+    Ok(out)
 }
 
 fn data_file_linkage_stats(
@@ -4943,6 +5258,17 @@ async fn annotate_one(opts: &SdrfAnnotateOptions, accession: &str) -> Result<Res
         }
     }
     let evidence = build_evidence(opts, accession)?;
+    let explicit_mappings = if let Some(path) = opts.explicit_row_mapping_manifest.as_deref() {
+        if !path.is_file() {
+            bail!(
+                "explicit row-mapping manifest not found: {}",
+                path.display()
+            );
+        }
+        load_explicit_row_mappings(path, accession, &evidence.raw_files)?
+    } else {
+        Vec::new()
+    };
     for p in [
         &evidence_path,
         &proposal_path,
@@ -5043,9 +5369,58 @@ async fn annotate_one(opts: &SdrfAnnotateOptions, accession: &str) -> Result<Res
     let proposal_repair_count = provenance_issues.len();
     let existing = !evidence.existing_sdrf_path.is_empty();
 
-    let (headers, rows, generation_mode) = draft_rows(&proposal, &evidence)?;
+    let (headers, rows, generation_mode) =
+        draft_rows_with_explicit_mappings(&proposal, &evidence, &explicit_mappings)?;
     write_sdrf(&draft_path, &headers, &rows)?;
     let mut issues = provenance_issues;
+    if !explicit_mappings.is_empty() {
+        let refs = explicit_mappings
+            .iter()
+            .map(|row| format!("{}:{}", row.design_source, row.design_ref))
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>()
+            .join("; ");
+        issues.push(ValidationIssue {
+            level: "warning".into(),
+            code: "source_grounded_explicit_row_mapping_applied".into(),
+            row: 0,
+            column: "comment[data file]".into(),
+            message: format!(
+                "serialized {} source-grounded biological row(s) from explicit mapping manifest {} (refs: {})",
+                explicit_mappings.len(),
+                opts.explicit_row_mapping_manifest
+                    .as_ref()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_default(),
+                refs
+            ),
+        });
+        let mapped_raws = explicit_mappings
+            .iter()
+            .map(|row| row.raw_file.trim().to_ascii_lowercase())
+            .collect::<BTreeSet<_>>();
+        let unmapped_raws = evidence
+            .raw_files
+            .iter()
+            .filter(|file| !mapped_raws.contains(&file.file_name.trim().to_ascii_lowercase()))
+            .map(|file| file.file_name.clone())
+            .collect::<Vec<_>>();
+        if !unmapped_raws.is_empty() {
+            issues.push(ValidationIssue {
+                level: "error".into(),
+                code: "explicit_row_mapping_repository_scope_incomplete".into(),
+                row: 0,
+                column: "comment[data file]".into(),
+                message: format!(
+                    "explicit source-grounded mapping covers {} of {} repository RAW files; remaining RAW roles must be source-resolved before the accession is counted locally complete: {}",
+                    mapped_raws.len(),
+                    evidence.raw_files.len(),
+                    unmapped_raws.join("; ")
+                ),
+            });
+        }
+    }
     if evidence.study_design.generic_archive_files > 0 {
         issues.push(ValidationIssue {
             level: "warning".into(),
@@ -5060,6 +5435,7 @@ async fn annotate_one(opts: &SdrfAnnotateOptions, accession: &str) -> Result<Res
         });
     }
     if !existing
+        && explicit_mappings.is_empty()
         && (proposal.relation_mode != "one_cell_per_data_file"
             || evidence.study_design.repository_file_mode == "generic_archives_only")
     {
@@ -5074,22 +5450,32 @@ async fn annotate_one(opts: &SdrfAnnotateOptions, accession: &str) -> Result<Res
     write_review(&review_path, &issues)?;
     let errors = issues.iter().filter(|x| x.level == "error").count();
     let locally_valid = errors == 0;
+    let has_isolation_template_gap = evidence
+        .metadata_scaffold
+        .template_gaps
+        .iter()
+        .any(|gap| gap.field == "single_cell_isolation_method");
+    let explicit_scope_incomplete =
+        !explicit_mappings.is_empty() && explicit_mappings.len() < evidence.raw_files.len();
     let completeness = if existing && locally_valid {
         "existing_sdrf_enriched_locally_valid"
     } else if existing {
         "existing_sdrf_enriched_requires_review"
     } else if evidence.study_design.repository_file_mode == "generic_archives_only" {
         "incomplete_repository_archive_contents_mapping"
+    } else if !explicit_mappings.is_empty() && locally_valid {
+        "locally_valid_draft"
+    } else if explicit_scope_incomplete {
+        "incomplete_explicit_row_mapping_repository_scope"
+    } else if !explicit_mappings.is_empty() && has_isolation_template_gap {
+        "incomplete_template_isolation_method_gap"
+    } else if !explicit_mappings.is_empty() {
+        "incomplete_required_metadata"
     } else if proposal.relation_mode == "one_cell_per_data_file" && locally_valid {
         "locally_valid_draft"
     } else if proposal.relation_mode != "one_cell_per_data_file" {
         "incomplete_sample_to_file_or_channel_mapping"
-    } else if evidence
-        .metadata_scaffold
-        .template_gaps
-        .iter()
-        .any(|gap| gap.field == "single_cell_isolation_method")
-    {
+    } else if has_isolation_template_gap {
         "incomplete_template_isolation_method_gap"
     } else {
         "incomplete_required_metadata"
@@ -5107,7 +5493,9 @@ async fn annotate_one(opts: &SdrfAnnotateOptions, accession: &str) -> Result<Res
         raw_file_count: evidence.raw_files.len(), evidence_item_count: evidence.evidence.len(), manuscript_source_count: evidence.manuscript_sources.len(),
         annotation_source_count: evidence.annotation_sources.len(), ollama_model: opts.model.clone(), ollama_used,
         draft_path: draft_path.display().to_string(), proposal_path: proposal_path.display().to_string(), evidence_path: evidence_path.display().to_string(),
-        review_path: review_path.display().to_string(), validation_issue_count: issues.len(), validation_error_count: errors, proposal_repair_count, locally_valid,
+        review_path: review_path.display().to_string(), validation_issue_count: issues.len(), validation_error_count: errors, proposal_repair_count,
+        explicit_row_mapping_manifest: opts.explicit_row_mapping_manifest.as_ref().map(|p| p.display().to_string()).unwrap_or_default(),
+        explicit_row_mapping_rows: explicit_mappings.len(), locally_valid,
         completeness_status: completeness.into(),
         template_drift_note: "The linked single-cell template is work-in-progress. This generator pins the 1.0.0 column profile shown by the rendered specification/GitHub view observed 2026-09-06. Revalidate against the live template before submission because the template may change.".into(),
         validation_issues: issues,
@@ -5749,6 +6137,111 @@ mod tests {
         assert_eq!(rows[0][idx], "cell_A-01");
         let issues = validate_draft(&headers, &rows, &evidence);
         assert!(issues.iter().all(|x| x.level != "error"), "{issues:?}");
+    }
+
+    #[test]
+    fn explicit_source_grounded_manifest_serializes_multiplex_rows() {
+        let evidence = DatasetEvidence {
+            accession: "PXD028040".into(),
+            project_json_path: String::new(),
+            files_json_path: String::new(),
+            existing_sdrf_path: String::new(),
+            raw_files: vec![
+                RawFile {
+                    file_name: "2018-08-27_SC02.RAW".into(),
+                    file_uri: "ftp://example/2018-08-27_SC02.RAW".into(),
+                    category: "RAW".into(),
+                },
+                RawFile {
+                    file_name: "2018-08-27_SC03_tmt_single_neurons.RAW".into(),
+                    file_uri: "ftp://example/2018-08-27_SC03_tmt_single_neurons.RAW".into(),
+                    category: "RAW".into(),
+                },
+            ],
+            study_design: StudyDesignScaffold {
+                relation_mode_hint: "multiplexed_cells_per_data_file".into(),
+                relation_confidence: "high".into(),
+                ..Default::default()
+            },
+            metadata_scaffold: DeterministicMetadataScaffold::default(),
+            evidence: vec![],
+            manuscript_sources: vec![],
+            annotation_sources: vec![],
+        };
+        let root = tmp();
+        fs::create_dir_all(&root).unwrap();
+        let manifest = root.join("mapping.tsv");
+        fs::write(
+            &manifest,
+            concat!(
+                "accession\traw_file\tsource_name\tcell_identifier\tbiological_replicate\ttechnical_replicate\tsample_type\tcells_per_well\tlabel\tcarrier_channel\treference_channel\tdesign_source\tdesign_ref\tmapping_key\tmapping_confidence\n",
+                "PXD028040\t2018-08-27_SC02.RAW\tDA_neuron_1\tDA_neuron_1\t1\t1\tsingle cell\t1\tTMT128\tTMT131\tnot applicable\tChoi_design.xlsx\tSheet2:row15\tdate_sc_run_key\thigh\n",
+                "PXD028040\t2018-08-27_SC03_tmt_single_neurons.RAW\tDA_neuron_1\tDA_neuron_1\t1\t2\tsingle cell\t1\tTMT128\tTMT131\tnot applicable\tChoi_design.xlsx\tSheet2:row16\tdate_sc_run_key\thigh\n"
+            ),
+        )
+        .unwrap();
+        let mappings =
+            load_explicit_row_mappings(&manifest, "PXD028040", &evidence.raw_files).unwrap();
+        assert_eq!(mappings.len(), 2);
+        let proposal = SdrfProposal {
+            relation_mode: "multiplexed_cells_per_data_file".into(),
+            organism: "Mus musculus".into(),
+            organism_part: "substantia nigra pars compacta".into(),
+            disease: "normal".into(),
+            cell_type: "dopaminergic neuron".into(),
+            sample_type: "single cell".into(),
+            single_cell_isolation_method: "manual picking".into(),
+            individual: "not available".into(),
+            sample_preparation_batch: "not available".into(),
+            cells_per_well: "1".into(),
+            proteomics_data_acquisition_method: "data-dependent acquisition".into(),
+            label: "TMT128".into(),
+            instrument: "Orbitrap".into(),
+            cleavage_agent_details: "trypsin".into(),
+            fraction_identifier: "1".into(),
+            technical_replicate: "1".into(),
+            carrier_channel: "TMT131".into(),
+            reference_channel: "not applicable".into(),
+            ..Default::default()
+        };
+        let (headers, rows, mode) =
+            draft_rows_with_explicit_mappings(&proposal, &evidence, &mappings).unwrap();
+        assert_eq!(mode, "generated_source_grounded_explicit_row_mapping");
+        assert_eq!(rows.len(), 2);
+        let at = |name: &str| headers.iter().position(|h| h == name).unwrap();
+        assert_eq!(rows[0][at("source name")], "DA_neuron_1");
+        assert_eq!(rows[1][at("source name")], "DA_neuron_1");
+        assert_eq!(rows[0][at("characteristics[biological replicate]")], "1");
+        assert_eq!(rows[0][at("comment[technical replicate]")], "1");
+        assert_eq!(rows[1][at("comment[technical replicate]")], "2");
+        assert_eq!(rows[0][at("comment[label]")], "TMT128");
+        assert_eq!(rows[0][at(SC_CARRIER_CHANNEL)], "TMT131");
+        let issues = validate_draft(&headers, &rows, &evidence);
+        assert!(issues.iter().all(|x| x.level != "error"), "{issues:?}");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn explicit_manifest_rejects_duplicate_raw_assignment() {
+        let raw_files = vec![RawFile {
+            file_name: "run.raw".into(),
+            file_uri: String::new(),
+            category: "RAW".into(),
+        }];
+        let root = tmp();
+        fs::create_dir_all(&root).unwrap();
+        let manifest = root.join("mapping.tsv");
+        fs::write(
+            &manifest,
+            concat!(
+                "accession\traw_file\tsource_name\tcell_identifier\tbiological_replicate\ttechnical_replicate\tsample_type\tcells_per_well\tlabel\tcarrier_channel\treference_channel\tdesign_source\tdesign_ref\tmapping_key\tmapping_confidence\n",
+                "PXD028040\trun.raw\tcell1\tcell1\t1\t1\tsingle cell\t1\tTMT128\tTMT131\tnot applicable\tdesign.xlsx\trow1\texact_raw_name\thigh\n",
+                "PXD028040\trun.raw\tcell2\tcell2\t2\t1\tsingle cell\t1\tTMT128\tTMT131\tnot applicable\tdesign.xlsx\trow2\texact_raw_name\thigh\n"
+            ),
+        )
+        .unwrap();
+        assert!(load_explicit_row_mappings(&manifest, "PXD028040", &raw_files).is_err());
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]

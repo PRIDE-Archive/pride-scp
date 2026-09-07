@@ -285,6 +285,10 @@ enum Command {
         /// Usable files here take precedence over the PRIDE SDRF API cache.
         #[arg(long)]
         resolved_sdrf_dir: Option<PathBuf>,
+        /// Optional source-grounded explicit row-mapping manifest. Rows in this manifest
+        /// replace generic de-novo row construction only for matching accessions.
+        #[arg(long)]
+        explicit_row_mapping_manifest: Option<PathBuf>,
         #[arg(long, default_value = "data/sdrf_annotation")]
         output: PathBuf,
         #[arg(long, default_value = "qwen2.5:3b")]
@@ -587,6 +591,7 @@ async fn main() -> Result<()> {
             publication_manifest,
             manuscript_text,
             resolved_sdrf_dir,
+            explicit_row_mapping_manifest,
             output,
             model,
             ollama_url,
@@ -613,6 +618,7 @@ async fn main() -> Result<()> {
                 accessions,
                 accessions_file,
                 resolved_sdrf_dir,
+                explicit_row_mapping_manifest,
                 model,
                 ollama_url,
                 timeout_seconds: timeout,
