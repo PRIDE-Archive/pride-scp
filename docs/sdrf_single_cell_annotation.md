@@ -1982,3 +1982,38 @@ source extractors emit claims; only explicit resolution rules may promote claims
 The graph may ingest community sources such as `https://scp.slavovlab.net/` for discovery and
 corroboration, but community-source claims cannot by themselves establish accession-specific RAW,
 sample or reporter-channel mappings.
+
+### v0.5.5 global graph canonicalization/resolution
+
+The v0.5.4 graph foundation is followed by an accession-agnostic resolver before small-LLM semantic
+claim extraction is scaled up.  `scripts/scp_kg_resolve.py` normalizes reusable identities, collapses
+duplicate source lineages, caps evidence repetition by source family, detects conflicts, and applies
+risk-aware claim-promotion gates.
+
+The resolver does not choose scientific outcomes from accession identifiers and remains covered by
+`scripts/check_sdrf_generalization_guard.py`.  High-risk SDRF mappings such as RAW-to-branch,
+RAW-to-cell and RAW-to-reporter-channel assignments require primary or structured source closure;
+community resources and runtime hypotheses cannot promote those mappings by confidence voting.
+
+Noisy v0.5.3 branch hypotheses are retained as hypotheses.  The resolver may conservatively cluster
+compatible hypotheses into `canonical_branch_candidate` records, while contradictory combinations
+(e.g. label-free modality plus TMT reporter chemistry) are surfaced explicitly rather than silently
+accepted.  These branch-resolution records are diagnostic and are not serialized into SDRF rows.
+
+Run:
+
+```bash
+./scripts/run_scp_global_knowledge_graph_v055.sh
+```
+
+Primary new outputs are:
+
+```text
+data/scp_global_knowledge_graph_v055/resolution/kg_resolution_summary.json
+data/scp_global_knowledge_graph_v055/resolution/conflicts.tsv
+data/scp_global_knowledge_graph_v055/resolution/corroborated_not_accepted.tsv
+data/scp_global_knowledge_graph_v055/resolution/hypothesis_only.tsv
+data/scp_global_knowledge_graph_v055/resolution/branch_resolution.tsv
+```
+
+The stage is non-generative and does not change the accepted SDRF-ready count by itself.

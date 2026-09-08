@@ -23,7 +23,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable, Iterator
 
-VERSION = "pride-scp-global-knowledge-graph-v0.1"
+VERSION = "pride-scp-global-knowledge-graph-v0.2"
 PXD_RE = re.compile(r"\bPXD\d{6,}\b", re.I)
 MSV_RE = re.compile(r"\bMSV\d{6,}\b", re.I)
 DOI_RE = re.compile(r"\b10\.\d{4,9}/[-._;()/:A-Z0-9]+", re.I)
@@ -172,6 +172,70 @@ class GraphStore:
               claim_id TEXT NOT NULL REFERENCES claim(claim_id) ON DELETE CASCADE,
               PRIMARY KEY(edge_id, claim_id)
             );
+
+            CREATE TABLE IF NOT EXISTS node_canonicalization (
+              node_id TEXT PRIMARY KEY REFERENCES node(node_id) ON DELETE CASCADE,
+              canonical_node_id TEXT NOT NULL REFERENCES node(node_id),
+              canonicalization_method TEXT NOT NULL,
+              confidence REAL NOT NULL DEFAULT 1.0,
+              attrs_json TEXT NOT NULL DEFAULT '{}'
+            );
+            CREATE INDEX IF NOT EXISTS idx_node_canonicalization_target ON node_canonicalization(canonical_node_id);
+
+            CREATE TABLE IF NOT EXISTS resolution_group (
+              resolution_id TEXT PRIMARY KEY,
+              canonical_subject_id TEXT NOT NULL REFERENCES node(node_id),
+              canonical_predicate TEXT NOT NULL,
+              canonical_object_id TEXT REFERENCES node(node_id),
+              canonical_literal_value TEXT NOT NULL DEFAULT '',
+              canonical_literal_datatype TEXT NOT NULL DEFAULT '',
+              scope_accession TEXT NOT NULL DEFAULT '',
+              branch_scope TEXT NOT NULL DEFAULT '',
+              risk_class TEXT NOT NULL DEFAULT 'semantic',
+              status TEXT NOT NULL,
+              support_score REAL NOT NULL DEFAULT 0.0,
+              independent_lineages INTEGER NOT NULL DEFAULT 0,
+              independent_families INTEGER NOT NULL DEFAULT 0,
+              claim_count INTEGER NOT NULL DEFAULT 0,
+              winning_edge_id TEXT REFERENCES edge(edge_id),
+              conflict_key TEXT NOT NULL DEFAULT '',
+              resolution_method TEXT NOT NULL DEFAULT '',
+              attrs_json TEXT NOT NULL DEFAULT '{}'
+            );
+            CREATE INDEX IF NOT EXISTS idx_resolution_group_scope ON resolution_group(scope_accession);
+            CREATE INDEX IF NOT EXISTS idx_resolution_group_status ON resolution_group(status);
+
+            CREATE TABLE IF NOT EXISTS resolution_claim (
+              resolution_id TEXT NOT NULL REFERENCES resolution_group(resolution_id) ON DELETE CASCADE,
+              claim_id TEXT NOT NULL REFERENCES claim(claim_id) ON DELETE CASCADE,
+              source_lineage TEXT NOT NULL,
+              source_family TEXT NOT NULL,
+              normalized_confidence REAL NOT NULL DEFAULT 0.0,
+              contribution REAL NOT NULL DEFAULT 0.0,
+              PRIMARY KEY(resolution_id, claim_id)
+            );
+
+            CREATE TABLE IF NOT EXISTS branch_resolution (
+              branch_resolution_id TEXT PRIMARY KEY,
+              scope_accession TEXT NOT NULL,
+              canonical_branch_key TEXT NOT NULL,
+              status TEXT NOT NULL,
+              modality TEXT NOT NULL DEFAULT '',
+              chemistry TEXT NOT NULL DEFAULT '',
+              acquisition TEXT NOT NULL DEFAULT '',
+              confidence REAL NOT NULL DEFAULT 0.0,
+              blocker TEXT NOT NULL DEFAULT '',
+              attrs_json TEXT NOT NULL DEFAULT '{}'
+            );
+            CREATE INDEX IF NOT EXISTS idx_branch_resolution_scope ON branch_resolution(scope_accession);
+
+            CREATE TABLE IF NOT EXISTS branch_resolution_member (
+              branch_resolution_id TEXT NOT NULL REFERENCES branch_resolution(branch_resolution_id) ON DELETE CASCADE,
+              branch_node_id TEXT NOT NULL REFERENCES node(node_id) ON DELETE CASCADE,
+              relation TEXT NOT NULL DEFAULT 'member',
+              similarity REAL NOT NULL DEFAULT 1.0,
+              PRIMARY KEY(branch_resolution_id, branch_node_id)
+            );
             """
         )
 
@@ -292,6 +356,70 @@ class GraphStore:
         self.conn.executemany("INSERT OR IGNORE INTO edge_claim(edge_id,claim_id) VALUES(?,?)", [(eid, cid) for cid in ids])
         return eid
 
+    def resolved_edge(
+        self,
+        claim_ids: Iterable[str],
+        *,
+        subject: NodeRef,
+        predicate: str,
+        object_ref: NodeRef | None = None,
+        literal_value: Any = "",
+        literal_datatype: str = "",
+        scope_accession: str = "",
+        branch_scope: str = "",
+        status: str = "accepted",
+        confidence: float,
+        resolution_method: str,
+        attrs: dict[str, Any] | None = None,
+    ) -> str:
+        """Create a canonical edge from claims that may use aliases or hypothesis predicates.
+
+        Unlike :meth:`promote_edge`, this method deliberately permits heterogeneous raw claim
+        signatures.  The resolver supplies the canonical subject/predicate/object signature and the
+        edge retains every contributing claim through ``edge_claim`` provenance links.
+        """
+        ids = sorted(set(claim_ids))
+        if not ids:
+            raise ValueError("at least one claim is required")
+        for cid in ids:
+            if self.conn.execute("SELECT 1 FROM claim WHERE claim_id=?", (cid,)).fetchone() is None:
+                raise ValueError(f"unknown claim id: {cid}")
+        sid = self.node(subject)
+        oid = self.node(object_ref) if object_ref else None
+        literal = norm(literal_value)
+        signature = (sid, predicate, oid, literal, literal_datatype, scope_accession.upper(), branch_scope)
+        eid = stable_id("edge", *[x or "" for x in signature], status)
+        self.conn.execute(
+            """INSERT INTO edge(edge_id,subject_id,predicate,object_id,literal_value,literal_datatype,scope_accession,branch_scope,status,confidence,resolution_method,attrs_json)
+               VALUES(?,?,?,?,?,?,?,?,?,?,?,?)
+               ON CONFLICT(edge_id) DO UPDATE SET
+                 confidence=MAX(edge.confidence, excluded.confidence),
+                 resolution_method=excluded.resolution_method,
+                 attrs_json=excluded.attrs_json""",
+            (eid, *signature, status, float(confidence), resolution_method, json_text(attrs or {})),
+        )
+        self.conn.executemany(
+            "INSERT OR IGNORE INTO edge_claim(edge_id,claim_id) VALUES(?,?)",
+            [(eid, cid) for cid in ids],
+        )
+        return eid
+
+    def clear_resolution(self) -> None:
+        """Remove only resolver-derived state, preserving source claims and primary accepted edges."""
+        resolver_edges = [
+            r[0] for r in self.conn.execute(
+                "SELECT edge_id FROM edge WHERE resolution_method LIKE 'kg_resolver:%'"
+            )
+        ]
+        if resolver_edges:
+            self.conn.executemany("DELETE FROM edge_claim WHERE edge_id=?", [(x,) for x in resolver_edges])
+            self.conn.executemany("DELETE FROM edge WHERE edge_id=?", [(x,) for x in resolver_edges])
+        self.conn.execute("DELETE FROM resolution_claim")
+        self.conn.execute("DELETE FROM resolution_group")
+        self.conn.execute("DELETE FROM branch_resolution_member")
+        self.conn.execute("DELETE FROM branch_resolution")
+        self.conn.execute("DELETE FROM node_canonicalization")
+
     def export_tsv(self, output: Path) -> None:
         output.mkdir(parents=True, exist_ok=True)
         tables = {
@@ -300,6 +428,11 @@ class GraphStore:
             "claims.tsv": ("claim", ["claim_id","subject_id","predicate","object_id","literal_value","literal_datatype","scope_accession","branch_scope","source_id","extractor","confidence","status","evidence_locator","evidence_text","attrs_json"]),
             "edges.tsv": ("edge", ["edge_id","subject_id","predicate","object_id","literal_value","literal_datatype","scope_accession","branch_scope","status","confidence","resolution_method","attrs_json"]),
             "edge_claims.tsv": ("edge_claim", ["edge_id","claim_id"]),
+            "node_canonicalization.tsv": ("node_canonicalization", ["node_id","canonical_node_id","canonicalization_method","confidence","attrs_json"]),
+            "resolution_groups.tsv": ("resolution_group", ["resolution_id","canonical_subject_id","canonical_predicate","canonical_object_id","canonical_literal_value","canonical_literal_datatype","scope_accession","branch_scope","risk_class","status","support_score","independent_lineages","independent_families","claim_count","winning_edge_id","conflict_key","resolution_method","attrs_json"]),
+            "resolution_claims.tsv": ("resolution_claim", ["resolution_id","claim_id","source_lineage","source_family","normalized_confidence","contribution"]),
+            "branch_resolution.tsv": ("branch_resolution", ["branch_resolution_id","scope_accession","canonical_branch_key","status","modality","chemistry","acquisition","confidence","blocker","attrs_json"]),
+            "branch_resolution_members.tsv": ("branch_resolution_member", ["branch_resolution_id","branch_node_id","relation","similarity"]),
         }
         for name, (table, fields) in tables.items():
             with (output/name).open("w", newline="", encoding="utf-8") as fh:
@@ -361,6 +494,8 @@ class GraphStore:
             "claim_status_counts": {r[0]: r[1] for r in self.conn.execute("SELECT status,COUNT(*) FROM claim GROUP BY status ORDER BY status")},
             "source_type_counts": {r[0]: r[1] for r in self.conn.execute("SELECT source_type,COUNT(*) FROM source GROUP BY source_type ORDER BY source_type")},
             "node_type_counts": {r[0]: r[1] for r in self.conn.execute("SELECT node_type,COUNT(*) FROM node GROUP BY node_type ORDER BY node_type")},
+            "resolution_status_counts": {r[0]: r[1] for r in self.conn.execute("SELECT status,COUNT(*) FROM resolution_group GROUP BY status ORDER BY status")},
+            "branch_resolution_status_counts": {r[0]: r[1] for r in self.conn.execute("SELECT status,COUNT(*) FROM branch_resolution GROUP BY status ORDER BY status")},
         }
 
 

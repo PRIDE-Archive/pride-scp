@@ -100,3 +100,95 @@ as invented SDRF values.
 
 Changing only an accession identifier must not change scientific inference.  Accessions are allowed
 as runtime data and query scopes, not as scientific configuration.
+
+## v0.5.5 canonicalization and resolution
+
+The global graph deliberately stores more claims than accepted facts.  `scripts/scp_kg_resolve.py`
+adds the first accession-agnostic canonicalization/resolution layer between source ingestion and any
+future SDRF projection.
+
+### Canonical identity
+
+Reusable identities are normalized before evidence is compared.  The resolver currently
+canonicalizes common technology/reporter aliases (for example `TMT pro 18-plex`, `TMTpro18` and
+`TMTpro 18 plex`), reporter-channel notation, acquisition-method labels and modality spelling.  The
+original source nodes are retained and `node_canonicalization` records the mapping to the canonical
+node; source provenance is never discarded.
+
+Unknown terms are preserved rather than force-mapped to a known vocabulary.  Canonicalization is a
+normalization operation, not a semantic guess.
+
+### Source lineage and independent corroboration
+
+Raw claim count is not treated as evidence strength.  The resolver computes both a source lineage and
+an evidence family for every claim.  Multiple repeated observations from one lineage are collapsed to
+their strongest contribution, and multiple lineages from the same evidence family are capped when
+computing corroboration support.
+
+Consequently, ten `scp.slavovlab.net` pages repeating the same method/publication do not count as ten
+independent sources.  Community resources remain valuable for discovery and corroboration but cannot
+manufacture accession-specific SDRF truth by repetition.
+
+### Risk-aware resolution
+
+Canonical claim groups are classified by risk:
+
+- `source_relation`: statements that a page/repository mentions or links a resource;
+- `bibliographic`: repository title/date/RAW inventory and publication identity;
+- `semantic`: modality, chemistry, acquisition and other method-level facts;
+- `mapping`: branch/file/sample/channel joins used directly by SDRF rows;
+- `relationship`: cross-accession predecessor/redeposit/related-study hypotheses.
+
+The acceptance gate becomes stricter as risk increases.  High-risk RAW/sample/channel mapping claims
+require primary or structured source closure.  Community evidence, publication prose or runtime
+hypotheses cannot independently close such a mapping.  Cross-accession relationship inferences remain
+review-gated even when strongly corroborated unless an explicit source closes the relationship.
+
+Claim-resolution states are explicit:
+
+- `accepted_existing` — already present as a canonical primary edge;
+- `accepted_resolved` — promoted by resolver policy;
+- `corroborated_not_accepted` — independently supported but below the risk-specific generation gate;
+- `source_asserted` — present in a source but insufficiently corroborated;
+- `hypothesis_only` — supported only by derived/runtime hypotheses;
+- `conflicted` — mutually exclusive alternatives remain;
+- `rejected_by_stronger_evidence` — a functional fact conflicts with a stronger already accepted
+  primary fact.
+
+### Branch-hypothesis resolution
+
+The resolver also canonicalizes the noisy branch hypotheses produced by the generalized v0.5.3
+extractor.  It does not promote those branches to graph truth.  Instead it:
+
+1. normalizes modality/chemistry/acquisition/reporter-role features;
+2. marks internally impossible combinations such as label-free modality plus TMT reporter chemistry;
+3. marks incompatible specific reporter chemistries as contradictory;
+4. conservatively clusters only compatible hypotheses with sufficiently similar evidence;
+5. emits `canonical_branch_candidate`, `unresolved_hypothesis`, or `contradictory_hypothesis` review
+   records.
+
+A canonical branch candidate still requires source-grounded publication/repository/structured claims
+before becoming an accepted experimental branch.
+
+### Resolver tables and exports
+
+The SQLite graph now additionally contains:
+
+- `node_canonicalization`;
+- `resolution_group`;
+- `resolution_claim`;
+- `branch_resolution`;
+- `branch_resolution_member`.
+
+The standard graph export includes corresponding TSVs.  The v0.5.5 runner also writes explicit
+review queues under `resolution/`, including conflicts, corroborated-but-not-accepted facts,
+hypothesis-only facts and branch-resolution diagnostics.
+
+Run:
+
+```bash
+./scripts/run_scp_global_knowledge_graph_v055.sh
+```
+
+The stage remains non-generative.  Its purpose is to create a reliable canonical knowledge layer
+before the small LLM is allowed to contribute manuscript-derived semantic claims at scale.
