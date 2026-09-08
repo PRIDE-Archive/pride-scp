@@ -1743,3 +1743,140 @@ supplementary design/sample/channel material, recover only those assets and buil
 mapping contract.  If a source-limited required-metadata accession gains a trustworthy publication,
 rerun that accession alone through the existing deterministic annotation scaffold.  Do not reopen
 already-solved reporter or isolation architecture lanes.
+
+## v0.5.1: multiplex evidence graph and structured-analysis-artifact reconstruction
+
+The real v0.5.0 run recovered four source-sensitive publications but did **not** improve the
+reporter mapping gate for the eight residual studies: all eight remained
+`chemistry_or_partial_channel_evidence` and no medium/high reporter-role candidate emerged.  That
+is treated as an architectural stop condition.  The pipeline must not continue with broader regexes,
+more publication searches, or repeated support-file triage.
+
+The core failure is the assumption that a usable SDRF design must be stated as a local prose
+relationship such as `reporter 126 = single cell`.  For unsupported PRIDE submissions, design truth
+is often distributed across several source types:
+
+1. publication methods establish the **single-cell branch/modality** and global labeling contract;
+2. result workbooks and vendor analysis databases retain **sample/channel/file structure**;
+3. analysis-code/data repositories linked by the authors retain cell/sample identities and input
+   tables;
+4. reporter abundance columns can validate carrier/blank/reference behavior quantitatively; and
+5. related PRIDE accessions can represent separate branches, reannouncements, or duplicate study
+   deposits and must be resolved before generation.
+
+`scripts/sdrf_multiplex_evidence_graph.py` implements this architecture as a non-generative evidence
+graph.  It never reads GT/reference resources and it does not write SDRF rows.
+
+### Layer A — branch/modality contract
+
+The graph first asks which repository branch is actually single-cell proteomics and whether that
+branch is label-free or reporter multiplexed.  Dataset-level TMT evidence is not sufficient.  This is
+a mandatory correction to the earlier relation model: mixed studies can contain TMT experiments in
+one branch and label-free SCP in another.
+
+A high-confidence label-free SCP branch is removed from the reporter-multiplex reconstruction lane
+and routed to repository/run segmentation instead.
+
+### Layer B — chemistry-aware global reporter contract
+
+Reporter roles are parsed as **sets**, not nearest-token assignments.  The parser supports explicit
+channel lists and set language such as:
+
+```text
+single cells labeled with 126, 127, 128 and 129
+all channels except 126 and 127C
+carrier labeled with TMT126
+127C left empty
+```
+
+Chemistry-specific channel universes are represented for TMT6plex, TMT10plex, TMTpro16 and
+TMTpro18.  A channel cannot silently acquire two roles.  A complete global design requires an
+explicit analytical set plus carrier/reference role and no contradiction.
+
+Mandatory regression fixtures include:
+
+* TMT6: analytical `126,127,128,129`, blank `130`, carrier `131`;
+* TMTpro18: carrier `126`, blank `127C`, analytical = the other 16 channels;
+* partial RETICLE-style contract: carrier `126`, expected 14 analytical cells, but exact analytical
+  channel set remains open until a structured source closes it.
+
+### Layer C — structured repository analysis artifacts
+
+v0.4.7 was correct to reject result-table *semantic* noise but too aggressive in excluding result
+artifacts entirely.  v0.5.1 restores them as structured sources:
+
+* `.pdResult`, `.msf`, `.pdStudy`: SQLite schema/table inspection and bounded reads of
+  sample/channel/file/quantification fields;
+* `.sky`: Skyline XML replicate/file/sample relationships;
+* `.xlsx`: sheet/row structure, sample/file/channel cells;
+* `.csv/.tsv/.txt`: headers and bounded structured rows; result tables are never scanned as free
+  prose;
+* reporter abundance/intensity/SN columns: bounded per-channel median summaries for quantitative
+  validation.
+
+Repository acquisition is bounded by per-accession file count and maximum file size.  Large or
+unsupported artifacts remain explicit blockers rather than being silently skipped.
+
+### Layer D — publication-linked external analysis sources
+
+GitHub/Zenodo/Mendeley links are accepted only when they are explicitly present in publication
+content or accepted supplementary-link inventories.  For GitHub repositories the stage may perform
+a bounded tree query and retrieve only small high-value files whose names indicate cell/sample/input/
+design/metadata/channel information.  This is author-linked source evidence, not generic web search.
+
+Review-only publication candidates from v0.5.0 can enter this evidence graph only after their full
+text is fetched and the exact accession is independently re-verified.  Title similarity by itself is
+not publication evidence.
+
+### Layer E — cross-accession relation/integrity graph
+
+Highly similar project titles are paired and their RAW filename inventories compared.  The stage
+emits relation-review candidates such as same-study/related-deposition or probable duplicate/
+reannouncement.  It never chooses a canonical accession automatically.
+
+### Layer F — generation authorization
+
+The evidence graph emits one of the following states rather than directly generating SDRF rows:
+
+```text
+branch_reclassification_ready
+global_design_closed_run_mapping_open
+structured_artifact_evidence_partial
+external_analysis_source_identified
+explicit_row_manifest_candidate
+source_graph_open
+```
+
+Only `explicit_row_manifest_candidate` is eligible for a future source-grounded explicit-row manifest.
+Even then, biological sample identities must come from a source table/code input or another explicit
+source; quantitative reporter behavior can validate channel roles but cannot invent biological
+identity.
+
+Run:
+
+```bash
+./scripts/run_gt105_pride_sdrf_multiplex_evidence_graph_v051.sh
+```
+
+Expected output root:
+
+```text
+data/sdrf_multiplex_evidence_graph_gt105_pride_v051/
+```
+
+Key outputs:
+
+```text
+audit/multiplex_evidence_graph_summary.json
+audit/multiplex_evidence_graph.tsv
+audit/branch_contracts.tsv
+audit/design_contracts.tsv
+audit/artifact_inventory.tsv
+audit/structured_artifact_evidence.tsv
+audit/external_analysis_sources.tsv
+audit/relation_candidates.tsv
+audit/review_publication_promotions.tsv
+```
+
+The next implementation must follow the graph result.  Do not return to token-local reporter regexes
+or blanket publication/support searches if a graph layer remains open.
