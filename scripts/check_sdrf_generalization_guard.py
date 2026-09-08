@@ -18,6 +18,7 @@ DEFAULT_FILES = [
     "scripts/scp_kg_build.py",
     "scripts/scp_kg_ingest_slavov.py",
     "scripts/scp_kg_resolve.py",
+    "scripts/scp_kg_extract_semantic_claims.py",
     "scripts/sdrf_generalized_evidence_graph.py",
     "scripts/sdrf_multibranch_evidence_graph.py",
     "scripts/sdrf_multiplex_evidence_graph.py",

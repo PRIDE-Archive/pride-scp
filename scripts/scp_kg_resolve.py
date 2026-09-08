@@ -23,7 +23,7 @@ from urllib.parse import urlparse
 
 from scp_knowledge_graph import GraphStore, NodeRef, json_text, norm, stable_id
 
-VERSION = "pride-scp-kg-resolver-v0.1"
+VERSION = "pride-scp-kg-resolver-v0.2"
 
 # Trust weight is evidence quality, not a probability.  Contributions are capped per source family
 # so dozens of pages from one community site cannot manufacture independent corroboration.
@@ -31,6 +31,8 @@ TRUST_WEIGHTS = {
     "repository_primary": 1.00,
     "publication_association": 0.95,
     "peer_reviewed": 0.92,
+    "peer_reviewed_model_extraction": 0.78,
+    "repository_model_extraction": 0.80,
     "primary_structured_evidence": 0.90,
     "derived_structured_evidence": 0.82,
     "analysis_repository": 0.72,
@@ -230,7 +232,10 @@ def source_lineage(source: sqlite3.Row | dict[str, Any]) -> str:
     metadata = json.loads(source["metadata_json"] or "{}")
     explicit = norm(metadata.get("lineage_uri") or metadata.get("parent_source_uri"))
     if explicit:
-        return f"explicit:{explicit.lower()}"
+        low = explicit.lower()
+        if low.startswith(("doi:", "pmid:", "repository:")):
+            return low
+        return f"explicit:{low}"
     uri = norm(source["uri"])
     trust = norm(source["trust_class"]) or "unclassified"
     # Publications are independent by DOI/source URI; repository evidence is independent per
@@ -410,6 +415,8 @@ class Resolver:
             "publication_association": 0.95,
             "analysis_repository": 0.90,
             "peer_reviewed": 1.80,
+            "peer_reviewed_model_extraction": 1.25,
+            "repository_model_extraction": 1.20,
             "primary_structured_evidence": 1.80,
             "derived_structured_evidence": 1.60,
             "repository_primary": 1.20,
@@ -442,7 +449,10 @@ class Resolver:
             return
 
         asserted = [c for c in group.claims if c.raw_status != "hypothesis"]
-        strong_families = {"repository_primary", "peer_reviewed", "primary_structured_evidence", "derived_structured_evidence"}
+        strong_families = {
+            "repository_primary", "peer_reviewed", "primary_structured_evidence", "derived_structured_evidence",
+            "peer_reviewed_model_extraction", "repository_model_extraction",
+        }
         families = {c.source_family for c in asserted}
         max_asserted = max((c.contribution for c in asserted), default=0.0)
 
@@ -807,6 +817,15 @@ def self_test() -> None:
             page=NodeRef("CommunityResourcePage","https://scp.example/a","A")
             g.claim(page,"MENTIONS_ACCESSION",comm1,object_ref=acc,extractor="community",confidence=0.9,evidence_locator="page",evidence_text="PXD fixture")
 
+            # A single model interpretation of a publication must not self-promote, but matching
+            # model interpretations from independent publication + repository source lineages may
+            # corroborate a semantic fact.
+            model_pub=g.source("llm_publication_semantic","doi:10.0000/model",trust_class="peer_reviewed_model_extraction",scope_accession="PXD900101",metadata={"lineage_uri":"doi:10.0000/model"})
+            model_repo=g.source("llm_pride_metadata_semantic","pride-snapshot:PXD900101",trust_class="repository_model_extraction",scope_accession="PXD900101",metadata={"lineage_uri":"repository:PXD900101:pride-snapshot:PXD900101"})
+            tech=NodeRef("Technology","TMTpro18","TMTpro18")
+            g.claim(acc,"USES_CHEMISTRY",model_pub,object_ref=tech,scope_accession="PXD900101",extractor="small_llm:fixture",confidence=.98,evidence_locator="Methods",evidence_text="TMTpro18")
+            g.claim(acc,"USES_CHEMISTRY",model_repo,object_ref=tech,scope_accession="PXD900101",extractor="small_llm:fixture",confidence=.98,evidence_locator="description",evidence_text="TMTpro18")
+
             # Contradictory branch hypotheses must remain diagnostic, never canonical truth.
             hyp=g.source("runtime_inference","fixture:v053",trust_class="derived_hypothesis")
             bh=NodeRef("ExperimentalBranchHypothesis","PXD900101::h1","h1",{"accession":"PXD900101"})
@@ -816,10 +835,11 @@ def self_test() -> None:
 
             r=Resolver(g); summary=r.run()
             assert summary["node_aliases"] >= 2
+            assert g.conn.execute("SELECT COUNT(*) FROM resolution_group WHERE canonical_predicate='USES_CHEMISTRY' AND status='accepted_resolved'").fetchone()[0] >= 1
             # Existing repository edge survives.
             assert g.conn.execute("SELECT COUNT(*) FROM edge WHERE predicate='HAS_RAW_FILE' AND status='accepted'").fetchone()[0]==1
             # Alias-normalized semantic fact should resolve from peer-reviewed + community evidence.
-            assert g.conn.execute("SELECT COUNT(*) FROM edge WHERE predicate='USES_CHEMISTRY' AND status='accepted'").fetchone()[0]==1
+            assert g.conn.execute("SELECT COUNT(*) FROM edge WHERE predicate='USES_CHEMISTRY' AND status='accepted' AND branch_scope='b1'").fetchone()[0]==1
             # Community family is capped: two pages are not two independent families.
             rg=g.conn.execute("SELECT independent_families,support_score FROM resolution_group WHERE canonical_predicate='USES_CHEMISTRY' AND branch_scope='b1'").fetchone()
             assert rg[0]==2 and rg[1] < 1.5

@@ -192,3 +192,84 @@ Run:
 
 The stage remains non-generative.  Its purpose is to create a reliable canonical knowledge layer
 before the small LLM is allowed to contribute manuscript-derived semantic claims at scale.
+
+## v0.5.6 constrained small-LLM semantic claim extraction
+
+`scripts/scp_kg_extract_semantic_claims.py` connects the existing small local Ollama model to the
+knowledge graph as a **semantic source reader**, not an SDRF generator.
+
+The extractor reads two source classes for each runtime-selected accession:
+
+1. PRIDE project metadata from the local repository snapshot;
+2. locally resolved accession-associated manuscript/full-text rows from the publication manifest.
+
+Manuscript text is split into provenance-labelled, section-aware chunks. Explicit bibliography
+sections are excluded from semantic extraction so methods cited from unrelated papers are not
+mistaken for methods used by the current study. The full-manuscript mode processes all bounded
+chunks; a relevant mode is also available for larger catalogue-scale runs and reports the selected
+text-coverage fraction.
+
+### Model contract
+
+The model sees evidence IDs such as `P0001` or `M0001` and may emit only a fixed semantic ontology:
+
+- experimental modality;
+- reporter chemistry / reusable technology;
+- MS acquisition mode;
+- analytical/carrier/blank/reference reporter-role descriptions;
+- isolation and sample-preparation method;
+- organism, organism part, cell type, disease and sample type;
+- instrument and cleavage agent;
+- cells per well / multiplex size / relation-mode descriptions.
+
+The model cannot choose graph node types or arbitrary predicates. RAW/file/sample/cell/run mapping
+predicates are absent from the Ollama JSON schema and are rejected again by
+`import_claim_jsonl()` if an externally supplied small-LLM claim attempts to use them.
+
+Every accepted model claim must cite supplied passage IDs. The Python converter reconstructs exact
+source URI, content hash, source lineage, graph node type and evidence locator. A reporter-channel
+role is rejected unless the channel token itself occurs in the cited passage. Claims whose object is
+not lexically/alias-grounded in the source receive a deterministic confidence cap.
+
+### Source independence
+
+Model interpretation is not treated as identical to primary source truth. The resolver introduces
+lower-authority evidence families:
+
+- `peer_reviewed_model_extraction`;
+- `repository_model_extraction`.
+
+One small-LLM interpretation cannot self-promote a semantic fact. Matching claims from independent
+source lineages, such as manuscript text plus PRIDE project metadata, may satisfy the existing
+independent-corroboration gate. Mapping facts remain governed by the stricter structured-source gate.
+
+The model-derived source metadata stores a lineage URI so repeated chunks from the same manuscript
+count as one evidence lineage rather than independent votes.
+
+### Caching and reproducibility
+
+Each Ollama packet is cached by prompt version, model name and exact provenance-labelled packet
+content. Re-runs therefore reuse valid model responses unless `--force`/`LLM_FORCE=1` is requested.
+The run writes the original packets, validated graph-claim JSONL, rejected-claim JSONL and per-packet
+results for auditability.
+
+Run the integrated non-generative stage with:
+
+```bash
+./scripts/run_scp_global_knowledge_graph_v056.sh
+```
+
+This stage imports the constrained model claims and reruns the v0.5.5 canonical resolver. It still
+does not project or generate SDRFs.
+
+Source-local `ExperimentalContext` nodes deliberately include source identity in their keys. Two
+manuscripts/metadata records that happen to use similar context labels are therefore not merged by
+the LLM stage itself. Dataset-wide accession claims can corroborate across independent source
+lineages immediately; experimental-context claims require a later generic context/branch resolution
+step to establish cross-source identity. This prevents model wording from silently merging distinct
+sub-studies.
+
+`publication_mode=full` means source-order manuscript coverage up to the configured
+`max_publication_chunks`; setting that limit to `0` removes the cap. `publication_mode=relevant`
+selects the highest-scoring broad SCP/method passages up to the same cap. The extraction summary
+always reports the selected character-coverage fraction.

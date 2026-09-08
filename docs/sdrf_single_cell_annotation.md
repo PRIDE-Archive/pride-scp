@@ -2017,3 +2017,12 @@ data/scp_global_knowledge_graph_v055/resolution/branch_resolution.tsv
 ```
 
 The stage is non-generative and does not change the accepted SDRF-ready count by itself.
+
+## v0.5.6 small-LLM semantics in the global KG
+
+The small local LLM is now integrated as a constrained semantic claim extractor. It reads
+accession-associated PRIDE metadata and locally resolved publication text, cites explicit source
+passage IDs, and emits only the fixed knowledge-graph semantic ontology. It does **not** emit SDRF
+rows or file/sample/channel joins. Model claims are imported with provenance and lower-authority
+model-extraction trust classes, then adjudicated by the same conservative KG resolver before any
+future SDRF projection.

@@ -28,6 +28,19 @@ PXD_RE = re.compile(r"\bPXD\d{6,}\b", re.I)
 MSV_RE = re.compile(r"\bMSV\d{6,}\b", re.I)
 DOI_RE = re.compile(r"\b10\.\d{4,9}/[-._;()/:A-Z0-9]+", re.I)
 
+LLM_SEMANTIC_ALLOWED_PREDICATES = {
+    "HAS_EXPERIMENTAL_CONTEXT", "HAS_MODALITY", "USES_CHEMISTRY", "USES_TECHNOLOGY",
+    "HAS_ACQUISITION", "HAS_ANALYTICAL_CHANNEL", "HAS_CARRIER_CHANNEL", "HAS_BLANK_CHANNEL",
+    "HAS_REFERENCE_CHANNEL", "HAS_ISOLATION_METHOD", "HAS_SAMPLE_PREPARATION_METHOD",
+    "HAS_ORGANISM", "HAS_ORGANISM_PART", "HAS_CELL_TYPE", "HAS_DISEASE", "HAS_INSTRUMENT",
+    "HAS_CLEAVAGE_AGENT", "HAS_SAMPLE_TYPE", "HAS_RELATION_MODE", "HAS_CELLS_PER_WELL",
+    "HAS_MULTIPLEX_SIZE",
+}
+LLM_FORBIDDEN_MAPPING_PREDICATES = {
+    "BELONGS_TO_BRANCH", "HAS_REPORTER_CHANNEL_EVIDENCE", "HAS_SAMPLE_TOKEN_EVIDENCE",
+    "MAPS_TO_SAMPLE", "MAPS_TO_CELL", "MAPS_TO_CHANNEL",
+}
+
 
 def utc_now() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
@@ -533,17 +546,27 @@ def import_claim_jsonl(store: GraphStore, path: Path, default_extractor: str = "
         if obj.get("object"):
             o = obj["object"]
             object_ref = NodeRef(o["type"], o["key"], o.get("label", ""), o.get("attrs"))
+        source_type = obj.get("source_type", "external_claim_source")
+        extractor = obj.get("extractor", default_extractor)
+        predicate = norm(obj.get("predicate")).upper()
+        is_llm = str(source_type).startswith("llm_") or str(extractor).startswith("small_llm:")
+        if is_llm:
+            if predicate in LLM_FORBIDDEN_MAPPING_PREDICATES:
+                raise ValueError(f"{path}:{lineno}: LLM mapping predicate is forbidden: {predicate}")
+            if predicate not in LLM_SEMANTIC_ALLOWED_PREDICATES:
+                raise ValueError(f"{path}:{lineno}: LLM predicate is outside constrained semantic ontology: {predicate}")
         source_id = store.source(
-            obj.get("source_type", "external_claim_source"), source_uri,
-            title=obj.get("source_title", ""), trust_class=obj.get("trust_class", "unclassified"),
-            scope_accession=obj.get("scope_accession", ""), metadata=obj.get("source_metadata") or {},
+            source_type, source_uri,
+            title=obj.get("source_title", ""), content_sha256=obj.get("source_content_sha256", ""),
+            trust_class=obj.get("trust_class", "unclassified"), scope_accession=obj.get("scope_accession", ""),
+            retrieved_at=obj.get("source_retrieved_at", ""), metadata=obj.get("source_metadata") or {},
         )
         store.claim(
             NodeRef(subj["type"], subj["key"], subj.get("label", ""), subj.get("attrs")),
             obj["predicate"], source_id, object_ref=object_ref,
             literal_value=obj.get("literal_value", ""), literal_datatype=obj.get("literal_datatype", ""),
             scope_accession=obj.get("scope_accession", ""), branch_scope=obj.get("branch_scope", ""),
-            extractor=obj.get("extractor", default_extractor), confidence=float(obj.get("confidence", 0.5)),
+            extractor=extractor, confidence=float(obj.get("confidence", 0.5)),
             status=obj.get("status", "asserted"), evidence_locator=locator, evidence_text=evidence,
             attrs=obj.get("attrs") or {},
         )
@@ -567,6 +590,26 @@ def self_test() -> None:
             assert any(n["node_type"] == "Technology" for n in view["nodes"])
             assert len(view["claims"]) == 2 and len(view["edges"]) == 1
             s = g.summary(); assert s["nodes"] == 2 and s["claims"] == 2 and s["accepted_edges"] == 1
+        # Small-LLM imports have a second-line ontology/mapping guard independent of the extractor.
+        claims = Path(td)/"bad_llm_claim.jsonl"
+        claims.write_text(json.dumps({
+            "scope_accession":"PXD900001",
+            "subject":{"type":"RawFile","key":"PXD900001::run.raw"},
+            "predicate":"MAPS_TO_CELL",
+            "object":{"type":"Cell","key":"cell1"},
+            "source_uri":"doi:10.0000/example",
+            "source_type":"llm_publication_semantic",
+            "trust_class":"peer_reviewed_model_extraction",
+            "evidence_locator":"Methods",
+            "extractor":"small_llm:fixture",
+            "confidence":0.99
+        })+"\n")
+        with GraphStore(Path(td)/"guard.sqlite") as g:
+            try:
+                import_claim_jsonl(g, claims)
+                raise AssertionError("LLM mapping predicate should have been rejected")
+            except ValueError as exc:
+                assert "mapping predicate is forbidden" in str(exc)
         print("scp_knowledge_graph self-test: PASS")
 
 
