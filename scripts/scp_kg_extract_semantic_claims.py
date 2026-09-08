@@ -409,6 +409,10 @@ def build_publication_passages(
     for row_index,row in enumerate(rows,start=2):
         text_path=first(row,"publication_content_text_path","text_path","content_text_path")
         p=Path(text_path) if text_path else None
+        # Portable manifests may store publication content paths relative to the manifest itself.
+        # Existing absolute local manifests continue to work unchanged.
+        if p is not None and not p.is_absolute():
+            p = manifest.parent / p
         if not p or not p.is_file():
             continue
         text=p.read_text(errors="replace")

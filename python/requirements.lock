@@ -1,0 +1,9 @@
+# Exact transitive Python runtime lock for container/HPC builds.
+# Regenerate intentionally when dependency updates are accepted.
+certifi==2026.5.20
+charset-normalizer==3.4.7
+idna==3.17
+PyMuPDF==1.26.7
+pypdf==5.9.0
+requests==2.32.5
+urllib3==2.7.0

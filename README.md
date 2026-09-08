@@ -283,3 +283,10 @@ one-off evaluation material:
 Nothing is deleted. Files are moved to a timestamped sibling archive outside
 the Git worktree. See
 [`docs/repository_maintenance.md`](docs/repository_maintenance.md).
+
+## Reproducible container / HPC deployment
+
+The mixed Rust + Python pipeline has a Docker-canonical, Singularity/Apptainer and Slurm deployment
+pattern documented in [`docs/hpc_container_deployment.md`](docs/hpc_container_deployment.md). The HPC
+launchers support offline pre-fetched Ollama models, optional NVIDIA GPU execution and node-local
+staging without embedding cluster-specific paths in the application.

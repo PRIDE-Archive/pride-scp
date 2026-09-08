@@ -48,3 +48,13 @@ archive_*.sh
 # Secrets / OS noise
 .env
 .DS_Store
+
+# Container/HPC generated artifacts and externally staged model state
+/containers/*.sif
+/containers/*.sif.sha256
+/containers/*.sif.meta.txt
+/models/
+/hpc_inputs/
+/results/
+/logs/
+/persistent_cache/
