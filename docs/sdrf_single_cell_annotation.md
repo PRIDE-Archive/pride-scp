@@ -1973,3 +1973,12 @@ ACCESSIONS_FILE=/path/to/accessions.txt \
 If `ACCESSIONS_FILE` is not supplied, the compatibility runner can derive an accession list from a
 prior evidence-graph result solely to exercise the current benchmark cohort. That choice affects only
 which records are processed, never how any record is interpreted.
+
+### v0.5.4 global SCP knowledge/evidence graph
+
+The active generalized SDRF evidence path now has an explicit provenance-aware graph foundation.  See
+`docs/scp_knowledge_graph.md`.  Accession identifiers are graph entities/query scopes only.  Runtime
+source extractors emit claims; only explicit resolution rules may promote claims to canonical facts.
+The graph may ingest community sources such as `https://scp.slavovlab.net/` for discovery and
+corroboration, but community-source claims cannot by themselves establish accession-specific RAW,
+sample or reporter-channel mappings.
