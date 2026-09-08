@@ -581,7 +581,7 @@ def self_test() -> None:
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--accession", default="PXD028040")
+    ap.add_argument("--accession")
     ap.add_argument("--files-json", type=Path)
     ap.add_argument("--publication-manifest", type=Path)
     ap.add_argument("--reporter-audit-tsv", type=Path)
@@ -592,7 +592,7 @@ def main() -> int:
     if args.self_test:
         self_test()
         return 0
-    for attr in ("files_json", "publication_manifest", "reporter_audit_tsv", "output"):
+    for attr in ("accession", "files_json", "publication_manifest", "reporter_audit_tsv", "output"):
         if getattr(args, attr) is None:
             ap.error(f"--{attr.replace('_', '-')} is required unless --self-test is used")
     summary = audit(args)

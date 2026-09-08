@@ -1,14 +1,13 @@
 #!/usr/bin/env python3
 """Non-generative semantic audit of deposited reporter experimental-design workbooks.
 
-v0.4.3a established that PXD028040 has a public experimental-design workbook but that exact RAW
-basenames are not the workbook's primary linkage scheme.  This audit preserves workbook cell/column
-structure and asks a narrower question: can deposited RAW acquisitions be linked to workbook rows by
-explicit structured repository identifiers such as acquisition date + SC run code?
+This audit preserves workbook cell/column structure and asks whether deposited RAW acquisitions can
+be linked to workbook rows by explicit structured repository identifiers such as acquisition date,
+run code, sample identifier, or other source-declared keys.
 
-No SDRF rows are generated.  Filename words such as TMT or single_neuron are diagnostics only and
-never create biological identity.  A structured candidate is emitted only when explicit identifiers
-from the deposited RAW basename are also present in the deposited workbook row; ambiguity remains
+No SDRF rows are generated. Filename words such as TMT or single-cell are diagnostics only and never
+create biological identity. A structured candidate is emitted only when explicit identifiers from
+the deposited RAW basename are also present in the deposited workbook row; ambiguity remains
 ambiguity.
 """
 from __future__ import annotations
@@ -568,7 +567,7 @@ def self_test() -> None:
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--accession", default="PXD028040")
+    ap.add_argument("--accession")
     ap.add_argument("--files-json", type=Path)
     ap.add_argument("--support-xlsx", type=Path)
     ap.add_argument("--reporter-audit-tsv", type=Path)
@@ -578,11 +577,11 @@ def main() -> int:
     if args.self_test:
         self_test()
         return 0
-    for attr in ("files_json", "support_xlsx", "reporter_audit_tsv", "output"):
+    for attr in ("accession", "files_json", "support_xlsx", "reporter_audit_tsv", "output"):
         value = getattr(args, attr)
         if value is None:
             ap.error(f"--{attr.replace('_', '-')} is required unless --self-test is used")
-        if attr != "output" and not value.is_file():
+        if attr not in {"accession", "output"} and not value.is_file():
             ap.error(f"input not found: {value}")
     summary = audit(args)
     print(json.dumps(summary, indent=2))

@@ -1929,3 +1929,47 @@ Primary outputs are:
 
 Only a branch marked `explicit_row_mapping_candidate` may proceed to a future source-grounded row
 manifest.  PXD069039 remains generation-blocked until its relation to PXD073405 is resolved.
+
+## v0.5.3 generalized evidence-graph architecture
+
+The production SDRF evidence path must not contain accession-specific scientific behavior. An
+accession is an identifier, not a configuration key. The active runtime therefore follows this
+invariant:
+
+> If two deposits expose the same source evidence and artifact structure, changing only the
+> accession string must not change branch discovery, reporter roles, file membership, join logic,
+> relationship classification, or generation eligibility.
+
+The generalized evidence graph replaces the accession-specific v0.5.2 branch implementation with
+reusable capabilities:
+
+1. **Generic branch discovery** from publication/source neighborhoods, reporter-design contracts,
+   acquisition modality, chemistry and repository filename semantics. One accession may own multiple
+   branches.
+2. **Generic artifact adapters** for tabular files, workbooks, Proteome Discoverer SQLite files,
+   Skyline XML and publication-linked analysis repositories.
+3. **Generic file membership scoring** from branch/source features. No branch can be selected because
+   of a literal PXD identifier.
+4. **Generic multi-table joins** using exact RAW names, normalized basenames and unique composite
+   source keys. Row order is never accepted as a mapping key.
+5. **Generic cross-accession relationship detection** using title identity, RAW-file overlap,
+   containment and chronology.
+6. **Fail-closed generation gates**: unresolved mappings remain unresolved; evidence graphs do not
+   fabricate sample/channel identities.
+
+The maintained runtime is checked by `scripts/check_sdrf_generalization_guard.py`, which rejects
+literal PXD identifiers outside self-tests/regression fixtures in the active SDRF inference modules.
+Historical one-off v0.4.x benchmark helpers are retained only for reproducibility of accepted
+checkpoints; they are not part of the production inference path and must not be extended with new
+scientific behavior.
+
+Run the generalized graph on any newline-delimited accession list:
+
+```bash
+ACCESSIONS_FILE=/path/to/accessions.txt \
+  ./scripts/run_pride_sdrf_generalized_evidence_graph_v053.sh
+```
+
+If `ACCESSIONS_FILE` is not supplied, the compatibility runner can derive an accession list from a
+prior evidence-graph result solely to exercise the current benchmark cohort. That choice affects only
+which records are processed, never how any record is interpreted.

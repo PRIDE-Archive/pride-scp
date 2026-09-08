@@ -298,9 +298,10 @@ def _role_channels(block: str, role: str) -> list[str]:
         ]
     elif role == "blank":
         pats = [
-            re.compile(r"(?is)blank(?:\s+(?:sample|channel))?.{0,180}?(?:labeled|labelled|tagged|using|with)\s+(?:the\s+)?(?:TMT(?:pro)?\s*[-_]?\s*)?((?:12[6-9]|13[0-5])(?:[NC])?)"),
+            re.compile(r"(?is)blank(?:\s+(?:sample|channel))?(?:(?!(?:carrier|reference|bridge|analytical|analyte|single\s+(?:cell|zygote|oocyte|neuron))).){0,120}?(?:labeled|labelled|tagged|using|with)\s+(?:the\s+)?(?:TMT(?:pro)?\s*[-_]?\s*)?((?:12[6-9]|13[0-5])(?:[NC])?)"),
             re.compile(r"(?is)(?:TMT(?:pro)?\s*[-_]?\s*)?((?:12[6-9]|13[0-5])(?:[NC])?)\s+channel\s+(?:was|is)\s+(?:left\s+)?(?:empty|unused|blank)"),
             re.compile(r"(?is)channel\s+(?:TMT(?:pro)?\s*[-_]?\s*)?((?:12[6-9]|13[0-5])(?:[NC])?)\s+(?:was|is)\s+(?:left\s+)?(?:empty|unused|blank)"),
+            re.compile(r"(?is)blank(?:\s+(?:sample|channel))?(?:(?!(?:carrier|reference|bridge|analytical|analyte|single\s+(?:cell|zygote|oocyte|neuron))).){0,100}?(?:used|using|with|was\s+labeled|was\s+labelled)\s+(?:the\s+)?(?:TMT(?:pro)?\s*[-_]?\s*)?((?:12[6-9]|13[0-5])(?:[NC])?)"),
         ]
     elif role == "reference":
         pats = [
@@ -340,7 +341,7 @@ def contract_blocks(text: str) -> list[tuple[str, str]]:
         end = ms[i + 1].start() if i + 1 < len(ms) else min(len(clean), m.start() + 2600)
         blocks.append((norm(m.group(0)), clean[m.start():end]))
         marker_coverage.append((m.start(), end))
-    # Generic carrier-centered windows retain partial contracts (e.g. PXD029320) only when
+    # Generic carrier-centered windows retain partial contracts (for example a carrier-only partial design) only when
     # the carrier clause is not already owned by an explicit chemistry/set block.
     for i, m in enumerate(re.finditer(r"(?i)\bcarrier(?:\s+(?:sample|channel|cells?|proteome))?\b", clean)):
         if any(lo <= m.start() < hi for lo, hi in marker_coverage):
@@ -674,7 +675,7 @@ def extract_external_sources(accession: str, source_ref: str, text: str) -> list
 def recover_review_publication_candidates(path: Path, wanted: set[str], timeout: float = 45.0) -> tuple[dict[str, list[tuple[str, str]]], list[ExternalSource], list[PublicationPromotion]]:
     """Promote a review-only PMC candidate only after re-verifying the exact accession in full text.
 
-    This closes the v0.5.0 PXD029320 failure mode without weakening publication identity rules: title
+    This closes the review-only exact-accession recovery failure mode without weakening publication identity rules: title
     overlap merely authorizes a bounded fetch; exact PXD verification in the fetched article is still
     mandatory before the text can enter the evidence graph.
     """

@@ -280,7 +280,7 @@ def nearest_role(text: str, start: int, end: int, radius: int = 150) -> str | No
     Reporter prose usually describes a channel immediately after the token (for example
     ``TMT-128 ... as the analyte``).  Prefer that following role within the current
     reporter segment; only fall back to a preceding role when no following role exists.
-    This prevents PXD028040's TMT-131 from inheriting the preceding TMT-128 analyte role.
+    This prevents a later reporter token from inheriting the preceding reporter's analyte role.
     """
     priority = {"carrier": 0, "reference": 1, "blank": 2, "single_cell": 3}
     channel_matches = list(CHANNEL_TOKEN_RE.finditer(text))
