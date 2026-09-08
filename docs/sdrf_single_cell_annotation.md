@@ -1880,3 +1880,52 @@ audit/review_publication_promotions.tsv
 
 The next implementation must follow the graph result.  Do not return to token-local reporter regexes
 or blanket publication/support searches if a graph layer remains open.
+
+## v0.5.2 multi-branch/sub-study evidence graph
+
+The v0.5.1 evidence graph demonstrated that a PRIDE accession cannot always be represented safely by
+one accession-wide modality.  v0.5.2 therefore makes source-grounded sub-study branches first-class
+objects before any additional SDRF generation.
+
+The stage is deliberately non-generative.  Each branch owns its own:
+
+- modality;
+- repository-file membership;
+- global reporter design, when present;
+- sample/run mapping state;
+- generation eligibility and blocker.
+
+The bounded real-data targets are:
+
+- **PXD041399**: separate label-free DDA, label-free DIA, TMT6 single-cell and TMTpro/TMT8
+  single-cell branches.  The TMT6 publication contract is branch-scoped as analytical 126/127/128/129,
+  blank 130 and carrier 131.  The TMTpro/TMT8 publication contract preserves its explicit eight
+  analytical reporters without inventing carrier/blank roles that are not stated in that branch.
+- **PXD041328/PXD048347**: attach the accepted TMTpro18 design (carrier 126, blank 127C, 16
+  analytical channels) to accession-specific gastruloid SCP branches and inspect the publication-linked
+  `PSobrevalsAlcaraz/SCP_Stelloo.et.al.2023` analysis repository, including CellenOne characteristics
+  and sorted/unsorted input archives, for explicit RAW/cell/channel joins.
+- **PXD069039/PXD073405**: perform accession-integrity review before generation.  A near-identical
+  project identity plus large exact RAW overlap is treated as a probable predecessor/expanded
+  redeposition when most earlier RAWs are contained in the later accession.  PXD073405 is segmented
+  into the primary H3 single-cell SureQuant/shTMT branch and explicit DDA/PRM/SureQuant method-
+  development comparator branches.
+
+File-name membership is allowed only when the filename itself contains a strong branch token and the
+branch is independently supported by publication/repository context.  Opaque run names are not
+translated into biological identities.  CellenOne row order alone is never joined to RAW files or
+reporter channels without an explicit source-grounded key.
+
+Primary outputs are:
+
+- `branch_contracts.tsv`;
+- `branch_file_membership.tsv`;
+- `branch_summary.tsv`;
+- `external_analysis_mapping_evidence.tsv`;
+- `external_mapping_status.tsv`;
+- `accession_integrity.tsv`;
+- `shared_raw_files.tsv` and `unique_raw_files.tsv`;
+- `accession_branch_summary.tsv`.
+
+Only a branch marked `explicit_row_mapping_candidate` may proceed to a future source-grounded row
+manifest.  PXD069039 remains generation-blocked until its relation to PXD073405 is resolved.
