@@ -2026,3 +2026,20 @@ passage IDs, and emits only the fixed knowledge-graph semantic ontology. It does
 rows or file/sample/channel joins. Model claims are imported with provenance and lower-authority
 model-extraction trust classes, then adjudicated by the same conservative KG resolver before any
 future SDRF projection.
+
+## v0.5.7 semantic-extraction performance architecture
+
+The v0.5.6 small-LLM semantic source reader is preserved but optimized for catalogue-scale use.
+Manuscripts remain the source of truth; a deterministic high-recall retrieval stage selects
+SDRF-relevant evidence windows before the CPU LLM is invoked.  Retrieval does not make scientific
+annotations and reports its coverage explicitly.
+
+Completed v0.5.6 semantic cache entries can be reused when the underlying accession/source content
+hash is unchanged.  v0.5.7 also writes incremental packet/claim checkpoints and supports separating
+the global KG cohort (`ACCESSIONS_FILE`) from the expensive semantic-LLM cohort
+(`LLM_ACCESSIONS_FILE`).  This allows structured/accepted SDRF evidence to populate the graph for a
+large catalogue while reserving model reading for accessions or semantic gaps that actually require
+it.
+
+The scientific safety policy is unchanged: the small LLM cannot emit RAW-to-cell, RAW-to-sample,
+RAW-to-channel or branch-membership mappings, and no model claim bypasses the canonical resolver.

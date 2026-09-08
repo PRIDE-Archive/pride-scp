@@ -21,6 +21,7 @@ import sys
 import time
 from collections import Counter, defaultdict
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -36,8 +37,8 @@ if str(SCRIPT_DIR) not in sys.path:
 from scp_knowledge_graph import norm, read_accessions, stable_id  # noqa: E402
 from sdrf_multiplex_evidence_graph import project_json  # noqa: E402
 
-VERSION = "pride-scp-kg-small-llm-semantic-extractor-v0.1"
-PROMPT_VERSION = "scp-kg-semantic-claims-v1"
+VERSION = "pride-scp-kg-small-llm-semantic-extractor-v0.2"
+PROMPT_VERSION = "scp-kg-semantic-claims-v2"
 
 # The model may emit only these source-semantic facts.  In particular, there are no RAW/file/sample
 # mapping predicates here.  Reporter roles are semantic design facts and are allowed only when the
@@ -316,12 +317,95 @@ def publication_source_identity(row: dict[str,str], manifest: Path, row_index: i
     return uri,lineage,title,doi,pmid
 
 
+def semantic_anchor_features(section: str, text: str) -> set[str]:
+    low=(section+" "+text).lower()
+    out={name for name,terms in ANCHOR_GROUPS.items() if any(t in low for t in terms)}
+    sl=section.lower()
+    if any(x in sl for x in SECTION_BONUS): out.add("methods_section")
+    if "data availability" in sl: out.add("data_availability")
+    return out
+
+
+def semantic_excerpt(text: str, *, max_chars: int) -> str:
+    """Keep high-recall ontology-anchored paragraphs from a selected source chunk.
+
+    The source document stays available in full and the chunk locator remains unchanged.  This only
+    reduces the amount of narrative prose sent to the CPU LLM.  No scientific fact is inferred here.
+    """
+    if max_chars <= 0 or len(text) <= max_chars:
+        return text
+    paras=[norm(x) for x in re.split(r"\n\s*\n", text) if norm(x)]
+    if len(paras) <= 1:
+        return text[:max_chars]
+    scored=[]
+    for i,para in enumerate(paras):
+        score=passage_score("",para)
+        # Role-bearing reporter sentences and explicit single-cell wording get retrieval priority.
+        low=para.lower()
+        if any(x in low for x in ("carrier", "blank", "reference channel", "reporter channel")): score += 4
+        if "single cell" in low or "single-cell" in low: score += 2
+        scored.append((score,i,para))
+    chosen=[]; used=0
+    for score,i,para in sorted(scored,key=lambda x:(-x[0],x[1])):
+        if score <= 0 and chosen:
+            continue
+        need=len(para)+(2 if chosen else 0)
+        if chosen and used+need>max_chars:
+            continue
+        if not chosen and len(para)>max_chars:
+            para=para[:max_chars]; need=len(para)
+        chosen.append((i,para)); used += need
+        if used >= max_chars*0.85:
+            break
+    if not chosen:
+        return text[:max_chars]
+    chosen.sort()
+    return "\n\n".join(x[1] for x in chosen)[:max_chars]
+
+
+def select_semantic_chunks(scored: list[tuple[float,int,str,str]], *, max_chunks: int) -> tuple[list[tuple[float,int,str,str]],dict[str,Any]]:
+    """High-recall, diversity-aware source retrieval for SDRF-relevant semantics."""
+    if not scored:
+        return [],{"feature_groups_found":[],"feature_groups_selected":[],"candidate_chunks":0}
+    cap=max_chunks if max_chunks>0 else len(scored)
+    features={idx:semantic_anchor_features(sec,chunk) for _,idx,sec,chunk in scored}
+    candidates=[x for x in scored if x[0]>0 or features[x[1]]]
+    if not candidates:
+        candidates=scored[:min(2,len(scored))]
+    found=set().union(*(features[x[1]] for x in candidates)) if candidates else set()
+    selected=[]; selected_idx=set(); covered=set()
+    # Greedy feature coverage first, then score.  This avoids spending all model budget on one long
+    # methods subsection while missing biology/sample-preparation/acquisition evidence elsewhere.
+    remaining=list(candidates)
+    while remaining and len(selected)<cap:
+        best=max(remaining,key=lambda x:(len(features[x[1]]-covered),x[0],-x[1]))
+        gain=features[best[1]]-covered
+        if not gain and selected:
+            break
+        selected.append(best); selected_idx.add(best[1]); covered |= features[best[1]]
+        remaining=[x for x in remaining if x[1]!=best[1]]
+    for x in sorted(candidates,key=lambda x:(-x[0],x[1])):
+        if len(selected)>=cap: break
+        if x[1] not in selected_idx:
+            selected.append(x); selected_idx.add(x[1]); covered |= features[x[1]]
+    selected.sort(key=lambda x:x[1])
+    return selected,{
+        "candidate_chunks":len(candidates),
+        "feature_groups_found":sorted(found),
+        "feature_groups_selected":sorted(covered),
+        "feature_group_coverage_fraction":(len(covered)/len(found)) if found else 1.0,
+    }
+
+
 def build_publication_passages(
     accession: str, rows: list[dict[str,str]], manifest: Path, *,
-    target_chars: int, max_chunks: int, mode: str,
+    target_chars: int, max_chunks: int, mode: str, semantic_excerpt_chars: int = 2800,
 ) -> tuple[list[Passage], dict[str,Any]]:
-    passages: list[Passage]=[]; stats={"publications":0,"chunks_total":0,"chunks_selected":0,"text_chars_total":0,"text_chars_selected":0}
-    next_id=1
+    passages: list[Passage]=[]
+    stats={"publications":0,"chunks_total":0,"chunks_selected":0,"text_chars_total":0,"text_chars_selected":0,
+           "model_chars_selected":0,"semantic_candidate_chunks":0,"semantic_feature_groups_found":[],
+           "semantic_feature_groups_selected":[]}
+    next_id=1; feature_found=set(); feature_selected=set()
     for row_index,row in enumerate(rows,start=2):
         text_path=first(row,"publication_content_text_path","text_path","content_text_path")
         p=Path(text_path) if text_path else None
@@ -333,24 +417,33 @@ def build_publication_passages(
         chunks=split_publication_chunks(text,target_chars=target_chars)
         scored=[(passage_score(sec,chunk),idx,sec,chunk) for idx,(sec,chunk) in enumerate(chunks)]
         stats["publications"]+=1; stats["chunks_total"]+=len(scored); stats["text_chars_total"]+=sum(len(x[3]) for x in scored)
+        retrieval={}
         if mode=="full":
             selected=scored if max_chunks<=0 else scored[:max_chunks]
+        elif mode=="semantic":
+            selected,retrieval=select_semantic_chunks(scored,max_chunks=max_chunks)
+            stats["semantic_candidate_chunks"] += int(retrieval.get("candidate_chunks",0))
+            feature_found.update(retrieval.get("feature_groups_found",[])); feature_selected.update(retrieval.get("feature_groups_selected",[]))
         elif max_chunks<=0 or len(scored)<=max_chunks:
             selected=scored
         else:
-            # Relevant mode keeps highest-scoring evidence while also preserving early manuscript
-            # context.  This is retrieval only; scientific interpretation remains with the model.
             priority=sorted(scored,key=lambda x:(-x[0],x[1]))[:max_chunks]
             selected=sorted(priority,key=lambda x:x[1])
         for score,idx,sec,chunk in selected:
+            model_text=semantic_excerpt(chunk,max_chars=semantic_excerpt_chars) if mode=="semantic" else chunk
             pid=f"P{next_id:04d}"; next_id+=1
             passages.append(Passage(
                 pid,"publication",uri,title or doi or pmid,
-                f"{p.name}:chunk{idx+1}:{sec}",chunk,sha256_text(text),
+                f"{p.name}:chunk{idx+1}:{sec}",model_text,sha256_text(text),
                 "peer_reviewed_model_extraction",lineage,score,
             ))
+            stats["model_chars_selected"] += len(model_text)
         stats["chunks_selected"]+=len(selected); stats["text_chars_selected"]+=sum(len(x[3]) for x in selected)
     stats["coverage_fraction"]=(stats["text_chars_selected"]/stats["text_chars_total"]) if stats["text_chars_total"] else 0.0
+    stats["model_character_fraction"]=(stats["model_chars_selected"]/stats["text_chars_total"]) if stats["text_chars_total"] else 0.0
+    stats["semantic_feature_groups_found"]=sorted(feature_found)
+    stats["semantic_feature_groups_selected"]=sorted(feature_selected)
+    stats["semantic_feature_group_coverage_fraction"]=(len(feature_selected)/len(feature_found)) if feature_found else 1.0
     return passages,stats
 
 
@@ -369,7 +462,7 @@ def packetize(accession: str, passages: list[Passage], *, max_packet_chars: int 
     return packets
 
 
-def response_schema() -> dict[str,Any]:
+def response_schema(max_claims: int = 24) -> dict[str,Any]:
     claim={
         "type":"object",
         "properties":{
@@ -385,10 +478,10 @@ def response_schema() -> dict[str,Any]:
         "required":["subject_scope","context_key","context_label","predicate","object_value","evidence_refs","confidence","certainty"],
         "additionalProperties":False,
     }
-    return {"type":"object","properties":{"claims":{"type":"array","items":claim,"maxItems":80}},"required":["claims"],"additionalProperties":False}
+    return {"type":"object","properties":{"claims":{"type":"array","items":claim,"maxItems":max_claims}},"required":["claims"],"additionalProperties":False}
 
 
-def prompt_for(packet: Packet) -> str:
+def prompt_for(packet: Packet, *, max_claims: int = 24) -> str:
     evidence=[]
     for p in packet.passages:
         evidence.append(f"### {p.passage_id}\nSOURCE: {p.source_kind}\nLOCATOR: {p.source_locator}\nTEXT:\n{p.text}")
@@ -397,7 +490,7 @@ def prompt_for(packet: Packet) -> str:
 
 ACCESSION SCOPE: {packet.accession}
 
-Your job is NOT to generate an SDRF and NOT to guess missing metadata. Extract only claims that are explicitly stated or unambiguously supported by the supplied evidence passages.
+Your job is NOT to generate an SDRF and NOT to guess missing metadata. Extract only claims that are explicitly stated or unambiguously supported by the supplied evidence passages. Emit at most {max_claims} non-duplicate, high-value claims; prefer omission over repetition.
 
 ALLOWED PREDICATES:
 {predicates}
@@ -422,15 +515,22 @@ EVIDENCE PASSAGES:
 """
 
 
-def post_ollama(url: str, model: str, packet: Packet, *, timeout: int, num_ctx: int, retries: int) -> tuple[dict[str,Any],dict[str,Any]]:
+def post_ollama(
+    url: str, model: str, packet: Packet, *, timeout: int, num_ctx: int, retries: int,
+    num_predict: int, max_claims: int, keep_alive: str, num_thread: int,
+) -> tuple[dict[str,Any],dict[str,Any]]:
     if requests is None:
         raise RuntimeError("requests is required for Ollama semantic extraction")
+    options={"temperature":0.0,"num_ctx":num_ctx,"num_predict":num_predict}
+    if num_thread>0:
+        options["num_thread"]=num_thread
     payload={
         "model":model,
-        "prompt":prompt_for(packet),
+        "prompt":prompt_for(packet,max_claims=max_claims),
         "stream":False,
-        "format":response_schema(),
-        "options":{"temperature":0.0,"num_ctx":num_ctx},
+        "format":response_schema(max_claims=max_claims),
+        "options":options,
+        "keep_alive":keep_alive,
     }
     last=None; started=time.monotonic()
     for attempt in range(retries+1):
@@ -443,7 +543,17 @@ def post_ollama(url: str, model: str, packet: Packet, *, timeout: int, num_ctx: 
             obj=json.loads(raw)
             if not isinstance(obj,dict) or not isinstance(obj.get("claims"),list):
                 raise ValueError("structured response missing claims[]")
-            return obj,{"attempts":attempt+1,"wall_seconds":round(time.monotonic()-started,3),"eval_count":body.get("eval_count"),"prompt_eval_count":body.get("prompt_eval_count")}
+            stats={
+                "attempts":attempt+1,
+                "wall_seconds":round(time.monotonic()-started,3),
+                "eval_count":body.get("eval_count"),
+                "prompt_eval_count":body.get("prompt_eval_count"),
+            }
+            for key in ("total_duration","load_duration","prompt_eval_duration","eval_duration"):
+                value=body.get(key)
+                if isinstance(value,(int,float)):
+                    stats[key+"_seconds"]=round(float(value)/1_000_000_000.0,3)
+            return obj,stats
         except Exception as exc:
             last=exc
             if attempt>=retries: break
@@ -584,49 +694,170 @@ def write_jsonl(path: Path, rows: Iterable[dict[str,Any]]) -> None:
             fh.write(json.dumps(row,ensure_ascii=False,sort_keys=True)+"\n")
 
 
+def packet_json(packet: Packet) -> dict[str,Any]:
+    return {"accession":packet.accession,"packet_id":packet.packet_id,"source_kind":packet.source_kind,"passages":[p.__dict__ for p in packet.passages]}
+
+
+def packet_cache_key(packet: Packet, model: str) -> str:
+    pjson=packet_json(packet)
+    return hashlib.sha256((PROMPT_VERSION+"\n"+model+"\n"+json.dumps(pjson,sort_keys=True)).encode()).hexdigest()
+
+
+def cached_packet_to_object(raw: dict[str,Any]) -> Packet | None:
+    pjson=raw.get("packet") or {}
+    try:
+        passages=tuple(Passage(**x) for x in (pjson.get("passages") or []))
+        if not passages: return None
+        return Packet(str(pjson.get("accession") or "").upper(),str(pjson.get("packet_id") or "legacy"),str(pjson.get("source_kind") or passages[0].source_kind),passages)
+    except Exception:
+        return None
+
+
+def import_compatible_legacy_cache(
+    cache: Path, *, model: str, wanted: set[str], valid_source_hashes: set[tuple[str,str,str]],
+) -> tuple[list[dict[str,Any]],list[dict[str,Any]],set[tuple[str,str,str]],dict[str,int]]:
+    """Reuse completed older semantic packets whose underlying source content is still identical.
+
+    This is deliberately source-hash/locator checked.  It allows an interrupted v0.5.6 run to feed
+    v0.5.7 without forcing the CPU model to reread already-completed evidence merely because the new
+    prompt uses smaller packets and a stricter output cap.
+    """
+    claims=[]; rejects=[]; covered=set(); packets=0; files=0
+    for path in sorted(cache.glob("*.json")):
+        try: raw=json.loads(path.read_text())
+        except Exception: continue
+        if norm(raw.get("model")) != norm(model): continue
+        packet=cached_packet_to_object(raw)
+        if packet is None or packet.accession not in wanted: continue
+        response=raw.get("response")
+        if not isinstance(response,dict) or not isinstance(response.get("claims"),list): continue
+        # Every cited source must still be an identical source document / metadata passage.
+        valid=True
+        for p in packet.passages:
+            if (packet.accession,p.source_uri,p.content_sha256) not in valid_source_hashes:
+                valid=False; break
+        if not valid: continue
+        a,r=claim_records_from_response(packet,response,model)
+        claims.extend(a); rejects.extend(r); packets+=1; files+=1
+        for p in packet.passages:
+            covered.add((packet.accession,p.source_uri,p.source_locator))
+    return claims,rejects,covered,{"legacy_cache_files":files,"legacy_cache_packets_imported":packets,"legacy_graph_claims":len(claims),"legacy_rejected_claims":len(rejects)}
+
+
+def write_packet_plan(path: Path, rows: list[dict[str,Any]]) -> None:
+    path.parent.mkdir(parents=True,exist_ok=True)
+    fields=["ordinal","accession","packet_id","source_kind","passages","evidence_chars","cache_state","source_locators"]
+    with path.open("w",newline="",encoding="utf-8") as fh:
+        w=csv.DictWriter(fh,fieldnames=fields,delimiter="\t",extrasaction="ignore"); w.writeheader(); w.writerows(rows)
+
+
+def append_jsonl(path: Path, row: dict[str,Any]) -> None:
+    path.parent.mkdir(parents=True,exist_ok=True)
+    with path.open("a",encoding="utf-8") as fh:
+        fh.write(json.dumps(row,ensure_ascii=False,sort_keys=True)+"\n")
+
+
 def run(args: argparse.Namespace) -> int:
+    started_all=time.monotonic()
     accessions=read_accessions(args.accessions_file); wanted=set(accessions)
     by_pub=publication_rows_by_accession(args.publication_manifest,wanted)
     out=args.output; out.mkdir(parents=True,exist_ok=True); cache=args.cache_dir or out/"cache"; cache.mkdir(parents=True,exist_ok=True)
     packets_dir=out/"packets"; packets_dir.mkdir(exist_ok=True)
-    claims=[]; rejects=[]; packet_stats=[]; coverage={}
-    source_counts=Counter(); response_claims=0; cache_hits=0; failures=[]
+    coverage={}; all_passages_by_acc={}; source_counts=Counter()
 
+    # Build the complete source/retrieval plan before making any model call.  Users can inspect the
+    # plan immediately and the console reports exactly how many expensive packets remain.
     for acc in accessions:
         passages=build_metadata_passages(acc,args.snapshot,max_chars=args.metadata_packet_chars)
-        pub_passages,pstats=build_publication_passages(acc,by_pub.get(acc,[]),args.publication_manifest,target_chars=args.chunk_chars,max_chunks=args.max_publication_chunks,mode=args.publication_mode)
-        passages += pub_passages; coverage[acc]=pstats
-        # Packetize separately per raw source URI so one model response can never synthesize across
-        # unrelated manuscripts or repository metadata.
+        pub_passages,pstats=build_publication_passages(
+            acc,by_pub.get(acc,[]),args.publication_manifest,target_chars=args.chunk_chars,
+            max_chunks=args.max_publication_chunks,mode=args.publication_mode,
+            semantic_excerpt_chars=args.semantic_excerpt_chars,
+        )
+        passages += pub_passages; coverage[acc]=pstats; all_passages_by_acc[acc]=passages
+
+    valid_source_hashes={(acc,p.source_uri,p.content_sha256) for acc,ps in all_passages_by_acc.items() for p in ps}
+    claims=[]; rejects=[]; covered=set(); legacy_stats={"legacy_cache_files":0,"legacy_cache_packets_imported":0,"legacy_graph_claims":0,"legacy_rejected_claims":0}
+    if args.reuse_legacy_cache:
+        a,r,covered,legacy_stats=import_compatible_legacy_cache(cache,model=args.model,wanted=wanted,valid_source_hashes=valid_source_hashes)
+        claims.extend(a); rejects.extend(r)
+
+    planned=[]
+    for acc in accessions:
+        # Remove passages already read successfully by a compatible older cached packet.
+        passages=[p for p in all_passages_by_acc[acc] if (acc,p.source_uri,p.source_locator) not in covered]
         by_source: dict[tuple[str,str],list[Passage]]=defaultdict(list)
         for p in passages: by_source[(p.source_kind,p.source_uri)].append(p)
-        acc_packets=[]
         for _,ps in sorted(by_source.items()):
-            acc_packets.extend(packetize(acc,ps,max_packet_chars=args.max_packet_chars,max_passages=args.max_passages_per_packet))
-        for packet in acc_packets:
-            pjson={"accession":packet.accession,"packet_id":packet.packet_id,"source_kind":packet.source_kind,"passages":[p.__dict__ for p in packet.passages]}
-            (packets_dir/f"{packet.packet_id}.json").write_text(json.dumps(pjson,indent=2,ensure_ascii=False)+"\n")
-            source_counts[packet.source_kind]+=1
-            cache_key=hashlib.sha256((PROMPT_VERSION+"\n"+args.model+"\n"+json.dumps(pjson,sort_keys=True)).encode()).hexdigest()
-            cache_path=cache/f"{cache_key}.json"
-            stats={"accession":acc,"packet_id":packet.packet_id,"source_kind":packet.source_kind,"cache":False,"claims":0,"accepted":0,"rejected":0,"error":""}
-            try:
-                if cache_path.is_file() and not args.force:
-                    cached=json.loads(cache_path.read_text())
-                    response=cached["response"]; model_stats=cached.get("model_stats",{}); cache_hits+=1; stats["cache"]=True
-                elif args.dry_run:
-                    stats["error"]="dry_run_no_model_call"; packet_stats.append(stats); continue
-                else:
-                    response,model_stats=post_ollama(args.ollama_url,args.model,packet,timeout=args.timeout,num_ctx=args.num_ctx,retries=args.retries)
-                    cache_path.write_text(json.dumps({"prompt_version":PROMPT_VERSION,"model":args.model,"packet":pjson,"response":response,"model_stats":model_stats},indent=2,ensure_ascii=False)+"\n")
-                response_claims += len(response.get("claims") or []); stats["claims"]=len(response.get("claims") or [])
-                a,r=claim_records_from_response(packet,response,args.model); claims.extend(a); rejects.extend(r); stats["accepted"]=len(a); stats["rejected"]=len(r); stats.update({f"model_{k}":v for k,v in model_stats.items()})
-            except Exception as exc:
-                stats["error"]=f"{type(exc).__name__}: {exc}"; failures.append(stats.copy())
-                if args.fail_fast: raise
-            packet_stats.append(stats)
+            planned.extend(packetize(acc,ps,max_packet_chars=args.max_packet_chars,max_passages=args.max_passages_per_packet))
 
-    # Stable graph-claim dedupe across overlapping publication chunks.
+    if args.max_packets>0:
+        planned=planned[:args.max_packets]
+    plan_rows=[]; current_cache_hits=0
+    for i,packet in enumerate(planned,start=1):
+        pjson=packet_json(packet)
+        (packets_dir/f"{packet.packet_id}.json").write_text(json.dumps(pjson,indent=2,ensure_ascii=False)+"\n")
+        source_counts[packet.source_kind]+=1
+        cp=cache/f"{packet_cache_key(packet,args.model)}.json"
+        state="current_cache" if cp.is_file() and not args.force else "model_call"
+        current_cache_hits += int(state=="current_cache")
+        plan_rows.append({
+            "ordinal":i,"accession":packet.accession,"packet_id":packet.packet_id,"source_kind":packet.source_kind,
+            "passages":len(packet.passages),"evidence_chars":sum(len(p.text) for p in packet.passages),"cache_state":state,
+            "source_locators":";".join(p.source_locator for p in packet.passages),
+        })
+    write_packet_plan(out/"packet_plan.tsv",plan_rows)
+    packet_counts=Counter(p.accession for p in planned)
+    model_calls=sum(1 for r in plan_rows if r["cache_state"]=="model_call")
+    print(json.dumps({
+        "semantic_extraction_plan":{
+            "extractor_version":VERSION,"publication_mode":args.publication_mode,"accessions":len(accessions),
+            "planned_packets":len(planned),"planned_model_calls":model_calls,"current_prompt_cache_hits":current_cache_hits,
+            **legacy_stats,"packets_by_accession":dict(packet_counts),
+            "max_packet_chars":args.max_packet_chars,"max_claims_per_packet":args.max_claims,"num_ctx":args.num_ctx,"num_predict":args.num_predict,
+        }
+    },indent=2))
+
+    checkpoint_claims=out/"semantic_claims.checkpoint.jsonl"; checkpoint_rejects=out/"rejected_claims.checkpoint.jsonl"; checkpoint_packets=out/"packet_results.checkpoint.jsonl"
+    for path in (checkpoint_claims,checkpoint_rejects,checkpoint_packets):
+        path.write_text("")
+    for row in claims: append_jsonl(checkpoint_claims,row)
+    for row in rejects: append_jsonl(checkpoint_rejects,row)
+
+    packet_stats=[]; response_claims=0; cache_hits=current_cache_hits; failures=[]; model_wall=0.0
+    total=len(planned)
+    for ordinal,packet in enumerate(planned,start=1):
+        pjson=packet_json(packet); cache_key=packet_cache_key(packet,args.model); cache_path=cache/f"{cache_key}.json"
+        evidence_chars=sum(len(p.text) for p in packet.passages)
+        stats={"ordinal":ordinal,"accession":packet.accession,"packet_id":packet.packet_id,"source_kind":packet.source_kind,"passages":len(packet.passages),"evidence_chars":evidence_chars,"cache":False,"claims":0,"accepted":0,"rejected":0,"error":""}
+        stamp=datetime.now().astimezone().isoformat(timespec="seconds")
+        cache_state="hit" if cache_path.is_file() and not args.force else "miss"
+        print(f"[{ordinal}/{total}] {packet.accession} {packet.source_kind} chars={evidence_chars} cache={cache_state} start={stamp}",flush=True)
+        one_start=time.monotonic()
+        try:
+            if cache_path.is_file() and not args.force:
+                cached=json.loads(cache_path.read_text()); response=cached["response"]; model_stats=cached.get("model_stats",{}); stats["cache"]=True
+            elif args.dry_run:
+                stats["error"]="dry_run_no_model_call"; packet_stats.append(stats); append_jsonl(checkpoint_packets,stats); continue
+            else:
+                response,model_stats=post_ollama(
+                    args.ollama_url,args.model,packet,timeout=args.timeout,num_ctx=args.num_ctx,retries=args.retries,
+                    num_predict=args.num_predict,max_claims=args.max_claims,keep_alive=args.keep_alive,num_thread=args.num_thread,
+                )
+                cache_path.write_text(json.dumps({"prompt_version":PROMPT_VERSION,"model":args.model,"packet":pjson,"response":response,"model_stats":model_stats},indent=2,ensure_ascii=False)+"\n")
+            response_claims += len(response.get("claims") or []); stats["claims"]=len(response.get("claims") or [])
+            a,r=claim_records_from_response(packet,response,args.model); claims.extend(a); rejects.extend(r); stats["accepted"]=len(a); stats["rejected"]=len(r); stats.update({f"model_{k}":v for k,v in model_stats.items()})
+            for row in a: append_jsonl(checkpoint_claims,row)
+            for row in r: append_jsonl(checkpoint_rejects,row)
+        except Exception as exc:
+            stats["error"]=f"{type(exc).__name__}: {exc}"; failures.append(stats.copy())
+            if args.fail_fast: raise
+        wall=time.monotonic()-one_start; stats["packet_wall_seconds"]=round(wall,3)
+        if not stats["cache"]: model_wall += wall
+        packet_stats.append(stats); append_jsonl(checkpoint_packets,stats)
+        print(f"[{ordinal}/{total}] {packet.accession} done wall={wall:.1f}s claims={stats['claims']} accepted={stats['accepted']} rejected={stats['rejected']} error={stats['error'] or '-'}",flush=True)
+
+    # Stable graph-claim dedupe across overlapping publication chunks and legacy/current cache input.
     dedup={}
     for row in claims:
         sig=json.dumps({k:row.get(k) for k in ("scope_accession","branch_scope","subject","predicate","object","literal_value","source_uri")},sort_keys=True)
@@ -634,23 +865,29 @@ def run(args: argparse.Namespace) -> int:
         if old is None or float(row.get("confidence",0))>float(old.get("confidence",0)):
             dedup[sig]=row
     claims=list(dedup.values())
-    write_jsonl(out/"semantic_claims.jsonl",claims)
-    write_jsonl(out/"rejected_claims.jsonl",rejects)
+    write_jsonl(out/"semantic_claims.jsonl",claims); write_jsonl(out/"rejected_claims.jsonl",rejects)
     with (out/"packet_results.tsv").open("w",newline="",encoding="utf-8") as fh:
         fields=sorted({k for r in packet_stats for k in r}) if packet_stats else ["accession","packet_id"]
         w=csv.DictWriter(fh,fieldnames=fields,delimiter="\t",extrasaction="ignore"); w.writeheader(); w.writerows(packet_stats)
     summary={
         "extractor_version":VERSION,"prompt_version":PROMPT_VERSION,"model":args.model,"accessions":len(accessions),
         "publication_mode":args.publication_mode,"packets":len(packet_stats),"packet_source_counts":dict(source_counts),"cache_hits":cache_hits,
-        "model_response_claims":response_claims,"graph_claims_after_validation_dedupe":len(claims),"rejected_claims":len(rejects),"packet_failures":len(failures),
+        **legacy_stats,
+        "planned_model_calls":model_calls,"model_response_claims":response_claims,"graph_claims_after_validation_dedupe":len(claims),"rejected_claims":len(rejects),"packet_failures":len(failures),
+        "wall_seconds_total":round(time.monotonic()-started_all,3),"model_wall_seconds_this_run":round(model_wall,3),
         "publication_coverage":coverage,
         "predicate_counts":dict(Counter(r["predicate"] for r in claims)),
         "source_type_counts":dict(Counter(r["source_type"] for r in claims)),
+        "performance_policy":{
+            "semantic_retrieval":args.publication_mode=="semantic","semantic_excerpt_chars":args.semantic_excerpt_chars,
+            "max_packet_chars":args.max_packet_chars,"max_claims_per_packet":args.max_claims,"num_ctx":args.num_ctx,"num_predict":args.num_predict,
+            "legacy_cache_reuse":args.reuse_legacy_cache,"incremental_checkpoints":True,
+        },
         "policies":{
             "model_generates_sdrf":False,"model_mapping_predicates_allowed":False,"provenance_refs_required":True,
             "cross_source_claim_synthesis_allowed":False,"uncertain_claims_rejected":True,"citation_only_confidence_capped":True,
         },
-        "outputs":{"claims":str(out/"semantic_claims.jsonl"),"rejected":str(out/"rejected_claims.jsonl"),"packets":str(packets_dir),"packet_results":str(out/"packet_results.tsv")},
+        "outputs":{"claims":str(out/"semantic_claims.jsonl"),"rejected":str(out/"rejected_claims.jsonl"),"packets":str(packets_dir),"packet_plan":str(out/"packet_plan.tsv"),"packet_results":str(out/"packet_results.tsv")},
     }
     (out/"semantic_claim_extraction_summary.json").write_text(json.dumps(summary,indent=2,ensure_ascii=False)+"\n")
     print(json.dumps(summary,indent=2,ensure_ascii=False))
@@ -686,6 +923,23 @@ def self_test() -> None:
         (root/"projects"/f"{acc}.json").write_text(json.dumps({"title":"Synthetic SCP","description":"Single cells acquired by DDA","checksum":"abcdef"}))
         pp=build_metadata_passages(acc,root)
         assert pp and "Single cells acquired by DDA" in pp[0].text and "abcdef" not in pp[0].text
+    # Semantic retrieval must preserve diverse ontology evidence while shortening model text.
+    scored=[(passage_score("Methods",x),i,"Methods",x) for i,x in enumerate([
+        "Single-cell samples were isolated by CellenONE.",
+        "TMTpro18 channel 126 was the carrier and 127C the blank.",
+        "Data were acquired by DIA on an Orbitrap.",
+        "Long unrelated biological discussion without method anchors."
+    ])]
+    sel,meta=select_semantic_chunks(scored,max_chunks=3)
+    assert len(sel)==3 and meta["feature_group_coverage_fraction"]>0.5
+    assert len(semantic_excerpt("\n\n".join(x[3] for x in scored),max_chars=120))<=120
+    # A completed older prompt cache may be reused only when accession/source content still match.
+    with tempfile.TemporaryDirectory() as td:
+        cache=Path(td)
+        legacy={"prompt_version":"scp-kg-semantic-claims-v1","model":"fixture:3b","packet":packet_json(packet),"response":response,"model_stats":{"wall_seconds":1.0}}
+        (cache/"legacy.json").write_text(json.dumps(legacy))
+        aa,rr,cov,meta=import_compatible_legacy_cache(cache,model="fixture:3b",wanted={acc},valid_source_hashes={(acc,p.source_uri,p.content_sha256)})
+        assert meta["legacy_cache_packets_imported"]==1 and aa and (acc,p.source_uri,p.source_locator) in cov
     print("scp_kg_extract_semantic_claims self-test: PASS")
 
 
@@ -699,14 +953,21 @@ def main() -> int:
     p.add_argument("--model",default="qwen2.5:3b")
     p.add_argument("--ollama-url",default="http://localhost:11434/api/generate")
     p.add_argument("--timeout",type=int,default=1200)
-    p.add_argument("--num-ctx",type=int,default=32768)
+    p.add_argument("--num-ctx",type=int,default=8192)
+    p.add_argument("--num-predict",type=int,default=3072)
+    p.add_argument("--num-thread",type=int,default=0)
+    p.add_argument("--keep-alive",default="30m")
+    p.add_argument("--max-claims",type=int,default=20)
     p.add_argument("--retries",type=int,default=1)
     p.add_argument("--chunk-chars",type=int,default=6500)
-    p.add_argument("--max-publication-chunks",type=int,default=24)
-    p.add_argument("--publication-mode",choices=["full","relevant"],default="full")
+    p.add_argument("--max-publication-chunks",type=int,default=6)
+    p.add_argument("--publication-mode",choices=["full","relevant","semantic"],default="semantic")
+    p.add_argument("--semantic-excerpt-chars",type=int,default=2800)
     p.add_argument("--metadata-packet-chars",type=int,default=18000)
-    p.add_argument("--max-packet-chars",type=int,default=20000)
-    p.add_argument("--max-passages-per-packet",type=int,default=6)
+    p.add_argument("--max-packet-chars",type=int,default=8000)
+    p.add_argument("--max-passages-per-packet",type=int,default=3)
+    p.add_argument("--max-packets",type=int,default=0)
+    p.add_argument("--reuse-legacy-cache",action=argparse.BooleanOptionalAction,default=True)
     p.add_argument("--force",action="store_true")
     p.add_argument("--dry-run",action="store_true")
     p.add_argument("--fail-fast",action="store_true")

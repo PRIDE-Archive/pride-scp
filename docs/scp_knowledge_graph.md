@@ -273,3 +273,45 @@ sub-studies.
 `max_publication_chunks`; setting that limit to `0` removes the cap. `publication_mode=relevant`
 selects the highest-scoring broad SCP/method passages up to the same cap. The extraction summary
 always reports the selected character-coverage fraction.
+
+## v0.5.7 optimized semantic extraction
+
+The v0.5.6 architecture is retained, but the CPU small-LLM stage no longer defaults to brute-force
+full-manuscript packet processing.  v0.5.7 adds a high-recall retrieval layer that selects diverse
+SCP/SDRF-relevant source chunks across single-cell scope, multiplexing, acquisition, preparation and
+biology, then sends only bounded source excerpts to the model.  Retrieval is auditable: the summary
+records source characters, selected chunk coverage, model-character fraction and anchor-feature
+coverage for every accession.
+
+The model budget is also bounded more aggressively by default (`num_ctx=8192`, `max_claims=20`,
+`max_packet_chars=8000`).  These settings are performance controls only; the fixed semantic ontology,
+provenance requirements and ban on model-generated RAW/sample/channel joins are unchanged.
+
+Completed older semantic packets are reusable across prompt versions when accession, source URI and
+source-content SHA256 still match.  This allows an interrupted v0.5.6 run to seed v0.5.7 without
+throwing away expensive CPU inference already completed.  New packet/claim/rejection checkpoints are
+written incrementally after every packet.
+
+The integrated runner is:
+
+```bash
+./scripts/run_scp_global_knowledge_graph_v057.sh
+```
+
+Useful runtime controls include:
+
+```text
+RESUME=1                    reuse an existing v0.5.7 base graph and skip KG/community rebuild
+BASE_GRAPH_FROM=/path/db    seed a new v0.5.7 run from an already-built compatible base graph
+LLM_ACCESSIONS_FILE=...     run expensive LLM extraction only on a selected accession subset
+PUBLICATION_MODE=semantic   high-recall semantic retrieval (default)
+MAX_PUBLICATION_CHUNKS=6    maximum selected source chunks/publication
+SEMANTIC_EXCERPT_CHARS=2800 maximum model-facing characters/selected chunk
+LLM_MAX_PACKET_CHARS=8000   bounded evidence per Ollama request
+LLM_MAX_CLAIMS=20           bounded structured output claims/request
+LLM_MAX_PACKETS=0           0 means no packet cap; positive values support bounded performance pilots
+```
+
+`packet_plan.tsv` is produced before inference begins and the console prints per-packet start/end,
+cache state, evidence size and wall time.  This makes catalogue-scale runtime measurable before a
+large semantic-enrichment launch.
