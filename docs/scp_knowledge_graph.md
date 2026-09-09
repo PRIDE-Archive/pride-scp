@@ -315,3 +315,26 @@ LLM_MAX_PACKETS=0           0 means no packet cap; positive values support bound
 `packet_plan.tsv` is produced before inference begins and the console prints per-packet start/end,
 cache state, evidence size and wall time.  This makes catalogue-scale runtime measurable before a
 large semantic-enrichment launch.
+
+## v0.5.9 reproducible grounded semantic extraction
+
+The H200 smoke established that GPU throughput is sufficient for catalogue-scale semantic extraction,
+but the first fresh PXD041399 run exposed two avoidable schema/normalization losses: most rejected
+claims used invalid passage IDs and a smaller subset returned multiple/decorated reporter channels in
+one value.
+
+v0.5.9 keeps the v0.5.7 retrieval and v0.5.8 HPC architecture unchanged while tightening the model
+contract:
+
+- `evidence_refs` is now a packet-specific JSON-schema enum containing only the supplied passage IDs;
+- generation defaults to `temperature=0`, `seed=42`, `top_k=1`, `top_p=1.0`;
+- prompt/schema/response SHA-256 values and generation settings are written into packet provenance;
+- legacy decorated evidence refs are recovered only by literal packet-ID token extraction;
+- reporter-channel lists are split deterministically into explicit channel tokens, with every token
+  still required to occur in the cited source text;
+- validated legacy claims may be imported, but old prompt caches no longer suppress re-extraction
+  after a prompt/schema upgrade unless explicitly requested;
+- rejection reasons are summarized globally, by accession and by packet.
+
+The model remains unable to create RAW/sample/cell/channel mappings. The stricter structured-output
+schema improves provenance fidelity without relaxing any scientific acceptance gate.

@@ -2043,3 +2043,13 @@ it.
 
 The scientific safety policy is unchanged: the small LLM cannot emit RAW-to-cell, RAW-to-sample,
 RAW-to-channel or branch-membership mappings, and no model claim bypasses the canonical resolver.
+
+## v0.5.9 seeded/provenance-constrained small-LLM semantics
+
+The H200 deployment showed that semantic inference is fast enough to rerun source evidence after a
+prompt/schema upgrade. v0.5.9 therefore prioritizes reproducibility and provenance closure over reuse
+of old packet coverage. Packet-local evidence IDs are enforced in the Ollama JSON schema itself,
+seeded greedy generation is recorded in cache identity, and explicit reporter-channel lists may be
+split only when each literal token is present in the cited source. Uncertain claims remain rejected.
+No model-generated RAW/sample/cell/run mapping is permitted, and the formal SDRF-valid count changes
+only after a later deterministic SDRF projection/validation stage.

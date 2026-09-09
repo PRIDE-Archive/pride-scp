@@ -359,3 +359,19 @@ execute the SIF with `--nv`, which injects the host NVIDIA driver stack. Therefo
 
 The launchers never depend on internet access. A missing model is an explicit error rather than a
 runtime `ollama pull`.
+
+## v0.5.9 semantic reproducibility controls
+
+The semantic Slurm launcher accepts the following environment controls in addition to the existing
+model/context settings:
+
+```text
+LLM_SEED=42        fixed generation seed
+LLM_FORCE=0        set to 1 to bypass packet cache for a controlled repeat
+LLM_MAX_PACKETS=0  optionally cap a benchmark run
+```
+
+The extractor also fixes `temperature=0`, `top_k=1`, and `top_p=1.0`. These settings, the seed,
+prompt/schema hashes, and response hash are recorded in packet results/cache provenance. After a
+prompt/schema upgrade, legacy validated claims can still be imported, but legacy packets do not hide
+the corresponding source passages from the new extractor by default.

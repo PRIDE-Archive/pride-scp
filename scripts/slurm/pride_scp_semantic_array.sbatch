@@ -26,6 +26,9 @@ SEMANTIC_EXCERPT_CHARS="${SEMANTIC_EXCERPT_CHARS:-2800}"
 LLM_MAX_PACKET_CHARS="${LLM_MAX_PACKET_CHARS:-8000}"
 LLM_MAX_PASSAGES_PER_PACKET="${LLM_MAX_PASSAGES_PER_PACKET:-3}"
 LLM_MAX_CLAIMS="${LLM_MAX_CLAIMS:-20}"
+LLM_MAX_PACKETS="${LLM_MAX_PACKETS:-0}"
+LLM_SEED="${LLM_SEED:-42}"
+LLM_FORCE="${LLM_FORCE:-0}"
 OLLAMA_NUM_CTX="${OLLAMA_NUM_CTX:-8192}"
 OLLAMA_NUM_PREDICT="${OLLAMA_NUM_PREDICT:-3072}"
 OLLAMA_TIMEOUT="${OLLAMA_TIMEOUT:-1200}"
@@ -74,7 +77,7 @@ echo "============================================================"
 echo "PRIDE-SCP semantic LLM shard"
 echo "job_id=$JOB_ID array_task=$TASK_ID shard_index=$SHARD_INDEX/$N_SHARDS node=$(hostname) start=$START_ISO"
 echo "cpus=$CPUS worker_cpus=$WORKER_CPUS llm_threads=$LLM_THREADS memory=$MEMORY"
-echo "use_gpu=$USE_GPU CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-unset} model=$MODEL"
+echo "use_gpu=$USE_GPU CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-unset} model=$MODEL seed=$LLM_SEED force=$LLM_FORCE"
 echo "sif=$SIF input_root=$INPUT_ROOT model_root=$MODEL_ROOT cache_root=$CACHE_ROOT"
 echo "result=$PERSIST_OUT run_name=$RUN_NAME"
 echo "============================================================"
@@ -131,6 +134,11 @@ mkdir -p "$JOB_SCRATCH/runtime_tmp" "$JOB_SCRATCH/home"
 export RAYON_NUM_THREADS="$WORKER_CPUS"
 export OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 NUMEXPR_NUM_THREADS=1
 
+EXTRACTOR_EXTRA_ARGS=(--seed "$LLM_SEED" --max-packets "$LLM_MAX_PACKETS")
+if [[ "$LLM_FORCE" == "1" ]]; then
+  EXTRACTOR_EXTRA_ARGS+=(--force)
+fi
+
 "$CONTAINER_BIN" exec "${GPU_ARGS[@]}" \
   --bind "$LOCAL_INPUT:/input:ro,$LOCAL_MODEL:/models/ollama,$LOCAL_CACHE:/cache,$LOCAL_OUT:/output,$SHARD_FILE:/scratch/shard_accessions.txt:ro,$JOB_SCRATCH/runtime_tmp:/runtime_tmp,$JOB_SCRATCH/home:/home/hpc" \
   "$LOCAL_SIF" \
@@ -165,6 +173,7 @@ export OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 NUMEXPR_NUM_TH
       --max-packet-chars "$LLM_MAX_PACKET_CHARS" \
       --max-passages-per-packet "$LLM_MAX_PASSAGES_PER_PACKET" \
       --max-claims "$LLM_MAX_CLAIMS" \
+      "${EXTRACTOR_EXTRA_ARGS[@]}" \
       --require-all-packets
 
 rsync -a --delete "$LOCAL_OUT/" "$PERSIST_OUT/"

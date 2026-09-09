@@ -37,8 +37,9 @@ if str(SCRIPT_DIR) not in sys.path:
 from scp_knowledge_graph import norm, read_accessions, stable_id  # noqa: E402
 from sdrf_multiplex_evidence_graph import project_json  # noqa: E402
 
-VERSION = "pride-scp-kg-small-llm-semantic-extractor-v0.2"
-PROMPT_VERSION = "scp-kg-semantic-claims-v2"
+VERSION = "pride-scp-kg-small-llm-semantic-extractor-v0.3"
+PROMPT_VERSION = "scp-kg-semantic-claims-v3"
+DEFAULT_SEED = 42
 
 # The model may emit only these source-semantic facts.  In particular, there are no RAW/file/sample
 # mapping predicates here.  Reporter roles are semantic design facts and are allowed only when the
@@ -68,6 +69,12 @@ LITERAL_PREDICATES = {
     "HAS_MULTIPLEX_SIZE": "integer",
 }
 ALLOWED_PREDICATES = tuple(sorted(set(PREDICATE_OBJECT_TYPES) | set(LITERAL_PREDICATES)))
+REPORTER_CHANNEL_PREDICATES = {
+    "HAS_ANALYTICAL_CHANNEL",
+    "HAS_CARRIER_CHANNEL",
+    "HAS_BLANK_CHANNEL",
+    "HAS_REFERENCE_CHANNEL",
+}
 
 # Broad source-selection anchors.  These are retrieval hints, not scientific inference rules.
 ANCHOR_GROUPS = {
@@ -466,7 +473,13 @@ def packetize(accession: str, passages: list[Passage], *, max_packet_chars: int 
     return packets
 
 
-def response_schema(max_claims: int = 24) -> dict[str,Any]:
+def response_schema(max_claims: int = 24, *, evidence_ids: Iterable[str] = ()) -> dict[str,Any]:
+    evidence_ids = tuple(dict.fromkeys(norm(x).upper() for x in evidence_ids if norm(x)))
+    evidence_item: dict[str, Any] = {"type": "string"}
+    # This is intentionally packet-specific.  Structured generation should make it impossible for
+    # a current Ollama response to cite a passage that was not supplied to that model request.
+    if evidence_ids:
+        evidence_item["enum"] = list(evidence_ids)
     claim={
         "type":"object",
         "properties":{
@@ -475,7 +488,7 @@ def response_schema(max_claims: int = 24) -> dict[str,Any]:
             "context_label":{"type":"string"},
             "predicate":{"type":"string","enum":list(ALLOWED_PREDICATES)},
             "object_value":{"type":"string"},
-            "evidence_refs":{"type":"array","items":{"type":"string"},"minItems":1,"maxItems":4},
+            "evidence_refs":{"type":"array","items":evidence_item,"minItems":1,"maxItems":4},
             "confidence":{"type":"number","minimum":0.0,"maximum":1.0},
             "certainty":{"type":"string","enum":["explicit","strongly_implied","uncertain"]},
         },
@@ -490,6 +503,7 @@ def prompt_for(packet: Packet, *, max_claims: int = 24) -> str:
     for p in packet.passages:
         evidence.append(f"### {p.passage_id}\nSOURCE: {p.source_kind}\nLOCATOR: {p.source_locator}\nTEXT:\n{p.text}")
     predicates="\n".join(f"- {x}" for x in ALLOWED_PREDICATES)
+    evidence_ids=", ".join(p.passage_id for p in packet.passages)
     return f"""You are a constrained semantic evidence extractor for a single-cell-proteomics knowledge graph.
 
 ACCESSION SCOPE: {packet.accession}
@@ -500,7 +514,7 @@ ALLOWED PREDICATES:
 {predicates}
 
 STRICT RULES:
-1. Every claim MUST cite one or more supplied passage IDs in evidence_refs. Never cite an ID not present below.
+1. Every claim MUST cite one or more supplied passage IDs in evidence_refs. The ONLY valid passage IDs for this request are: {evidence_ids}. Copy those IDs exactly and put only the IDs in evidence_refs; do not add labels, locators, prose, or combined strings.
 2. Use subject_scope='experimental_context' for experimental design/method/biology facts unless the source explicitly states the fact is dataset-wide. Give the same concise context_key to facts that clearly belong to the same source-described experiment. Context keys are source-local evidence labels, not canonical branch IDs.
 3. Do not create a new context merely because a new sentence uses a different synonym. Conversely, do not merge experiments that the source explicitly distinguishes (for example DDA vs DIA, TMT vs label-free, comparator vs primary single-cell experiment).
 4. RAW/file/sample/cell/run mappings are FORBIDDEN. Do not emit file names, sample IDs, well IDs, or RAW-to-channel assignments. Reporter-role facts such as '126 was the carrier channel' are allowed only when the cited source explicitly states that role.
@@ -521,18 +535,29 @@ EVIDENCE PASSAGES:
 
 def post_ollama(
     url: str, model: str, packet: Packet, *, timeout: int, num_ctx: int, retries: int,
-    num_predict: int, max_claims: int, keep_alive: str, num_thread: int,
+    num_predict: int, max_claims: int, keep_alive: str, num_thread: int, seed: int,
 ) -> tuple[dict[str,Any],dict[str,Any]]:
     if requests is None:
         raise RuntimeError("requests is required for Ollama semantic extraction")
-    options={"temperature":0.0,"num_ctx":num_ctx,"num_predict":num_predict}
+    options={
+        "temperature":0.0,
+        "seed":seed,
+        # top_k=1 makes the intended greedy/deterministic decoding policy explicit rather than
+        # relying only on temperature=0 backend behaviour.
+        "top_k":1,
+        "top_p":1.0,
+        "num_ctx":num_ctx,
+        "num_predict":num_predict,
+    }
     if num_thread>0:
         options["num_thread"]=num_thread
+    schema=response_schema(max_claims=max_claims,evidence_ids=(p.passage_id for p in packet.passages))
+    prompt=prompt_for(packet,max_claims=max_claims)
     payload={
         "model":model,
-        "prompt":prompt_for(packet,max_claims=max_claims),
+        "prompt":prompt,
         "stream":False,
-        "format":response_schema(max_claims=max_claims),
+        "format":schema,
         "options":options,
         "keep_alive":keep_alive,
     }
@@ -552,6 +577,14 @@ def post_ollama(
                 "wall_seconds":round(time.monotonic()-started,3),
                 "eval_count":body.get("eval_count"),
                 "prompt_eval_count":body.get("prompt_eval_count"),
+                "prompt_eval_cached_count":body.get("prompt_eval_cached_count"),
+                "generation_seed":seed,
+                "generation_temperature":0.0,
+                "generation_top_k":1,
+                "generation_top_p":1.0,
+                "prompt_sha256":sha256_text(prompt),
+                "schema_sha256":sha256_text(json.dumps(schema,sort_keys=True,separators=(",",":"))),
+                "response_sha256":sha256_text(json.dumps(obj,sort_keys=True,separators=(",",":"),ensure_ascii=False)),
             }
             for key in ("total_duration","load_duration","prompt_eval_duration","eval_duration"):
                 value=body.get(key)
@@ -587,9 +620,72 @@ def evidence_grounding(predicate: str, object_value: str, passages: list[Passage
     if any(a in text.lower() for a in aliases.get(ov,[])):
         return "known_alias_in_source"
     # Reporter role claims require the channel token itself to be in the cited source.
-    if predicate in {"HAS_ANALYTICAL_CHANNEL","HAS_CARRIER_CHANNEL","HAS_BLANK_CHANNEL","HAS_REFERENCE_CHANNEL"}:
+    if predicate in REPORTER_CHANNEL_PREDICATES:
         return "ungrounded_channel"
     return "citation_supported_no_lexical_alias"
+
+
+def normalize_evidence_refs(raw_refs: Iterable[Any], passage_map: dict[str, Passage]) -> tuple[list[str], list[str]]:
+    """Normalize only explicit packet-local passage identifiers.
+
+    New v0.3 structured responses are schema-constrained to exact IDs, so this mostly supports
+    already-completed v0.1/v0.2 cache entries.  It is intentionally not fuzzy: a string is accepted
+    only when it contains one or more literal packet IDs as standalone identifier tokens.
+    """
+    canonical={pid.upper():pid for pid in passage_map}
+    ordered=[]; invalid=[]
+    for raw in raw_refs:
+        value=norm(raw)
+        if not value:
+            continue
+        upper=value.upper()
+        if upper in canonical:
+            hits=[canonical[upper]]
+        else:
+            hits=[]
+            for key,pid in canonical.items():
+                if re.search(rf"(?<![A-Z0-9]){re.escape(key)}(?![A-Z0-9])", upper):
+                    hits.append(pid)
+        if not hits:
+            invalid.append(value)
+            continue
+        for pid in hits:
+            if pid not in ordered:
+                ordered.append(pid)
+    return ordered,invalid
+
+
+def canonical_reporter_tokens(value: str) -> list[str]:
+    """Extract only explicit canonical TMT reporter tokens from a model value.
+
+    A model sometimes violates the one-channel-per-claim instruction and returns values such as
+    ``126, 127C`` or ``TMT-126 (carrier)``.  Splitting those literal tokens is deterministic and does
+    not infer missing N/C suffixes or expand numeric ranges.
+    """
+    text=norm(value).upper()
+    if not text:
+        return []
+    out=[]
+    pattern=re.compile(r"(?<!\d)(12[6-9]|13[0-5])\s*[-_ ]?\s*([NC])?(?![A-Z0-9])")
+    for match in pattern.finditer(text):
+        token=match.group(1)+(match.group(2) or "")
+        if token not in out:
+            out.append(token)
+    return out
+
+
+def reporter_channel_present(token: str, passages: Iterable[Passage]) -> bool:
+    token=norm(token).upper().replace(" ","")
+    m=re.fullmatch(r"(12[6-9]|13[0-5])([NC])?",token)
+    if not m:
+        return False
+    number,suffix=m.groups()
+    if suffix:
+        pattern=re.compile(rf"(?<!\d){re.escape(number)}\s*[-_ ]?\s*{suffix}(?![A-Z0-9])",re.I)
+    else:
+        # Do not silently coerce an explicitly N/C-resolved channel to the unresolved numeric token.
+        pattern=re.compile(rf"(?<!\d){re.escape(number)}(?![A-Z0-9])",re.I)
+    return any(pattern.search(p.text) for p in passages)
 
 
 def context_ref(accession: str, source_uri: str, context_key: str, context_label: str) -> dict[str,Any]:
@@ -606,21 +702,38 @@ def context_ref(accession: str, source_uri: str, context_key: str, context_label
 def claim_records_from_response(packet: Packet, response: dict[str,Any], model: str) -> tuple[list[dict[str,Any]],list[dict[str,Any]]]:
     passage_map={p.passage_id:p for p in packet.passages}
     accepted=[]; rejected=[]; seen=set(); context_link_seen=set()
-    for idx,c in enumerate(response.get("claims") or [],start=1):
+    expanded=[]
+    for idx,c0 in enumerate(response.get("claims") or [],start=1):
+        c=dict(c0) if isinstance(c0,dict) else {}
+        pred=norm(c.get("predicate")).upper()
+        if pred in REPORTER_CHANNEL_PREDICATES:
+            tokens=canonical_reporter_tokens(norm(c.get("object_value")))
+            if tokens:
+                for subidx,token in enumerate(tokens,start=1):
+                    one=dict(c); one["object_value"]=token
+                    expanded.append((idx,subidx,one,norm(c.get("object_value"))))
+                continue
+        expanded.append((idx,1,c,norm(c.get("object_value"))))
+
+    for idx,subidx,c,raw_object in expanded:
         reason=""
-        pred=norm(c.get("predicate")).upper(); obj=norm(c.get("object_value")); refs=[norm(x) for x in (c.get("evidence_refs") or []) if norm(x)]
+        pred=norm(c.get("predicate")).upper(); obj=norm(c.get("object_value"))
+        raw_refs=[norm(x) for x in (c.get("evidence_refs") or []) if norm(x)]
+        refs,invalid_refs=normalize_evidence_refs(raw_refs,passage_map)
         if pred not in ALLOWED_PREDICATES: reason="predicate_not_allowed"
         elif not obj: reason="empty_object_value"
-        elif not refs or any(r not in passage_map for r in refs): reason="invalid_evidence_ref"
+        elif not refs or invalid_refs: reason="invalid_evidence_ref"
         elif c.get("certainty")=="uncertain": reason="model_marked_uncertain"
         cited=[passage_map[r] for r in refs if r in passage_map]
         grounding=evidence_grounding(pred,obj,cited) if cited else ""
-        if pred in {"HAS_ANALYTICAL_CHANNEL","HAS_CARRIER_CHANNEL","HAS_BLANK_CHANNEL","HAS_REFERENCE_CHANNEL"}:
-            channel_token=re.sub(r"(?i)^TMT", "", obj).strip().upper().replace(" ", "")
+        if pred in REPORTER_CHANNEL_PREDICATES:
+            channel_token=obj.strip().upper().replace(" ", "")
             if not re.fullmatch(r"(?:12[6-9]|13[0-5])(?:[NC])?", channel_token):
                 reason="reporter_channel_must_be_single_canonical_token"
-            elif grounding=="ungrounded_channel":
+            elif not reporter_channel_present(channel_token,cited):
                 reason="reporter_channel_not_present_in_cited_source"
+            else:
+                grounding="explicit_reporter_token_in_source"
         try: conf=float(c.get("confidence",0.0))
         except Exception: conf=0.0; reason=reason or "invalid_confidence"
         conf=max(0.0,min(1.0,conf))
@@ -628,13 +741,19 @@ def claim_records_from_response(packet: Packet, response: dict[str,Any], model: 
         if grounding=="citation_supported_no_lexical_alias": conf=min(conf,0.76)
         if conf<0.50: reason=reason or "confidence_below_floor"
         if reason:
-            rejected.append({"packet_id":packet.packet_id,"claim_index":idx,"reason":reason,"predicate":pred,"object_value":obj,"evidence_refs":refs,"grounding":grounding})
+            rejected.append({
+                "accession":packet.accession,"source_kind":packet.source_kind,
+                "packet_id":packet.packet_id,"claim_index":idx,"derived_subclaim_index":subidx,
+                "reason":reason,"predicate":pred,"object_value":obj,"raw_object_value":raw_object,
+                "evidence_refs":refs,"evidence_refs_raw":raw_refs,"invalid_evidence_refs":invalid_refs,
+                "grounding":grounding,
+            })
             continue
         # All cited passages in one model claim must come from the same raw source lineage.  This
         # prevents one model call from synthesizing a fact across unrelated manuscripts/sources.
         source_uris={p.source_uri for p in cited}
         if len(source_uris)!=1:
-            rejected.append({"packet_id":packet.packet_id,"claim_index":idx,"reason":"cross_source_claim_forbidden","predicate":pred,"object_value":obj,"evidence_refs":refs})
+            rejected.append({"accession":packet.accession,"source_kind":packet.source_kind,"packet_id":packet.packet_id,"claim_index":idx,"derived_subclaim_index":subidx,"reason":"cross_source_claim_forbidden","predicate":pred,"object_value":obj,"evidence_refs":refs,"evidence_refs_raw":raw_refs})
             continue
         p0=cited[0]
         evidence_text="\n\n".join(f"[{p.passage_id}] {p.text}" for p in cited)
@@ -681,7 +800,7 @@ def claim_records_from_response(packet: Packet, response: dict[str,Any], model: 
             if dtype=="integer":
                 m=re.search(r"\d+",obj)
                 if not m:
-                    rejected.append({"packet_id":packet.packet_id,"claim_index":idx,"reason":"integer_literal_missing","predicate":pred,"object_value":obj})
+                    rejected.append({"accession":packet.accession,"source_kind":packet.source_kind,"packet_id":packet.packet_id,"claim_index":idx,"derived_subclaim_index":subidx,"reason":"integer_literal_missing","predicate":pred,"object_value":obj})
                     continue
                 obj=m.group(0)
             record["literal_value"]=obj; record["literal_datatype"]=dtype
@@ -702,9 +821,25 @@ def packet_json(packet: Packet) -> dict[str,Any]:
     return {"accession":packet.accession,"packet_id":packet.packet_id,"source_kind":packet.source_kind,"passages":[p.__dict__ for p in packet.passages]}
 
 
-def packet_cache_key(packet: Packet, model: str) -> str:
+def generation_spec(*, model: str, num_ctx: int, num_predict: int, num_thread: int, max_claims: int, seed: int) -> dict[str,Any]:
+    return {
+        "prompt_version":PROMPT_VERSION,
+        "model":model,
+        "temperature":0.0,
+        "seed":seed,
+        "top_k":1,
+        "top_p":1.0,
+        "num_ctx":num_ctx,
+        "num_predict":num_predict,
+        "num_thread":num_thread,
+        "max_claims":max_claims,
+    }
+
+
+def packet_cache_key(packet: Packet, spec: dict[str,Any]) -> str:
     pjson=packet_json(packet)
-    return hashlib.sha256((PROMPT_VERSION+"\n"+model+"\n"+json.dumps(pjson,sort_keys=True)).encode()).hexdigest()
+    payload={"generation":spec,"packet":pjson}
+    return hashlib.sha256(json.dumps(payload,sort_keys=True,separators=(",",":"),ensure_ascii=False).encode()).hexdigest()
 
 
 def cached_packet_to_object(raw: dict[str,Any]) -> Packet | None:
@@ -718,7 +853,7 @@ def cached_packet_to_object(raw: dict[str,Any]) -> Packet | None:
 
 
 def import_compatible_legacy_cache(
-    cache: Path, *, model: str, wanted: set[str], valid_source_hashes: set[tuple[str,str,str]],
+    cache: Path, *, model: str, wanted: set[str], valid_source_hashes: set[tuple[str,str,str]], suppress_reextract: bool = False,
 ) -> tuple[list[dict[str,Any]],list[dict[str,Any]],set[tuple[str,str,str]],dict[str,int]]:
     """Reuse completed older semantic packets whose underlying source content is still identical.
 
@@ -743,8 +878,12 @@ def import_compatible_legacy_cache(
         if not valid: continue
         a,r=claim_records_from_response(packet,response,model)
         claims.extend(a); rejects.extend(r); packets+=1; files+=1
-        for p in packet.passages:
-            covered.add((packet.accession,p.source_uri,p.source_locator))
+        # GPU inference is now cheap enough that prompt/schema upgrades should re-read the evidence
+        # by default.  Older validated claims may still be imported, but legacy packets suppress
+        # re-extraction only when explicitly requested.
+        if suppress_reextract:
+            for p in packet.passages:
+                covered.add((packet.accession,p.source_uri,p.source_locator))
     return claims,rejects,covered,{"legacy_cache_files":files,"legacy_cache_packets_imported":packets,"legacy_graph_claims":len(claims),"legacy_rejected_claims":len(rejects)}
 
 
@@ -783,8 +922,16 @@ def run(args: argparse.Namespace) -> int:
     valid_source_hashes={(acc,p.source_uri,p.content_sha256) for acc,ps in all_passages_by_acc.items() for p in ps}
     claims=[]; rejects=[]; covered=set(); legacy_stats={"legacy_cache_files":0,"legacy_cache_packets_imported":0,"legacy_graph_claims":0,"legacy_rejected_claims":0}
     if args.reuse_legacy_cache:
-        a,r,covered,legacy_stats=import_compatible_legacy_cache(cache,model=args.model,wanted=wanted,valid_source_hashes=valid_source_hashes)
+        a,r,covered,legacy_stats=import_compatible_legacy_cache(
+            cache,model=args.model,wanted=wanted,valid_source_hashes=valid_source_hashes,
+            suppress_reextract=args.legacy_cache_suppresses_reextract,
+        )
         claims.extend(a); rejects.extend(r)
+
+    gen_spec=generation_spec(
+        model=args.model,num_ctx=args.num_ctx,num_predict=args.num_predict,num_thread=args.num_thread,
+        max_claims=args.max_claims,seed=args.seed,
+    )
 
     planned=[]
     for acc in accessions:
@@ -802,7 +949,7 @@ def run(args: argparse.Namespace) -> int:
         pjson=packet_json(packet)
         (packets_dir/f"{packet.packet_id}.json").write_text(json.dumps(pjson,indent=2,ensure_ascii=False)+"\n")
         source_counts[packet.source_kind]+=1
-        cp=cache/f"{packet_cache_key(packet,args.model)}.json"
+        cp=cache/f"{packet_cache_key(packet,gen_spec)}.json"
         state="current_cache" if cp.is_file() and not args.force else "model_call"
         current_cache_hits += int(state=="current_cache")
         plan_rows.append({
@@ -819,6 +966,7 @@ def run(args: argparse.Namespace) -> int:
             "planned_packets":len(planned),"planned_model_calls":model_calls,"current_prompt_cache_hits":current_cache_hits,
             **legacy_stats,"packets_by_accession":dict(packet_counts),
             "max_packet_chars":args.max_packet_chars,"max_claims_per_packet":args.max_claims,"num_ctx":args.num_ctx,"num_predict":args.num_predict,
+            "generation":gen_spec,
         }
     },indent=2))
 
@@ -831,7 +979,7 @@ def run(args: argparse.Namespace) -> int:
     packet_stats=[]; response_claims=0; cache_hits=current_cache_hits; failures=[]; model_wall=0.0
     total=len(planned)
     for ordinal,packet in enumerate(planned,start=1):
-        pjson=packet_json(packet); cache_key=packet_cache_key(packet,args.model); cache_path=cache/f"{cache_key}.json"
+        pjson=packet_json(packet); cache_key=packet_cache_key(packet,gen_spec); cache_path=cache/f"{cache_key}.json"
         evidence_chars=sum(len(p.text) for p in packet.passages)
         stats={"ordinal":ordinal,"accession":packet.accession,"packet_id":packet.packet_id,"source_kind":packet.source_kind,"passages":len(packet.passages),"evidence_chars":evidence_chars,"cache":False,"claims":0,"accepted":0,"rejected":0,"error":""}
         stamp=datetime.now().astimezone().isoformat(timespec="seconds")
@@ -846,9 +994,12 @@ def run(args: argparse.Namespace) -> int:
             else:
                 response,model_stats=post_ollama(
                     args.ollama_url,args.model,packet,timeout=args.timeout,num_ctx=args.num_ctx,retries=args.retries,
-                    num_predict=args.num_predict,max_claims=args.max_claims,keep_alive=args.keep_alive,num_thread=args.num_thread,
+                    num_predict=args.num_predict,max_claims=args.max_claims,keep_alive=args.keep_alive,num_thread=args.num_thread,seed=args.seed,
                 )
-                cache_path.write_text(json.dumps({"prompt_version":PROMPT_VERSION,"model":args.model,"packet":pjson,"response":response,"model_stats":model_stats},indent=2,ensure_ascii=False)+"\n")
+                cache_path.write_text(json.dumps({
+                    "prompt_version":PROMPT_VERSION,"model":args.model,"generation":gen_spec,
+                    "packet":pjson,"response":response,"model_stats":model_stats,
+                },indent=2,ensure_ascii=False)+"\n")
             response_claims += len(response.get("claims") or []); stats["claims"]=len(response.get("claims") or [])
             a,r=claim_records_from_response(packet,response,args.model); claims.extend(a); rejects.extend(r); stats["accepted"]=len(a); stats["rejected"]=len(r); stats.update({f"model_{k}":v for k,v in model_stats.items()})
             for row in a: append_jsonl(checkpoint_claims,row)
@@ -873,6 +1024,12 @@ def run(args: argparse.Namespace) -> int:
     with (out/"packet_results.tsv").open("w",newline="",encoding="utf-8") as fh:
         fields=sorted({k for r in packet_stats for k in r}) if packet_stats else ["accession","packet_id"]
         w=csv.DictWriter(fh,fieldnames=fields,delimiter="\t",extrasaction="ignore"); w.writeheader(); w.writerows(packet_stats)
+    rejection_reason_counts=Counter(r.get("reason","reason_missing") for r in rejects)
+    rejection_by_accession: dict[str,Counter[str]]=defaultdict(Counter)
+    rejection_by_packet: dict[str,Counter[str]]=defaultdict(Counter)
+    for row in rejects:
+        rejection_by_accession[str(row.get("accession") or "legacy_or_unknown")][str(row.get("reason") or "reason_missing")]+=1
+        rejection_by_packet[str(row.get("packet_id") or "unknown_packet")][str(row.get("reason") or "reason_missing")]+=1
     summary={
         "extractor_version":VERSION,"prompt_version":PROMPT_VERSION,"model":args.model,"accessions":len(accessions),
         "publication_mode":args.publication_mode,"packets":len(packet_stats),"packet_source_counts":dict(source_counts),"cache_hits":cache_hits,
@@ -882,10 +1039,16 @@ def run(args: argparse.Namespace) -> int:
         "publication_coverage":coverage,
         "predicate_counts":dict(Counter(r["predicate"] for r in claims)),
         "source_type_counts":dict(Counter(r["source_type"] for r in claims)),
+        "rejection_reason_counts":dict(rejection_reason_counts),
+        "rejection_reason_counts_by_accession":{k:dict(v) for k,v in sorted(rejection_by_accession.items())},
+        "rejection_reason_counts_by_packet":{k:dict(v) for k,v in sorted(rejection_by_packet.items())},
+        "generation":gen_spec,
         "performance_policy":{
             "semantic_retrieval":args.publication_mode=="semantic","semantic_excerpt_chars":args.semantic_excerpt_chars,
             "max_packet_chars":args.max_packet_chars,"max_claims_per_packet":args.max_claims,"num_ctx":args.num_ctx,"num_predict":args.num_predict,
-            "legacy_cache_reuse":args.reuse_legacy_cache,"incremental_checkpoints":True,
+            "legacy_cache_reuse":args.reuse_legacy_cache,
+            "legacy_cache_suppresses_reextract":args.legacy_cache_suppresses_reextract,
+            "incremental_checkpoints":True,
         },
         "policies":{
             "model_generates_sdrf":False,"model_mapping_predicates_allowed":False,"provenance_refs_required":True,
@@ -918,6 +1081,25 @@ def self_test() -> None:
     assert preds["HAS_EXPERIMENTAL_CONTEXT"]==1
     assert preds["USES_CHEMISTRY"]==1 and preds["HAS_CARRIER_CHANNEL"]==1 and preds["HAS_BLANK_CHANNEL"]==1 and preds["HAS_ACQUISITION"]==1
     assert any(r["reason"]=="reporter_channel_not_present_in_cited_source" for r in rejected)
+    # Packet-local structured schemas must enumerate only supplied evidence IDs.
+    schema=response_schema(max_claims=5,evidence_ids=["P0001"])
+    evidence_items=schema["properties"]["claims"]["items"]["properties"]["evidence_refs"]["items"]
+    assert evidence_items["enum"]==["P0001"]
+    # Legacy decorated refs may be recovered only by literal packet-ID token extraction.
+    refs,bad=normalize_evidence_refs(["Evidence: P0001"],{"P0001":p})
+    assert refs==["P0001"] and not bad
+    refs,bad=normalize_evidence_refs(["P9999"],{"P0001":p})
+    assert not refs and bad==["P9999"]
+    # Multi-channel model values are deterministically split, never range-expanded, and every
+    # resulting token still has to be explicitly present in the cited source.
+    split_response={"claims":[
+        {"subject_scope":"experimental_context","context_key":"single_cell_tmt","context_label":"single-cell TMT experiment","predicate":"HAS_CARRIER_CHANNEL","object_value":"TMT-126, 127C","evidence_refs":["P0001"],"confidence":0.99,"certainty":"explicit"},
+    ]}
+    aa,rr=claim_records_from_response(packet,split_response,"fixture:3b")
+    role_objects={x.get("object",{}).get("key") for x in aa if x.get("predicate")=="HAS_CARRIER_CHANNEL"}
+    assert role_objects=={"126","127C"} and not rr
+    spec=generation_spec(model="fixture:3b",num_ctx=8192,num_predict=3072,num_thread=7,max_claims=20,seed=42)
+    assert spec["seed"]==42 and spec["top_k"]==1 and spec["temperature"]==0.0
     # Publication chunking must remove the bibliography after an explicit References heading.
     chunks=split_publication_chunks("Methods\nSingle-cell TMTpro18 was used.\n\nReferences\nOther study used TMT6.")
     assert chunks and all("Other study used TMT6" not in x[1] for x in chunks)
@@ -943,7 +1125,9 @@ def self_test() -> None:
         legacy={"prompt_version":"scp-kg-semantic-claims-v1","model":"fixture:3b","packet":packet_json(packet),"response":response,"model_stats":{"wall_seconds":1.0}}
         (cache/"legacy.json").write_text(json.dumps(legacy))
         aa,rr,cov,meta=import_compatible_legacy_cache(cache,model="fixture:3b",wanted={acc},valid_source_hashes={(acc,p.source_uri,p.content_sha256)})
-        assert meta["legacy_cache_packets_imported"]==1 and aa and (acc,p.source_uri,p.source_locator) in cov
+        assert meta["legacy_cache_packets_imported"]==1 and aa and not cov
+        aa,rr,cov,meta=import_compatible_legacy_cache(cache,model="fixture:3b",wanted={acc},valid_source_hashes={(acc,p.source_uri,p.content_sha256)},suppress_reextract=True)
+        assert (acc,p.source_uri,p.source_locator) in cov
     print("scp_kg_extract_semantic_claims self-test: PASS")
 
 
@@ -960,6 +1144,7 @@ def main() -> int:
     p.add_argument("--num-ctx",type=int,default=8192)
     p.add_argument("--num-predict",type=int,default=3072)
     p.add_argument("--num-thread",type=int,default=0)
+    p.add_argument("--seed",type=int,default=DEFAULT_SEED)
     p.add_argument("--keep-alive",default="30m")
     p.add_argument("--max-claims",type=int,default=20)
     p.add_argument("--retries",type=int,default=1)
@@ -972,6 +1157,7 @@ def main() -> int:
     p.add_argument("--max-passages-per-packet",type=int,default=3)
     p.add_argument("--max-packets",type=int,default=0)
     p.add_argument("--reuse-legacy-cache",action=argparse.BooleanOptionalAction,default=True)
+    p.add_argument("--legacy-cache-suppresses-reextract",action=argparse.BooleanOptionalAction,default=False)
     p.add_argument("--force",action="store_true")
     p.add_argument("--dry-run",action="store_true")
     p.add_argument("--fail-fast",action="store_true")
