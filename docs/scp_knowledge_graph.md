@@ -120,6 +120,10 @@ normalization operation, not a semantic guess.
 
 ### Source lineage and independent corroboration
 
+Resolver execution is idempotent with respect to prior resolver-derived state: rerunning resolution on
+an already-resolved seed graph first clears resolution rows that reference resolver-created winning edges,
+then removes those derived edges. This ordering is required for SQLite foreign-key safety.
+
 Raw claim count is not treated as evidence strength.  The resolver computes both a source lineage and
 an evidence family for every claim.  Multiple repeated observations from one lineage are collapsed to
 their strongest contribution, and multiple lineages from the same evidence family are capped when

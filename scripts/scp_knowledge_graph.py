@@ -418,20 +418,30 @@ class GraphStore:
         return eid
 
     def clear_resolution(self) -> None:
-        """Remove only resolver-derived state, preserving source claims and primary accepted edges."""
+        """Remove only resolver-derived state, preserving source claims and primary accepted edges.
+
+        Resolution groups can reference resolver-created edges through ``winning_edge_id``.  Clear
+        those referencing rows before deleting the derived edges so re-running the resolver on an
+        already-resolved/seeded graph remains foreign-key safe.
+        """
         resolver_edges = [
             r[0] for r in self.conn.execute(
                 "SELECT edge_id FROM edge WHERE resolution_method LIKE 'kg_resolver:%'"
             )
         ]
+
+        # Child/reference tables first.  In particular, resolution_group.winning_edge_id references
+        # edge(edge_id) without ON DELETE CASCADE, so deleting resolver edges before groups can raise
+        # sqlite3.IntegrityError on a graph that has already been resolved.
+        self.conn.execute("DELETE FROM resolution_claim")
+        self.conn.execute("DELETE FROM branch_resolution_member")
+        self.conn.execute("DELETE FROM branch_resolution")
+        self.conn.execute("DELETE FROM resolution_group")
+        self.conn.execute("DELETE FROM node_canonicalization")
+
         if resolver_edges:
             self.conn.executemany("DELETE FROM edge_claim WHERE edge_id=?", [(x,) for x in resolver_edges])
             self.conn.executemany("DELETE FROM edge WHERE edge_id=?", [(x,) for x in resolver_edges])
-        self.conn.execute("DELETE FROM resolution_claim")
-        self.conn.execute("DELETE FROM resolution_group")
-        self.conn.execute("DELETE FROM branch_resolution_member")
-        self.conn.execute("DELETE FROM branch_resolution")
-        self.conn.execute("DELETE FROM node_canonicalization")
 
     def export_tsv(self, output: Path) -> None:
         output.mkdir(parents=True, exist_ok=True)

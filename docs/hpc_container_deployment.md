@@ -193,8 +193,13 @@ semantic LLM array ────────┘
 ```
 
 The base job and semantic array may run simultaneously. Each array task writes an independent
-semantic-claim output. The final CPU job imports all completed claim files into one copied base KG and
-runs the resolver once.
+semantic-claim output. By default the base job only constructs/refreshes the base KG (`BASE_RESOLVE=0`);
+resolution is deliberately deferred until after semantic claims have been merged. Set `BASE_RESOLVE=1`
+only when a standalone pre-semantic resolution report is explicitly required. The final CPU job imports
+all completed claim files into one copied base KG and runs the resolver once.
+
+The resolver is rerun-safe on already-resolved seed graphs. Resolver-derived resolution rows are cleared
+before their referenced resolver-created edges, preserving SQLite foreign-key integrity.
 
 The launchers do not contain fixed resource `#SBATCH` directives. Resources are selected at submission
 time so the same scripts can run on another cluster.
@@ -273,7 +278,7 @@ MERGE_JOB=$(sbatch --parsable \
   --mem=16G \
   --time=02:00:00 \
   --output="$PERSIST_ROOT/logs/pride-scp-merge-%j.out" \
-  --export=ALL,PERSIST_ROOT="$PERSIST_ROOT",SIF="$SIF",RUN_NAME="$RUN_NAME" \
+  --export=ALL,PERSIST_ROOT="$PERSIST_ROOT",SIF="$SIF",RUN_NAME="$RUN_NAME",EXPECTED_SHARDS="$N_SHARDS" \
   "$PERSIST_ROOT/scripts/pride_scp_kg_merge_resolve.sbatch")
 
 echo "MERGE_JOB=$MERGE_JOB"

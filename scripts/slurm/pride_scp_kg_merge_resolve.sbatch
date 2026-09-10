@@ -15,6 +15,7 @@ SCRATCH_ROOT="${SCRATCH_ROOT:-/tmp}"
 BASE_RESULT="${BASE_RESULT:-$RESULT_ROOT/$RUN_NAME/base}"
 SHARD_ROOT="${SHARD_ROOT:-$RESULT_ROOT/$RUN_NAME/shards}"
 FINAL_RESULT="${FINAL_RESULT:-$RESULT_ROOT/$RUN_NAME/final}"
+EXPECTED_SHARDS="${EXPECTED_SHARDS:-0}"
 
 JOB_ID="${SLURM_JOB_ID:-local}"
 JOB_SCRATCH="$SCRATCH_ROOT/pride-scp_${JOB_ID}_merge"
@@ -42,7 +43,7 @@ trap fail_handler EXIT INT TERM
 echo "============================================================"
 echo "PRIDE-SCP semantic claim merge + canonical resolve"
 echo "job_id=$JOB_ID node=$(hostname) start=$START_ISO"
-echo "base=$BASE_RESULT shards=$SHARD_ROOT final=$FINAL_RESULT"
+echo "base=$BASE_RESULT shards=$SHARD_ROOT final=$FINAL_RESULT expected_shards=$EXPECTED_SHARDS"
 echo "============================================================"
 
 [[ -f "$SIF" && -f "$SIF_SHA" ]] || { echo "ERROR: missing SIF or SHA" >&2; exit 2; }
@@ -56,6 +57,10 @@ cp -f "$BASE_RESULT/scp_knowledge_graph.sqlite" "$LOCAL_OUT/scp_knowledge_graph.
 
 mapfile -t CLAIM_FILES < <(find "$SHARD_ROOT" -mindepth 2 -maxdepth 2 -type f -name semantic_claims.jsonl | sort)
 [[ ${#CLAIM_FILES[@]} -gt 0 ]] || { echo "ERROR: no semantic_claims.jsonl files found under $SHARD_ROOT" >&2; exit 2; }
+if [[ "$EXPECTED_SHARDS" =~ ^[0-9]+$ ]] && (( EXPECTED_SHARDS > 0 )) && (( ${#CLAIM_FILES[@]} != EXPECTED_SHARDS )); then
+  echo "ERROR: expected $EXPECTED_SHARDS semantic claim shard(s), found ${#CLAIM_FILES[@]} under $SHARD_ROOT" >&2
+  exit 2
+fi
 : > "$MERGED"
 for f in "${CLAIM_FILES[@]}"; do
   echo "merge_claims=$f"

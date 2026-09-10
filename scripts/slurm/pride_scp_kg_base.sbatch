@@ -13,6 +13,7 @@ RESULT_ROOT="${RESULT_ROOT:-$PERSIST_ROOT/results}"
 RUN_NAME="${RUN_NAME:-kg-semantic}"
 SCRATCH_ROOT="${SCRATCH_ROOT:-/tmp}"
 STAGE_INPUT="${STAGE_INPUT:-1}"
+BASE_RESOLVE="${BASE_RESOLVE:-0}"
 
 JOB_ID="${SLURM_JOB_ID:-local}"
 CPUS="${SLURM_CPUS_PER_TASK:-1}"
@@ -46,7 +47,7 @@ echo "============================================================"
 echo "PRIDE-SCP base KG build"
 echo "job_id=$JOB_ID node=$(hostname) start=$START_ISO"
 echo "cpus=$CPUS memory=$MEMORY container_runtime=$($CONTAINER_BIN --version | head -1)"
-echo "sif=$SIF input_root=$INPUT_ROOT result=$PERSIST_OUT run_name=$RUN_NAME"
+echo "sif=$SIF input_root=$INPUT_ROOT result=$PERSIST_OUT run_name=$RUN_NAME base_resolve=$BASE_RESOLVE"
 echo "============================================================"
 
 [[ -f "$SIF" && -f "$SIF_SHA" ]] || { echo "ERROR: missing SIF or SHA file" >&2; exit 2; }
@@ -85,8 +86,14 @@ V053_ARGS=()
     "${V053_ARGS[@]}" \
     --output /output
 
-"$CONTAINER_BIN" exec --bind "$LOCAL_OUT:/output" "$LOCAL_SIF" \
-  python /opt/pride-scp/scripts/scp_kg_resolve.py --db /output/scp_knowledge_graph.sqlite --output /output/resolution
+if [[ "$BASE_RESOLVE" == "1" ]]; then
+  "$CONTAINER_BIN" exec --bind "$LOCAL_OUT:/output" "$LOCAL_SIF" \
+    python /opt/pride-scp/scripts/scp_kg_resolve.py \
+      --db /output/scp_knowledge_graph.sqlite \
+      --output /output/resolution
+else
+  echo "base_resolve=0; deferring canonical resolution until semantic-claim merge"
+fi
 
 rsync -a --delete "$LOCAL_OUT/" "$PERSIST_OUT/"
 END_EPOCH=$(date +%s)

@@ -23,7 +23,7 @@ from urllib.parse import urlparse
 
 from scp_knowledge_graph import GraphStore, NodeRef, json_text, norm, stable_id
 
-VERSION = "pride-scp-kg-resolver-v0.2"
+VERSION = "pride-scp-kg-resolver-v0.2.1"
 
 # Trust weight is evidence quality, not a probability.  Contributions are capped per source family
 # so dozens of pages from one community site cannot manufacture independent corroboration.
@@ -846,6 +846,20 @@ def self_test() -> None:
             assert g.conn.execute("SELECT COUNT(*) FROM edge WHERE predicate='MENTIONS_ACCESSION' AND status='accepted'").fetchone()[0]==1
             br=g.conn.execute("SELECT status FROM branch_resolution WHERE scope_accession='PXD900101'").fetchall()
             assert any(x[0]=="contradictory_hypothesis" for x in br)
+
+            # Regression: a resolver rerun must be idempotent/foreign-key safe even when
+            # resolution_group.winning_edge_id points at edges created by the previous resolver run.
+            first_counts = (
+                g.conn.execute("SELECT COUNT(*) FROM resolution_group").fetchone()[0],
+                g.conn.execute("SELECT COUNT(*) FROM edge WHERE resolution_method LIKE 'kg_resolver:%'").fetchone()[0],
+            )
+            summary2=Resolver(g).run()
+            second_counts = (
+                g.conn.execute("SELECT COUNT(*) FROM resolution_group").fetchone()[0],
+                g.conn.execute("SELECT COUNT(*) FROM edge WHERE resolution_method LIKE 'kg_resolver:%'").fetchone()[0],
+            )
+            assert first_counts == second_counts
+            assert summary2["resolver_promoted_mapping_edges"] == 0
     print("scp_kg_resolve self-test: PASS")
 
 
