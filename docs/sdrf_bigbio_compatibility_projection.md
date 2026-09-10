@@ -1,4 +1,4 @@
-# PRIDE-SCP BigBio 1.1 compatibility projection (v0.5.14)
+# PRIDE-SCP BigBio 1.1 compatibility projection (v0.5.14.1)
 
 This stage converts an already source-closed PRIDE-SCP SDRF candidate into a separate BigBio-1.1
 compatibility derivative. The source candidate is immutable and remains the scientific provenance
@@ -10,7 +10,7 @@ Automatic normalization is restricted to representation and specification metada
 - place `factor value[...]` columns last;
 - write `comment[sdrf version] = v1.1.0`;
 - replace legacy/internal template metadata with versioned BigBio template declarations;
-- derive `human` only when every concrete organism row is human;
+- derive `human` only when every concrete organism value across every `characteristics[organism]` column is human;
 - add `not available` for missing human age/sex/disease fields because those sentinels are permitted
   by the BigBio human template.
 
@@ -25,3 +25,15 @@ blockers. Independent-review approval must match the normalized projected SHA-25
 External `parse_sdrf` or `sdrf-skills` validation findings are scientific readiness states and do not
 make the overall batch operationally fail. A non-zero process status is reserved for a required tool
 being unavailable.
+
+## v0.5.14.1 whole-file organism-template hardening
+
+Whole-file organism template derivation now consumes every duplicate `characteristics[organism]`
+column, not only the first occurrence. This closes a generic legacy-layout failure mode in which a
+mixed/non-human candidate could be misclassified as all-human when an earlier duplicate organism
+column contained only human values. The source candidate remains read-only; only the separate
+hash-tracked compatibility derivative is written.
+
+Readiness telemetry now states `candidate_rewritten_by_gate=false`,
+`source_candidate_mutated_by_gate=false`, and `normalized_derivative_created_by_gate=true` so the
+immutability contract is explicit.

@@ -32,7 +32,7 @@ from pathlib import Path
 from typing import Any, Iterable
 
 VERSION = "pride-scp-sdrf-readiness-v0.2"
-POLICY_VERSION = "pride-scp-bigbio-readiness-v0.5.14"
+POLICY_VERSION = "pride-scp-bigbio-readiness-v0.5.14.1"
 SDRF_PIPELINES_PIN = "0.1.6"
 
 SDRF_SPEC_VERSION = "1.1.0"
@@ -490,8 +490,12 @@ def derive_templates(headers: list[str], rows: list[list[str]], explicit: list[s
     if re.search(r"\bdia\b|data[- ]independent", acquisitions):
         names.add("dia-acquisition")
 
+    # Derive organism-layer templates from *all* characteristics[organism] columns. Historical
+    # SDRFs can contain duplicate organism columns; looking only at the first occurrence can
+    # incorrectly classify a mixed/non-human file as wholly human. Every concrete organism
+    # observation across every duplicate column participates in the whole-file template decision.
     organism_values = [
-        value for value in row_values(headers, rows, "characteristics[organism]") if not placeholder(value)
+        value for value in row_values_all(headers, rows, "characteristics[organism]") if not placeholder(value)
     ]
     if organism_values and all(_is_human_organism(value) for value in organism_values):
         names.add("human")
@@ -1032,7 +1036,9 @@ def write_outputs(args: argparse.Namespace, results: list[ReadinessResult]) -> d
         "policies": {
             "model_generates_sdrf": False,
             "model_creates_sample_file_channel_mapping": False,
-            "candidate_rewritten_by_gate": True,
+            "candidate_rewritten_by_gate": False,
+            "source_candidate_mutated_by_gate": False,
+            "normalized_derivative_created_by_gate": True,
             "candidate_schema_metadata_normalized_by_gate": True,
             "candidate_scientific_values_invented_by_gate": False,
             "normalization_is_hash_audited": True,
@@ -1122,6 +1128,8 @@ def self_test() -> None:
         assert all(x["passed"] for x in res.parse_sdrf)
         assert res.normalization.applied
         assert res.projected_sha256 and res.projected_sha256 != original_digest
+        # The source candidate is a provenance anchor and must remain byte-identical.
+        assert sha256_file(sdrf) == original_digest
         assert Path(res.normalization.manifest_path).is_file()
 
         projected_headers, projected_rows = read_sdrf(Path(res.projected_path))
@@ -1163,6 +1171,22 @@ def self_test() -> None:
         mixed_templates = derive_templates(mixed_headers, mixed_rows, [])
         assert "human" not in mixed_templates
         assert "dia-acquisition" in mixed_templates
+
+        # Historical files may carry duplicate organism columns. Whole-file template derivation must
+        # inspect every duplicate column, not only the first one. This protects arbitrary mixed-species
+        # candidates from accidental `human` template selection.
+        duplicate_organism_headers = [
+            "source name", "characteristics[organism]", "characteristics[organism]",
+            "assay name", "technology type", "comment[proteomics data acquisition method]",
+            "comment[sdrf template]",
+        ]
+        duplicate_organism_rows = [
+            ["h", "Homo sapiens", "Homo sapiens", "h", "proteomic profiling by mass spectrometry", "DIA", "human v1.1.0"],
+            ["m", "Homo sapiens", "Mus musculus (mouse)", "m", "proteomic profiling by mass spectrometry", "DIA", "human v1.1.0"],
+        ]
+        duplicate_templates = derive_templates(duplicate_organism_headers, duplicate_organism_rows, [])
+        assert "human" not in duplicate_templates
+        assert "dia-acquisition" in duplicate_templates
 
         # Multiple non-identical candidates are fail-closed.
         alt = candidate_root / "datasets" / accession
