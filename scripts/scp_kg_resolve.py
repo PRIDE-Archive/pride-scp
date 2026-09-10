@@ -15,7 +15,7 @@ import html
 import json
 import re
 import sqlite3
-from collections import defaultdict
+from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable
@@ -23,7 +23,7 @@ from urllib.parse import urlparse
 
 from scp_knowledge_graph import GraphStore, NodeRef, json_text, norm, stable_id
 
-VERSION = "pride-scp-kg-resolver-v0.2.1"
+VERSION = "pride-scp-kg-resolver-v0.2.2"
 
 # Trust weight is evidence quality, not a probability.  Contributions are capped per source family
 # so dozens of pages from one community site cannot manufacture independent corroboration.
@@ -94,6 +94,28 @@ REPORTER_MODALITIES = {
     "targeted_reporter_single_cell",
 }
 UNRESOLVED_MODALITIES = {"modality_unresolved", "single_cell_modality_unresolved"}
+
+# Positive semantic facts must carry informative values.  These tokens represent absence/unknown
+# state rather than a biological or experimental fact and therefore remain in raw claim provenance
+# only; the resolver will never promote them.
+NONINFORMATIVE_SEMANTIC_VALUES = {
+    "none", "na", "null", "unknown", "unspecified", "notspecified", "notreported",
+    "unreported", "notavailable", "notapplicable", "missing", "undetermined",
+}
+
+# Common ontology namespace labels that can appear in repository JSON `cvLabel` fields.  They name
+# the vocabulary, not the organism/tissue/cell/disease value.  This is a generic type check, not an
+# accession-specific rule.
+ONTOLOGY_NAMESPACE_SENTINELS = {
+    "HAS_ORGANISM": {"NEWT", "NCBITAXON"},
+    "HAS_ORGANISM_PART": {"BTO", "UBERON"},
+    "HAS_CELL_TYPE": {"CL"},
+    "HAS_DISEASE": {"DOID", "MONDO"},
+}
+
+REPORTER_ROLE_PREDICATES = {
+    "HAS_ANALYTICAL_CHANNEL", "HAS_CARRIER_CHANNEL", "HAS_BLANK_CHANNEL", "HAS_REFERENCE_CHANNEL"
+}
 
 
 def _simple_key(value: str) -> str:
@@ -345,6 +367,67 @@ class ResolutionGroup:
     attrs: dict[str, Any] = field(default_factory=dict)
 
 
+
+def _semantic_object_value(claim: CanonicalClaim) -> str:
+    if claim.object_ref is not None:
+        return norm(claim.object_ref.label or claim.object_ref.canonical_key)
+    return norm(claim.literal)
+
+
+def _semantic_hygiene_reason(claim: CanonicalClaim) -> str:
+    value = _semantic_object_value(claim)
+    if not value:
+        return "empty_semantic_value"
+    if _simple_key(value) in NONINFORMATIVE_SEMANTIC_VALUES:
+        return "noninformative_semantic_value"
+    sentinels = ONTOLOGY_NAMESPACE_SENTINELS.get(claim.predicate, set())
+    if value.upper() in sentinels:
+        return "ontology_namespace_not_entity_value"
+    return ""
+
+
+def _is_reporter_chemistry(value: str) -> bool:
+    key, _ = canonical_technology(value)
+    return key.startswith("tmt")
+
+
+def _modality_family(value: str) -> str:
+    key, _ = canonical_modality(value)
+    if key in LABEL_FREE_MODALITIES or key == "label_free":
+        return "label_free"
+    if key in REPORTER_MODALITIES or "reporter" in key:
+        return "reporter"
+    if key in UNRESOLVED_MODALITIES:
+        return "unresolved"
+    return key
+
+
+def _chemistry_compatible(a: str, b: str) -> bool:
+    ka, _ = canonical_technology(a)
+    kb, _ = canonical_technology(b)
+    if ka == kb:
+        return True
+    # Generic TMT/TMTpro observations are compatible with a more specific member of the same family.
+    if ka == "tmt" and kb.startswith("tmt"):
+        return True
+    if kb == "tmt" and ka.startswith("tmt"):
+        return True
+    if ka == "tmtpro" and kb.startswith("tmtpro"):
+        return True
+    if kb == "tmtpro" and ka.startswith("tmtpro"):
+        return True
+    return False
+
+
+def _feature_json(feature: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "modalities": sorted(feature["modalities"]),
+        "chemistries": sorted(feature["chemistries"]),
+        "acquisitions": sorted(feature["acquisitions"]),
+        "reporter_roles": {k: sorted(v) for k, v in sorted(feature["roles"].items())},
+    }
+
+
 class Resolver:
     def __init__(self, store: GraphStore):
         self.store = store
@@ -521,8 +604,94 @@ class Resolver:
         groups = list(grouped.values())
         for g in groups:
             self._base_decision(g)
+        self._apply_semantic_hygiene(groups)
         self._apply_functional_conflicts(groups)
+        self._apply_semantic_consistency_conflicts(groups)
         return groups
+
+    def _apply_semantic_hygiene(self, groups: list[ResolutionGroup]) -> None:
+        for g in groups:
+            if g.risk != "semantic" or g.status == "accepted_existing":
+                continue
+            reason = _semantic_hygiene_reason(g.claims[0])
+            if not reason:
+                continue
+            g.status = "rejected_semantic_hygiene"
+            g.method = reason
+            g.attrs["semantic_hygiene_reason"] = reason
+            g.attrs["semantic_hygiene_value"] = _semantic_object_value(g.claims[0])
+
+    def _apply_semantic_consistency_conflicts(self, groups: list[ResolutionGroup]) -> None:
+        # Reporter role exclusivity: within one canonical source-local context/branch, a reporter
+        # channel cannot simultaneously be analytical, carrier, blank and/or reference.  Do not pick
+        # a winner from weak model/hypothesis evidence; expose the contradiction instead.
+        by_channel: dict[tuple[str, str, str, str], list[ResolutionGroup]] = defaultdict(list)
+        for g in groups:
+            first = g.claims[0]
+            if first.predicate not in REPORTER_ROLE_PREDICATES or first.object_ref is None:
+                continue
+            if g.status == "rejected_semantic_hygiene":
+                continue
+            key = (g.signature[0], first.scope_accession, first.branch_scope, first.object_ref.canonical_key)
+            by_channel[key].append(g)
+        for key, variants in by_channel.items():
+            roles = {g.claims[0].predicate for g in variants}
+            if len(roles) <= 1:
+                continue
+            conflict_id = stable_id("semantic_conflict", "reporter_role_exclusivity", *key)
+            strong_existing = [g for g in variants if g.status == "accepted_existing"]
+            for g in variants:
+                g.conflict_key = conflict_id
+                g.attrs["semantic_conflict"] = "reporter_role_exclusivity"
+                g.attrs["conflicting_roles"] = sorted(roles)
+                if g.status == "accepted_existing":
+                    continue
+                if len(strong_existing) == 1:
+                    g.status = "rejected_by_stronger_evidence"
+                    g.method = "reporter_role_conflict_with_existing_truth"
+                else:
+                    g.status = "conflicted"
+                    g.method = "reporter_role_exclusivity_conflict"
+
+        # A source-local context cannot coherently be label-free while also carrying reporter
+        # chemistry or reporter-role facts.  This is a diagnostic consistency rule, not modality
+        # inference; it never manufactures a replacement modality.
+        by_context: dict[tuple[str, str, str], list[ResolutionGroup]] = defaultdict(list)
+        for g in groups:
+            if g.status == "rejected_semantic_hygiene":
+                continue
+            first = g.claims[0]
+            if g.risk != "semantic":
+                continue
+            by_context[(g.signature[0], first.scope_accession, first.branch_scope)].append(g)
+        for key, variants in by_context.items():
+            label_free = [g for g in variants if g.claims[0].predicate == "HAS_MODALITY" and g.claims[0].object_ref and _modality_family(g.claims[0].object_ref.canonical_key) == "label_free"]
+            reporter = []
+            for g in variants:
+                c = g.claims[0]
+                if c.predicate in REPORTER_ROLE_PREDICATES:
+                    reporter.append(g)
+                elif c.predicate == "HAS_MODALITY" and c.object_ref and _modality_family(c.object_ref.canonical_key) == "reporter":
+                    reporter.append(g)
+                elif c.predicate == "USES_CHEMISTRY" and c.object_ref and _is_reporter_chemistry(c.object_ref.canonical_key):
+                    reporter.append(g)
+            if not label_free or not reporter:
+                continue
+            involved = []
+            seen_group_ids = set()
+            for candidate in label_free + reporter:
+                marker = id(candidate)
+                if marker not in seen_group_ids:
+                    seen_group_ids.add(marker)
+                    involved.append(candidate)
+            conflict_id = stable_id("semantic_conflict", "label_free_reporter_context", *key)
+            for g in involved:
+                g.conflict_key = conflict_id
+                g.attrs["semantic_conflict"] = "label_free_with_reporter_evidence"
+                if g.status == "accepted_existing":
+                    continue
+                g.status = "conflicted"
+                g.method = "label_free_reporter_context_conflict"
 
     def _apply_functional_conflicts(self, groups: list[ResolutionGroup]) -> None:
         by_key: dict[tuple[str,str,str,str], list[ResolutionGroup]] = defaultdict(list)
@@ -739,12 +908,161 @@ class Resolver:
             counts[status]+=1
         return {"branch_clusters":len(clusters),"status_counts":dict(sorted(counts.items()))}
 
+    def resolve_context_branch_alignment(self, claims: list[CanonicalClaim]) -> dict[str, Any]:
+        """Diagnose compatibility between source-local semantic contexts and branch hypotheses.
+
+        This layer is deliberately non-generative and non-promoting.  It never asserts that a
+        context *is* a branch; it only records whether independently extracted semantic features are
+        compatible with, ambiguous among, or contradictory to existing branch hypotheses.
+        """
+        context_nodes = {
+            r["node_id"]: r for r in self.conn.execute("SELECT * FROM node WHERE node_type='ExperimentalContext'")
+        }
+        branch_nodes = {
+            r["node_id"]: r for r in self.conn.execute("SELECT * FROM node WHERE node_type='ExperimentalBranchHypothesis'")
+        }
+        def blank() -> dict[str, Any]:
+            return {"modalities": set(), "chemistries": set(), "acquisitions": set(), "roles": defaultdict(set), "accession": "", "lineages": set()}
+        contexts = {nid: blank() for nid in context_nodes}
+        branches = {nid: blank() for nid in branch_nodes}
+        for c in claims:
+            for target, feature in ((contexts, contexts.get(c.subject_node_id)), (branches, branches.get(c.subject_node_id))):
+                if feature is None:
+                    continue
+                feature["accession"] = c.scope_accession or feature["accession"]
+                feature["lineages"].add(c.source_lineage)
+                if c.predicate == "HAS_MODALITY" and c.object_ref:
+                    feature["modalities"].add(c.object_ref.canonical_key)
+                elif c.predicate == "USES_CHEMISTRY" and c.object_ref:
+                    feature["chemistries"].add(c.object_ref.canonical_key)
+                elif c.predicate == "HAS_ACQUISITION" and c.object_ref:
+                    feature["acquisitions"].add(c.object_ref.canonical_key)
+                elif c.predicate in REPORTER_ROLE_PREDICATES and c.object_ref:
+                    feature["roles"][c.predicate].add(c.object_ref.canonical_key)
+
+        candidate_rows: dict[str, list[dict[str, Any]]] = defaultdict(list)
+        for context_id, cf in contexts.items():
+            if not (cf["modalities"] or cf["chemistries"] or cf["acquisitions"] or cf["roles"]):
+                continue
+            acc = cf["accession"]
+            if not acc:
+                continue
+            for branch_id, bf in branches.items():
+                if bf["accession"] != acc:
+                    continue
+                matched: list[str] = []
+                conflicts: list[str] = []
+                score = 0.0
+                conflict_score = 0.0
+
+                cm = {_modality_family(x) for x in cf["modalities"] if _modality_family(x) != "unresolved"}
+                bm = {_modality_family(x) for x in bf["modalities"] if _modality_family(x) != "unresolved"}
+                if cm and bm:
+                    inter = cm & bm
+                    if inter:
+                        score += 0.35
+                        matched.append("modality:" + ",".join(sorted(inter)))
+                    elif {"label_free", "reporter"}.issubset(cm | bm):
+                        conflict_score += 1.0
+                        conflicts.append("label_free_vs_reporter_modality")
+
+                cc = set(cf["chemistries"])
+                bc = set(bf["chemistries"])
+                if cc and bc:
+                    compat = {(a, b) for a in cc for b in bc if _chemistry_compatible(a, b)}
+                    if compat:
+                        score += 0.35
+                        matched.append("chemistry:" + ",".join(sorted({a for a, _ in compat} | {b for _, b in compat})))
+                    elif any(_is_reporter_chemistry(x) for x in cc) and any(_is_reporter_chemistry(x) for x in bc):
+                        conflict_score += 0.60
+                        conflicts.append("incompatible_reporter_chemistry")
+
+                ca = set(cf["acquisitions"])
+                ba = set(bf["acquisitions"])
+                if ca and ba:
+                    inter = ca & ba
+                    if inter:
+                        score += 0.15
+                        matched.append("acquisition:" + ",".join(sorted(inter)))
+                    else:
+                        conflict_score += 0.15
+                        conflicts.append("different_acquisition")
+
+                role_matches = 0
+                role_conflicts = 0
+                for role in REPORTER_ROLE_PREDICATES:
+                    overlap = set(cf["roles"].get(role, set())) & set(bf["roles"].get(role, set()))
+                    role_matches += len(overlap)
+                    if overlap:
+                        matched.append(role + ":" + ",".join(sorted(overlap)))
+                crole_by_channel: dict[str, set[str]] = defaultdict(set)
+                brole_by_channel: dict[str, set[str]] = defaultdict(set)
+                for role in REPORTER_ROLE_PREDICATES:
+                    for ch in cf["roles"].get(role, set()): crole_by_channel[ch].add(role)
+                    for ch in bf["roles"].get(role, set()): brole_by_channel[ch].add(role)
+                for ch in set(crole_by_channel) & set(brole_by_channel):
+                    if crole_by_channel[ch].isdisjoint(brole_by_channel[ch]):
+                        role_conflicts += 1
+                        conflicts.append("reporter_role:" + ch)
+                if role_matches:
+                    score += min(0.15, 0.05 * role_matches)
+                if role_conflicts:
+                    conflict_score += min(0.60, 0.30 * role_conflicts)
+
+                row = {
+                    "context_id": context_id,
+                    "branch_id": branch_id,
+                    "accession": acc,
+                    "score": round(score, 4),
+                    "conflict_score": round(conflict_score, 4),
+                    "matched": matched,
+                    "conflicts": conflicts,
+                    "context": cf,
+                    "branch": bf,
+                }
+                candidate_rows[context_id].append(row)
+
+        status_counts: dict[str, int] = defaultdict(int)
+        inserted = 0
+        for context_id, rows in candidate_rows.items():
+            viable = [r for r in rows if r["score"] >= 0.55 and r["conflict_score"] < 0.50]
+            for r in rows:
+                if r["conflict_score"] >= 0.50:
+                    status = "contradictory"
+                elif r in viable:
+                    status = "unique_compatible_candidate" if len(viable) == 1 else "ambiguous_compatible_candidate"
+                elif r["score"] >= 0.30:
+                    status = "weak_candidate"
+                else:
+                    status = "insufficient_evidence"
+                aid = stable_id("context_branch_alignment", r["accession"], r["context_id"], r["branch_id"])
+                attrs = {
+                    "matched": r["matched"],
+                    "conflicts": r["conflicts"],
+                    "context_features": _feature_json(r["context"]),
+                    "branch_features": _feature_json(r["branch"]),
+                    "non_promoting": True,
+                }
+                self.conn.execute(
+                    """INSERT INTO context_branch_alignment(
+                       alignment_id,scope_accession,context_node_id,branch_node_id,status,compatibility_score,
+                       conflict_score,matched_features,conflicting_features,context_source_lineages,evidence_summary,attrs_json
+                       ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    (aid, r["accession"], r["context_id"], r["branch_id"], status, r["score"], r["conflict_score"],
+                     len(r["matched"]), len(r["conflicts"]), len(r["context"]["lineages"]),
+                     ";".join(r["matched"] + r["conflicts"]), json_text(attrs)),
+                )
+                inserted += 1
+                status_counts[status] += 1
+        return {"alignments": inserted, "status_counts": dict(sorted(status_counts.items()))}
+
     def run(self) -> dict[str, Any]:
         self.store.clear_resolution()
         claims=self.canonical_claims()
         groups=self.groups(claims)
         self.persist_groups(groups)
         branch_summary=self.resolve_branches(claims)
+        context_alignment_summary=self.resolve_context_branch_alignment(claims)
         self.conn.commit()
         status_counts={r[0]:r[1] for r in self.conn.execute("SELECT status,COUNT(*) FROM resolution_group GROUP BY status ORDER BY status")}
         risk_counts={r[0]:r[1] for r in self.conn.execute("SELECT risk_class,COUNT(*) FROM resolution_group GROUP BY risk_class ORDER BY risk_class")}
@@ -763,11 +1081,20 @@ class Resolver:
             "resolver_promoted_accession_scoped_edges":self.conn.execute("SELECT COUNT(*) FROM edge WHERE resolution_method LIKE 'kg_resolver:%' AND scope_accession<>''").fetchone()[0],
             "resolver_promoted_mapping_edges":accepted_by_risk.get("mapping",0),
             "branch_resolution":branch_summary,
+            "semantic_hygiene":{
+                "rejected_groups":sum(1 for g in groups if g.status=="rejected_semantic_hygiene"),
+                "conflicted_groups":sum(1 for g in groups if g.status=="conflicted" and g.method in {"reporter_role_exclusivity_conflict","label_free_reporter_context_conflict"}),
+                "method_counts":dict(sorted(Counter(g.method for g in groups if g.method in {"noninformative_semantic_value","ontology_namespace_not_entity_value","reporter_role_exclusivity_conflict","label_free_reporter_context_conflict","reporter_role_conflict_with_existing_truth"}).items())),
+            },
+            "context_branch_alignment":context_alignment_summary,
             "policy":{
                 "community_repetition_capped_per_source_family":True,
                 "hypothesis_claims_cannot_self_promote":True,
                 "mapping_requires_primary_or_structured_source_closure":True,
                 "cross_accession_relationships_remain_review_gated":True,
+                "noninformative_semantic_values_never_promote":True,
+                "reporter_role_conflicts_remain_review_gated":True,
+                "context_branch_alignment_is_non_promoting":True,
             },
         }
 
@@ -780,7 +1107,9 @@ def export_resolution_report(store: GraphStore, output: Path, summary: dict[str,
         "conflicts.tsv":"SELECT * FROM resolution_group WHERE status='conflicted' ORDER BY scope_accession,canonical_predicate,resolution_id",
         "corroborated_not_accepted.tsv":"SELECT * FROM resolution_group WHERE status='corroborated_not_accepted' ORDER BY scope_accession,canonical_predicate,resolution_id",
         "hypothesis_only.tsv":"SELECT * FROM resolution_group WHERE status='hypothesis_only' ORDER BY scope_accession,canonical_predicate,resolution_id",
+        "semantic_hygiene.tsv":"SELECT * FROM resolution_group WHERE status='rejected_semantic_hygiene' OR resolution_method IN ('reporter_role_exclusivity_conflict','label_free_reporter_context_conflict','reporter_role_conflict_with_existing_truth') ORDER BY scope_accession,branch_scope,canonical_predicate,resolution_id",
         "branch_resolution.tsv":"SELECT * FROM branch_resolution ORDER BY scope_accession,canonical_branch_key",
+        "context_branch_alignment.tsv":"SELECT * FROM context_branch_alignment ORDER BY scope_accession,context_node_id,compatibility_score DESC,branch_node_id",
     }
     import csv
     for name,q in queries.items():
@@ -826,12 +1155,28 @@ def self_test() -> None:
             g.claim(acc,"USES_CHEMISTRY",model_pub,object_ref=tech,scope_accession="PXD900101",extractor="small_llm:fixture",confidence=.98,evidence_locator="Methods",evidence_text="TMTpro18")
             g.claim(acc,"USES_CHEMISTRY",model_repo,object_ref=tech,scope_accession="PXD900101",extractor="small_llm:fixture",confidence=.98,evidence_locator="description",evidence_text="TMTpro18")
 
+            # Semantic hygiene: source-local model contexts retain provenance but placeholder/CV-label
+            # values and internally contradictory reporter roles must never become accepted truth.
+            ctx=NodeRef("ExperimentalContext","PXD900101::ctx:reporter","reporter context",{"accession":"PXD900101"})
+            g.claim(ctx,"HAS_MODALITY",model_pub,object_ref=NodeRef("Modality","reporter_multiplexed_single_cell","reporter_multiplexed_single_cell"),scope_accession="PXD900101",branch_scope="PXD900101::ctx:reporter",extractor="small_llm:fixture",confidence=.98,evidence_locator="Methods",evidence_text="single-cell TMTpro18")
+            g.claim(ctx,"USES_CHEMISTRY",model_pub,object_ref=NodeRef("ReporterChemistry","TMTpro18","TMTpro18"),scope_accession="PXD900101",branch_scope="PXD900101::ctx:reporter",extractor="small_llm:fixture",confidence=.98,evidence_locator="Methods",evidence_text="TMTpro18")
+            g.claim(ctx,"HAS_CARRIER_CHANNEL",model_pub,object_ref=NodeRef("ReporterChannel","126","126"),scope_accession="PXD900101",branch_scope="PXD900101::ctx:reporter",extractor="small_llm:fixture",confidence=.98,evidence_locator="Methods",evidence_text="126 carrier")
+            g.claim(ctx,"HAS_ANALYTICAL_CHANNEL",model_pub,object_ref=NodeRef("ReporterChannel","126","126"),scope_accession="PXD900101",branch_scope="PXD900101::ctx:reporter",extractor="small_llm:fixture",confidence=.90,evidence_locator="Methods",evidence_text="126")
+            badctx=NodeRef("ExperimentalContext","PXD900101::ctx:metadata","metadata context",{"accession":"PXD900101"})
+            g.claim(badctx,"HAS_ORGANISM",model_repo,object_ref=NodeRef("Organism","NEWT","NEWT"),scope_accession="PXD900101",branch_scope="PXD900101::ctx:metadata",extractor="small_llm:fixture",confidence=1.0,evidence_locator="project.organisms[0].cvLabel",evidence_text="NEWT")
+            g.claim(badctx,"HAS_DISEASE",model_repo,object_ref=NodeRef("Disease","not_specified","not_specified"),scope_accession="PXD900101",branch_scope="PXD900101::ctx:metadata",extractor="small_llm:fixture",confidence=1.0,evidence_locator="description",evidence_text="not specified")
+
             # Contradictory branch hypotheses must remain diagnostic, never canonical truth.
             hyp=g.source("runtime_inference","fixture:v053",trust_class="derived_hypothesis")
             bh=NodeRef("ExperimentalBranchHypothesis","PXD900101::h1","h1",{"accession":"PXD900101"})
             g.claim(acc,"HAS_BRANCH_HYPOTHESIS",hyp,object_ref=bh,scope_accession="PXD900101",branch_scope="h1",extractor="fixture",confidence=.55,status="hypothesis",evidence_locator="row1",evidence_text="h1")
             g.claim(bh,"HAS_MODALITY_HYPOTHESIS",hyp,object_ref=NodeRef("Modality","label_free","label_free"),scope_accession="PXD900101",branch_scope="h1",extractor="fixture",confidence=.55,status="hypothesis",evidence_locator="row1",evidence_text="label free")
             g.claim(bh,"USES_CHEMISTRY_HYPOTHESIS",hyp,object_ref=NodeRef("ReporterChemistry","TMT6plex","TMT6plex"),scope_accession="PXD900101",branch_scope="h1",extractor="fixture",confidence=.55,status="hypothesis",evidence_locator="row1",evidence_text="TMT6")
+            bh2=NodeRef("ExperimentalBranchHypothesis","PXD900101::h2","h2",{"accession":"PXD900101"})
+            g.claim(acc,"HAS_BRANCH_HYPOTHESIS",hyp,object_ref=bh2,scope_accession="PXD900101",branch_scope="h2",extractor="fixture",confidence=.55,status="hypothesis",evidence_locator="row2",evidence_text="h2")
+            g.claim(bh2,"HAS_MODALITY_HYPOTHESIS",hyp,object_ref=NodeRef("Modality","reporter_multiplexed_single_cell","reporter_multiplexed_single_cell"),scope_accession="PXD900101",branch_scope="h2",extractor="fixture",confidence=.55,status="hypothesis",evidence_locator="row2",evidence_text="reporter multiplexed single cell")
+            g.claim(bh2,"USES_CHEMISTRY_HYPOTHESIS",hyp,object_ref=NodeRef("ReporterChemistry","TMTpro18","TMTpro18"),scope_accession="PXD900101",branch_scope="h2",extractor="fixture",confidence=.55,status="hypothesis",evidence_locator="row2",evidence_text="TMTpro18")
+            g.claim(bh2,"HAS_CARRIER_CHANNEL",hyp,object_ref=NodeRef("ReporterChannel","126","126"),scope_accession="PXD900101",branch_scope="h2",extractor="fixture",confidence=.55,status="hypothesis",evidence_locator="row2",evidence_text="126 carrier")
 
             r=Resolver(g); summary=r.run()
             assert summary["node_aliases"] >= 2
@@ -846,6 +1191,24 @@ def self_test() -> None:
             assert g.conn.execute("SELECT COUNT(*) FROM edge WHERE predicate='MENTIONS_ACCESSION' AND status='accepted'").fetchone()[0]==1
             br=g.conn.execute("SELECT status FROM branch_resolution WHERE scope_accession='PXD900101'").fetchall()
             assert any(x[0]=="contradictory_hypothesis" for x in br)
+            # Namespace/placeholder values are retained only as rejected resolution groups.
+            hygiene=dict(g.conn.execute("SELECT resolution_method,COUNT(*) FROM resolution_group WHERE status='rejected_semantic_hygiene' GROUP BY resolution_method"))
+            assert hygiene.get("ontology_namespace_not_entity_value",0) >= 1
+            assert hygiene.get("noninformative_semantic_value",0) >= 1
+            # Same reporter channel in multiple roles is exposed as a semantic conflict.
+            assert g.conn.execute("SELECT COUNT(*) FROM resolution_group WHERE resolution_method='reporter_role_exclusivity_conflict'").fetchone()[0] >= 2
+            # The reporter context should uniquely match the compatible reporter/TMTpro18 branch and
+            # contradict the label-free/TMT6 branch.  These alignments are diagnostic only.
+            aligns=dict(g.conn.execute("SELECT status,COUNT(*) FROM context_branch_alignment GROUP BY status"))
+            assert aligns.get("unique_compatible_candidate",0) >= 1
+            assert aligns.get("contradictory",0) >= 1
+            assert summary["context_branch_alignment"]["alignments"] >= 2
+            report_dir=root/"resolution"
+            export_resolution_report(g, report_dir, summary)
+            assert (report_dir/"semantic_hygiene.tsv").is_file()
+            assert (report_dir/"context_branch_alignment.tsv").is_file()
+            assert (report_dir/"semantic_hygiene.tsv").read_text().strip()
+            assert (report_dir/"context_branch_alignment.tsv").read_text().strip()
 
             # Regression: a resolver rerun must be idempotent/foreign-key safe even when
             # resolution_group.winning_edge_id points at edges created by the previous resolver run.

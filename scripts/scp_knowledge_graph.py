@@ -249,6 +249,24 @@ class GraphStore:
               similarity REAL NOT NULL DEFAULT 1.0,
               PRIMARY KEY(branch_resolution_id, branch_node_id)
             );
+
+            CREATE TABLE IF NOT EXISTS context_branch_alignment (
+              alignment_id TEXT PRIMARY KEY,
+              scope_accession TEXT NOT NULL,
+              context_node_id TEXT NOT NULL REFERENCES node(node_id) ON DELETE CASCADE,
+              branch_node_id TEXT NOT NULL REFERENCES node(node_id) ON DELETE CASCADE,
+              status TEXT NOT NULL,
+              compatibility_score REAL NOT NULL DEFAULT 0.0,
+              conflict_score REAL NOT NULL DEFAULT 0.0,
+              matched_features INTEGER NOT NULL DEFAULT 0,
+              conflicting_features INTEGER NOT NULL DEFAULT 0,
+              context_source_lineages INTEGER NOT NULL DEFAULT 0,
+              evidence_summary TEXT NOT NULL DEFAULT '',
+              attrs_json TEXT NOT NULL DEFAULT '{}',
+              UNIQUE(context_node_id, branch_node_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_context_branch_alignment_scope ON context_branch_alignment(scope_accession);
+            CREATE INDEX IF NOT EXISTS idx_context_branch_alignment_status ON context_branch_alignment(status);
             """
         )
 
@@ -434,6 +452,7 @@ class GraphStore:
         # edge(edge_id) without ON DELETE CASCADE, so deleting resolver edges before groups can raise
         # sqlite3.IntegrityError on a graph that has already been resolved.
         self.conn.execute("DELETE FROM resolution_claim")
+        self.conn.execute("DELETE FROM context_branch_alignment")
         self.conn.execute("DELETE FROM branch_resolution_member")
         self.conn.execute("DELETE FROM branch_resolution")
         self.conn.execute("DELETE FROM resolution_group")
@@ -456,6 +475,7 @@ class GraphStore:
             "resolution_claims.tsv": ("resolution_claim", ["resolution_id","claim_id","source_lineage","source_family","normalized_confidence","contribution"]),
             "branch_resolution.tsv": ("branch_resolution", ["branch_resolution_id","scope_accession","canonical_branch_key","status","modality","chemistry","acquisition","confidence","blocker","attrs_json"]),
             "branch_resolution_members.tsv": ("branch_resolution_member", ["branch_resolution_id","branch_node_id","relation","similarity"]),
+            "context_branch_alignment.tsv": ("context_branch_alignment", ["alignment_id","scope_accession","context_node_id","branch_node_id","status","compatibility_score","conflict_score","matched_features","conflicting_features","context_source_lineages","evidence_summary","attrs_json"]),
         }
         for name, (table, fields) in tables.items():
             with (output/name).open("w", newline="", encoding="utf-8") as fh:
@@ -519,6 +539,7 @@ class GraphStore:
             "node_type_counts": {r[0]: r[1] for r in self.conn.execute("SELECT node_type,COUNT(*) FROM node GROUP BY node_type ORDER BY node_type")},
             "resolution_status_counts": {r[0]: r[1] for r in self.conn.execute("SELECT status,COUNT(*) FROM resolution_group GROUP BY status ORDER BY status")},
             "branch_resolution_status_counts": {r[0]: r[1] for r in self.conn.execute("SELECT status,COUNT(*) FROM branch_resolution GROUP BY status ORDER BY status")},
+            "context_branch_alignment_status_counts": {r[0]: r[1] for r in self.conn.execute("SELECT status,COUNT(*) FROM context_branch_alignment GROUP BY status ORDER BY status")},
         }
 
 

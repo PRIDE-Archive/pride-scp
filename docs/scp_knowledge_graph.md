@@ -342,3 +342,36 @@ contract:
 
 The model remains unable to create RAW/sample/cell/channel mappings. The stricter structured-output
 schema improves provenance fidelity without relaxing any scientific acceptance gate.
+
+## v0.5.11 semantic hygiene and context-to-branch diagnostics
+
+The eight-accession Qwen2.5-14B H200 pilot demonstrated high semantic recall, but inspection of the
+source-grounded claims also exposed generic model-output failure modes that must remain quarantined:
+ontology namespace labels used as entity values, positive `none`/`not_specified` facts, mutually
+exclusive reporter roles, and label-free modality assertions inside reporter-chemistry contexts.
+
+Resolver v0.2.2 therefore adds a non-generative semantic-hygiene layer. Raw claims remain preserved
+for provenance, but non-informative values and ontology namespace sentinels are marked
+`rejected_semantic_hygiene`; same-context reporter-role collisions and label-free/reporter design
+collisions are exposed as explicit conflicts rather than resolved by score. These rules never create
+a replacement value or mapping.
+
+The same iteration adds `context_branch_alignment`, a diagnostic table that compares source-local
+`ExperimentalContext` design features against existing `ExperimentalBranchHypothesis` features.
+Compatibility uses only already-extracted modality, reporter chemistry, acquisition and reporter-role
+claims. Rows are classified as `unique_compatible_candidate`, `ambiguous_compatible_candidate`,
+`weak_candidate`, `insufficient_evidence`, or `contradictory`. The alignment is explicitly
+non-promoting: it cannot create `BELONGS_TO_BRANCH`, RAW/sample/channel mappings, accepted branch
+edges, or SDRF rows.
+
+Human-review outputs now include:
+
+```text
+semantic_hygiene.tsv
+context_branch_alignment.tsv
+```
+
+The resolver summary also reports semantic-hygiene method counts and context/branch alignment status
+counts. These diagnostics are intended to determine whether independent source-local semantic
+contexts can safely corroborate the older branch hypotheses before any branch promotion policy is
+implemented.

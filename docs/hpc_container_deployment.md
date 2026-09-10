@@ -380,3 +380,20 @@ The extractor also fixes `temperature=0`, `top_k=1`, and `top_p=1.0`. These sett
 prompt/schema hashes, and response hash are recorded in packet results/cache provenance. After a
 prompt/schema upgrade, legacy validated claims can still be imported, but legacy packets do not hide
 the corresponding source passages from the new extractor by default.
+
+## v0.5.11 post-merge semantic-hygiene audit
+
+After semantic shards are merged, resolver v0.2.2 writes two additional diagnostic reports:
+
+```text
+$PERSIST_ROOT/results/<run>/final/resolution/semantic_hygiene.tsv
+$PERSIST_ROOT/results/<run>/final/resolution/context_branch_alignment.tsv
+```
+
+No additional GPU extraction is required to apply these resolver-side diagnostics to an existing set
+of semantic shard JSONL files. Rebuild/deploy the SIF containing the updated Python resolver, rebuild
+the inexpensive base graph, and rerun the merge/resolver while reusing the existing shard outputs.
+
+`context_branch_alignment.tsv` is non-generative and must not be interpreted as a branch assignment.
+Only future source-closure logic may decide whether a uniquely compatible context provides sufficient
+corroboration for a branch; v0.5.11 records compatibility/conflict evidence only.
