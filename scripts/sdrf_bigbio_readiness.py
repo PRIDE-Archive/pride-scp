@@ -9,7 +9,9 @@ source-closure signals, then applies the BigBio-facing acceptance stack:
   PRIDE_SCP source closure -> single-cell contract -> parse_sdrf -> sdrf-skills check/score
   -> hash-bound independent review -> submission layout
 
-A validator pass is necessary but never treated as proof of scientific truth.
+A validator pass is necessary but never treated as proof of scientific truth. Source candidates are
+immutable; the readiness gate may create a hash-audited BigBio-1.1 compatibility derivative containing
+only schema/order/version/template metadata normalization. Missing scientific values remain blockers.
 """
 from __future__ import annotations
 
@@ -29,9 +31,26 @@ from dataclasses import dataclass, field, asdict
 from pathlib import Path
 from typing import Any, Iterable
 
-VERSION = "pride-scp-sdrf-readiness-v0.1"
-POLICY_VERSION = "pride-scp-bigbio-readiness-v0.5.13"
+VERSION = "pride-scp-sdrf-readiness-v0.2"
+POLICY_VERSION = "pride-scp-bigbio-readiness-v0.5.14"
 SDRF_PIPELINES_PIN = "0.1.6"
+
+SDRF_SPEC_VERSION = "1.1.0"
+SDRF_SPEC_VALUE = f"v{SDRF_SPEC_VERSION}"
+
+# These required-value rules mirror the pinned BigBio 1.1.0 templates.  They are intentionally
+# conservative: schema/metadata can be normalized, but scientific values are never invented.
+REQUIRED_CONCRETE_RULES: dict[str, dict[str, Any]] = {
+    "characteristics[biological replicate]": {"pattern": re.compile(r"^(?:\d+|pooled)$", re.I), "allow_not_applicable": False},
+    "comment[technical replicate]": {"pattern": re.compile(r"^\d+$"), "allow_not_applicable": False},
+    "comment[fraction identifier]": {"pattern": re.compile(r"^\d+$"), "allow_not_applicable": False},
+    "comment[label]": {"pattern": None, "allow_not_applicable": False},
+    "comment[cleavage agent details]": {"pattern": None, "allow_not_applicable": True},
+    "comment[proteomics data acquisition method]": {"pattern": None, "allow_not_applicable": False},
+    "comment[instrument]": {"pattern": None, "allow_not_applicable": False},
+}
+
+ORGANISM_TEMPLATE_NAMES = {"human", "vertebrates", "invertebrates", "plants"}
 
 # Versions observed in the current upstream template manifest on 2026-09-10.  Runtime validation is
 # still delegated to parse_sdrf; these constants are provenance/reporting anchors, not a replacement
@@ -117,6 +136,17 @@ class CandidateInfo:
 
 
 @dataclass
+class NormalizationInfo:
+    applied: bool = False
+    source_sha256: str = ""
+    projected_sha256: str = ""
+    actions: list[str] = field(default_factory=list)
+    blockers: list[str] = field(default_factory=list)
+    warnings: list[str] = field(default_factory=list)
+    manifest_path: str = ""
+
+
+@dataclass
 class GraphSignals:
     available: bool = False
     semantic_conflicts: int = 0
@@ -151,6 +181,8 @@ class ReadinessResult:
     skills_score: dict[str, Any] = field(default_factory=dict)
     review: dict[str, Any] = field(default_factory=dict)
     projected_path: str = ""
+    projected_sha256: str = ""
+    normalization: NormalizationInfo = field(default_factory=NormalizationInfo)
     submission_path: str = ""
 
 
@@ -222,6 +254,20 @@ def row_values(headers: list[str], rows: list[list[str]], header: str) -> list[s
     if idx is None:
         return []
     return [row[idx] if idx < len(row) else "" for row in rows]
+
+
+def column_indices(headers: list[str], header: str) -> list[int]:
+    target = norm_header(header)
+    return [i for i, value in enumerate(headers) if value == target]
+
+
+def row_values_all(headers: list[str], rows: list[list[str]], header: str) -> list[str]:
+    indices = column_indices(headers, header)
+    out: list[str] = []
+    for row in rows:
+        for idx in indices:
+            out.append(row[idx] if idx < len(row) else "")
+    return out
 
 
 def object_file_name(obj: dict[str, Any]) -> str:
@@ -407,25 +453,226 @@ def graph_signals(db_path: Path | None, accession: str) -> GraphSignals:
     return out
 
 
+def _organism_token(value: str) -> str:
+    low = norm_value(value).lower()
+    m = re.search(r"nt=([^;]+);\s*ac=ncbitaxon:(\d+)", low)
+    if m:
+        return f"{m.group(1).strip()}|ncbitaxon:{m.group(2)}"
+    return low
+
+
+def _is_human_organism(value: str) -> bool:
+    low = _organism_token(value)
+    return (
+        low in {"homo sapiens", "human", "ncbitaxon:9606", "homo sapiens|ncbitaxon:9606"}
+        or low.startswith("homo sapiens (")
+    )
+
+
 def derive_templates(headers: list[str], rows: list[list[str]], explicit: list[str]) -> list[str]:
-    names: set[str] = {x.strip().lower() for x in explicit if x.strip()}
+    explicit_names = {x.strip().lower() for x in explicit if x.strip()}
+    names: set[str] = set(explicit_names)
     names.add("single-cell")
     names.add("ms-proteomics")
-    for value in row_values(headers, rows, "comment[sdrf template]"):
+
+    # Historical PRIDE_SCP artifacts may contain stale/incorrect organism-layer template metadata.
+    # Reuse only non-organism BigBio template names from the file. Organism templates are re-derived
+    # conservatively below from the actual SDRF organism column, or may be forced explicitly by CLI.
+    for value in row_values_all(headers, rows, "comment[sdrf template]"):
         low = value.lower()
         for name in KNOWN_TEMPLATE_NAMES:
+            if name in ORGANISM_TEMPLATE_NAMES:
+                continue
             if re.search(rf"(?<![a-z0-9-]){re.escape(name)}(?![a-z0-9-])", low):
                 names.add(name)
+
     acquisitions = " ".join(row_values(headers, rows, "comment[proteomics data acquisition method]")).lower()
     if re.search(r"\bdia\b|data[- ]independent", acquisitions):
         names.add("dia-acquisition")
-    organisms = " ".join(row_values(headers, rows, "characteristics[organism]")).lower()
-    if "homo sapiens" in organisms or "ncbitaxon:9606" in organisms:
+
+    organism_values = [
+        value for value in row_values(headers, rows, "characteristics[organism]") if not placeholder(value)
+    ]
+    if organism_values and all(_is_human_organism(value) for value in organism_values):
         names.add("human")
-    # Parent templates are still validated separately because sdrf-pipelines 0.1.6 has a known
-    # repeated --template pitfall; one subprocess per template is unambiguous.
+    elif "human" not in explicit_names:
+        names.discard("human")
+
+    # Parent templates are validated separately because sdrf-pipelines 0.1.6 has a known repeated
+    # --template pitfall; one subprocess per template is unambiguous.
     order = ["ms-proteomics", "single-cell", "dia-acquisition", "human", "vertebrates", "invertebrates", "plants", "cell-lines"]
     return sorted(names, key=lambda x: (order.index(x) if x in order else len(order), x))
+
+
+def _column_group(header: str) -> int:
+    if header == "source name":
+        return 0
+    if header.startswith("characteristics[") or header == "material type":
+        return 1
+    if header == "assay name":
+        return 2
+    if header == "technology type":
+        return 3
+    if header.startswith("factor value["):
+        return 7
+    if header == "comment[sdrf version]":
+        return 5
+    if header == "comment[sdrf template]":
+        return 6
+    return 4
+
+
+def _write_sdrf(path: Path, headers: list[str], rows: list[list[str]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", newline="", encoding="utf-8") as fh:
+        writer = csv.writer(fh, delimiter="\t", lineterminator="\n", quoting=csv.QUOTE_MINIMAL)
+        writer.writerow(headers)
+        writer.writerows(rows)
+
+
+def _add_uniform_column(
+    headers: list[str], rows: list[list[str]], header: str, value: str, *, before_factors: bool = True
+) -> None:
+    idx = len(headers)
+    if before_factors:
+        for i, h in enumerate(headers):
+            if h.startswith("factor value["):
+                idx = i
+                break
+    headers.insert(idx, header)
+    for row in rows:
+        row.insert(idx, value)
+
+
+def _remove_columns(headers: list[str], rows: list[list[str]], header: str) -> int:
+    indices = list(reversed(column_indices(headers, header)))
+    for idx in indices:
+        headers.pop(idx)
+        for row in rows:
+            if idx < len(row):
+                row.pop(idx)
+    return len(indices)
+
+
+def _required_value_blockers(headers: list[str], rows: list[list[str]]) -> list[str]:
+    blockers: list[str] = []
+    required_headers = {
+        "characteristics[organism]",
+        "characteristics[organism part]",
+        "characteristics[biological replicate]",
+        "comment[technical replicate]",
+        "comment[data file]",
+        "comment[proteomics data acquisition method]",
+        "comment[instrument]",
+        "comment[cleavage agent details]",
+        "comment[label]",
+        "comment[fraction identifier]",
+    }
+    for header in sorted(required_headers):
+        if header not in headers:
+            blockers.append(f"bigbio_required_column_missing:{header}")
+
+    for header, rule in REQUIRED_CONCRETE_RULES.items():
+        values = row_values(headers, rows, header)
+        if not values:
+            continue
+        bad_rows = 0
+        for value in values:
+            low = norm_value(value).lower().replace("_", " ")
+            if low == "not applicable" and rule["allow_not_applicable"]:
+                continue
+            if placeholder(value):
+                bad_rows += 1
+                continue
+            pattern = rule.get("pattern")
+            if pattern is not None and not pattern.fullmatch(norm_value(value)):
+                bad_rows += 1
+        if bad_rows:
+            blockers.append(f"bigbio_required_value_unresolved:{header}:{bad_rows}_rows")
+    return blockers
+
+
+def normalize_bigbio_projection(
+    source: Path, projected: Path, templates: list[str]
+) -> tuple[list[str], list[list[str]], NormalizationInfo]:
+    headers, rows = read_sdrf(source)
+    info = NormalizationInfo(source_sha256=sha256_file(source))
+    if not headers or not rows:
+        info.blockers.append("candidate_sdrf_has_no_data_rows")
+        return headers, rows, info
+
+    # Work on a detached copy. No source candidate is modified in place.
+    headers = list(headers)
+    rows = [list(row) for row in rows]
+
+    # BigBio 1.1 requires all characteristics columns before assay name and factor values last.
+    old_order = list(headers)
+    indexed = list(enumerate(headers))
+    indexed.sort(key=lambda pair: (_column_group(pair[1]), pair[0]))
+    order = [idx for idx, _ in indexed]
+    if order != list(range(len(headers))):
+        headers = [headers[i] for i in order]
+        rows = [[row[i] if i < len(row) else "" for i in order] for row in rows]
+        info.actions.append("reordered_columns_to_bigbio_1_1_groups")
+
+    # comment[sdrf version] is the specification version, not the PRIDE_SCP generator version.
+    version_indices = column_indices(headers, "comment[sdrf version]")
+    if not version_indices:
+        _add_uniform_column(headers, rows, "comment[sdrf version]", SDRF_SPEC_VALUE)
+        info.actions.append(f"added_comment_sdrf_version:{SDRF_SPEC_VALUE}")
+    else:
+        first = version_indices[0]
+        if any(norm_value(row[first]) != SDRF_SPEC_VALUE for row in rows):
+            for row in rows:
+                row[first] = SDRF_SPEC_VALUE
+            info.actions.append(f"normalized_comment_sdrf_version:{SDRF_SPEC_VALUE}")
+        # Collapse duplicate legacy version columns; provenance is preserved in the external manifest.
+        for idx in reversed(version_indices[1:]):
+            headers.pop(idx)
+            for row in rows:
+                row.pop(idx)
+            info.actions.append("removed_duplicate_comment_sdrf_version")
+
+    # Replace stale PRIDE_SCP/internal template metadata with valid BigBio template declarations.
+    removed_templates = _remove_columns(headers, rows, "comment[sdrf template]")
+    if removed_templates:
+        info.actions.append(f"replaced_legacy_comment_sdrf_template_columns:{removed_templates}")
+    for template in templates:
+        version = TEMPLATE_VERSION_HINTS.get(template)
+        if not version:
+            info.warnings.append(f"template_version_hint_unavailable:{template}")
+            continue
+        _add_uniform_column(headers, rows, "comment[sdrf template]", f"{template} v{version}")
+    if templates:
+        info.actions.append("declared_bigbio_templates:" + ",".join(templates))
+
+    # Human required demographics explicitly allow 'not available'. Adding that sentinel documents
+    # absence of source metadata; it does not invent a biological value.
+    if "human" in templates:
+        for header in ("characteristics[disease]", "characteristics[age]", "characteristics[sex]"):
+            if header not in headers:
+                _add_uniform_column(headers, rows, header, "not available")
+                info.actions.append(f"added_allowed_not_available:{header}")
+
+    # Re-run canonical column grouping after metadata/template additions.
+    indexed = list(enumerate(headers))
+    indexed.sort(key=lambda pair: (_column_group(pair[1]), pair[0]))
+    order = [idx for idx, _ in indexed]
+    headers = [headers[i] for i in order]
+    rows = [[row[i] if i < len(row) else "" for i in order] for row in rows]
+
+    info.blockers.extend(_required_value_blockers(headers, rows))
+    info.blockers = list(dict.fromkeys(info.blockers))
+    info.actions = list(dict.fromkeys(info.actions))
+    info.warnings = list(dict.fromkeys(info.warnings))
+    info.applied = bool(info.actions)
+
+    _write_sdrf(projected, headers, rows)
+    info.projected_sha256 = sha256_file(projected)
+    manifest = projected.with_suffix(".normalization.json")
+    info.manifest_path = str(manifest)
+    manifest.write_text(json.dumps(asdict(info), indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    return headers, rows, info
 
 
 def run_command(argv: list[str], *, cwd: Path | None = None, timeout: int = 180) -> CommandResult:
@@ -561,6 +808,8 @@ def blocker_state(blockers: list[str]) -> str:
     text = " ".join(blockers).lower()
     if "template" in text or "single_cell_required" in text:
         return "blocked_bigbio_template"
+    if "bigbio_required_value_unresolved" in text or "bigbio_required_column_missing" in text:
+        return "blocked_metadata_incomplete"
     if "mapping" in text or "data_file" in text or "repository_scope" in text:
         return "blocked_mapping_incomplete"
     if "metadata" in text or "isolation" in text or "placeholder" in text:
@@ -619,11 +868,30 @@ def evaluate_accession(args: argparse.Namespace, accession: str, reviews: dict[s
         result.state = blocker_state(result.blockers)
         return result
 
-    # A candidate that passes internal deterministic checks is projected byte-for-byte.  The gate
-    # never rewrites cell/sample/channel values and therefore cannot create unsupported truth.
+    # Create a BigBio-1.1 compatibility derivative. Only schema/order/version/template metadata are
+    # normalized automatically. Required scientific values that are missing/placeholder remain
+    # blockers; they are never guessed from identifiers, filenames or model output.
+    normalized = Path(args.output) / "normalized" / accession / f"{accession}.sdrf.tsv"
+    normalized_headers, normalized_rows, normalization = normalize_bigbio_projection(
+        candidate_path, normalized, templates
+    )
+    result.normalization = normalization
+    result.warnings.extend(x for x in normalization.warnings if x not in result.warnings)
+    if normalization.blockers:
+        result.blockers.extend(x for x in normalization.blockers if x not in result.blockers)
+        result.state = blocker_state(result.blockers)
+        return result
+
+    # Only a normalized candidate with no unresolved required scientific values becomes projected.
     projected = Path(args.output) / "projected" / accession / f"{accession}.sdrf.tsv"
-    ensure_copy(candidate_path, projected)
+    ensure_copy(normalized, projected)
     result.projected_path = str(projected)
+    result.projected_sha256 = sha256_file(projected)
+    result.normalization.projected_sha256 = result.projected_sha256
+    if result.normalization.manifest_path:
+        projected_manifest = projected.parent / f"{accession}.normalization.json"
+        ensure_copy(Path(result.normalization.manifest_path), projected_manifest)
+        result.normalization.manifest_path = str(projected_manifest)
     result.ready_for_projection = True
     result.state = "projected_internal_candidate"
 
@@ -667,7 +935,7 @@ def evaluate_accession(args: argparse.Namespace, accession: str, reviews: dict[s
     result.review = receipt
     approved = (
         receipt.get("status", "").strip().lower() in {"approved", "pass", "passed"}
-        and receipt.get("sha256", "").strip().lower() == info.sha256.lower()
+        and receipt.get("sha256", "").strip().lower() == result.projected_sha256.lower()
     )
     if not approved:
         result.state = "needs_independent_review"
@@ -705,6 +973,7 @@ def write_outputs(args: argparse.Namespace, results: list[ReadinessResult]) -> d
     fields = [
         "accession", "state", "ready_for_projection", "submission_ready", "candidate_path", "candidate_sha256",
         "candidate_source_kind", "internal_audit_path", "internal_locally_valid", "completeness_status",
+        "projected_sha256", "normalization_applied", "normalization_actions", "normalization_blockers",
         "rows", "unique_data_files", "matched_repository_files", "unmatched_repository_files",
         "templates", "blockers", "warnings", "semantic_conflicts", "semantic_hygiene_rejections",
         "canonical_branch_candidates", "contradictory_branches", "unresolved_branches",
@@ -725,6 +994,10 @@ def write_outputs(args: argparse.Namespace, results: list[ReadinessResult]) -> d
                 "internal_audit_path": r.candidate.internal_audit_path,
                 "internal_locally_valid": "" if r.candidate.locally_valid is None else str(r.candidate.locally_valid).lower(),
                 "completeness_status": r.candidate.completeness_status,
+                "projected_sha256": r.projected_sha256,
+                "normalization_applied": str(r.normalization.applied).lower(),
+                "normalization_actions": ";".join(r.normalization.actions),
+                "normalization_blockers": ";".join(r.normalization.blockers),
                 "rows": r.rows,
                 "unique_data_files": r.unique_data_files,
                 "matched_repository_files": r.matched_repository_files,
@@ -759,7 +1032,10 @@ def write_outputs(args: argparse.Namespace, results: list[ReadinessResult]) -> d
         "policies": {
             "model_generates_sdrf": False,
             "model_creates_sample_file_channel_mapping": False,
-            "candidate_rewritten_by_gate": False,
+            "candidate_rewritten_by_gate": True,
+            "candidate_schema_metadata_normalized_by_gate": True,
+            "candidate_scientific_values_invented_by_gate": False,
+            "normalization_is_hash_audited": True,
             "parse_sdrf_proves_scientific_truth": False,
             "sdrf_skills_fix_auto_applied": False,
             "multiple_templates_validated_in_separate_processes": True,
@@ -769,6 +1045,7 @@ def write_outputs(args: argparse.Namespace, results: list[ReadinessResult]) -> d
         "outputs": {
             "readiness_tsv": str(out / "sdrf_readiness.tsv"),
             "per_accession": str(out / "accessions"),
+            "normalized": str(out / "normalized"),
             "projected": str(out / "projected"),
             "sandbox_submission": str(out / "submission" / "sandbox"),
             "datasets_submission": str(out / "submission" / "datasets"),
@@ -793,17 +1070,27 @@ def self_test() -> None:
         candidate_root = root / "candidates"
         candidate_root.mkdir()
         sdrf = candidate_root / f"{accession}.sdrf.tsv"
-        sdrf.write_text(
-            "\t".join([
-                "source name", "assay name", "technology type", "characteristics[organism]",
-                "characteristics[single cell isolation protocol]", "characteristics[cell identifier]",
-                "comment[data file]", "comment[proteomics data acquisition method]", "comment[sdrf template]",
-            ]) + "\n" +
-            "\t".join(["cell_A", "assay_A", "proteomic profiling by mass spectrometry", "Homo sapiens",
-                        "cellenONE", "cell_A", "cell_A.raw", "DDA", "single-cell v1.0.0; human v1.1.0"]) + "\n" +
-            "\t".join(["cell_B", "assay_B", "proteomic profiling by mass spectrometry", "Homo sapiens",
-                        "cellenONE", "cell_B", "cell_B.raw", "DDA", "single-cell v1.0.0; human v1.1.0"]) + "\n"
-        )
+        legacy_headers = [
+            "source name", "assay name", "technology type", "characteristics[organism]",
+            "characteristics[organism part]", "characteristics[biological replicate]",
+            "characteristics[single cell isolation protocol]", "characteristics[cell identifier]",
+            "characteristics[individual]", "characteristics[cells per well]",
+            "comment[proteomics data acquisition method]", "comment[instrument]",
+            "comment[cleavage agent details]", "comment[label]", "comment[fraction identifier]",
+            "comment[technical replicate]", "comment[data file]", "comment[sdrf version]",
+            "comment[sdrf template]", "factor value[condition]",
+        ]
+        legacy_rows = [
+            ["cell_A", "assay_A", "proteomic profiling by mass spectrometry", "Homo sapiens", "blood", "1",
+             "cellenONE", "cell_A", "donor1", "1", "Data-dependent acquisition", "Orbitrap Fusion Lumos",
+             "NT=Trypsin;AC=MS:1001251", "label free sample", "1", "1", "cell_A.raw",
+             "pride-scp-sdrf-v0.3.6", "pride-scp-sdrf-v0.3.6", "case"],
+            ["cell_B", "assay_B", "proteomic profiling by mass spectrometry", "Homo sapiens", "blood", "2",
+             "cellenONE", "cell_B", "donor2", "1", "Data-dependent acquisition", "Orbitrap Fusion Lumos",
+             "NT=Trypsin;AC=MS:1001251", "label free sample", "1", "1", "cell_B.raw",
+             "pride-scp-sdrf-v0.3.6", "pride-scp-sdrf-v0.3.6", "control"],
+        ]
+        _write_sdrf(sdrf, [norm_header(x) for x in legacy_headers], legacy_rows)
         audit_dir = candidate_root / "audit"
         audit_dir.mkdir()
         (audit_dir / f"{accession}.sdrf_audit.json").write_text(json.dumps({
@@ -818,8 +1105,8 @@ def self_test() -> None:
         fake.write_text("#!/usr/bin/env bash\nexit 0\n")
         fake.chmod(0o755)
         reviews = root / "reviews.tsv"
-        digest = sha256_file(sdrf)
-        reviews.write_text(f"accession\tsha256\tstatus\treviewer\n{accession}\t{digest}\tapproved\ttest-reviewer\n")
+        original_digest = sha256_file(sdrf)
+        reviews.write_text(f"accession\tsha256\tstatus\treviewer\n{accession}\t{original_digest}\tapproved\ttest-reviewer\n")
 
         ns = argparse.Namespace(
             candidate_root=[str(candidate_root)], graph_db="", snapshot=str(snapshot), template=[],
@@ -827,22 +1114,55 @@ def self_test() -> None:
             command_timeout=10, skills_mode="off", sdrf_skills_root="", python=sys.executable,
         )
         res = evaluate_accession(ns, accession, review_manifest(reviews))
-        # With skills deliberately off, even an approved receipt cannot yield submission_ready; this
-        # proves the independent tools cannot be silently bypassed.
         assert res.ready_for_projection
         assert res.state == "needs_independent_review"
         assert not res.submission_ready
         assert set(res.templates) >= {"ms-proteomics", "single-cell", "human"}
-        assert len(res.parse_sdrf) == 4  # default structural + three separate template invocations
+        assert len(res.parse_sdrf) == 4
         assert all(x["passed"] for x in res.parse_sdrf)
-        assert Path(res.projected_path).read_bytes() == sdrf.read_bytes()
+        assert res.normalization.applied
+        assert res.projected_sha256 and res.projected_sha256 != original_digest
+        assert Path(res.normalization.manifest_path).is_file()
 
-        # Missing required single-cell column must fail before external validation.
-        bad = candidate_root / "PXD999998.sdrf.tsv"
-        bad.write_text("source name\tassay name\ttechnology type\tcomment[data file]\nA\tA\tMS\tcell_A.raw\n")
-        res2 = evaluate_accession(ns, "PXD999998", {})
-        assert res2.state == "blocked_bigbio_template"
+        projected_headers, projected_rows = read_sdrf(Path(res.projected_path))
+        assert max(column_indices(projected_headers, "characteristics[organism]")) < header_index(projected_headers, "assay name")
+        assert projected_headers[-1].startswith("factor value[")
+        assert set(row_values(projected_headers, projected_rows, "comment[sdrf version]")) == {"v1.1.0"}
+        template_values = row_values_all(projected_headers, projected_rows, "comment[sdrf template]")
+        assert template_values and all(re.fullmatch(r"[\w-]+ v\d+\.\d+\.\d+(?:-[\w.]+)?", x) for x in template_values)
+        assert "characteristics[age]" in projected_headers
+        assert "characteristics[sex]" in projected_headers
+        assert "characteristics[disease]" in projected_headers
+
+        # Missing scientific values that BigBio requires must block rather than being synthesized.
+        bad_acc = "PXD999998"
+        (snapshot / "files" / f"{bad_acc}.json").write_text(json.dumps({
+            "files": [{"fileName": "bad.raw", "fileCategory": {"value": "RAW"}}]
+        }))
+        bad = candidate_root / f"{bad_acc}.sdrf.tsv"
+        bad_rows = [list(legacy_rows[0])]
+        bad_rows[0][5] = "not available"
+        bad_rows[0][16] = "bad.raw"
+        _write_sdrf(bad, [norm_header(x) for x in legacy_headers], bad_rows)
+        res2 = evaluate_accession(ns, bad_acc, {})
+        assert res2.state == "blocked_metadata_incomplete"
         assert not res2.ready_for_projection
+        assert any("characteristics[biological replicate]" in x for x in res2.normalization.blockers)
+        assert not res2.parse_sdrf
+
+        # Mixed-organism files must not be validated wholesale as human merely because one row is human
+        # or because stale historical template metadata says human.
+        mixed_headers = [
+            "source name", "characteristics[organism]", "assay name", "technology type",
+            "comment[proteomics data acquisition method]", "comment[sdrf template]",
+        ]
+        mixed_rows = [
+            ["h", "Homo sapiens", "h", "proteomic profiling by mass spectrometry", "DIA", "human v1.1.0"],
+            ["m", "Mus musculus (mouse)", "m", "proteomic profiling by mass spectrometry", "DIA", "human v1.1.0"],
+        ]
+        mixed_templates = derive_templates(mixed_headers, mixed_rows, [])
+        assert "human" not in mixed_templates
+        assert "dia-acquisition" in mixed_templates
 
         # Multiple non-identical candidates are fail-closed.
         alt = candidate_root / "datasets" / accession
@@ -862,7 +1182,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--graph-db", default="")
     p.add_argument("--snapshot", required=False, default="data/snapshot")
     p.add_argument("--candidate-root", action="append", default=[], help="repeatable trusted candidate search root")
-    p.add_argument("--output", default="data/sdrf_bigbio_readiness_v0513")
+    p.add_argument("--output", default="data/sdrf_bigbio_readiness_v0514")
     p.add_argument("--template", action="append", default=[], help="additional BigBio leaf template to validate")
     p.add_argument("--parse-sdrf", default="parse_sdrf")
     p.add_argument("--validator-mode", choices=["required", "optional", "off"], default="required")
@@ -894,12 +1214,14 @@ def main() -> int:
         print(f"[{idx}/{len(accessions)}] {accession} -> {result.state} candidate={result.candidate.path or '-'}")
     summary = write_outputs(args, results)
     print(json.dumps(summary, indent=2, sort_keys=True))
-    # Block the command only for runtime/tooling failures when those tools were explicitly required;
-    # scientific blockers are expected outputs and do not make a 105-accession batch operationally fail.
-    fatal_states = {"blocked_parse_sdrf", "blocked_bigbio_check"}
-    if any(r.state in fatal_states for r in results) and (args.validator_mode == "required" or args.skills_mode == "required"):
-        return 4
-    return 0
+    # Scientific standards failures are expected readiness outputs and must not make a 105-accession
+    # Slurm batch fail. Only unavailable tooling that was explicitly required is operationally fatal.
+    fatal = False
+    if args.validator_mode == "required":
+        fatal = fatal or any("parse_sdrf_unavailable" in r.blockers for r in results)
+    if args.skills_mode == "required":
+        fatal = fatal or any("sdrf_skills_unavailable" in r.blockers for r in results)
+    return 4 if fatal else 0
 
 
 if __name__ == "__main__":
