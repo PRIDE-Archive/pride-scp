@@ -23,7 +23,7 @@ from urllib.parse import urlparse
 
 from scp_knowledge_graph import GraphStore, NodeRef, json_text, norm, stable_id
 
-VERSION = "pride-scp-kg-resolver-v0.2.2"
+VERSION = "pride-scp-kg-resolver-v0.2.3"
 
 # Trust weight is evidence quality, not a probability.  Contributions are capped per source family
 # so dozens of pages from one community site cannot manufacture independent corroboration.
@@ -908,12 +908,12 @@ class Resolver:
             counts[status]+=1
         return {"branch_clusters":len(clusters),"status_counts":dict(sorted(counts.items()))}
 
-    def resolve_context_branch_alignment(self, claims: list[CanonicalClaim]) -> dict[str, Any]:
-        """Diagnose compatibility between source-local semantic contexts and branch hypotheses.
+    def resolve_context_branch_alignment(self, claims: list[CanonicalClaim], groups: list[ResolutionGroup]) -> dict[str, Any]:
+        """Diagnose clean compatibility between source-local contexts and branch hypotheses.
 
-        This layer is deliberately non-generative and non-promoting.  It never asserts that a
-        context *is* a branch; it only records whether independently extracted semantic features are
-        compatible with, ambiguous among, or contradictory to existing branch hypotheses.
+        Alignment is deliberately non-generative/non-promoting.  v0.2.3 also consumes resolver
+        hygiene/conflict state: quarantined/conflicted features cannot become positive compatibility
+        evidence, and an internally conflicted context can never be called a clean unique match.
         """
         context_nodes = {
             r["node_id"]: r for r in self.conn.execute("SELECT * FROM node WHERE node_type='ExperimentalContext'")
@@ -921,32 +921,91 @@ class Resolver:
         branch_nodes = {
             r["node_id"]: r for r in self.conn.execute("SELECT * FROM node WHERE node_type='ExperimentalBranchHypothesis'")
         }
+
         def blank() -> dict[str, Any]:
-            return {"modalities": set(), "chemistries": set(), "acquisitions": set(), "roles": defaultdict(set), "accession": "", "lineages": set()}
+            return {
+                "modalities": set(), "chemistries": set(), "acquisitions": set(),
+                "roles": defaultdict(set), "accession": "", "lineages": set(),
+                "excluded_methods": set(), "excluded_statuses": set(), "internal_conflicts": set(),
+            }
+
         contexts = {nid: blank() for nid in context_nodes}
         branches = {nid: blank() for nid in branch_nodes}
+
+        # Canonical subject signature -> original node ids.  A canonicalized subject may correspond
+        # to one original source-local context; this mapping keeps alignment anchored to graph nodes.
+        subject_ids: dict[str, set[str]] = defaultdict(set)
         for c in claims:
-            for target, feature in ((contexts, contexts.get(c.subject_node_id)), (branches, branches.get(c.subject_node_id))):
+            subject_ids[c.signature[0]].add(c.subject_node_id)
+
+        def add_feature(feature: dict[str, Any], c: CanonicalClaim) -> None:
+            feature["accession"] = c.scope_accession or feature["accession"]
+            feature["lineages"].add(c.source_lineage)
+            if c.predicate == "HAS_MODALITY" and c.object_ref:
+                feature["modalities"].add(c.object_ref.canonical_key)
+            elif c.predicate == "USES_CHEMISTRY" and c.object_ref:
+                feature["chemistries"].add(c.object_ref.canonical_key)
+            elif c.predicate == "HAS_ACQUISITION" and c.object_ref:
+                feature["acquisitions"].add(c.object_ref.canonical_key)
+            elif c.predicate in REPORTER_ROLE_PREDICATES and c.object_ref:
+                feature["roles"][c.predicate].add(c.object_ref.canonical_key)
+
+        usable_statuses = {"accepted_existing", "accepted_resolved", "source_asserted", "hypothesis_only"}
+        conflict_statuses = {"conflicted", "rejected_semantic_hygiene", "rejected_by_stronger_evidence"}
+
+        # Use resolution groups, not raw claims, so hygiene/conflict decisions are upstream of
+        # compatibility scoring.  Any excluded feature is retained as diagnostics only.
+        for g in groups:
+            if not g.claims:
+                continue
+            first = g.claims[0]
+            node_ids = subject_ids.get(g.signature[0], {first.subject_node_id})
+            for node_id in node_ids:
+                feature = contexts.get(node_id) or branches.get(node_id)
                 if feature is None:
                     continue
-                feature["accession"] = c.scope_accession or feature["accession"]
-                feature["lineages"].add(c.source_lineage)
-                if c.predicate == "HAS_MODALITY" and c.object_ref:
-                    feature["modalities"].add(c.object_ref.canonical_key)
-                elif c.predicate == "USES_CHEMISTRY" and c.object_ref:
-                    feature["chemistries"].add(c.object_ref.canonical_key)
-                elif c.predicate == "HAS_ACQUISITION" and c.object_ref:
-                    feature["acquisitions"].add(c.object_ref.canonical_key)
-                elif c.predicate in REPORTER_ROLE_PREDICATES and c.object_ref:
-                    feature["roles"][c.predicate].add(c.object_ref.canonical_key)
+                feature["accession"] = first.scope_accession or feature["accession"]
+                feature["lineages"].update(c.source_lineage for c in g.claims)
+                if g.status in conflict_statuses:
+                    feature["excluded_statuses"].add(g.status)
+                    if g.method:
+                        feature["excluded_methods"].add(g.method)
+                    if g.conflict_key:
+                        feature["internal_conflicts"].add(g.conflict_key)
+                    continue
+                if g.status not in usable_statuses:
+                    feature["excluded_statuses"].add(g.status)
+                    if g.method:
+                        feature["excluded_methods"].add(g.method)
+                    continue
+                add_feature(feature, first)
+
+        # Existing branch resolver classification is another eligibility gate.  A branch belonging
+        # to a contradictory cluster can never be a clean compatibility candidate; an unresolved
+        # branch may be compared diagnostically but cannot yield a unique/ambiguous clean match.
+        branch_resolution_state: dict[str, dict[str, str]] = {}
+        for r in self.conn.execute(
+            """SELECT m.branch_node_id,b.branch_resolution_id,b.status,b.canonical_branch_key
+               FROM branch_resolution_member m
+               JOIN branch_resolution b ON b.branch_resolution_id=m.branch_resolution_id"""
+        ):
+            branch_resolution_state[r["branch_node_id"]] = {
+                "resolution_id": r["branch_resolution_id"],
+                "status": r["status"],
+                "canonical_branch_key": r["canonical_branch_key"],
+            }
 
         candidate_rows: dict[str, list[dict[str, Any]]] = defaultdict(list)
+        contexts_with_internal_conflict = 0
         for context_id, cf in contexts.items():
             if not (cf["modalities"] or cf["chemistries"] or cf["acquisitions"] or cf["roles"]):
                 continue
             acc = cf["accession"]
             if not acc:
                 continue
+            context_dirty = bool(cf["excluded_methods"] or cf["internal_conflicts"])
+            if context_dirty:
+                contexts_with_internal_conflict += 1
             for branch_id, bf in branches.items():
                 if bf["accession"] != acc:
                     continue
@@ -998,8 +1057,10 @@ class Resolver:
                 crole_by_channel: dict[str, set[str]] = defaultdict(set)
                 brole_by_channel: dict[str, set[str]] = defaultdict(set)
                 for role in REPORTER_ROLE_PREDICATES:
-                    for ch in cf["roles"].get(role, set()): crole_by_channel[ch].add(role)
-                    for ch in bf["roles"].get(role, set()): brole_by_channel[ch].add(role)
+                    for ch in cf["roles"].get(role, set()):
+                        crole_by_channel[ch].add(role)
+                    for ch in bf["roles"].get(role, set()):
+                        brole_by_channel[ch].add(role)
                 for ch in set(crole_by_channel) & set(brole_by_channel):
                     if crole_by_channel[ch].isdisjoint(brole_by_channel[ch]):
                         role_conflicts += 1
@@ -1009,6 +1070,9 @@ class Resolver:
                 if role_conflicts:
                     conflict_score += min(0.60, 0.30 * role_conflicts)
 
+                br_state = branch_resolution_state.get(branch_id, {})
+                branch_status = br_state.get("status", "")
+                branch_dirty = bool(bf["excluded_methods"] or bf["internal_conflicts"])
                 row = {
                     "context_id": context_id,
                     "branch_id": branch_id,
@@ -1019,18 +1083,42 @@ class Resolver:
                     "conflicts": conflicts,
                     "context": cf,
                     "branch": bf,
+                    "context_dirty": context_dirty,
+                    "branch_dirty": branch_dirty,
+                    "branch_resolution_status": branch_status,
+                    "branch_resolution_id": br_state.get("resolution_id", ""),
+                    "canonical_branch_key": br_state.get("canonical_branch_key", ""),
                 }
                 candidate_rows[context_id].append(row)
 
         status_counts: dict[str, int] = defaultdict(int)
         inserted = 0
+        clean_unique_contexts = 0
         for context_id, rows in candidate_rows.items():
-            viable = [r for r in rows if r["score"] >= 0.55 and r["conflict_score"] < 0.50]
+            eligible = [
+                r for r in rows
+                if r["score"] >= 0.55
+                and r["conflict_score"] < 0.50
+                and not r["context_dirty"]
+                and not r["branch_dirty"]
+                and r["branch_resolution_status"] == "canonical_branch_candidate"
+            ]
+            eligible_clusters = {
+                r["branch_resolution_id"] or r["branch_id"] for r in eligible
+            }
+            if len(eligible_clusters) == 1:
+                clean_unique_contexts += 1
             for r in rows:
-                if r["conflict_score"] >= 0.50:
+                if r["branch_resolution_status"] == "contradictory_hypothesis" or r["branch_dirty"]:
+                    status = "branch_contradictory"
+                elif r["conflict_score"] >= 0.50:
                     status = "contradictory"
-                elif r in viable:
-                    status = "unique_compatible_candidate" if len(viable) == 1 else "ambiguous_compatible_candidate"
+                elif r["context_dirty"] and r["score"] >= 0.30:
+                    status = "context_conflicted_candidate"
+                elif r["branch_resolution_status"] == "unresolved_hypothesis" and r["score"] >= 0.30:
+                    status = "branch_unresolved_candidate"
+                elif r in eligible:
+                    status = "unique_compatible_candidate" if len(eligible_clusters) == 1 else "ambiguous_compatible_candidate"
                 elif r["score"] >= 0.30:
                     status = "weak_candidate"
                 else:
@@ -1041,8 +1129,23 @@ class Resolver:
                     "conflicts": r["conflicts"],
                     "context_features": _feature_json(r["context"]),
                     "branch_features": _feature_json(r["branch"]),
+                    "context_excluded_methods": sorted(r["context"]["excluded_methods"]),
+                    "context_excluded_statuses": sorted(r["context"]["excluded_statuses"]),
+                    "context_internal_conflicts": sorted(r["context"]["internal_conflicts"]),
+                    "branch_excluded_methods": sorted(r["branch"]["excluded_methods"]),
+                    "branch_excluded_statuses": sorted(r["branch"]["excluded_statuses"]),
+                    "branch_internal_conflicts": sorted(r["branch"]["internal_conflicts"]),
+                    "branch_resolution_id": r["branch_resolution_id"],
+                    "branch_resolution_status": r["branch_resolution_status"],
+                    "canonical_branch_key": r["canonical_branch_key"],
+                    "clean_candidate_eligible": r in eligible,
                     "non_promoting": True,
                 }
+                evidence_bits = list(r["matched"] + r["conflicts"])
+                if r["context_dirty"]:
+                    evidence_bits.append("context_internal_conflict")
+                if r["branch_resolution_status"]:
+                    evidence_bits.append("branch_status:" + r["branch_resolution_status"])
                 self.conn.execute(
                     """INSERT INTO context_branch_alignment(
                        alignment_id,scope_accession,context_node_id,branch_node_id,status,compatibility_score,
@@ -1050,11 +1153,22 @@ class Resolver:
                        ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
                     (aid, r["accession"], r["context_id"], r["branch_id"], status, r["score"], r["conflict_score"],
                      len(r["matched"]), len(r["conflicts"]), len(r["context"]["lineages"]),
-                     ";".join(r["matched"] + r["conflicts"]), json_text(attrs)),
+                     ";".join(evidence_bits), json_text(attrs)),
                 )
                 inserted += 1
                 status_counts[status] += 1
-        return {"alignments": inserted, "status_counts": dict(sorted(status_counts.items()))}
+        return {
+            "alignments": inserted,
+            "status_counts": dict(sorted(status_counts.items())),
+            "contexts_with_internal_conflict": contexts_with_internal_conflict,
+            "clean_unique_contexts": clean_unique_contexts,
+            "clean_candidate_policy": {
+                "requires_context_without_hygiene_or_semantic_conflict": True,
+                "requires_branch_without_semantic_conflict": True,
+                "requires_canonical_branch_candidate": True,
+                "conflicted_features_contribute_to_score": False,
+            },
+        }
 
     def run(self) -> dict[str, Any]:
         self.store.clear_resolution()
@@ -1062,7 +1176,7 @@ class Resolver:
         groups=self.groups(claims)
         self.persist_groups(groups)
         branch_summary=self.resolve_branches(claims)
-        context_alignment_summary=self.resolve_context_branch_alignment(claims)
+        context_alignment_summary=self.resolve_context_branch_alignment(claims, groups)
         self.conn.commit()
         status_counts={r[0]:r[1] for r in self.conn.execute("SELECT status,COUNT(*) FROM resolution_group GROUP BY status ORDER BY status")}
         risk_counts={r[0]:r[1] for r in self.conn.execute("SELECT risk_class,COUNT(*) FROM resolution_group GROUP BY risk_class ORDER BY risk_class")}
@@ -1162,6 +1276,9 @@ def self_test() -> None:
             g.claim(ctx,"USES_CHEMISTRY",model_pub,object_ref=NodeRef("ReporterChemistry","TMTpro18","TMTpro18"),scope_accession="PXD900101",branch_scope="PXD900101::ctx:reporter",extractor="small_llm:fixture",confidence=.98,evidence_locator="Methods",evidence_text="TMTpro18")
             g.claim(ctx,"HAS_CARRIER_CHANNEL",model_pub,object_ref=NodeRef("ReporterChannel","126","126"),scope_accession="PXD900101",branch_scope="PXD900101::ctx:reporter",extractor="small_llm:fixture",confidence=.98,evidence_locator="Methods",evidence_text="126 carrier")
             g.claim(ctx,"HAS_ANALYTICAL_CHANNEL",model_pub,object_ref=NodeRef("ReporterChannel","126","126"),scope_accession="PXD900101",branch_scope="PXD900101::ctx:reporter",extractor="small_llm:fixture",confidence=.90,evidence_locator="Methods",evidence_text="126")
+            cleanctx=NodeRef("ExperimentalContext","PXD900101::ctx:clean-reporter","clean reporter context",{"accession":"PXD900101"})
+            g.claim(cleanctx,"HAS_MODALITY",model_pub,object_ref=NodeRef("Modality","reporter_multiplexed_single_cell","reporter_multiplexed_single_cell"),scope_accession="PXD900101",branch_scope="PXD900101::ctx:clean-reporter",extractor="small_llm:fixture",confidence=.98,evidence_locator="Methods",evidence_text="single-cell TMTpro18")
+            g.claim(cleanctx,"USES_CHEMISTRY",model_pub,object_ref=NodeRef("ReporterChemistry","TMTpro18","TMTpro18"),scope_accession="PXD900101",branch_scope="PXD900101::ctx:clean-reporter",extractor="small_llm:fixture",confidence=.98,evidence_locator="Methods",evidence_text="TMTpro18")
             badctx=NodeRef("ExperimentalContext","PXD900101::ctx:metadata","metadata context",{"accession":"PXD900101"})
             g.claim(badctx,"HAS_ORGANISM",model_repo,object_ref=NodeRef("Organism","NEWT","NEWT"),scope_accession="PXD900101",branch_scope="PXD900101::ctx:metadata",extractor="small_llm:fixture",confidence=1.0,evidence_locator="project.organisms[0].cvLabel",evidence_text="NEWT")
             g.claim(badctx,"HAS_DISEASE",model_repo,object_ref=NodeRef("Disease","not_specified","not_specified"),scope_accession="PXD900101",branch_scope="PXD900101::ctx:metadata",extractor="small_llm:fixture",confidence=1.0,evidence_locator="description",evidence_text="not specified")
@@ -1197,11 +1314,23 @@ def self_test() -> None:
             assert hygiene.get("noninformative_semantic_value",0) >= 1
             # Same reporter channel in multiple roles is exposed as a semantic conflict.
             assert g.conn.execute("SELECT COUNT(*) FROM resolution_group WHERE resolution_method='reporter_role_exclusivity_conflict'").fetchone()[0] >= 2
-            # The reporter context should uniquely match the compatible reporter/TMTpro18 branch and
-            # contradict the label-free/TMT6 branch.  These alignments are diagnostic only.
+            # The internally conflicted reporter context is never allowed to become a clean unique
+            # match.  A separate clean reporter/TMTpro18 context uniquely matches the compatible
+            # canonical branch; the contradictory label-free/TMT6 branch stays ineligible.
             aligns=dict(g.conn.execute("SELECT status,COUNT(*) FROM context_branch_alignment GROUP BY status"))
             assert aligns.get("unique_compatible_candidate",0) >= 1
-            assert aligns.get("contradictory",0) >= 1
+            assert aligns.get("context_conflicted_candidate",0) >= 1
+            assert aligns.get("branch_contradictory",0) >= 1
+            assert summary["context_branch_alignment"]["clean_unique_contexts"] >= 1
+            assert summary["context_branch_alignment"]["contexts_with_internal_conflict"] >= 1
+            dirty_row=g.conn.execute(
+                "SELECT status,attrs_json FROM context_branch_alignment WHERE context_node_id=? AND branch_node_id=?",
+                (g.node(ctx), g.node(bh2)),
+            ).fetchone()
+            assert dirty_row is not None and dirty_row[0] == "context_conflicted_candidate"
+            dirty_attrs=json.loads(dirty_row[1])
+            assert not any(x.startswith("HAS_CARRIER_CHANNEL:") for x in dirty_attrs["matched"])
+            assert dirty_attrs["context_internal_conflicts"]
             assert summary["context_branch_alignment"]["alignments"] >= 2
             report_dir=root/"resolution"
             export_resolution_report(g, report_dir, summary)

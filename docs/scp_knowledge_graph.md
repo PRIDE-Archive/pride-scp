@@ -375,3 +375,32 @@ The resolver summary also reports semantic-hygiene method counts and context/bra
 counts. These diagnostics are intended to determine whether independent source-local semantic
 contexts can safely corroborate the older branch hypotheses before any branch promotion policy is
 implemented.
+
+## v0.5.12 conflict-aware context-to-branch eligibility
+
+The first v0.5.11 eight-accession diagnostic showed that a context could be labelled
+`unique_compatible_candidate` even when some of the same context's semantic groups had already been
+quarantined or marked conflicted.  For example, reporter-role collisions could be excluded from the
+human hygiene report while the raw reporter-role claims still contributed positive alignment score.
+That made the alignment output too optimistic.
+
+Resolver v0.2.3 makes semantic hygiene an explicit upstream gate for context/branch compatibility:
+
+- alignment features are now built from `resolution_group` decisions rather than raw claims;
+- `conflicted`, `rejected_semantic_hygiene`, and `rejected_by_stronger_evidence` groups cannot
+  contribute positive compatibility score;
+- contexts carrying any semantic hygiene/conflict state cannot be labelled a clean unique or
+  ambiguous branch candidate; compatible rows are labelled `context_conflicted_candidate` instead;
+- branches whose branch-resolution cluster is `contradictory_hypothesis` are labelled
+  `branch_contradictory` and are ineligible for clean matching;
+- branches in `unresolved_hypothesis` clusters can be compared diagnostically but cannot become clean
+  unique candidates;
+- clean `unique_compatible_candidate` / `ambiguous_compatible_candidate` rows require a clean context,
+  a clean branch, and a `canonical_branch_candidate` branch-resolution cluster;
+- uniqueness is counted over canonical branch-resolution clusters, so multiple hypothesis nodes that
+  collapse into one branch cluster do not manufacture ambiguity.
+
+Alignment JSON diagnostics record excluded methods/statuses, internal conflict IDs, branch-resolution
+status and whether the row was eligible for clean candidacy.  The resolver summary additionally
+reports `contexts_with_internal_conflict`, `clean_unique_contexts`, and the exact clean-candidate
+policy.  This remains non-promoting and cannot create mappings, branch membership, or SDRF rows.
