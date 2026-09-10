@@ -2124,3 +2124,10 @@ GT metadata.
 ### v0.5.13.1 readiness preflight
 
 Empty/missing candidate roots no longer crash the Slurm launcher. The host launcher passes an explicit empty candidate directory to the unchanged v0.5.13 container, producing per-accession scientific blocker states. Use `scripts/stage_sdrf_readiness_candidates.py` to build a trusted positive candidate root from explicit evidence roots; the helper requires companion local-valid/source-closed audits and refuses divergent hashes.
+
+### v0.5.13.2 candidate audit discovery
+
+Readiness candidate staging recognizes the canonical historical annotation layout where the SDRF is
+under `<run>/sdrf/` and its deterministic audit is under `<run>/audit/` as
+`PXDxxxxxx.sdrf.audit.json`. Missing audit discovery is an operational blocker only; the stager does
+not infer local validity and does not use GT labels as source truth.

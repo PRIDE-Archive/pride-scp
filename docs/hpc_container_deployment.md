@@ -447,3 +447,17 @@ validator/tooling can be configured to fail the job by using `VALIDATOR_MODE=req
 ### v0.5.13.1 readiness preflight
 
 Empty/missing candidate roots no longer crash the Slurm launcher. The host launcher passes an explicit empty candidate directory to the unchanged v0.5.13 container, producing per-accession scientific blocker states. Use `scripts/stage_sdrf_readiness_candidates.py` to build a trusted positive candidate root from explicit evidence roots; the helper requires companion local-valid/source-closed audits and refuses divergent hashes.
+
+### v0.5.13.2 readiness launcher hardening
+
+The readiness launcher explicitly binds the accessions file, resolved KG, snapshot, candidate roots,
+output directory, optional sdrf-skills bundle and optional review manifest to stable in-container
+paths. It does not rely on site-specific Singularity auto-bind behavior for NFS paths. SIF SHA-256 is
+verified by comparing the manifest's first hash field to the requested SIF directly, independent of
+the submission working directory. Any pre-readiness launcher error creates
+`OUT/launcher_failure.txt` with the failing command and line.
+
+Candidate staging recognizes the historical PRIDE_SCP sibling audit layout
+`<run>/audit/PXDxxxxxx.sdrf.audit.json` in addition to underscore-style audit names. Candidate SDRF
+bytes are never modified; a normalized staging audit is emitted only from an already-existing
+PRIDE_SCP audit.
