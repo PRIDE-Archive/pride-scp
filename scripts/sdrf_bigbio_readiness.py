@@ -32,7 +32,7 @@ from pathlib import Path
 from typing import Any, Iterable
 
 VERSION = "pride-scp-sdrf-readiness-v0.2"
-POLICY_VERSION = "pride-scp-bigbio-readiness-v0.5.14.1"
+POLICY_VERSION = "pride-scp-bigbio-readiness-v0.5.14.2"
 SDRF_PIPELINES_PIN = "0.1.6"
 
 SDRF_SPEC_VERSION = "1.1.0"
@@ -51,6 +51,17 @@ REQUIRED_CONCRETE_RULES: dict[str, dict[str, Any]] = {
 }
 
 ORGANISM_TEMPLATE_NAMES = {"human", "vertebrates", "invertebrates", "plants"}
+ROW_DERIVED_TEMPLATE_NAMES = ORGANISM_TEMPLATE_NAMES | {"dia-acquisition"}
+
+PRIDE_SCP_ANNOTATION_TOOL = "pride-scp-sdrf"
+PRIDE_SCP_ANNOTATION_TOOL_RE = re.compile(
+    r"^(?:pride-scp-sdrf\s+)?pride-scp-sdrf-v(?P<version>\d+\.\d+\.\d+(?:[-+][A-Za-z0-9.-]+)?)$",
+    re.I,
+)
+PRIDE_SCP_ANNOTATION_TOOL_VALID_RE = re.compile(
+    r"^pride-scp-sdrf\s+v\d+\.\d+\.\d+(?:[-+][A-Za-z0-9.-]+)?$",
+    re.I,
+)
 
 # Versions observed in the current upstream template manifest on 2026-09-10.  Runtime validation is
 # still delegated to parse_sdrf; these constants are provenance/reporting anchors, not a replacement
@@ -469,26 +480,68 @@ def _is_human_organism(value: str) -> bool:
     )
 
 
+def _normalize_pride_scp_annotation_tool(value: str) -> str:
+    text = norm_value(value)
+    if PRIDE_SCP_ANNOTATION_TOOL_VALID_RE.fullmatch(text):
+        return text
+    match = PRIDE_SCP_ANNOTATION_TOOL_RE.fullmatch(text)
+    if not match:
+        return text
+    return f"{PRIDE_SCP_ANNOTATION_TOOL} v{match.group('version')}"
+
+
+def _is_dia_acquisition(value: str) -> bool:
+    low = norm_value(value).lower()
+    # This is a whole-file template-selection classifier, not an ontology resolver. Keep it strict
+    # enough that mixed DDA/DIA studies are not validated wholesale with the DIA leaf template.
+    return bool(
+        re.search(r"\bdata[- ]independent acquisition\b", low)
+        or re.search(r"\bdia\b", low)
+        or "diapasef" in low
+        or "swath" in low
+    )
+
+
+def _normalize_dia_acquisition_value(value: str) -> str:
+    text = norm_value(value)
+    low = text.lower()
+    # Historical PRIDE_SCP drafts used PRIDE:0000628 for the exact label Data-independent acquisition.
+    # BigBio dia-acquisition v1.1.0 uses PRIDE:0000450 for this same named term. This is a controlled
+    # representation update only; it never changes DDA to DIA or infers a method from other fields.
+    if re.fullmatch(
+        r"nt=data-independent acquisition;\s*ac=pride:0000628", low, re.I
+    ):
+        return "NT=Data-independent acquisition;AC=PRIDE:0000450"
+    return text
+
+
 def derive_templates(headers: list[str], rows: list[list[str]], explicit: list[str]) -> list[str]:
     explicit_names = {x.strip().lower() for x in explicit if x.strip()}
     names: set[str] = set(explicit_names)
     names.add("single-cell")
     names.add("ms-proteomics")
 
-    # Historical PRIDE_SCP artifacts may contain stale/incorrect organism-layer template metadata.
-    # Reuse only non-organism BigBio template names from the file. Organism templates are re-derived
-    # conservatively below from the actual SDRF organism column, or may be forced explicitly by CLI.
+    # Historical PRIDE_SCP artifacts may contain stale/incorrect whole-file template metadata.
+    # Reuse templates that are not intrinsically row-derived. Organism and DIA templates are re-derived
+    # conservatively from the actual SDRF values below, or may be forced explicitly by CLI.
     for value in row_values_all(headers, rows, "comment[sdrf template]"):
         low = value.lower()
         for name in KNOWN_TEMPLATE_NAMES:
-            if name in ORGANISM_TEMPLATE_NAMES:
+            if name in ROW_DERIVED_TEMPLATE_NAMES:
                 continue
             if re.search(rf"(?<![a-z0-9-]){re.escape(name)}(?![a-z0-9-])", low):
                 names.add(name)
 
-    acquisitions = " ".join(row_values(headers, rows, "comment[proteomics data acquisition method]")).lower()
-    if re.search(r"\bdia\b|data[- ]independent", acquisitions):
+    acquisition_values = [
+        value
+        for value in row_values_all(headers, rows, "comment[proteomics data acquisition method]")
+        if not placeholder(value)
+    ]
+    dia_flags = [_is_dia_acquisition(value) for value in acquisition_values]
+    if acquisition_values and all(dia_flags):
         names.add("dia-acquisition")
+    elif "dia-acquisition" not in explicit_names:
+        names.discard("dia-acquisition")
 
     # Derive organism-layer templates from *all* characteristics[organism] columns. Historical
     # SDRFs can contain duplicate organism columns; looking only at the first occurrence can
@@ -636,6 +689,34 @@ def normalize_bigbio_projection(
             for row in rows:
                 row.pop(idx)
             info.actions.append("removed_duplicate_comment_sdrf_version")
+
+    # BigBio 1.1 defines comment[sdrf annotation tool] as either `name vX.Y.Z`,
+    # `NT=name;VV=vX.Y.Z`, or `manual curation`. Historical PRIDE_SCP drafts serialized the
+    # internal generator token directly (or duplicated the tool name), e.g.
+    # `pride-scp-sdrf pride-scp-sdrf-v0.3.1`. Normalize only this known PRIDE_SCP lineage.
+    annotation_tool_changes = 0
+    for idx in column_indices(headers, "comment[sdrf annotation tool]"):
+        for row in rows:
+            old_value = row[idx]
+            new_value = _normalize_pride_scp_annotation_tool(old_value)
+            if new_value != old_value:
+                row[idx] = new_value
+                annotation_tool_changes += 1
+    if annotation_tool_changes:
+        info.actions.append(f"normalized_pride_scp_annotation_tool:{annotation_tool_changes}_cells")
+
+    # Canonicalize the one known legacy PRIDE accession for the exact DIA term. This is a standards
+    # identifier correction for an already-explicit DIA value, not scientific inference.
+    dia_value_changes = 0
+    for idx in column_indices(headers, "comment[proteomics data acquisition method]"):
+        for row in rows:
+            old_value = row[idx]
+            new_value = _normalize_dia_acquisition_value(old_value)
+            if new_value != old_value:
+                row[idx] = new_value
+                dia_value_changes += 1
+    if dia_value_changes:
+        info.actions.append(f"normalized_dia_acquisition_accession:{dia_value_changes}_cells")
 
     # Replace stale PRIDE_SCP/internal template metadata with valid BigBio template declarations.
     removed_templates = _remove_columns(headers, rows, "comment[sdrf template]")
@@ -1084,17 +1165,19 @@ def self_test() -> None:
             "comment[proteomics data acquisition method]", "comment[instrument]",
             "comment[cleavage agent details]", "comment[label]", "comment[fraction identifier]",
             "comment[technical replicate]", "comment[data file]", "comment[sdrf version]",
-            "comment[sdrf template]", "factor value[condition]",
+            "comment[sdrf template]", "comment[sdrf annotation tool]", "factor value[condition]",
         ]
         legacy_rows = [
             ["cell_A", "assay_A", "proteomic profiling by mass spectrometry", "Homo sapiens", "blood", "1",
              "cellenONE", "cell_A", "donor1", "1", "Data-dependent acquisition", "Orbitrap Fusion Lumos",
              "NT=Trypsin;AC=MS:1001251", "label free sample", "1", "1", "cell_A.raw",
-             "pride-scp-sdrf-v0.3.6", "pride-scp-sdrf-v0.3.6", "case"],
+             "pride-scp-sdrf-v0.3.6", "pride-scp-sdrf-v0.3.6",
+             "pride-scp-sdrf pride-scp-sdrf-v0.3.6", "case"],
             ["cell_B", "assay_B", "proteomic profiling by mass spectrometry", "Homo sapiens", "blood", "2",
              "cellenONE", "cell_B", "donor2", "1", "Data-dependent acquisition", "Orbitrap Fusion Lumos",
              "NT=Trypsin;AC=MS:1001251", "label free sample", "1", "1", "cell_B.raw",
-             "pride-scp-sdrf-v0.3.6", "pride-scp-sdrf-v0.3.6", "control"],
+             "pride-scp-sdrf-v0.3.6", "pride-scp-sdrf-v0.3.6",
+             "pride-scp-sdrf-v0.3.6", "control"],
         ]
         _write_sdrf(sdrf, [norm_header(x) for x in legacy_headers], legacy_rows)
         audit_dir = candidate_root / "audit"
@@ -1138,6 +1221,9 @@ def self_test() -> None:
         assert set(row_values(projected_headers, projected_rows, "comment[sdrf version]")) == {"v1.1.0"}
         template_values = row_values_all(projected_headers, projected_rows, "comment[sdrf template]")
         assert template_values and all(re.fullmatch(r"[\w-]+ v\d+\.\d+\.\d+(?:-[\w.]+)?", x) for x in template_values)
+        annotation_values = row_values_all(projected_headers, projected_rows, "comment[sdrf annotation tool]")
+        assert annotation_values == ["pride-scp-sdrf v0.3.6", "pride-scp-sdrf v0.3.6"]
+        assert not any("pride-scp-sdrf-v" in x for x in annotation_values)
         assert "characteristics[age]" in projected_headers
         assert "characteristics[sex]" in projected_headers
         assert "characteristics[disease]" in projected_headers
@@ -1187,6 +1273,24 @@ def self_test() -> None:
         duplicate_templates = derive_templates(duplicate_organism_headers, duplicate_organism_rows, [])
         assert "human" not in duplicate_templates
         assert "dia-acquisition" in duplicate_templates
+
+        # A mixed DDA/DIA file must not receive a whole-file DIA leaf template merely because one
+        # row or stale template declaration mentions DIA.
+        mixed_acquisition_headers = [
+            "source name", "assay name", "technology type",
+            "comment[proteomics data acquisition method]", "comment[sdrf template]",
+        ]
+        mixed_acquisition_rows = [
+            ["a", "a", "proteomic profiling by mass spectrometry", "Data-independent acquisition", "dia-acquisition v1.1.0"],
+            ["b", "b", "proteomic profiling by mass spectrometry", "Data-dependent acquisition", "dia-acquisition v1.1.0"],
+        ]
+        assert "dia-acquisition" not in derive_templates(mixed_acquisition_headers, mixed_acquisition_rows, [])
+        assert "dia-acquisition" in derive_templates(mixed_acquisition_headers, mixed_acquisition_rows, ["dia-acquisition"])
+        assert (
+            _normalize_dia_acquisition_value("NT=Data-independent acquisition;AC=PRIDE:0000628")
+            == "NT=Data-independent acquisition;AC=PRIDE:0000450"
+        )
+        assert _normalize_dia_acquisition_value("Data-dependent acquisition") == "Data-dependent acquisition"
 
         # Multiple non-identical candidates are fail-closed.
         alt = candidate_root / "datasets" / accession

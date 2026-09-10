@@ -21,6 +21,13 @@ pub const SINGLE_CELL_TEMPLATE_URL: &str =
     "https://github.com/bigbio/sdrf-templates/blob/main/single-cell/1.0.0/single-cell.yaml";
 pub const SDRF_SPEC_URL: &str = "https://sdrf.quantms.org/specification.html";
 pub const GENERATOR_VERSION: &str = "pride-scp-sdrf-v0.4.5";
+
+fn sdrf_annotation_tool_value() -> String {
+    let version = GENERATOR_VERSION
+        .strip_prefix("pride-scp-sdrf-")
+        .unwrap_or(GENERATOR_VERSION);
+    format!("pride-scp-sdrf {version}")
+}
 const MANUSCRIPT_SCAN_MAX_CHARS: usize = 2_000_000;
 const MANUSCRIPT_EVIDENCE_MAX_RESERVED_ITEMS: usize = 24;
 const MANUSCRIPT_EVIDENCE_MAX_RESERVED_CHARS: usize = 12_000;
@@ -4205,7 +4212,7 @@ fn merge_existing_sdrf(
             row[j] = SDRF_SPEC_VERSION.into();
         }
         if let Some(j) = idx("comment[sdrf annotation tool]") {
-            row[j] = format!("pride-scp-sdrf {GENERATOR_VERSION}");
+            row[j] = sdrf_annotation_tool_value();
         }
         if let Some(j) = sc_template_idx {
             row[j] = format!("single-cell v{SINGLE_CELL_TEMPLATE_VERSION}");
@@ -4406,7 +4413,7 @@ fn draft_rows_from_explicit_mappings(
         set(
             &mut row,
             "comment[sdrf annotation tool]",
-            GENERATOR_VERSION.to_string(),
+            sdrf_annotation_tool_value(),
         );
         rows.push(row);
     }
@@ -4647,7 +4654,7 @@ fn draft_rows_with_explicit_mappings(
         set(
             &mut row,
             "comment[sdrf annotation tool]",
-            GENERATOR_VERSION.to_string(),
+            sdrf_annotation_tool_value(),
         );
         rows.push(row);
     }
@@ -6258,6 +6265,12 @@ mod tests {
             .position(|h| h == SC_CELL_IDENTIFIER)
             .unwrap();
         assert_eq!(rows[0][idx], "cell_A-01");
+        let annotation_idx = headers
+            .iter()
+            .position(|h| h == "comment[sdrf annotation tool]")
+            .unwrap();
+        assert_eq!(rows[0][annotation_idx], "pride-scp-sdrf v0.4.5");
+        assert_eq!(sdrf_annotation_tool_value(), "pride-scp-sdrf v0.4.5");
         let issues = validate_draft(&headers, &rows, &evidence);
         assert!(issues.iter().all(|x| x.level != "error"), "{issues:?}");
     }
