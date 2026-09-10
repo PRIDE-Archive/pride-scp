@@ -2053,3 +2053,69 @@ seeded greedy generation is recorded in cache identity, and explicit reporter-ch
 split only when each literal token is present in the cited source. Uncertain claims remain rejected.
 No model-generated RAW/sample/cell/run mapping is permitted, and the formal SDRF-valid count changes
 only after a later deterministic SDRF projection/validation stage.
+
+## v0.5.13: BigBio-aligned fail-closed SDRF readiness gate
+
+The final SDRF acceptance lane is intentionally separated from semantic extraction.  The small LLM
+may enrich source-local facts in the global knowledge graph, but it is not an SDRF generator and it
+must never construct sample-to-file, cell-to-file, or reporter-channel mappings.
+
+The readiness trust chain is:
+
+```text
+repository/publication/structured evidence
+  -> PRIDE_SCP source closure and semantic hygiene
+  -> source-grounded SDRF candidate
+  -> BigBio single-cell/template checks
+  -> parse_sdrf validation
+  -> sdrf-skills deterministic check/score
+  -> independent SHA-256-bound review
+  -> submission_ready
+```
+
+`parse_sdrf` is the official BigBio validator, but a clean validation result is treated as
+standards-conformance evidence rather than proof that the biological interpretation or mapping is
+true.  PRIDE_SCP's source-closure checks remain upstream and cannot be waived by an external validator.
+
+The container pins `sdrf-pipelines[ontology]==0.1.6`.  Because current `parse_sdrf` releases accept a
+single effective `--template` value, the readiness wrapper invokes each template in a separate process
+rather than repeating `--template` on one command.  The wrapper always evaluates the mass-spectrometry
+and single-cell profiles and may add evidence-derived leaf templates such as `human` or
+`dia-acquisition`.
+
+`sdrf-skills` is intentionally not baked from a moving Git branch.  Use
+`containers/prefetch_bigbio_sdrf_assets.sh` to create a checksummed external bundle containing the exact
+skills/spec/template commits used for a run.  The gate may call:
+
+```text
+python -m tools check <file.sdrf.tsv>
+python -m tools score <file.sdrf.tsv>
+```
+
+It never calls `tools fix` automatically.  Any proposed repair must return through PRIDE_SCP evidence
+closure before it can replace an SDRF candidate.
+
+Readiness states are fail-closed.  Important states include:
+
+```text
+blocked_internal_evidence
+blocked_branch_conflict
+blocked_mapping_incomplete
+blocked_metadata_incomplete
+blocked_semantic_conflict
+blocked_bigbio_template
+blocked_parse_sdrf
+blocked_bigbio_check
+projected_internal_candidate
+needs_independent_review
+submission_ready
+```
+
+A projected candidate is copied byte-for-byte to `submission/sandbox/{ACCESSION}/`.  It moves to the
+`submission/datasets/{ACCESSION}/` layout only when deterministic BigBio checks passed and an explicit
+independent-review manifest approves the exact candidate SHA-256.  Editing an SDRF therefore
+invalidates its review approval automatically.
+
+The readiness gate is non-generative: an accession without a source-closed SDRF candidate is reported
+with a blocker rather than receiving scaffold rows guessed from filenames, semantic model output, or
+GT metadata.

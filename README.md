@@ -290,3 +290,11 @@ The mixed Rust + Python pipeline has a Docker-canonical, Singularity/Apptainer a
 pattern documented in [`docs/hpc_container_deployment.md`](docs/hpc_container_deployment.md). The HPC
 launchers support offline pre-fetched Ollama models, optional NVIDIA GPU execution and node-local
 staging without embedding cluster-specific paths in the application.
+
+### BigBio-aligned SDRF readiness
+
+`python scripts/sdrf_bigbio_readiness.py` provides the fail-closed final acceptance gate for
+source-grounded SDRF candidates. It integrates the official `parse_sdrf` validator, optional frozen
+`sdrf-skills` deterministic checks, SHA-256-bound independent-review approval, and the eventual
+`bigbio/sdrf-annotated-datasets` `sandbox/`/`datasets/` directory contract. It never generates missing
+sample/file/channel truth.

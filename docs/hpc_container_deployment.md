@@ -397,3 +397,48 @@ the inexpensive base graph, and rerun the merge/resolver while reusing the exist
 `context_branch_alignment.tsv` is non-generative and must not be interpreted as a branch assignment.
 Only future source-closure logic may decide whether a uniquely compatible context provides sufficient
 corroboration for a branch; v0.5.11 records compatibility/conflict evidence only.
+
+## v0.5.13 BigBio SDRF readiness on Codon
+
+The v0.5.13 SIF includes `sdrf-pipelines[ontology]==0.1.6` and the PRIDE_SCP readiness wrapper.  The
+BigBio `sdrf-skills` repository remains an external, checksummed source bundle so its exact commit and
+nested specification/template revisions are visible in provenance.
+
+Create that bundle once on an internet-connected workstation:
+
+```bash
+./containers/prefetch_bigbio_sdrf_assets.sh models/bigbio-sdrf-assets main
+```
+
+Copy it to the cluster and verify `bundle.sha256` before use.  The readiness Slurm job is CPU-only and
+must consume an already-resolved global KG plus explicit candidate roots.  It does not call Ollama.
+
+For cluster environments without outbound ontology access, use `ONTOLOGY_MODE=skip` for the pilot.
+That still runs structural/default and per-template `parse_sdrf` validation.  Before community
+submission, rerun the same exact SDRF with ontology validation enabled and current upstream tooling;
+the independent-review gate remains required either way.
+
+The Slurm launcher is:
+
+```text
+scripts/slurm/pride_scp_sdrf_readiness.sbatch
+```
+
+Important environment variables:
+
+```text
+ACCESSIONS_FILE
+GRAPH_DB
+SNAPSHOT
+CANDIDATE_ROOTS       # colon-separated, explicit; no recursive guessing
+OUT
+VALIDATOR_MODE        # required|optional|off
+ONTOLOGY_MODE         # skip|online
+SKILLS_MODE           # required|optional|off
+BIGBIO_SKILLS_ROOT    # optional frozen bundle/sdrf-skills path
+REVIEW_APPROVED_MANIFEST
+```
+
+Scientific blocker states are successful batch outputs, not scheduler failures.  Missing required
+validator/tooling can be configured to fail the job by using `VALIDATOR_MODE=required` or
+`SKILLS_MODE=required`.

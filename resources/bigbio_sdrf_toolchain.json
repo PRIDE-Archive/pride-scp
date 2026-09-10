@@ -1,0 +1,38 @@
+{
+  "contract_version": "pride-scp-bigbio-readiness-v0.5.13",
+  "observed_date": "2026-09-10",
+  "sdrf_pipelines": {
+    "distribution": "sdrf-pipelines[ontology]",
+    "version": "0.1.6",
+    "role": "official structural/template/ontology validator",
+    "truth_policy": "necessary_but_not_sufficient"
+  },
+  "sdrf_skills": {
+    "distribution": "external_git_bundle",
+    "role": "deterministic check/score and independent-review methodology",
+    "runtime_update_allowed": false,
+    "auto_fix_allowed": false
+  },
+  "template_hints": {
+    "single-cell": "1.0.0",
+    "ms-proteomics": "1.1.0",
+    "dia-acquisition": "1.1.0",
+    "human": "1.1.0",
+    "vertebrates": "1.1.0",
+    "invertebrates": "1.1.0",
+    "plants": "1.1.0",
+    "cell-lines": "1.1.0"
+  },
+  "submission_repository": {
+    "repository": "bigbio/sdrf-annotated-datasets",
+    "ready_layout": "datasets/{ACCESSION}/{ACCESSION}.sdrf.tsv",
+    "draft_layout": "sandbox/{ACCESSION}/{ACCESSION}.sdrf.tsv"
+  },
+  "policies": {
+    "model_generates_sdrf": false,
+    "model_creates_sample_file_channel_mapping": false,
+    "validator_can_create_truth": false,
+    "auto_fix_is_accepted_truth": false,
+    "submission_requires_hash_bound_independent_review": true
+  }
+}
