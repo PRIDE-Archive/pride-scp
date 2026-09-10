@@ -442,3 +442,8 @@ REVIEW_APPROVED_MANIFEST
 Scientific blocker states are successful batch outputs, not scheduler failures.  Missing required
 validator/tooling can be configured to fail the job by using `VALIDATOR_MODE=required` or
 `SKILLS_MODE=required`.
+
+
+### v0.5.13.1 readiness preflight
+
+Empty/missing candidate roots no longer crash the Slurm launcher. The host launcher passes an explicit empty candidate directory to the unchanged v0.5.13 container, producing per-accession scientific blocker states. Use `scripts/stage_sdrf_readiness_candidates.py` to build a trusted positive candidate root from explicit evidence roots; the helper requires companion local-valid/source-closed audits and refuses divergent hashes.
