@@ -29,6 +29,46 @@ def output(cmd: list[str], *, cwd: pathlib.Path | None = None) -> str:
     return run(cmd, cwd=cwd, capture=True).stdout.strip()
 
 
+def changed_paths(repo: pathlib.Path) -> list[str]:
+    """Return worktree paths from git porcelain without corrupting leading status spaces.
+
+    `output()` intentionally strips surrounding whitespace for scalar command output, but
+    porcelain status uses a leading space as one of its two status columns.  Parsing status
+    through `output()` therefore turns ` M path` into `M path` and shifts the pathname.
+    Use NUL-delimited porcelain directly and preserve the raw bytes here instead.
+    """
+    cp = run(
+        ['git', 'status', '--porcelain=v1', '-z', '--untracked-files=all'],
+        cwd=repo,
+        capture=True,
+    )
+    raw = cp.stdout
+    if not raw:
+        return []
+
+    records = raw.split('\0')
+    paths: list[str] = []
+    i = 0
+    while i < len(records):
+        rec = records[i]
+        i += 1
+        if not rec:
+            continue
+        if len(rec) < 4 or rec[2] != ' ':
+            raise RuntimeError(f'unexpected git porcelain record: {rec!r}')
+        status = rec[:2]
+        path = rec[3:]
+        # In -z mode, rename/copy records are followed by the second pathname.  The
+        # destination path in the first record is the path that would be committed;
+        # consume the companion pathname so it is not mistaken for a new record.
+        if 'R' in status or 'C' in status:
+            if i >= len(records) or not records[i]:
+                raise RuntimeError(f'incomplete rename/copy porcelain record: {rec!r}')
+            i += 1
+        paths.append(path.replace('\\', '/'))
+    return paths
+
+
 def sha256(path: pathlib.Path) -> str:
     h = hashlib.sha256(path.read_bytes()).hexdigest()
     return h
@@ -124,6 +164,23 @@ def self_test() -> None:
     assert remote_owner('https://github.com/alice/sdrf-annotated-datasets.git') == 'alice'
     body = make_pr_body({'rows':'1','unique_data_files':'1','templates':'single-cell v1.0.0'}, 'PXD000001', 'a'*64, 'add')
     assert 'PXD000001' in body and 'human-reviewed' in body and 'parse_sdrf' in body
+
+    # Regression: porcelain status for a tracked modification starts with a space.
+    # Ensure changed_paths() preserves the pathname rather than shifting it by one
+    # character through whitespace trimming.
+    with tempfile.TemporaryDirectory(prefix='pride_scp_pr_selftest_') as td:
+        repo = pathlib.Path(td)
+        run(['git', 'init', '-q'], cwd=repo)
+        run(['git', 'config', 'user.email', 'selftest@example.invalid'], cwd=repo)
+        run(['git', 'config', 'user.name', 'PRIDE-SCP self-test'], cwd=repo)
+        target = repo / 'datasets' / 'PXD000001' / 'PXD000001.sdrf.tsv'
+        target.parent.mkdir(parents=True)
+        target.write_text('header\nold\n')
+        run(['git', 'add', '.'], cwd=repo)
+        run(['git', 'commit', '-q', '-m', 'seed'], cwd=repo)
+        target.write_text('header\nnew\n')
+        assert changed_paths(repo) == ['datasets/PXD000001/PXD000001.sdrf.tsv']
+
     print('self-test: PASS')
 
 
@@ -226,13 +283,12 @@ def main() -> None:
                     if sha256(target) != expected:
                         raise RuntimeError(f'{acc}: copied hash changed')
 
-                    status = output(['git', 'status', '--porcelain', '--untracked-files=all'], cwd=wt)
-                    if not status:
+                    changed = changed_paths(wt)
+                    if not changed:
                         results.append({'accession':acc,'status':'no_change_upstream','branch':branch,'pr_url':'','message':'upstream already contains identical file'})
                         continue
-                    changed = output(['git', 'status', '--porcelain', '--untracked-files=all'], cwd=wt).splitlines()
-                    allowed_suffix = f'datasets/{acc}/{acc}.sdrf.tsv'
-                    bad = [line for line in changed if not line[3:].replace('\\','/').endswith(allowed_suffix)]
+                    allowed_path = f'datasets/{acc}/{acc}.sdrf.tsv'
+                    bad = [path for path in changed if path != allowed_path]
                     if bad:
                         raise RuntimeError(f'{acc}: unexpected changed paths: {bad}')
 
