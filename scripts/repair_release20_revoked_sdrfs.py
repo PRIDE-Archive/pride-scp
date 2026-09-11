@@ -142,7 +142,7 @@ def repair_062702(rows, changes):
             setv(row, "characteristics[individual]", "not applicable", changes, "cell line has no embryo/donor identity")
             setv(row, "characteristics[cell type]", "not applicable", changes, "proteome digest standard")
             setv(row, "characteristics[cell line]", "HeLa", changes, "HeLa digest standard")
-            setv(row, "characteristics[sample type]", "study sample", changes, "method-development/benchmark sample")
+            setv(row, "characteristics[sample type]", "not available", changes, "generic study-role term is not currently validator-backed; preserve role as unavailable rather than inventing a PRIDE ontology value")
             setv(row, "characteristics[single cell isolation protocol]", "not applicable", changes, "proteome digest standard")
             setv(row, "characteristics[cell identifier]", "not applicable", changes, "not a biological single cell")
             setv(row, "characteristics[cells per well]", "not applicable", changes, "proteome digest standard")

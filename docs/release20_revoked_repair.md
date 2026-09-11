@@ -46,3 +46,13 @@ This iteration does not modify the specification-correct DIA representation:
 `NT=Data-independent acquisition;AC=PRIDE:0000450`
 
 The known `sdrf-pipelines` issue #345 remains a validator/tooling issue and is not worked around by corrupting the SDRF metadata.
+
+
+## v2 sample-type hardening
+
+`PXD062702` exposed a generic validator-delivery mismatch: the SDRF specification documents
+`study sample` as an example sample-role value, but current `sdrf-pipelines` ontology-backed validation
+does not resolve it under `PRIDE:0000895`. New PRIDE-SCP output must therefore not synthesize the
+literal `study sample`. When no more specific source-backed sample-role term is available, emit the
+reserved value `not available`. The scientific guard blocks `study sample` before external validation,
+including on HPC runs where ontology validation is skipped.

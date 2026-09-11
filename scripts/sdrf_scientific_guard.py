@@ -8,7 +8,7 @@ from dataclasses import dataclass, field, asdict
 from pathlib import Path
 from typing import Any
 
-VERSION = "pride-scp-sdrf-scientific-guard-v0.1"
+VERSION = "pride-scp-sdrf-scientific-guard-v0.2"
 RESERVED = {"", "not available", "not applicable", "unknown", "pooled", "anonymized"}
 DDA_RE = re.compile(r"(?:^|[_\-.])DDA(?:top\d+)?(?:[_\-.]|$)", re.I)
 DIA_RE = re.compile(r"(?:^|[_\-.])DIA(?:[_\-.]|$)", re.I)
@@ -119,7 +119,23 @@ def analyze(path: Path, project_json: Path | None = None) -> GuardResult:
         if bad:
             add("empty_control_has_concrete_biological_identity", i, headers=bad)
 
-    # 4. Narrow identifier/model/version fields must not contain obvious truncated protocol prose.
+    # 4. Known sample-role ontology delivery gap. The current specification advertises
+    #    "study sample", but the maintained PRIDE ontology cache used by sdrf-pipelines does not
+    #    currently expose it as a child of PRIDE:0000895. Do not synthesize this literal in new
+    #    output. Use a source-backed ontology role where one exists; otherwise fail closed to the
+    #    reserved value "not available". This guard is intentionally explicit so ontology-skipped
+    #    HPC readiness runs cannot silently publish a value that current upstream CI rejects.
+    if "characteristics[sample type]" in headers:
+        for i, row in enumerate(rows, 2):
+            if _low(row.get("characteristics[sample type]", "")) == "study sample":
+                add(
+                    "sample_type_study_sample_not_currently_validator_backed",
+                    i,
+                    value=row.get("characteristics[sample type]", ""),
+                    remediation="use a source-backed PRIDE sample-role term, or 'not available' when the role is not source-resolved",
+                )
+
+    # 5. Narrow identifier/model/version fields must not contain obvious truncated protocol prose.
     for h in ("comment[nanopots chip version]", "comment[microfluidics chip type]", "comment[lcm microscope model]"):
         if h not in headers:
             continue
@@ -132,7 +148,7 @@ def analyze(path: Path, project_json: Path | None = None) -> GuardResult:
             if truncated:
                 add("narrow_metadata_field_contains_truncated_protocol_prose", i, header=h, value=v)
 
-    # 5. Repository-wide project metadata collapse checks. These are contradiction detectors only.
+    # 6. Repository-wide project metadata collapse checks. These are contradiction detectors only.
     if project_json and project_json.is_file():
         try:
             project = json.loads(project_json.read_text(encoding="utf-8"))
@@ -172,7 +188,7 @@ def self_test() -> None:
         p = td / "x.tsv"
         p.write_text(
             "source name\tcharacteristics[organism]\tcharacteristics[organism part]\tcharacteristics[individual]\tcharacteristics[cell line]\tcharacteristics[cell type]\tcharacteristics[sample type]\tcharacteristics[cells per well]\tcomment[data file]\tcomment[proteomics data acquisition method]\tcomment[nanopots chip version]\n"
-            "x\tHomo sapiens\tEmbryo\tEmbryo\tHeLa\tEarly embryonic cell\tsingle cell\t1\tfoo_DDAtop20.raw\tNT=Data-independent acquisition;AC=PRIDE:0000450\tnanoPOTS chip[2] (Figure S2) and then prepared f\n"
+            "x\tHomo sapiens\tEmbryo\tEmbryo\tHeLa\tEarly embryonic cell\tstudy sample\t1\tfoo_DDAtop20.raw\tNT=Data-independent acquisition;AC=PRIDE:0000450\tnanoPOTS chip[2] (Figure S2) and then prepared f\n"
         )
         project = td / "project.json"
         project.write_text(json.dumps({"organisms": [{"name":"Homo sapiens"},{"name":"Xenopus laevis"}]}))
@@ -181,6 +197,7 @@ def self_test() -> None:
         assert "individual_duplicates_nonindividual_semantic_field" in text
         assert "explicit_dda_conflicts" in text
         assert "truncated_protocol_prose" in text
+        assert "sample_type_study_sample_not_currently_validator_backed" in text
         assert "multiorganism_project_collapsed" in text
     print("sdrf_scientific_guard self-test: PASS")
 

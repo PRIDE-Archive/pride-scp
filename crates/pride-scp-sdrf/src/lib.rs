@@ -4584,7 +4584,7 @@ fn draft_rows_with_explicit_mappings(
                     "1".to_string(),
                 ),
                 RawFileRole::FewCell(n) => (
-                    "study sample".to_string(),
+                    "not available".to_string(),
                     concrete_proposal_value(&proposal.single_cell_isolation_method)
                         .unwrap_or_else(|| "not applicable".to_string()),
                     "not applicable".to_string(),
@@ -4760,7 +4760,14 @@ fn load_explicit_row_mappings(
         }
         let sample_type = row.sample_type.trim().to_ascii_lowercase();
         let single_cell_row = sample_type == "single cell";
-        let non_single_study_row = sample_type == "study sample";
+        let non_single_study_row = sample_type == "not available";
+        if sample_type == "not available" {
+            bail!(
+                "explicit row mapping {} RAW {} uses sample_type=study sample, which is advertised by the SDRF glossary but is not currently validator-backed under PRIDE:0000895; use a source-backed role or not available",
+                accession,
+                row.raw_file
+            );
+        }
         if !single_cell_row && !non_single_study_row {
             bail!(
                 "explicit row mapping {} RAW {} uses unsupported sample_type for the bounded manifest contract: {}",
@@ -4975,7 +4982,7 @@ fn row_explicit_non_single_cell_role(index: &HashMap<&str, usize>, row: &[String
     {
         return true;
     }
-    if sample_type == "study sample" {
+    if sample_type == "not available" {
         let cells_not_applicable = index
             .get(SC_CELLS_PER_WELL)
             .and_then(|&j| row.get(j))
@@ -5140,7 +5147,6 @@ fn validate_draft_with_policy(
     let cell_id =
         Regex::new(r"^[A-Za-z0-9_.-]+$|^(?:carrier|reference|empty|not applicable)$").unwrap();
     let sample_types = [
-        "study sample",
         "single cell",
         "reference",
         "bridge",
@@ -5209,7 +5215,15 @@ fn validate_draft_with_policy(
         }
         if let Some(&j) = index.get(SC_SAMPLE_TYPE) {
             let v = row[j].trim().to_ascii_lowercase();
-            if !sample_types.contains(&v.as_str()) {
+            if v == "study sample" {
+                issues.push(ValidationIssue {
+                    level: "error".into(),
+                    code: "sample_type_study_sample_not_currently_validator_backed".into(),
+                    row: ri + 1,
+                    column: SC_SAMPLE_TYPE.into(),
+                    message: "'study sample' is advertised by the SDRF glossary but is not currently resolvable as a PRIDE:0000895 child by the maintained validator cache; use a source-backed sample-role term or 'not available'".into(),
+                });
+            } else if !sample_types.contains(&v.as_str()) {
                 issues.push(ValidationIssue { level: "warning".into(), code: "sample_type_requires_cv_validation".into(), row: ri + 1, column: SC_SAMPLE_TYPE.into(), message: format!("sample type is not in the local common-value set; defer ontology/CV validation to sdrf-pipelines: {}", row[j]) });
             }
         }
@@ -6666,8 +6680,8 @@ mod tests {
             &manifest,
             concat!(
                 "accession\traw_file\tsource_name\tcell_identifier\tbiological_replicate\ttechnical_replicate\tsample_type\tcells_per_well\tlabel\tcarrier_channel\treference_channel\tdesign_source\tdesign_ref\tmapping_key\tmapping_confidence\n",
-                "PXD028040\t2018-08-08_SC02_reference.RAW\twhole_tissue_digest_2018_08_08_SC02\tnot applicable\tnot applicable\t1\tstudy sample\tnot applicable\tnot available\tnot applicable\tnot applicable\tChoi_design.xlsx\tSheet2:row6\tdate_sc_run_key\thigh\n",
-                "PXD028040\t2018-08-15_SC02_tmt_reference.RAW\twhole_tissue_digest_2018_08_15_SC02\tnot applicable\tnot applicable\t1\tstudy sample\tnot applicable\tTMT128\tTMT131\tnot applicable\tChoi_design.xlsx\tSheet2:row9\tdate_sc_run_key\thigh\n",
+                "PXD028040\t2018-08-08_SC02_reference.RAW\twhole_tissue_digest_2018_08_08_SC02\tnot applicable\tnot applicable\t1\tnot available\tnot applicable\tnot available\tnot applicable\tnot applicable\tChoi_design.xlsx\tSheet2:row6\tdate_sc_run_key\thigh\n",
+                "PXD028040\t2018-08-15_SC02_tmt_reference.RAW\twhole_tissue_digest_2018_08_15_SC02\tnot applicable\tnot applicable\t1\tnot available\tnot applicable\tTMT128\tTMT131\tnot applicable\tChoi_design.xlsx\tSheet2:row9\tdate_sc_run_key\thigh\n",
                 "PXD028040\t2018-08-27_SC02.RAW\tDA_neuron_1\tDA_neuron_1\t1\t1\tsingle cell\t1\tTMT128\tTMT131\tnot applicable\tChoi_design.xlsx\tSheet2:row15\tdate_sc_run_key\thigh\n"
             ),
         )
@@ -6700,7 +6714,7 @@ mod tests {
             draft_rows_with_explicit_mappings(&proposal, &evidence, &mappings).unwrap();
         let at = |name: &str| headers.iter().position(|h| h == name).unwrap();
         for row in &rows[..2] {
-            assert_eq!(row[at(SC_SAMPLE_TYPE)], "study sample");
+            assert_eq!(row[at(SC_SAMPLE_TYPE)], "not available");
             assert_eq!(row[at("characteristics[cell type]")], "not applicable");
             assert_eq!(row[at(SC_ISOLATION_METHOD)], "not applicable");
             assert_eq!(row[at(SC_CELL_IDENTIFIER)], "not applicable");
@@ -8188,7 +8202,7 @@ mod tests {
         let idx = |name: &str| header_first_index(&headers, name).unwrap();
         assert_eq!(rows[0][idx(SC_SAMPLE_TYPE)], "single cell");
         assert_eq!(rows[0][idx(SC_CELLS_PER_WELL)], "1");
-        assert_eq!(rows[1][idx(SC_SAMPLE_TYPE)], "study sample");
+        assert_eq!(rows[1][idx(SC_SAMPLE_TYPE)], "not available");
         assert_eq!(rows[1][idx(SC_CELLS_PER_WELL)], "40");
         assert_eq!(rows[1][idx(SC_CELL_IDENTIFIER)], "not applicable");
         assert_eq!(rows[2][idx(SC_SAMPLE_TYPE)], "empty");
