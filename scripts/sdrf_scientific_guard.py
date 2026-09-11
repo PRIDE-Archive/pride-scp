@@ -8,7 +8,7 @@ from dataclasses import dataclass, field, asdict
 from pathlib import Path
 from typing import Any
 
-VERSION = "pride-scp-sdrf-scientific-guard-v0.2"
+VERSION = "pride-scp-sdrf-scientific-guard-v0.3"
 RESERVED = {"", "not available", "not applicable", "unknown", "pooled", "anonymized"}
 DDA_RE = re.compile(r"(?:^|[_\-.])DDA(?:top\d+)?(?:[_\-.]|$)", re.I)
 DIA_RE = re.compile(r"(?:^|[_\-.])DIA(?:[_\-.]|$)", re.I)
@@ -62,6 +62,11 @@ def analyze(path: Path, project_json: Path | None = None) -> GuardResult:
         result.blockers.append(token)
         result.details.append({"code": code, "row": row_idx, **detail})
 
+    def warn(code: str, row_idx: int | None = None, **detail: Any) -> None:
+        token = code if row_idx is None else f"{code}:row_{row_idx}"
+        result.warnings.append(token)
+        result.details.append({"code": code, "row": row_idx, "severity": "warning", **detail})
+
     # 1. Individual/donor semantic leakage from other biological columns.
     aliases = [
         "characteristics[organism part]",
@@ -103,8 +108,14 @@ def analyze(path: Path, project_json: Path | None = None) -> GuardResult:
             add("data_file_name_explicit_dda_conflicts_with_dia_metadata", i, data_file=fn, acquisition=acq)
         if DIA_RE.search(fn) and "dependent acquisition" in acq and "independent" not in acq:
             add("data_file_name_explicit_dia_conflicts_with_dda_metadata", i, data_file=fn, acquisition=acq)
+        # WWA (wide-window acquisition) is a DDA strategy with wider precursor isolation, not DIA.
+        # Do not infer DIA merely from the word "wide". This is an explicit literature-backed
+        # acquisition semantic, not an accession-specific filename heuristic.
+        if re.search(r"(?:^|[_\-.])WWA(?:\d|[_\-.]|$)", fn, re.I) and "independent" in acq:
+            add("wide_window_acquisition_mislabeled_as_dia", i, data_file=fn, acquisition=acq)
 
-    # 3. Empty/blank controls should not carry concrete biological identities as if they were cells.
+    # 3. Empty/zero-cell controls must not carry concrete cell/tissue identity as if biological
+    #    material were present. Keep organism/study context separate from cell-specific identity.
     for i, row in enumerate(rows, 2):
         role = _low(row.get("characteristics[sample type]", ""))
         cells = _low(row.get("characteristics[cells per well]", ""))
@@ -113,9 +124,32 @@ def analyze(path: Path, project_json: Path | None = None) -> GuardResult:
         if not is_empty:
             continue
         bad = []
-        for h in ("characteristics[individual]", "characteristics[cell type]", "characteristics[cell line]"):
-            if _concrete(row.get(h, "")):
+        for h in (
+            "characteristics[individual]",
+            "characteristics[cell type]",
+            "characteristics[cell line]",
+            "characteristics[cellosaurus accession]",
+            "characteristics[cellosaurus name]",
+        ):
+            if h in headers and _concrete(row.get(h, "")):
                 bad.append(h)
+        contextual = [
+            h for h in (
+                "characteristics[organism part]",
+                "characteristics[disease]",
+                "characteristics[developmental stage]",
+                "characteristics[sex]",
+            )
+            if h in headers and _concrete(row.get(h, ""))
+        ]
+        if contextual:
+            warn("empty_control_carries_contextual_biological_metadata", i, headers=contextual)
+        material = _low(row.get("characteristics[material type]", ""))
+        if material in {"cell", "cell line", "tissue", "biofluid", "primary cell"}:
+            bad.append("characteristics[material type]")
+        cell_id = _low(row.get("characteristics[cell identifier]", ""))
+        if cell_id and cell_id not in RESERVED and cell_id != "empty":
+            bad.append("characteristics[cell identifier]")
         if bad:
             add("empty_control_has_concrete_biological_identity", i, headers=bad)
 
@@ -135,7 +169,21 @@ def analyze(path: Path, project_json: Path | None = None) -> GuardResult:
                     remediation="use a source-backed PRIDE sample-role term, or 'not available' when the role is not source-resolved",
                 )
 
-    # 5. Narrow identifier/model/version fields must not contain obvious truncated protocol prose.
+    # 5. Instrument/isolation metadata must be locally compatible with each row.
+    for i, row in enumerate(rows, 2):
+        lcm_model = _norm(row.get("comment[lcm microscope model]", ""))
+        isolation = _low(row.get("characteristics[single cell isolation protocol]", ""))
+        if _concrete(lcm_model) and not ("laser capture" in isolation or isolation == "lcm"):
+            add("lcm_microscope_model_without_lcm_isolation", i,
+                lcm_microscope_model=lcm_model, isolation_protocol=row.get("characteristics[single cell isolation protocol]", ""))
+
+        instrument = _low(row.get("comment[instrument]", ""))
+        dissociation = _low(row.get("comment[dissociation method]", ""))
+        if "q exactive" in instrument and ("ms:1000133" in dissociation or dissociation == "cid"):
+            add("q_exactive_row_uses_generic_cid_instead_of_hcd", i,
+                instrument=row.get("comment[instrument]", ""), dissociation=row.get("comment[dissociation method]", ""))
+
+    # 6. Narrow identifier/model/version fields must not contain obvious truncated protocol prose.
     for h in ("comment[nanopots chip version]", "comment[microfluidics chip type]", "comment[lcm microscope model]"):
         if h not in headers:
             continue
@@ -148,7 +196,7 @@ def analyze(path: Path, project_json: Path | None = None) -> GuardResult:
             if truncated:
                 add("narrow_metadata_field_contains_truncated_protocol_prose", i, header=h, value=v)
 
-    # 6. Repository-wide project metadata collapse checks. These are contradiction detectors only.
+    # 7. Repository-wide project metadata collapse checks. These are contradiction detectors only.
     if project_json and project_json.is_file():
         try:
             project = json.loads(project_json.read_text(encoding="utf-8"))
@@ -187,8 +235,9 @@ def self_test() -> None:
         td = Path(td)
         p = td / "x.tsv"
         p.write_text(
-            "source name\tcharacteristics[organism]\tcharacteristics[organism part]\tcharacteristics[individual]\tcharacteristics[cell line]\tcharacteristics[cell type]\tcharacteristics[sample type]\tcharacteristics[cells per well]\tcomment[data file]\tcomment[proteomics data acquisition method]\tcomment[nanopots chip version]\n"
-            "x\tHomo sapiens\tEmbryo\tEmbryo\tHeLa\tEarly embryonic cell\tstudy sample\t1\tfoo_DDAtop20.raw\tNT=Data-independent acquisition;AC=PRIDE:0000450\tnanoPOTS chip[2] (Figure S2) and then prepared f\n"
+            "source name\tcharacteristics[organism]\tcharacteristics[organism part]\tcharacteristics[individual]\tcharacteristics[cell line]\tcharacteristics[cell type]\tcharacteristics[cellosaurus accession]\tcharacteristics[disease]\tcharacteristics[developmental stage]\tcharacteristics[sex]\tcharacteristics[material type]\tcharacteristics[sample type]\tcharacteristics[cells per well]\tcharacteristics[cell identifier]\tcharacteristics[single cell isolation protocol]\tcomment[data file]\tcomment[proteomics data acquisition method]\tcomment[instrument]\tcomment[dissociation method]\tcomment[lcm microscope model]\tcomment[nanopots chip version]\n"
+            "x\tHomo sapiens\tEmbryo\tEmbryo\tHeLa\tEarly embryonic cell\tCVCL_0001\tcancer\tadult\tmale\tcell\tstudy sample\t1\tx1\tmanual aspiration\tfoo_DDAtop20.raw\tNT=Data-independent acquisition;AC=PRIDE:0000450\tNT=Q Exactive Plus;AC=MS:1002634\tNT=CID;AC=MS:1000133\tZeiss PALM MicroBeam\tnanoPOTS chip[2] (Figure S2) and then prepared f\n"
+            "blank\tHomo sapiens\tbrain\tnot applicable\tHeLa\tnot applicable\tCVCL_0001\tcancer\tadult\tmale\tcell line\tempty\t0\tblank_1\tnot applicable\tfoo_WWA4.raw\tNT=Data-independent acquisition;AC=PRIDE:0000450\tNT=Orbitrap Fusion Lumos;AC=MS:1002732\tHCD\tnot applicable\tnot available\n"
         )
         project = td / "project.json"
         project.write_text(json.dumps({"organisms": [{"name":"Homo sapiens"},{"name":"Xenopus laevis"}]}))
@@ -199,6 +248,10 @@ def self_test() -> None:
         assert "truncated_protocol_prose" in text
         assert "sample_type_study_sample_not_currently_validator_backed" in text
         assert "multiorganism_project_collapsed" in text
+        assert "q_exactive_row_uses_generic_cid_instead_of_hcd" in text
+        assert "lcm_microscope_model_without_lcm_isolation" in text
+        assert "empty_control_has_concrete_biological_identity" in text
+        assert "wide_window_acquisition_mislabeled_as_dia" in text
     print("sdrf_scientific_guard self-test: PASS")
 
 

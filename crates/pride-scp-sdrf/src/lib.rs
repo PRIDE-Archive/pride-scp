@@ -5055,13 +5055,20 @@ fn filename_acquisition_conflict(data_file: &str, acquisition: &str) -> Option<&
     let explicit_dia = Regex::new(r"(?:^|[-_.])dia(?:[-_.]|$)")
         .expect("static DIA regex")
         .is_match(&file);
+    let explicit_wwa = Regex::new(r"(?:^|[-_.])wwa(?:[0-9]+|[-_.]|$)")
+        .expect("static WWA regex")
+        .is_match(&file);
     let metadata_dia = acq.contains("data-independent")
         || acq.contains("data independent")
         || (acq.contains("dia") && !acq.contains("dda"));
     let metadata_dda =
         acq.contains("data-dependent") || acq.contains("data dependent") || acq.contains("dda");
-    if explicit_dda && metadata_dia {
-        Some("filename_explicit_dda_but_metadata_dia")
+    if (explicit_dda || explicit_wwa) && metadata_dia {
+        Some(if explicit_wwa {
+            "filename_explicit_wwa_but_metadata_dia"
+        } else {
+            "filename_explicit_dda_but_metadata_dia"
+        })
     } else if explicit_dia && metadata_dda && !metadata_dia {
         Some("filename_explicit_dia_but_metadata_dda")
     } else {
@@ -5298,6 +5305,8 @@ fn validate_draft_with_policy(
                 SC_INDIVIDUAL,
                 "characteristics[cell type]",
                 "characteristics[cell line]",
+                "characteristics[cellosaurus accession]",
+                "characteristics[cellosaurus name]",
             ] {
                 if let Some(&j) = index.get(header) {
                     let value = row[j].trim();
@@ -5313,6 +5322,104 @@ fn validate_draft_with_policy(
                         });
                     }
                 }
+            }
+            for header in [
+                "characteristics[organism part]",
+                "characteristics[disease]",
+                "characteristics[developmental stage]",
+                "characteristics[sex]",
+            ] {
+                if let Some(&j) = index.get(header) {
+                    let value = row[j].trim();
+                    if concrete_semantic_value(value) {
+                        issues.push(ValidationIssue {
+                            level: "warning".into(),
+                            code: "empty_control_carries_contextual_biological_metadata".into(),
+                            row: ri + 1,
+                            column: header.into(),
+                            message: format!(
+                                "empty/zero-cell control carries contextual biological metadata '{value}'; confirm this is intentional study context rather than row leakage"
+                            ),
+                        });
+                    }
+                }
+            }
+            if let Some(&j) = index.get("characteristics[material type]") {
+                let value = row[j].trim().to_ascii_lowercase();
+                if matches!(
+                    value.as_str(),
+                    "cell" | "cell line" | "tissue" | "biofluid" | "primary cell"
+                ) {
+                    issues.push(ValidationIssue {
+                        level: "error".into(),
+                        code: "empty_control_has_concrete_biological_identity".into(),
+                        row: ri + 1,
+                        column: "characteristics[material type]".into(),
+                        message: format!(
+                            "empty/zero-cell control carries biological material type '{}'",
+                            row[j]
+                        ),
+                    });
+                }
+            }
+            if let Some(&j) = index.get(SC_CELL_IDENTIFIER) {
+                let value = row[j].trim();
+                if concrete_semantic_value(value) && !value.eq_ignore_ascii_case("empty") {
+                    issues.push(ValidationIssue {
+                        level: "error".into(),
+                        code: "empty_control_has_concrete_biological_identity".into(),
+                        row: ri + 1,
+                        column: SC_CELL_IDENTIFIER.into(),
+                        message: format!(
+                            "empty/zero-cell control carries concrete cell identifier '{value}'"
+                        ),
+                    });
+                }
+            }
+        }
+
+        // Row-local technique compatibility. A concrete LCM microscope model is meaningful only
+        // for an LCM-isolated row; Q Exactive-family instruments use an HCD cell rather than the
+        // generic ion-trap CID term MS:1000133.
+        if let Some(&model_idx) = index.get("comment[lcm microscope model]") {
+            let model = row[model_idx].trim();
+            if concrete_semantic_value(model) {
+                let isolation = index
+                    .get(SC_ISOLATION_METHOD)
+                    .and_then(|&j| row.get(j))
+                    .map(|v| v.trim().to_ascii_lowercase())
+                    .unwrap_or_default();
+                if !isolation.contains("laser capture") && isolation != "lcm" {
+                    issues.push(ValidationIssue {
+                        level: "error".into(),
+                        code: "lcm_microscope_model_without_lcm_isolation".into(),
+                        row: ri + 1,
+                        column: "comment[lcm microscope model]".into(),
+                        message: format!(
+                            "LCM microscope model '{model}' is attached to non-LCM isolation protocol '{isolation}'"
+                        ),
+                    });
+                }
+            }
+        }
+        if let (Some(&instrument_idx), Some(&dissociation_idx)) = (
+            index.get("comment[instrument]"),
+            index.get("comment[dissociation method]"),
+        ) {
+            let instrument = row[instrument_idx].trim().to_ascii_lowercase();
+            let dissociation = row[dissociation_idx].trim().to_ascii_lowercase();
+            if instrument.contains("q exactive")
+                && (dissociation == "cid" || dissociation.contains("ms:1000133"))
+            {
+                issues.push(ValidationIssue {
+                    level: "error".into(),
+                    code: "q_exactive_row_uses_generic_cid_instead_of_hcd".into(),
+                    row: ri + 1,
+                    column: "comment[dissociation method]".into(),
+                    message: format!(
+                        "Q Exactive-family row uses generic CID metadata '{}'; require source-backed HCD or fail closed", row[dissociation_idx]
+                    ),
+                });
             }
         }
 
@@ -8322,6 +8429,99 @@ mod tests {
         assert!(issues
             .iter()
             .any(|x| x.code == "data_file_name_acquisition_contradiction"));
+    }
+
+    #[test]
+    fn scientific_guard_rejects_empty_control_leakage_wwa_dia_lcm_scope_and_qe_cid() {
+        let headers = vec![
+            "source name".into(),
+            "characteristics[organism]".into(),
+            "characteristics[organism part]".into(),
+            "characteristics[disease]".into(),
+            "characteristics[developmental stage]".into(),
+            "characteristics[sex]".into(),
+            "characteristics[cell line]".into(),
+            "characteristics[cellosaurus accession]".into(),
+            "characteristics[material type]".into(),
+            SC_SAMPLE_TYPE.into(),
+            SC_CELLS_PER_WELL.into(),
+            SC_CELL_IDENTIFIER.into(),
+            SC_ISOLATION_METHOD.into(),
+            SC_INDIVIDUAL.into(),
+            SC_PREP_BATCH.into(),
+            "assay name".into(),
+            "technology type".into(),
+            "comment[proteomics data acquisition method]".into(),
+            "comment[label]".into(),
+            "comment[instrument]".into(),
+            "comment[dissociation method]".into(),
+            "comment[lcm microscope model]".into(),
+            "comment[cleavage agent details]".into(),
+            "comment[fraction identifier]".into(),
+            "comment[technical replicate]".into(),
+            "comment[data file]".into(),
+            SC_CARRIER_CHANNEL.into(),
+            SC_REFERENCE_CHANNEL.into(),
+        ];
+        let rows = vec![vec![
+            "blank".into(),
+            "Homo sapiens".into(),
+            "brain".into(),
+            "glioblastoma".into(),
+            "adult".into(),
+            "male".into(),
+            "HeLa".into(),
+            "CVCL_0001".into(),
+            "cell line".into(),
+            "empty".into(),
+            "0".into(),
+            "blank_1".into(),
+            "manual aspiration".into(),
+            "not applicable".into(),
+            "not available".into(),
+            "assay1".into(),
+            "proteomic profiling by mass spectrometry".into(),
+            "NT=Data-independent acquisition;AC=PRIDE:0000450".into(),
+            "label free sample".into(),
+            "NT=Q Exactive Plus;AC=MS:1002634".into(),
+            "NT=CID;AC=MS:1000133".into(),
+            "Zeiss PALM MicroBeam".into(),
+            "NT=Trypsin;AC=MS:1001251".into(),
+            "1".into(),
+            "1".into(),
+            "run_WWA4.raw".into(),
+            "not applicable".into(),
+            "not applicable".into(),
+        ]];
+        let evidence = DatasetEvidence {
+            accession: "PXD999999".into(),
+            project_json_path: String::new(),
+            files_json_path: String::new(),
+            existing_sdrf_path: String::new(),
+            raw_files: vec![RawFile {
+                file_name: "run_WWA4.raw".into(),
+                file_uri: String::new(),
+                category: "RAW".into(),
+            }],
+            study_design: StudyDesignScaffold::default(),
+            metadata_scaffold: DeterministicMetadataScaffold::default(),
+            evidence: vec![],
+            manuscript_sources: vec![],
+            annotation_sources: vec![],
+        };
+        let issues = validate_draft(&headers, &rows, &evidence);
+        assert!(issues
+            .iter()
+            .any(|x| x.code == "empty_control_has_concrete_biological_identity"));
+        assert!(issues
+            .iter()
+            .any(|x| x.code == "data_file_name_acquisition_contradiction"));
+        assert!(issues
+            .iter()
+            .any(|x| x.code == "lcm_microscope_model_without_lcm_isolation"));
+        assert!(issues
+            .iter()
+            .any(|x| x.code == "q_exactive_row_uses_generic_cid_instead_of_hcd"));
     }
 
     #[test]
