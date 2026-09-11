@@ -61,7 +61,7 @@ REQUIRED_CONCRETE_RULES: dict[str, dict[str, Any]] = {
 }
 
 ORGANISM_TEMPLATE_NAMES = {"human", "vertebrates", "invertebrates", "plants"}
-ROW_DERIVED_TEMPLATE_NAMES = ORGANISM_TEMPLATE_NAMES | {"dia-acquisition"}
+ROW_DERIVED_TEMPLATE_NAMES = ORGANISM_TEMPLATE_NAMES | {"dia-acquisition", "cell-lines"}
 
 PRIDE_SCP_ANNOTATION_TOOL = "pride-scp-sdrf"
 PRIDE_SCP_ANNOTATION_TOOL_RE = re.compile(
@@ -694,6 +694,18 @@ def derive_templates(headers: list[str], rows: list[list[str]], explicit: list[s
         names.add("human")
     elif "human" not in explicit_names:
         names.discard("human")
+
+    # `cell-lines` is also a whole-file sample-layer contract: the template requires an actual
+    # characteristics[cell line] value for every row. Mixed experimental designs can legitimately
+    # contain cell-line samples alongside zero-cell blanks/controls where cell line is `not applicable`.
+    # Do not inherit a stale file-level cell-lines declaration into such files. This exact failure mode
+    # is documented upstream (sdrf-pipelines issue #312). An explicit CLI template remains an operator
+    # override and is therefore preserved.
+    cell_line_values = row_values_all(headers, rows, "characteristics[cell line]")
+    if cell_line_values and all(not placeholder(value) for value in cell_line_values):
+        names.add("cell-lines")
+    elif "cell-lines" not in explicit_names:
+        names.discard("cell-lines")
 
     # Parent templates are validated separately because sdrf-pipelines 0.1.6 has a known repeated
     # --template pitfall; one subprocess per template is unambiguous.
@@ -1511,6 +1523,29 @@ def self_test() -> None:
         duplicate_templates = derive_templates(duplicate_organism_headers, duplicate_organism_rows, [])
         assert "human" not in duplicate_templates
         assert "dia-acquisition" in duplicate_templates
+
+        # `cell-lines` is a whole-file contract. A mixed cell-line + zero-cell-control SDRF must not
+        # inherit stale cell-lines metadata because the template requires actual cell-line values on
+        # every row. Conversely, a file whose every row has a concrete cell line should select it.
+        mixed_cell_line_headers = [
+            "source name", "characteristics[cell line]", "assay name", "technology type",
+            "comment[proteomics data acquisition method]", "comment[sdrf template]",
+        ]
+        mixed_cell_line_rows = [
+            ["cell", "U-87 MG", "cell", "proteomic profiling by mass spectrometry",
+             "Data-dependent acquisition", "cell-lines v1.1.0"],
+            ["blank", "not applicable", "blank", "proteomic profiling by mass spectrometry",
+             "Data-dependent acquisition", "cell-lines v1.1.0"],
+        ]
+        assert "cell-lines" not in derive_templates(mixed_cell_line_headers, mixed_cell_line_rows, [])
+        assert "cell-lines" in derive_templates(mixed_cell_line_headers, mixed_cell_line_rows, ["cell-lines"])
+        all_cell_line_rows = [
+            ["a", "U-87 MG", "a", "proteomic profiling by mass spectrometry",
+             "Data-dependent acquisition", ""],
+            ["b", "HeLa", "b", "proteomic profiling by mass spectrometry",
+             "Data-dependent acquisition", ""],
+        ]
+        assert "cell-lines" in derive_templates(mixed_cell_line_headers, all_cell_line_rows, [])
 
         # A mixed DDA/DIA file must not receive a whole-file DIA leaf template merely because one
         # row or stale template declaration mentions DIA.
