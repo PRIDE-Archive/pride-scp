@@ -5009,6 +5009,75 @@ fn row_explicit_non_single_cell_role(index: &HashMap<&str, usize>, row: &[String
         .unwrap_or(false)
 }
 
+fn normalized_semantic_token(value: &str) -> String {
+    value
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .flat_map(|c| c.to_lowercase())
+        .collect()
+}
+
+fn concrete_semantic_value(value: &str) -> bool {
+    let low = value.trim().to_ascii_lowercase();
+    !low.is_empty()
+        && !matches!(
+            low.as_str(),
+            "not available" | "not applicable" | "unknown" | "pooled" | "anonymized"
+        )
+}
+
+fn individual_looks_synthesized_from_cell_line(individual: &str, cell_line: &str) -> bool {
+    if !concrete_semantic_value(individual) || !concrete_semantic_value(cell_line) {
+        return false;
+    }
+    let mut ind = normalized_semantic_token(individual);
+    let cell = normalized_semantic_token(cell_line);
+    if !ind.ends_with("donor") {
+        return false;
+    }
+    ind.truncate(ind.len().saturating_sub("donor".len()));
+    ind.len() >= 3 && (cell.starts_with(&ind) || ind.starts_with(&cell))
+}
+
+fn filename_acquisition_conflict(data_file: &str, acquisition: &str) -> Option<&'static str> {
+    let file = data_file.to_ascii_lowercase();
+    let acq = acquisition.to_ascii_lowercase();
+    let explicit_dda = Regex::new(r"(?:^|[-_.])dda(?:top[0-9]+)?(?:[-_.]|$)")
+        .expect("static DDA regex")
+        .is_match(&file);
+    let explicit_dia = Regex::new(r"(?:^|[-_.])dia(?:[-_.]|$)")
+        .expect("static DIA regex")
+        .is_match(&file);
+    let metadata_dia = acq.contains("data-independent")
+        || acq.contains("data independent")
+        || (acq.contains("dia") && !acq.contains("dda"));
+    let metadata_dda =
+        acq.contains("data-dependent") || acq.contains("data dependent") || acq.contains("dda");
+    if explicit_dda && metadata_dia {
+        Some("filename_explicit_dda_but_metadata_dia")
+    } else if explicit_dia && metadata_dda && !metadata_dia {
+        Some("filename_explicit_dia_but_metadata_dda")
+    } else {
+        None
+    }
+}
+
+fn evidence_project_values(evidence: &DatasetEvidence, collection: &str) -> BTreeSet<String> {
+    evidence
+        .evidence
+        .iter()
+        .filter(|item| {
+            item.source_kind == "pride_project"
+                && item
+                    .source_label
+                    .contains(&format!("project:{collection}["))
+                && item.source_label.ends_with(".name")
+        })
+        .map(|item| item.text.trim().to_string())
+        .filter(|value| concrete_semantic_value(value))
+        .collect()
+}
+
 fn validate_draft_with_policy(
     headers: &[String],
     rows: &[Vec<String>],
@@ -5144,6 +5213,163 @@ fn validate_draft_with_policy(
                 issues.push(ValidationIssue { level: "warning".into(), code: "sample_type_requires_cv_validation".into(), row: ri + 1, column: SC_SAMPLE_TYPE.into(), message: format!("sample type is not in the local common-value set; defer ontology/CV validation to sdrf-pipelines: {}", row[j]) });
             }
         }
+        // Cross-field scientific semantics: an individual/donor is not an organism part,
+        // cell type, or cell line. Downgrading these errors must happen in curation, never by
+        // silently accepting a schema-valid but scientifically contradictory draft.
+        if let Some(&individual_idx) = index.get(SC_INDIVIDUAL) {
+            let individual = row[individual_idx].trim();
+            if concrete_semantic_value(individual) {
+                for other_header in [
+                    "characteristics[organism part]",
+                    "characteristics[cell line]",
+                    "characteristics[cell type]",
+                    "characteristics[developmental stage]",
+                ] {
+                    if let Some(&other_idx) = index.get(other_header) {
+                        let other = row[other_idx].trim();
+                        if concrete_semantic_value(other) && individual.eq_ignore_ascii_case(other)
+                        {
+                            issues.push(ValidationIssue {
+                                level: "error".into(),
+                                code: "individual_duplicates_nonindividual_semantic_field".into(),
+                                row: ri + 1,
+                                column: SC_INDIVIDUAL.into(),
+                                message: format!(
+                                    "individual/donor value '{individual}' duplicates {other_header}; source-specific donor identity is unresolved"
+                                ),
+                            });
+                            break;
+                        }
+                    }
+                }
+                if let Some(&cell_idx) = index.get("characteristics[cell line]") {
+                    let cell_line = row[cell_idx].trim();
+                    if individual_looks_synthesized_from_cell_line(individual, cell_line) {
+                        issues.push(ValidationIssue {
+                            level: "error".into(),
+                            code: "individual_looks_synthesized_from_cell_line".into(),
+                            row: ri + 1,
+                            column: SC_INDIVIDUAL.into(),
+                            message: format!(
+                                "individual/donor value '{individual}' appears synthesized from cell line '{cell_line}' rather than source evidence"
+                            ),
+                        });
+                    }
+                }
+            }
+        }
+
+        // Empty/zero-cell controls must not inherit concrete biological cell identities from
+        // neighboring study rows.
+        let sample_type = index
+            .get(SC_SAMPLE_TYPE)
+            .and_then(|&j| row.get(j))
+            .map(|v| v.trim().to_ascii_lowercase())
+            .unwrap_or_default();
+        let cells_per_well = index
+            .get(SC_CELLS_PER_WELL)
+            .and_then(|&j| row.get(j))
+            .map(|v| v.trim().to_ascii_lowercase())
+            .unwrap_or_default();
+        let source_name = index
+            .get("source name")
+            .and_then(|&j| row.get(j))
+            .map(|v| v.trim().to_ascii_lowercase())
+            .unwrap_or_default();
+        let empty_control = matches!(sample_type.as_str(), "empty" | "blank" | "negative control")
+            || cells_per_well == "0"
+            || source_name.contains("blank");
+        if empty_control {
+            for header in [
+                SC_INDIVIDUAL,
+                "characteristics[cell type]",
+                "characteristics[cell line]",
+            ] {
+                if let Some(&j) = index.get(header) {
+                    let value = row[j].trim();
+                    if concrete_semantic_value(value) {
+                        issues.push(ValidationIssue {
+                            level: "error".into(),
+                            code: "empty_control_has_concrete_biological_identity".into(),
+                            row: ri + 1,
+                            column: header.into(),
+                            message: format!(
+                                "empty/zero-cell control carries concrete biological identity '{value}'"
+                            ),
+                        });
+                    }
+                }
+            }
+        }
+
+        // Single-cell recommended metadata must use explicit reserved words rather than blank
+        // strings when the value is unavailable/inapplicable.
+        for header in [SC_PREP_BATCH, SC_CARRIER_CHANNEL, SC_REFERENCE_CHANNEL] {
+            if let Some(&j) = index.get(header) {
+                if row[j].trim().is_empty() {
+                    issues.push(ValidationIssue {
+                        level: "error".into(),
+                        code: "single_cell_recommended_value_blank".into(),
+                        row: ri + 1,
+                        column: header.into(),
+                        message: "single-cell metadata value is blank; use a source-backed value or SDRF reserved word".into(),
+                    });
+                }
+            }
+        }
+
+        if let (Some(&file_idx), Some(&acq_idx)) = (
+            index.get("comment[data file]"),
+            index.get("comment[proteomics data acquisition method]"),
+        ) {
+            if let Some(reason) = filename_acquisition_conflict(&row[file_idx], &row[acq_idx]) {
+                issues.push(ValidationIssue {
+                    level: "error".into(),
+                    code: "data_file_name_acquisition_contradiction".into(),
+                    row: ri + 1,
+                    column: "comment[proteomics data acquisition method]".into(),
+                    message: format!(
+                        "explicit acquisition token in data file '{}' contradicts metadata '{}': {reason}",
+                        row[file_idx], row[acq_idx]
+                    ),
+                });
+            }
+        }
+
+        // Narrow model/version slots are identifiers, not containers for clipped methods prose.
+        for header in [
+            "comment[nanopots chip version]",
+            "comment[microfluidics chip type]",
+            "comment[lcm microscope model]",
+        ] {
+            if let Some(&j) = index.get(header) {
+                let value = row[j].trim();
+                let low = value.to_ascii_lowercase();
+                let prose_hint = low.contains("figure")
+                    || low.contains("prepared")
+                    || low.contains("described")
+                    || (low.contains('[') && (low.contains(" and ") || low.contains(" then ")));
+                let last_is_single_char = value
+                    .split_whitespace()
+                    .last()
+                    .map_or(false, |x| x.len() == 1);
+                if concrete_semantic_value(value)
+                    && prose_hint
+                    && (value.len() > 35 || last_is_single_char)
+                {
+                    issues.push(ValidationIssue {
+                        level: "error".into(),
+                        code: "narrow_metadata_field_contains_truncated_protocol_prose".into(),
+                        row: ri + 1,
+                        column: header.into(),
+                        message: format!(
+                            "narrow metadata field contains prose/truncation rather than a model/version identifier: {value}"
+                        ),
+                    });
+                }
+            }
+        }
+
         if let Some(&j) = index.get("comment[data file]") {
             let v = row[j].trim();
             let aliases = normalized_data_file_aliases(v);
@@ -5183,6 +5409,51 @@ fn validate_draft_with_policy(
                         row: ri + 1,
                         column: column.into(),
                         message: format!("{column} must be an integer in the core MS profile: {v}"),
+                    });
+                }
+            }
+        }
+    }
+
+    // A full-repository draft must not collapse a project with multiple explicit organisms or
+    // organism parts into one uniform candidate value. This is a contradiction detector only;
+    // it never assigns row-level biology.
+    for (collection, header, code) in [
+        (
+            "organisms",
+            "characteristics[organism]",
+            "multiorganism_project_collapsed_to_single_candidate_organism",
+        ),
+        (
+            "organismParts",
+            "characteristics[organism part]",
+            "multi_organism_part_project_collapsed_to_single_candidate_part",
+        ),
+    ] {
+        let project_values = evidence_project_values(evidence, collection);
+        if project_values.len() > 1 {
+            if let Some(&j) = index.get(header) {
+                let candidate_values = rows
+                    .iter()
+                    .filter_map(|row| row.get(j))
+                    .map(|v| v.trim().to_string())
+                    .filter(|v| concrete_semantic_value(v))
+                    .collect::<BTreeSet<_>>();
+                if candidate_values.len() == 1 {
+                    let level = if collection == "organismParts" {
+                        "warning"
+                    } else {
+                        "error"
+                    };
+                    issues.push(ValidationIssue {
+                        level: level.into(),
+                        code: code.into(),
+                        row: 0,
+                        column: header.into(),
+                        message: format!(
+                            "PRIDE project exposes multiple source values {:?}, but draft collapses them to {:?}; row-level source mapping may be unresolved. organismParts is diagnostic-only because repository metadata can contain cell-line/cell-type concepts",
+                            project_values, candidate_values
+                        ),
                     });
                 }
             }
@@ -7924,5 +8195,153 @@ mod tests {
         assert_eq!(rows[2][idx(SC_ISOLATION_METHOD)], "not applicable");
         assert_eq!(rows[3][idx(SC_SAMPLE_TYPE)], "bulk control");
         assert_eq!(rows[3][idx(SC_ISOLATION_METHOD)], "not applicable");
+    }
+
+    #[test]
+    fn scientific_guard_rejects_cross_field_individual_and_acquisition_contradiction() {
+        let headers = vec![
+            "source name".into(),
+            "characteristics[organism]".into(),
+            "characteristics[organism part]".into(),
+            "characteristics[cell type]".into(),
+            "characteristics[cell line]".into(),
+            SC_SAMPLE_TYPE.into(),
+            SC_ISOLATION_METHOD.into(),
+            SC_CELL_IDENTIFIER.into(),
+            SC_INDIVIDUAL.into(),
+            SC_PREP_BATCH.into(),
+            SC_CELLS_PER_WELL.into(),
+            "assay name".into(),
+            "technology type".into(),
+            "comment[proteomics data acquisition method]".into(),
+            "comment[label]".into(),
+            "comment[instrument]".into(),
+            "comment[cleavage agent details]".into(),
+            "comment[fraction identifier]".into(),
+            "comment[technical replicate]".into(),
+            "comment[data file]".into(),
+            SC_CARRIER_CHANNEL.into(),
+            SC_REFERENCE_CHANNEL.into(),
+        ];
+        let rows = vec![vec![
+            "cell1".into(),
+            "Homo sapiens".into(),
+            "Embryo".into(),
+            "early embryonic cell".into(),
+            "HeLa".into(),
+            "single cell".into(),
+            "manual picking".into(),
+            "cell1".into(),
+            "Embryo".into(),
+            "not available".into(),
+            "1".into(),
+            "assay1".into(),
+            "proteomic profiling by mass spectrometry".into(),
+            "NT=Data-independent acquisition;AC=PRIDE:0000450".into(),
+            "label free sample".into(),
+            "Orbitrap".into(),
+            "NT=Trypsin;AC=MS:1001251".into(),
+            "1".into(),
+            "1".into(),
+            "run_DDAtop20.raw".into(),
+            "not applicable".into(),
+            "not applicable".into(),
+        ]];
+        let evidence = DatasetEvidence {
+            accession: "PXD999999".into(),
+            project_json_path: String::new(),
+            files_json_path: String::new(),
+            existing_sdrf_path: String::new(),
+            raw_files: vec![RawFile {
+                file_name: "run_DDAtop20.raw".into(),
+                file_uri: String::new(),
+                category: "RAW".into(),
+            }],
+            study_design: StudyDesignScaffold::default(),
+            metadata_scaffold: DeterministicMetadataScaffold::default(),
+            evidence: vec![],
+            manuscript_sources: vec![],
+            annotation_sources: vec![],
+        };
+        let issues = validate_draft(&headers, &rows, &evidence);
+        assert!(issues
+            .iter()
+            .any(|x| x.code == "individual_duplicates_nonindividual_semantic_field"));
+        assert!(issues
+            .iter()
+            .any(|x| x.code == "data_file_name_acquisition_contradiction"));
+    }
+
+    #[test]
+    fn scientific_guard_rejects_multiorganism_project_collapse() {
+        let headers = vec![
+            "source name".into(),
+            "characteristics[organism]".into(),
+            "assay name".into(),
+            "technology type".into(),
+            "comment[proteomics data acquisition method]".into(),
+            "comment[label]".into(),
+            "comment[instrument]".into(),
+            "comment[cleavage agent details]".into(),
+            "comment[fraction identifier]".into(),
+            "comment[technical replicate]".into(),
+            "comment[data file]".into(),
+            SC_ISOLATION_METHOD.into(),
+            SC_CELL_IDENTIFIER.into(),
+            SC_PREP_BATCH.into(),
+            SC_CARRIER_CHANNEL.into(),
+            SC_REFERENCE_CHANNEL.into(),
+        ];
+        let rows = vec![vec![
+            "cell1".into(),
+            "Homo sapiens".into(),
+            "assay1".into(),
+            "proteomic profiling by mass spectrometry".into(),
+            "Data-dependent acquisition".into(),
+            "label free sample".into(),
+            "Orbitrap".into(),
+            "NT=Trypsin;AC=MS:1001251".into(),
+            "1".into(),
+            "1".into(),
+            "cell1.raw".into(),
+            "manual picking".into(),
+            "cell1".into(),
+            "not available".into(),
+            "not applicable".into(),
+            "not applicable".into(),
+        ]];
+        let evidence = DatasetEvidence {
+            accession: "PXD999999".into(),
+            project_json_path: String::new(),
+            files_json_path: String::new(),
+            existing_sdrf_path: String::new(),
+            raw_files: vec![RawFile {
+                file_name: "cell1.raw".into(),
+                file_uri: String::new(),
+                category: "RAW".into(),
+            }],
+            study_design: StudyDesignScaffold::default(),
+            metadata_scaffold: DeterministicMetadataScaffold::default(),
+            evidence: vec![
+                EvidenceItem {
+                    id: "E0001".into(),
+                    source_kind: "pride_project".into(),
+                    source_label: "project:organisms[0].name".into(),
+                    text: "Homo sapiens".into(),
+                },
+                EvidenceItem {
+                    id: "E0002".into(),
+                    source_kind: "pride_project".into(),
+                    source_label: "project:organisms[1].name".into(),
+                    text: "Xenopus laevis".into(),
+                },
+            ],
+            manuscript_sources: vec![],
+            annotation_sources: vec![],
+        };
+        let issues = validate_draft(&headers, &rows, &evidence);
+        assert!(issues
+            .iter()
+            .any(|x| x.code == "multiorganism_project_collapsed_to_single_candidate_organism"));
     }
 }

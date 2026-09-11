@@ -31,6 +31,9 @@ from dataclasses import dataclass, field, asdict
 from pathlib import Path
 from typing import Any, Iterable
 
+from sdrf_scientific_guard import VERSION as SCIENTIFIC_GUARD_VERSION
+from sdrf_scientific_guard import analyze as analyze_scientific_guard
+
 VERSION = "pride-scp-sdrf-readiness-v0.2"
 POLICY_VERSION = "pride-scp-bigbio-readiness-v0.5.14.3"
 SDRF_PIPELINES_PIN = "0.1.6"
@@ -908,6 +911,32 @@ def normalize_bigbio_projection(
                 _add_uniform_column(headers, rows, header, "not available")
                 info.actions.append(f"added_allowed_not_available:{header}")
 
+    # Single-cell recommended metadata must not remain as blank strings when the semantic state is
+    # already explicit.  These are reserved-word/schema normalizations only; no biological value is
+    # invented. For label-free rows, carrier/reference channels are inapplicable by definition.
+    if "single-cell" in templates:
+        batch_changes = 0
+        for idx in column_indices(headers, "comment[sample preparation batch]"):
+            for row in rows:
+                if not norm_value(row[idx]):
+                    row[idx] = "not available"
+                    batch_changes += 1
+        if batch_changes:
+            info.actions.append(f"filled_blank_sample_preparation_batch_not_available:{batch_changes}_cells")
+
+        labels = [norm_value(v).lower() for v in row_values(headers, rows, "comment[label]")]
+        label_free = bool(labels) and all(("label free" in v or "label-free" in v) for v in labels if v)
+        if label_free:
+            for header in ("comment[carrier channel]", "comment[reference channel]"):
+                changes = 0
+                for idx in column_indices(headers, header):
+                    for row in rows:
+                        if not norm_value(row[idx]):
+                            row[idx] = "not applicable"
+                            changes += 1
+                if changes:
+                    info.actions.append(f"filled_blank_label_free_{header}_not_applicable:{changes}_cells")
+
     # Re-run canonical column grouping after metadata/template additions.
     indexed = list(enumerate(headers))
     indexed.sort(key=lambda pair: (_column_group(pair[1]), pair[0]))
@@ -1068,9 +1097,12 @@ def blocker_state(blockers: list[str]) -> str:
         return "blocked_bigbio_template"
     if "bigbio_required_value_unresolved" in text or "bigbio_required_column_missing" in text:
         return "blocked_metadata_incomplete"
-    if "mapping" in text or "data_file" in text or "repository_scope" in text:
+    if ("mapping" in text or "data_file" in text or "repository_scope" in text
+            or "multiorganism" in text or "acquisition" in text):
         return "blocked_mapping_incomplete"
-    if "metadata" in text or "isolation" in text or "placeholder" in text:
+    if ("metadata" in text or "isolation" in text or "placeholder" in text
+            or "individual_" in text or "empty_control" in text or "truncated_protocol" in text
+            or "organism_part_project" in text):
         return "blocked_metadata_incomplete"
     if "branch" in text or "relation" in text:
         return "blocked_branch_conflict"
@@ -1104,6 +1136,10 @@ def evaluate_accession(args: argparse.Namespace, accession: str, reviews: dict[s
     blockers, warnings, missing, placeholders, data_files, unmatched = internal_candidate_checks(
         info, candidate_path, headers, rows, Path(args.snapshot), accession
     )
+    project_json = Path(args.snapshot) / "projects" / f"{accession}.json"
+    scientific_guard = analyze_scientific_guard(candidate_path, project_json if project_json.is_file() else None)
+    blockers.extend(f"scientific_guard:{x}" for x in scientific_guard.blockers)
+    warnings.extend(f"scientific_guard:{x}" for x in scientific_guard.warnings)
     templates = derive_templates(headers, rows, args.template)
     result = ReadinessResult(
         accession=accession,
@@ -1137,6 +1173,17 @@ def evaluate_accession(args: argparse.Namespace, accession: str, reviews: dict[s
     result.warnings.extend(x for x in normalization.warnings if x not in result.warnings)
     if normalization.blockers:
         result.blockers.extend(x for x in normalization.blockers if x not in result.blockers)
+        result.state = blocker_state(result.blockers)
+        return result
+
+    normalized_guard = analyze_scientific_guard(normalized, project_json if project_json.is_file() else None)
+    if normalized_guard.blockers:
+        result.blockers.extend(
+            x for x in (f"scientific_guard:{b}" for b in normalized_guard.blockers) if x not in result.blockers
+        )
+        result.warnings.extend(
+            x for x in (f"scientific_guard:{w}" for w in normalized_guard.warnings) if x not in result.warnings
+        )
         result.state = blocker_state(result.blockers)
         return result
 
@@ -1277,6 +1324,7 @@ def write_outputs(args: argparse.Namespace, results: list[ReadinessResult]) -> d
     summary = {
         "readiness_version": VERSION,
         "policy_version": POLICY_VERSION,
+        "scientific_guard_version": SCIENTIFIC_GUARD_VERSION,
         "accessions": len(results),
         "state_counts": dict(sorted(states.items())),
         "ready_for_projection": sum(r.ready_for_projection for r in results),
@@ -1311,6 +1359,8 @@ def write_outputs(args: argparse.Namespace, results: list[ReadinessResult]) -> d
             "specification_is_normative_over_known_validator_template_drift": True,
             "validator_drift_override_requires_exact_known_signature_and_local_spec_contract": True,
             "submission_ready_requires_hash_bound_review": True,
+            "scientific_guard_runs_before_external_validation": True,
+            "blank_single_cell_reserved_words_normalized_without_scientific_inference": True,
             "gt_runtime_truth_used": False,
         },
         "outputs": {
