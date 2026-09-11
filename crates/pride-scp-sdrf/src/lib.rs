@@ -4761,7 +4761,7 @@ fn load_explicit_row_mappings(
         let sample_type = row.sample_type.trim().to_ascii_lowercase();
         let single_cell_row = sample_type == "single cell";
         let non_single_study_row = sample_type == "not available";
-        if sample_type == "not available" {
+        if sample_type == "study sample" {
             bail!(
                 "explicit row mapping {} RAW {} uses sample_type=study sample, which is advertised by the SDRF glossary but is not currently validator-backed under PRIDE:0000895; use a source-backed role or not available",
                 accession,
@@ -6734,6 +6734,44 @@ mod tests {
         assert_eq!(rows[2][at(SC_ISOLATION_METHOD)], "manual picking");
         let issues = validate_draft(&headers, &rows, &evidence);
         assert!(issues.iter().all(|x| x.level != "error"), "{issues:?}");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn explicit_manifest_rejects_unbacked_study_sample_but_accepts_not_available() {
+        let raw_files = vec![RawFile {
+            file_name: "example.RAW".into(),
+            file_uri: "ftp://example/example.RAW".into(),
+            category: "RAW".into(),
+        }];
+        let root = tmp();
+        fs::create_dir_all(&root).unwrap();
+        let manifest = root.join("mapping.tsv");
+        let header = "accession\traw_file\tsource_name\tcell_identifier\tbiological_replicate\ttechnical_replicate\tsample_type\tcells_per_well\tlabel\tcarrier_channel\treference_channel\tdesign_source\tdesign_ref\tmapping_key\tmapping_confidence\n";
+
+        fs::write(
+            &manifest,
+            format!(
+                "{header}PXD000001\texample.RAW\tcontrol\tnot applicable\tnot applicable\t1\tnot available\tnot applicable\tnot available\tnot applicable\tnot applicable\tdesign.tsv\trow1\texact_raw_name\thigh\n"
+            ),
+        )
+        .unwrap();
+        let accepted = load_explicit_row_mappings(&manifest, "PXD000001", &raw_files).unwrap();
+        assert_eq!(accepted.len(), 1);
+        assert_eq!(accepted[0].sample_type, "not available");
+
+        fs::write(
+            &manifest,
+            format!(
+                "{header}PXD000001\texample.RAW\tcontrol\tnot applicable\tnot applicable\t1\tstudy sample\tnot applicable\tnot available\tnot applicable\tnot applicable\tdesign.tsv\trow1\texact_raw_name\thigh\n"
+            ),
+        )
+        .unwrap();
+        let err = load_explicit_row_mappings(&manifest, "PXD000001", &raw_files)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("sample_type=study sample"), "{err}");
+        assert!(err.contains("not currently validator-backed"), "{err}");
         let _ = fs::remove_dir_all(root);
     }
 
