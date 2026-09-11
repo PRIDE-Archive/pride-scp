@@ -1,4 +1,4 @@
-# PRIDE-SCP BigBio 1.1 compatibility projection (v0.5.14.2)
+# PRIDE-SCP BigBio 1.1 compatibility projection (v0.5.14.3)
 
 This stage converts an already source-closed PRIDE-SCP SDRF candidate into a separate BigBio-1.1
 compatibility derivative. The source candidate is immutable and remains the scientific provenance
@@ -78,4 +78,71 @@ therefore does not receive the DIA leaf template merely because one row or stale
 declaration mentions DIA.
 
 Scientific blockers remain unchanged and are never synthesized.
+
+## v0.5.14.3 specification-first contract and validator-drift handling
+
+The authoritative contract for this stage is the published SDRF-Proteomics v1.1.0 specification:
+
+- https://sdrf.quantms.org/specification.html
+- https://sdrf.quantms.org/specification.html#_single_cell
+- DIA template definition: section 14.11
+- single-cell template definition: section 14.12
+
+The readiness gate now encodes the stable representation rules that caused repeated integration
+failures instead of learning them accession by accession:
+
+1. `comment[sdrf version]` is `v1.1.0`.
+2. file-level metadata uses lowercase SDRF column names and canonical lowercase reserved words.
+3. `comment[sdrf annotation tool]` uses `name vX.Y.Z` (or another format explicitly allowed by the
+   specification), not an internal generator token.
+4. `comment[sdrf template]` declares selected **leaf templates only**; inherited parent templates are
+   implied by the specification. Parent and leaf validators are still run as separate subprocesses.
+5. single-cell projections require `characteristics[single cell isolation protocol]` and
+   `characteristics[cell identifier]`; missing scientific values remain blockers and are never filled.
+6. acquisition-method values preserve the specification's preferred ontology encoding. In particular,
+   DIA is `NT=Data-independent acquisition;AC=PRIDE:0000450`; valid NT/AC values are not degraded to
+   free text just to appease a validator implementation.
+7. exact known HCD legacy encodings are canonicalized to the specification-allowed short label `HCD`;
+   no fragmentation method is inferred. Current SDRF 1.1 documentation identifies MS:1000422 as the
+   canonical HCD concept and explicitly allows the short label.
+
+### sdrf-pipelines 0.1.6 DIA template drift
+
+The project pins `sdrf-pipelines[ontology]==0.1.6`, currently the latest PyPI release available to the
+portable container. Its vendored `dia-acquisition/1.1.0` template is known to have drifted from the
+upstream SDRF 1.1 template while retaining the same version label:
+
+https://github.com/bigbio/sdrf-pipelines/issues/345
+
+That bug rejects the specification-recommended value:
+
+```text
+NT=Data-independent acquisition;AC=PRIDE:0000450
+```
+
+even though both the current specification and upstream DIA 1.1 template list it as valid.
+
+PRIDE_SCP therefore does **not** rewrite the correct SDRF to a bare value as a validator workaround.
+Instead, for sdrf-pipelines 0.1.5/0.1.6 only, a failing DIA-template subprocess is treated as the known
+validator drift **only when all of the following hold**:
+
+- the failure contains exactly the documented stale-template error and no other validator error;
+- the file independently satisfies the local SDRF 1.1 DIA value/cardinality contract;
+- the structural and other template validators remain independently enforced.
+
+The readiness JSON records `compatibility_override=true` and a reason containing issue 345. Any other
+DIA failure remains blocking. This makes the exception narrow, explicit, auditable, and removable once
+a released sdrf-pipelines version resynchronizes its bundled template.
+
+### Regression policy
+
+Every compatibility rule above has a self-test. A future change must fail tests if it would reintroduce:
+
+- legacy PRIDE_SCP annotation-tool strings;
+- the obsolete PRIDE:0000628 DIA accession;
+- parent+child template declarations where the parent is inherited;
+- non-lowercase SDRF reserved words;
+- known noncanonical HCD encodings;
+- rewriting the spec-valid DIA NT/AC value solely because of validator issue 345; or
+- broad validator waivers that are not tied to an exact known upstream defect.
 

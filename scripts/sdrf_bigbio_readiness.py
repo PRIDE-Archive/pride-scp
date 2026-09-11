@@ -32,8 +32,15 @@ from pathlib import Path
 from typing import Any, Iterable
 
 VERSION = "pride-scp-sdrf-readiness-v0.2"
-POLICY_VERSION = "pride-scp-bigbio-readiness-v0.5.14.2"
+POLICY_VERSION = "pride-scp-bigbio-readiness-v0.5.14.3"
 SDRF_PIPELINES_PIN = "0.1.6"
+
+# Authoritative SDRF-Proteomics contract used by this gate.  The web specification is treated as
+# normative; the pinned validator is an implementation of that contract, not a source of scientific
+# truth.  Known implementation/template drift is handled explicitly and auditably below.
+SDRF_SPEC_URL = "https://sdrf.quantms.org/specification.html"
+SDRF_SINGLE_CELL_SPEC_URL = "https://sdrf.quantms.org/specification.html#_single_cell"
+SDRF_VALIDATOR_DIA_DRIFT_ISSUE = "https://github.com/bigbio/sdrf-pipelines/issues/345"
 
 SDRF_SPEC_VERSION = "1.1.0"
 SDRF_SPEC_VALUE = f"v{SDRF_SPEC_VERSION}"
@@ -62,6 +69,43 @@ PRIDE_SCP_ANNOTATION_TOOL_VALID_RE = re.compile(
     r"^pride-scp-sdrf\s+v\d+\.\d+\.\d+(?:[-+][A-Za-z0-9.-]+)?$",
     re.I,
 )
+
+# SDRF 1.1.0, sections 8.1/8.4 and template 14.11.  Keep the recommended NT/AC DIA
+# representation.  sdrf-pipelines 0.1.5/0.1.6 bundle a stale dia-acquisition 1.1.0 template that
+# rejects this *spec-valid* representation (upstream issue #345); that validator drift is handled
+# explicitly rather than by degrading the SDRF to a validator-specific spelling.
+DIA_SPEC_ALLOWED_VALUES = {
+    "data-independent acquisition",
+    "nt=data-independent acquisition;ac=pride:0000450",
+    "diapasef",
+    "nt=diapasef;ac=pride:0000650",
+    "swath ms",
+    "nt=swath ms;ac=pride:0000447",
+}
+KNOWN_DIA_TEMPLATE_DRIFT_PINS = {"0.1.5", "0.1.6"}
+KNOWN_DIA_TEMPLATE_DRIFT_ERROR_RE = re.compile(
+    r"^ERROR: Invalid value 'NT=Data-independent acquisition;AC=PRIDE:0000450' "
+    r"- must be one of the allowed values$"
+)
+
+# Current SDRF 1.1.0 section 8.3 states that HCD is canonically MS:1000422
+# (beam-type collision-induced dissociation), while the short label `HCD` is also valid.  Older
+# datasets and validators used PRIDE:0000590 / MS:1002481 or long noncanonical labels.  We only
+# canonicalize exact known HCD encodings; no fragmentation method is inferred.
+HCD_KNOWN_ACCESSIONS = {"ms:1000422", "pride:0000590", "ms:1002481"}
+HCD_KNOWN_LABELS = {
+    "hcd",
+    "beam-type collision-induced dissociation",
+    "higher energy beam-type collision-induced dissociation",
+    "higher-energy beam-type collision-induced dissociation",
+    "higher-energy c-trap dissociation",
+}
+RESERVED_WORDS_CANONICAL = {
+    "not available": "not available",
+    "not applicable": "not applicable",
+    "anonymized": "anonymized",
+    "pooled": "pooled",
+}
 
 # Versions observed in the current upstream template manifest on 2026-09-10.  Runtime validation is
 # still delegated to parse_sdrf; these constants are provenance/reporting anchors, not a replacement
@@ -118,6 +162,23 @@ KNOWN_TEMPLATE_NAMES = set(TEMPLATE_VERSION_HINTS) | {
     "immunopeptidomics", "metaproteomics", "crosslinking", "affinity-proteomics",
 }
 
+# SDRF 1.1 section 10.3 says comment[sdrf template] declares leaf templates only; parents are implied.
+# This map is used only to serialize file-level template metadata. Validation still runs each selected
+# parent/leaf separately because sdrf-pipelines <=0.1.6 does not safely merge repeated --template.
+TEMPLATE_PARENT = {
+    "dia-acquisition": "ms-proteomics",
+    "single-cell": "ms-proteomics",
+    "immunopeptidomics": "ms-proteomics",
+    "crosslinking": "ms-proteomics",
+    "metaproteomics": "ms-proteomics",
+    "cell-lines": "sample-metadata",
+    "human": "sample-metadata",
+    "vertebrates": "sample-metadata",
+    "invertebrates": "sample-metadata",
+    "plants": "sample-metadata",
+    "clinical-metadata": "sample-metadata",
+}
+
 
 @dataclass
 class CommandResult:
@@ -127,10 +188,12 @@ class CommandResult:
     stdout: str
     stderr: str
     available: bool = True
+    compatibility_override: bool = False
+    compatibility_reason: str = ""
 
     @property
     def passed(self) -> bool:
-        return self.available and self.returncode == 0
+        return self.available and (self.returncode == 0 or self.compatibility_override)
 
 
 @dataclass
@@ -506,13 +569,87 @@ def _normalize_dia_acquisition_value(value: str) -> str:
     text = norm_value(value)
     low = text.lower()
     # Historical PRIDE_SCP drafts used PRIDE:0000628 for the exact label Data-independent acquisition.
-    # BigBio dia-acquisition v1.1.0 uses PRIDE:0000450 for this same named term. This is a controlled
-    # representation update only; it never changes DDA to DIA or infers a method from other fields.
+    # SDRF 1.1.0 section 8.4 and dia-acquisition 1.1.0 specify PRIDE:0000450 and recommend NT/AC.
+    # This is a controlled identifier correction only; it never changes DDA to DIA or infers a method.
     if re.fullmatch(
         r"nt=data-independent acquisition;\s*ac=pride:0000628", low, re.I
     ):
         return "NT=Data-independent acquisition;AC=PRIDE:0000450"
     return text
+
+
+def _normalize_reserved_word(value: str) -> str:
+    text = norm_value(value)
+    return RESERVED_WORDS_CANONICAL.get(text.lower(), text)
+
+
+def _normalize_dissociation_method_value(value: str) -> str:
+    text = norm_value(value)
+    low = text.lower()
+    if low in HCD_KNOWN_LABELS:
+        return "HCD"
+    match = re.fullmatch(r"nt\s*=\s*(?P<name>[^;]+);\s*ac\s*=\s*(?P<accession>[^;]+)", text, re.I)
+    if not match:
+        return text
+    name = norm_value(match.group("name")).lower()
+    accession = norm_value(match.group("accession")).lower()
+    if name in HCD_KNOWN_LABELS and accession in HCD_KNOWN_ACCESSIONS:
+        return "HCD"
+    return text
+
+
+def _contract_key(value: str) -> str:
+    text = norm_value(value).lower()
+    text = re.sub(r"\s*=\s*", "=", text)
+    text = re.sub(r"\s*;\s*", ";", text)
+    return text
+
+
+def _dia_spec_contract_errors(headers: list[str], rows: list[list[str]]) -> list[str]:
+    """Validate the stable SDRF 1.1 DIA rules needed to detect validator-template drift.
+
+    This is intentionally narrow.  It does not replace parse_sdrf: it only proves that a file meets
+    the exact acquisition-value/cardinality contract documented in SDRF 1.1.0 template 14.11 before
+    we waive the known stale-template error in sdrf-pipelines 0.1.5/0.1.6.
+    """
+    indices = column_indices(headers, "comment[proteomics data acquisition method]")
+    if len(indices) != 1:
+        return [f"dia_spec_acquisition_column_cardinality:{len(indices)}"]
+    values = [row[indices[0]] if indices[0] < len(row) else "" for row in rows]
+    concrete = [value for value in values if not placeholder(value)]
+    if not concrete:
+        return ["dia_spec_acquisition_value_missing"]
+    keys = [_contract_key(value) for value in concrete]
+    invalid = sorted({key for key in keys if key not in DIA_SPEC_ALLOWED_VALUES})
+    errors: list[str] = []
+    if invalid:
+        errors.append("dia_spec_invalid_acquisition_value:" + "|".join(invalid))
+    if len(set(keys)) != 1:
+        errors.append("dia_spec_acquisition_requires_single_value")
+    return errors
+
+
+def _only_known_dia_template_drift(result: CommandResult) -> bool:
+    lines = [line.strip() for line in (result.stdout + "\n" + result.stderr).splitlines() if line.strip()]
+    error_lines = [line for line in lines if line.startswith("ERROR:")]
+    return len(error_lines) == 1 and bool(KNOWN_DIA_TEMPLATE_DRIFT_ERROR_RE.fullmatch(error_lines[0]))
+
+
+def _apply_known_validator_drift_override(path: Path, template: str, result: CommandResult) -> CommandResult:
+    if result.passed or template != "dia-acquisition" or SDRF_PIPELINES_PIN not in KNOWN_DIA_TEMPLATE_DRIFT_PINS:
+        return result
+    if not _only_known_dia_template_drift(result):
+        return result
+    headers, rows = read_sdrf(path)
+    contract_errors = _dia_spec_contract_errors(headers, rows)
+    if contract_errors:
+        return result
+    result.compatibility_override = True
+    result.compatibility_reason = (
+        f"known_sdrf_pipelines_{SDRF_PIPELINES_PIN}_dia_template_drift_issue_345;"
+        f"spec={SDRF_SPEC_URL}#_dia_acquisition"
+    )
+    return result
 
 
 def derive_templates(headers: list[str], rows: list[list[str]], explicit: list[str]) -> list[str]:
@@ -559,6 +696,12 @@ def derive_templates(headers: list[str], rows: list[list[str]], explicit: list[s
     # --template pitfall; one subprocess per template is unambiguous.
     order = ["ms-proteomics", "single-cell", "dia-acquisition", "human", "vertebrates", "invertebrates", "plants", "cell-lines"]
     return sorted(names, key=lambda x: (order.index(x) if x in order else len(order), x))
+
+
+def _declared_leaf_templates(templates: list[str]) -> list[str]:
+    selected = set(templates)
+    non_leaf = {parent for child, parent in TEMPLATE_PARENT.items() if child in selected and parent in selected}
+    return [template for template in templates if template not in non_leaf]
 
 
 def _column_group(header: str) -> int:
@@ -672,6 +815,31 @@ def normalize_bigbio_projection(
         rows = [[row[i] if i < len(row) else "" for i in order] for row in rows]
         info.actions.append("reordered_columns_to_bigbio_1_1_groups")
 
+    # SDRF 1.1 reserved words are lowercase by contract.  Canonicalize only the exact reserved
+    # tokens, never arbitrary biological or technical text.
+    reserved_word_changes = 0
+    for row in rows:
+        for idx, old_value in enumerate(row):
+            new_value = _normalize_reserved_word(old_value)
+            if new_value != old_value:
+                row[idx] = new_value
+                reserved_word_changes += 1
+    if reserved_word_changes:
+        info.actions.append(f"normalized_reserved_word_case:{reserved_word_changes}_cells")
+
+    # Canonicalize exact known HCD encodings according to SDRF 1.1 section 8.3.  `HCD` is explicitly
+    # permitted and avoids legacy/deprecated accession/label combinations without inferring a method.
+    hcd_changes = 0
+    for idx in column_indices(headers, "comment[dissociation method]"):
+        for row in rows:
+            old_value = row[idx]
+            new_value = _normalize_dissociation_method_value(old_value)
+            if new_value != old_value:
+                row[idx] = new_value
+                hcd_changes += 1
+    if hcd_changes:
+        info.actions.append(f"normalized_hcd_dissociation_method:{hcd_changes}_cells")
+
     # comment[sdrf version] is the specification version, not the PRIDE_SCP generator version.
     version_indices = column_indices(headers, "comment[sdrf version]")
     if not version_indices:
@@ -722,14 +890,15 @@ def normalize_bigbio_projection(
     removed_templates = _remove_columns(headers, rows, "comment[sdrf template]")
     if removed_templates:
         info.actions.append(f"replaced_legacy_comment_sdrf_template_columns:{removed_templates}")
-    for template in templates:
+    declared_templates = _declared_leaf_templates(templates)
+    for template in declared_templates:
         version = TEMPLATE_VERSION_HINTS.get(template)
         if not version:
             info.warnings.append(f"template_version_hint_unavailable:{template}")
             continue
         _add_uniform_column(headers, rows, "comment[sdrf template]", f"{template} v{version}")
-    if templates:
-        info.actions.append("declared_bigbio_templates:" + ",".join(templates))
+    if declared_templates:
+        info.actions.append("declared_bigbio_leaf_templates:" + ",".join(declared_templates))
 
     # Human required demographics explicitly allow 'not available'. Adding that sentinel documents
     # absence of source metadata; it does not invent a biological value.
@@ -780,13 +949,15 @@ def validate_parse_sdrf(path: Path, templates: list[str], command: str, ontology
     structural = base + ["--skip-ontology"]
     results.append(run_command(structural, timeout=timeout))
     for template in templates:
-        results.append(run_command(base + ["--template", template, "--skip-ontology"], timeout=timeout))
+        result = run_command(base + ["--template", template, "--skip-ontology"], timeout=timeout)
+        results.append(_apply_known_validator_drift_override(path, template, result))
     if ontology_mode == "online":
         # Ontology validation is an additional gate, never a replacement for the structural/template
         # invocations above.  Current upstream tooling may still miss truth-level accession defects.
         results.append(run_command(base, timeout=timeout))
         for template in templates:
-            results.append(run_command(base + ["--template", template], timeout=timeout))
+            result = run_command(base + ["--template", template], timeout=timeout)
+            results.append(_apply_known_validator_drift_override(path, template, result))
     return results
 
 
@@ -809,6 +980,8 @@ def command_dict(result: CommandResult) -> dict[str, Any]:
         "available": result.available,
         "returncode": result.returncode,
         "passed": result.passed,
+        "compatibility_override": result.compatibility_override,
+        "compatibility_reason": result.compatibility_reason,
         "stdout": result.stdout,
         "stderr": result.stderr,
     }
@@ -1114,6 +1287,15 @@ def write_outputs(args: argparse.Namespace, results: list[ReadinessResult]) -> d
         "skills_mode": args.skills_mode,
         "sdrf_skills_root": args.sdrf_skills_root or "",
         "template_version_hints": TEMPLATE_VERSION_HINTS,
+        "sdrf_spec_contract": {
+            "version": f"v{SDRF_SPEC_VERSION}",
+            "specification": SDRF_SPEC_URL,
+            "single_cell": SDRF_SINGLE_CELL_SPEC_URL,
+            "known_validator_dia_drift_issue": SDRF_VALIDATOR_DIA_DRIFT_ISSUE,
+            "validator_drift_overrides": sum(
+                1 for r in results for x in r.parse_sdrf if x.get("compatibility_override") is True
+            ),
+        },
         "policies": {
             "model_generates_sdrf": False,
             "model_creates_sample_file_channel_mapping": False,
@@ -1126,6 +1308,8 @@ def write_outputs(args: argparse.Namespace, results: list[ReadinessResult]) -> d
             "parse_sdrf_proves_scientific_truth": False,
             "sdrf_skills_fix_auto_applied": False,
             "multiple_templates_validated_in_separate_processes": True,
+            "specification_is_normative_over_known_validator_template_drift": True,
+            "validator_drift_override_requires_exact_known_signature_and_local_spec_contract": True,
             "submission_ready_requires_hash_bound_review": True,
             "gt_runtime_truth_used": False,
         },
@@ -1221,6 +1405,10 @@ def self_test() -> None:
         assert set(row_values(projected_headers, projected_rows, "comment[sdrf version]")) == {"v1.1.0"}
         template_values = row_values_all(projected_headers, projected_rows, "comment[sdrf template]")
         assert template_values and all(re.fullmatch(r"[\w-]+ v\d+\.\d+\.\d+(?:-[\w.]+)?", x) for x in template_values)
+        # single-cell extends ms-proteomics, so file-level metadata declares only the selected leaves.
+        assert "single-cell v1.0.0" in template_values
+        assert "human v1.1.0" in template_values
+        assert "ms-proteomics v1.1.0" not in template_values
         annotation_values = row_values_all(projected_headers, projected_rows, "comment[sdrf annotation tool]")
         assert annotation_values == ["pride-scp-sdrf v0.3.6", "pride-scp-sdrf v0.3.6"]
         assert not any("pride-scp-sdrf-v" in x for x in annotation_values)
@@ -1291,6 +1479,45 @@ def self_test() -> None:
             == "NT=Data-independent acquisition;AC=PRIDE:0000450"
         )
         assert _normalize_dia_acquisition_value("Data-dependent acquisition") == "Data-dependent acquisition"
+
+        # Encode the normative SDRF 1.1 DIA contract so a stale validator template cannot make us
+        # rewrite a correct NT/AC value into a validator-specific workaround.
+        dia_contract_headers = ["comment[proteomics data acquisition method]"]
+        dia_contract_rows = [["NT=Data-independent acquisition;AC=PRIDE:0000450"] for _ in range(2)]
+        assert not _dia_spec_contract_errors(dia_contract_headers, dia_contract_rows)
+        assert not _dia_spec_contract_errors(dia_contract_headers, [["Data-independent acquisition"]])
+        assert _dia_spec_contract_errors(
+            dia_contract_headers,
+            [["Data-independent acquisition"], ["NT=SWATH MS;AC=PRIDE:0000447"]],
+        )
+        stale = CommandResult(
+            "parse_sdrf validate-sdrf",
+            ["parse_sdrf", "validate-sdrf", "--template", "dia-acquisition"],
+            1,
+            "",
+            "ERROR: Invalid value 'NT=Data-independent acquisition;AC=PRIDE:0000450' - must be one of the allowed values\nThere were validation errors.\n",
+        )
+        contract_file = root / "dia_contract.sdrf.tsv"
+        _write_sdrf(contract_file, dia_contract_headers, dia_contract_rows)
+        overridden = _apply_known_validator_drift_override(contract_file, "dia-acquisition", stale)
+        assert overridden.passed and overridden.compatibility_override
+        assert "issue_345" in overridden.compatibility_reason
+        unrelated = CommandResult(
+            "parse_sdrf validate-sdrf",
+            ["parse_sdrf", "validate-sdrf", "--template", "dia-acquisition"],
+            1,
+            "",
+            "ERROR: some other DIA problem\nThere were validation errors.\n",
+        )
+        assert not _apply_known_validator_drift_override(contract_file, "dia-acquisition", unrelated).passed
+
+        # Stable representation-only normalizations directly encoded by SDRF 1.1.
+        assert _normalize_reserved_word("Not Available") == "not available"
+        assert _normalize_reserved_word("Tumor") == "Tumor"
+        assert _normalize_dissociation_method_value("higher energy beam-type collision-induced dissociation") == "HCD"
+        assert _normalize_dissociation_method_value("NT=beam-type collision-induced dissociation;AC=MS:1000422") == "HCD"
+        assert _normalize_dissociation_method_value("NT=HCD;AC=PRIDE:0000590") == "HCD"
+        assert _normalize_dissociation_method_value("ETD") == "ETD"
 
         # Multiple non-identical candidates are fail-closed.
         alt = candidate_root / "datasets" / accession

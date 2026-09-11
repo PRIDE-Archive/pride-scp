@@ -1,38 +1,55 @@
 {
-  "contract_version": "pride-scp-bigbio-readiness-v0.5.13",
-  "observed_date": "2026-09-10",
+  "contract_version": "pride-scp-bigbio-readiness-v0.5.14.3",
+  "observed_date": "2026-09-11",
+  "policies": {
+    "auto_fix_is_accepted_truth": false,
+    "model_creates_sample_file_channel_mapping": false,
+    "model_generates_sdrf": false,
+    "specification_is_normative_over_known_validator_template_drift": true,
+    "submission_requires_hash_bound_independent_review": true,
+    "validator_can_create_truth": false,
+    "validator_drift_override_requires_exact_known_signature_and_local_spec_contract": true
+  },
   "sdrf_pipelines": {
     "distribution": "sdrf-pipelines[ontology]",
-    "version": "0.1.6",
+    "known_drift": {
+      "affected_versions": [
+        "0.1.5",
+        "0.1.6"
+      ],
+      "issue": "https://github.com/bigbio/sdrf-pipelines/issues/345",
+      "policy": "never rewrite a spec-valid value merely to satisfy the stale bundled template; override only the exact known validator signature after local spec-contract checks pass",
+      "scope": "bundled dia-acquisition 1.1.0 rejects the spec-valid recommended NT+AC DIA value"
+    },
     "role": "official structural/template/ontology validator",
-    "truth_policy": "necessary_but_not_sufficient"
+    "truth_policy": "necessary_but_not_sufficient",
+    "version": "0.1.6"
   },
   "sdrf_skills": {
+    "auto_fix_allowed": false,
     "distribution": "external_git_bundle",
     "role": "deterministic check/score and independent-review methodology",
-    "runtime_update_allowed": false,
-    "auto_fix_allowed": false
+    "runtime_update_allowed": false
   },
-  "template_hints": {
-    "single-cell": "1.0.0",
-    "ms-proteomics": "1.1.0",
-    "dia-acquisition": "1.1.0",
-    "human": "1.1.0",
-    "vertebrates": "1.1.0",
-    "invertebrates": "1.1.0",
-    "plants": "1.1.0",
-    "cell-lines": "1.1.0"
+  "sdrf_specification": {
+    "role": "normative_format_and_template_contract",
+    "single_cell_url": "https://sdrf.quantms.org/specification.html#_single_cell",
+    "url": "https://sdrf.quantms.org/specification.html",
+    "version": "v1.1.0"
   },
   "submission_repository": {
-    "repository": "bigbio/sdrf-annotated-datasets",
+    "draft_layout": "sandbox/{ACCESSION}/{ACCESSION}.sdrf.tsv",
     "ready_layout": "datasets/{ACCESSION}/{ACCESSION}.sdrf.tsv",
-    "draft_layout": "sandbox/{ACCESSION}/{ACCESSION}.sdrf.tsv"
+    "repository": "bigbio/sdrf-annotated-datasets"
   },
-  "policies": {
-    "model_generates_sdrf": false,
-    "model_creates_sample_file_channel_mapping": false,
-    "validator_can_create_truth": false,
-    "auto_fix_is_accepted_truth": false,
-    "submission_requires_hash_bound_independent_review": true
+  "template_hints": {
+    "cell-lines": "1.1.0",
+    "dia-acquisition": "1.1.0",
+    "human": "1.1.0",
+    "invertebrates": "1.1.0",
+    "ms-proteomics": "1.1.0",
+    "plants": "1.1.0",
+    "single-cell": "1.0.0",
+    "vertebrates": "1.1.0"
   }
 }

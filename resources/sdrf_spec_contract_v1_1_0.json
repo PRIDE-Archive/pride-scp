@@ -1,0 +1,48 @@
+{
+  "contract_version": "pride-scp-sdrf-spec-contract-v1.1.0-2026-09-11",
+  "dia_acquisition": {
+    "accepted_values": [
+      "Data-independent acquisition",
+      "NT=Data-independent acquisition;AC=PRIDE:0000450",
+      "diaPASEF",
+      "NT=diaPASEF;AC=PRIDE:0000650",
+      "SWATH MS",
+      "NT=SWATH MS;AC=PRIDE:0000447"
+    ],
+    "preferred_dia": "NT=Data-independent acquisition;AC=PRIDE:0000450",
+    "single_value_only": true,
+    "template_version": "1.1.0"
+  },
+  "file_level_metadata": {
+    "annotation_tool_format": "name vX.Y.Z or NT=name;VV=vX.Y.Z",
+    "sdrf_version": "v1.1.0",
+    "template_format": "name vX.Y.Z",
+    "template_policy": "declare leaf templates only; parents implied"
+  },
+  "hcd": {
+    "canonical_accession": "MS:1000422",
+    "canonical_ontology_label": "beam-type collision-induced dissociation",
+    "deprecated_or_disallowed_accessions": [
+      "PRIDE:0000590",
+      "MS:1002481"
+    ],
+    "short_label_allowed": "HCD"
+  },
+  "normative_sources": {
+    "single_cell": "https://sdrf.quantms.org/specification.html#_single_cell",
+    "specification": "https://sdrf.quantms.org/specification.html"
+  },
+  "single_cell": {
+    "required_columns": [
+      "characteristics[single cell isolation protocol]",
+      "characteristics[cell identifier]"
+    ],
+    "template_version": "1.0.0"
+  },
+  "validator_compatibility": {
+    "known_issue": "https://github.com/bigbio/sdrf-pipelines/issues/345",
+    "policy": "exact-signature override only after local normative DIA contract passes",
+    "sdrf_pipelines_pin": "0.1.6"
+  },
+  "version": "v1.1.0"
+}

@@ -1,4 +1,8 @@
-# BigBio community SDRF validator pin used by the v0.5.13 readiness gate.
+# BigBio community SDRF validator pin used by the readiness gate.
+# NOTE: 0.1.6 bundles a known stale dia-acquisition 1.1.0 template that rejects the SDRF 1.1
+# recommended NT=Data-independent acquisition;AC=PRIDE:0000450 representation. The readiness
+# wrapper preserves the normative spec value and handles only that exact known drift signature.
+# See https://github.com/bigbio/sdrf-pipelines/issues/345
 # sdrf-skills is intentionally staged as an external checksummed source bundle because it is a
 # skills-first repository rather than a versioned Python package.
 sdrf-pipelines[ontology]==0.1.6
