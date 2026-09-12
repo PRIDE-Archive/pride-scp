@@ -80,3 +80,13 @@ All three repaired candidates must pass:
 
 Only after approval may PXD019958/#463 and PXD054066/#472 be updated. PXD019515 requires a new
 corrective PR referencing merged #462.
+
+
+## Repair4 v3 real-artifact control-count correction
+
+The exact PXD054066 PR artifact contains five, not four, rows with the explicit zero-cell-control
+signature `sample type=empty`, `cell identifier=empty`, and `cells per well=0`. The upstream Qodo
+comment enumerated four line locations and omitted the fifth equivalent blank row. Repair4 v3 therefore
+selects controls from that explicit three-field SDRF signature rather than a hard-coded reviewed-row
+count. Filename/source-name text containing `Blank` is deliberately insufficient to create control
+identity. The input SHA-256 remains bound to the exact submitted artifact.

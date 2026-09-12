@@ -21,7 +21,7 @@ from typing import Callable
 
 from sdrf_scientific_guard import analyze as analyze_guard
 
-VERSION = "pride-scp-release20-repair4-v2"
+VERSION = "pride-scp-release20-repair4-v3"
 
 # Inputs are intentionally bound to the exact latest reviewed artifacts.  PXD019515/PXD019958 use
 # the v5 repaired *source candidates*; PXD054066 uses the exact currently submitted PR artifact.
@@ -271,17 +271,19 @@ def repair_019958(headers: list[str], rows: list[list[str]], changes: list[dict[
 
 
 def is_zero_cell_control(headers: list[str], row: list[str]) -> bool:
+    """Return true only for an explicitly encoded zero-cell control.
+
+    This deliberately requires the three mutually reinforcing SDRF fields used by the
+    upstream review: control sample type, reserved empty cell identifier, and zero cells
+    per well. Filename/source-name text is not allowed to create control identity.
+    """
     sample_type = first_value(headers, row, "characteristics[sample type]").strip().lower()
     cells = first_value(headers, row, "characteristics[cells per well]").strip().lower()
     cell_id = first_value(headers, row, "characteristics[cell identifier]").strip().lower()
-    source = first_value(headers, row, "source name").strip().lower()
-    data_file = first_value(headers, row, "comment[data file]").strip().lower()
     return (
         sample_type in {"empty", "blank", "negative control"}
-        or cells == "0"
-        or cell_id == "empty"
-        or "blank" in source
-        or "blank" in data_file
+        and cells == "0"
+        and cell_id == "empty"
     )
 
 
@@ -332,9 +334,9 @@ def repair_054066(headers: list[str], rows: list[list[str]], changes: list[dict[
             "zero-cell blank control",
             required=False,
         )
-    if blank_count != 4:
+    if blank_count == 0:
         raise ValueError(
-            f"PXD054066: expected the four independently reviewed zero-cell blank controls, found {blank_count}; refuse broad repair"
+            "PXD054066: exact reviewed artifact contains no explicit zero-cell controls; refuse repair"
         )
 
 
@@ -500,11 +502,25 @@ def self_test() -> None:
     blank[9] = "empty"
     blank[10] = "0"
     blank[11] = "Blank_04.raw"
-    rows_054066 = [blank.copy(), blank.copy(), blank.copy(), blank.copy(), protein_054066.copy()]
+    # The exact reviewed PXD054066 artifact has five explicit zero-cell blanks. Upstream
+    # review enumerated only four of them, so follow the row semantics rather than the
+    # review comment's incomplete count.
+    filename_only_blank = protein_054066.copy()
+    filename_only_blank[0] = "Blank_named_but_single_cell"
+    filename_only_blank[11] = "Blank_named_but_single_cell.raw"
+    rows_054066 = [
+        blank.copy(),
+        blank.copy(),
+        blank.copy(),
+        blank.copy(),
+        blank.copy(),
+        filename_only_blank,
+        protein_054066.copy(),
+    ]
     repair_054066(headers_054066, rows_054066, [])
     for row in rows_054066:
         assert first_value(headers_054066, row, "comment[sample preparation batch]") == "not available"
-    for row in rows_054066[:4]:
+    for row in rows_054066[:5]:
         for header in (
             "characteristics[individual]",
             "characteristics[cell type]",
@@ -518,7 +534,10 @@ def self_test() -> None:
             == "cellenONE"
         )
         assert first_value(headers_054066, row, "characteristics[cell identifier]") == "empty"
-    assert first_value(headers_054066, rows_054066[4], "characteristics[cell line]") == "HeLa"
+    # A row that merely contains "Blank" in its filename/source name is not rewritten;
+    # filenames never create scientific control semantics.
+    assert first_value(headers_054066, rows_054066[5], "characteristics[cell line]") == "HeLa"
+    assert first_value(headers_054066, rows_054066[6], "characteristics[cell line]") == "HeLa"
 
     with tempfile.TemporaryDirectory() as td:
         p = Path(td) / "roundtrip.tsv"
