@@ -21,7 +21,7 @@ from typing import Callable
 
 from sdrf_scientific_guard import analyze as analyze_guard
 
-VERSION = "pride-scp-release20-repair4-v1"
+VERSION = "pride-scp-release20-repair4-v2"
 
 # Inputs are intentionally bound to the exact latest reviewed artifacts.  PXD019515/PXD019958 use
 # the v5 repaired *source candidates*; PXD054066 uses the exact currently submitted PR artifact.
@@ -144,6 +144,43 @@ def set_all(
         set_index(row, headers, idx, value, changes, reason)
 
 
+def ensure_repeated_columns(
+    headers: list[str],
+    rows: list[list[str]],
+    header: str,
+    minimum_count: int,
+    changes: list[dict[str, object]],
+    reason: str,
+) -> None:
+    """Ensure a repeated SDRF field has enough positional columns without collapsing duplicates.
+
+    Missing repeated columns are inserted immediately after the final existing occurrence so the
+    surrounding SDRF column order is preserved.  This is a representation repair only: inserted
+    cells start empty and must be populated by the caller from source-grounded values.
+    """
+    found = indices(headers, header)
+    if not found:
+        raise ValueError(f"required repeated column missing: {header}")
+    while len(found) < minimum_count:
+        insert_at = found[-1] + 1
+        headers.insert(insert_at, header)
+        for row in rows:
+            row.insert(insert_at, "")
+        occurrence = len(found) + 1
+        changes.append(
+            {
+                "scope": "schema",
+                "data_file": "",
+                "field": header,
+                "occurrence": occurrence,
+                "old": "<column absent>",
+                "new": "<repeated column inserted>",
+                "reason": reason,
+            }
+        )
+        found = indices(headers, header)
+
+
 def set_repeated_values(
     row: list[str],
     headers: list[str],
@@ -170,6 +207,14 @@ def set_repeated_values(
 
 
 def repair_019515(headers: list[str], rows: list[list[str]], changes: list[dict[str, object]]) -> None:
+    ensure_repeated_columns(
+        headers,
+        rows,
+        "comment[modification parameters]",
+        len(MODIFICATIONS),
+        changes,
+        "source supports three distinct modification parameters; add the missing repeated SDRF column rather than collapsing or overwriting duplicate headers",
+    )
     for row in rows:
         set_all(
             row,
@@ -194,11 +239,18 @@ def repair_019515(headers: list[str], rows: list[list[str]], changes: list[dict[
             MODIFICATIONS,
             changes,
             "publication: variable methionine oxidation, variable protein N-terminal acetylation, fixed cysteine carbamidomethylation",
-            exact_count=3,
         )
 
 
 def repair_019958(headers: list[str], rows: list[list[str]], changes: list[dict[str, object]]) -> None:
+    ensure_repeated_columns(
+        headers,
+        rows,
+        "comment[modification parameters]",
+        len(MODIFICATIONS),
+        changes,
+        "source supports three distinct modification parameters; add the missing repeated SDRF column rather than collapsing or overwriting duplicate headers",
+    )
     for row in rows:
         set_repeated_values(
             row,
@@ -215,7 +267,6 @@ def repair_019958(headers: list[str], rows: list[list[str]], changes: list[dict[
             MODIFICATIONS,
             changes,
             "publication: variable methionine oxidation, variable N-terminal acetylation, fixed cysteine carbamidomethylation",
-            exact_count=3,
         )
 
 
@@ -367,60 +418,59 @@ def run_repair(input_root: Path, repo: Path, output: Path, selected: list[str]) 
 
 
 def self_test() -> None:
-    # Regression: repeated columns must remain independent.  This is the exact class that caused the
-    # v5 cleavage/modification rejection when DictReader/DictWriter collapsed duplicate headers.
-    headers = [
-        "source name",
-        "characteristics[organism]",
-        "characteristics[organism part]",
-        "characteristics[individual]",
-        "characteristics[cell type]",
-        "characteristics[cell line]",
-        "characteristics[material type]",
-        "characteristics[sample type]",
-        "characteristics[single cell isolation protocol]",
-        "characteristics[cell identifier]",
-        "characteristics[cells per well]",
-        "comment[data file]",
-        "comment[sample preparation batch]",
-        "comment[cleavage agent details]",
-        "comment[cleavage agent details]",
-        "comment[modification parameters]",
-        "comment[modification parameters]",
-        "comment[modification parameters]",
-        "comment[precursor mass tolerance]",
-    ]
-    protein = [
-        "sample",
-        "Homo sapiens",
-        "cell culture",
-        "cell",
-        "cell culture",
-        "HeLa",
-        "cell",
-        "single cell",
-        "cellenONE",
-        "sample",
-        "1",
-        "sample.raw",
-        "bad batch",
-        "NT=Lys-C;AC=MS:1001309",
-        "NT=Lys-C;AC=MS:1001309",
-        "bad mod",
-        "bad mod",
-        "bad mod",
-        "5 ppm",
-    ]
-    blank = protein.copy()
-    blank[0] = "Blank_04"
-    blank[7] = "empty"
-    blank[9] = "empty"
-    blank[10] = "0"
-    blank[11] = "Blank_04.raw"
+    # Regression: reviewed legacy SDRFs may have only two repeated modification columns even though
+    # the source supports three distinct modifications.  Repair must add the missing repeated column
+    # positionally, preserve duplicate headers, and never collapse them through dict-based CSV I/O.
+    def fixture() -> tuple[list[str], list[str]]:
+        headers = [
+            "source name",
+            "characteristics[organism]",
+            "characteristics[organism part]",
+            "characteristics[individual]",
+            "characteristics[cell type]",
+            "characteristics[cell line]",
+            "characteristics[material type]",
+            "characteristics[sample type]",
+            "characteristics[single cell isolation protocol]",
+            "characteristics[cell identifier]",
+            "characteristics[cells per well]",
+            "comment[data file]",
+            "comment[sample preparation batch]",
+            "comment[cleavage agent details]",
+            "comment[cleavage agent details]",
+            "comment[modification parameters]",
+            "comment[modification parameters]",
+            "comment[precursor mass tolerance]",
+        ]
+        protein = [
+            "sample",
+            "Homo sapiens",
+            "cell culture",
+            "cell",
+            "cell culture",
+            "HeLa",
+            "cell",
+            "single cell",
+            "cellenONE",
+            "sample",
+            "1",
+            "sample.raw",
+            "bad batch",
+            "NT=Lys-C;AC=MS:1001309",
+            "NT=Lys-C;AC=MS:1001309",
+            "bad mod",
+            "bad mod",
+            "5 ppm",
+        ]
+        return headers, protein
 
+    headers, protein = fixture()
     changes: list[dict[str, object]] = []
     rows = [protein.copy()]
+    assert len(indices(headers, "comment[modification parameters]")) == 2
     repair_019515(headers, rows, changes)
+    assert len(indices(headers, "comment[modification parameters]")) == 3
+    assert any(change.get("scope") == "schema" for change in changes)
     assert [rows[0][i] for i in indices(headers, "comment[cleavage agent details]")] == [
         TRYPSIN,
         "not applicable",
@@ -428,37 +478,54 @@ def self_test() -> None:
     assert [rows[0][i] for i in indices(headers, "comment[modification parameters]")] == MODIFICATIONS
     assert first_value(headers, rows[0], "comment[precursor mass tolerance]") == "not available"
 
-    rows = [protein.copy()]
-    repair_019958(headers, rows, [])
-    assert [rows[0][i] for i in indices(headers, "comment[cleavage agent details]")] == [
-        TRYPSIN,
-        "not applicable",
-    ]
-    assert [rows[0][i] for i in indices(headers, "comment[modification parameters]")] == MODIFICATIONS
+    headers_019958, protein_019958 = fixture()
+    rows_019958 = [protein_019958]
+    changes_019958: list[dict[str, object]] = []
+    repair_019958(headers_019958, rows_019958, changes_019958)
+    assert len(indices(headers_019958, "comment[modification parameters]")) == 3
+    assert any(change.get("scope") == "schema" for change in changes_019958)
+    assert [
+        rows_019958[0][i]
+        for i in indices(headers_019958, "comment[cleavage agent details]")
+    ] == [TRYPSIN, "not applicable"]
+    assert [
+        rows_019958[0][i]
+        for i in indices(headers_019958, "comment[modification parameters]")
+    ] == MODIFICATIONS
 
-    rows = [blank.copy(), blank.copy(), blank.copy(), blank.copy(), protein.copy()]
-    repair_054066(headers, rows, [])
-    for row in rows:
-        assert first_value(headers, row, "comment[sample preparation batch]") == "not available"
-    for row in rows[:4]:
+    headers_054066, protein_054066 = fixture()
+    blank = protein_054066.copy()
+    blank[0] = "Blank_04"
+    blank[7] = "empty"
+    blank[9] = "empty"
+    blank[10] = "0"
+    blank[11] = "Blank_04.raw"
+    rows_054066 = [blank.copy(), blank.copy(), blank.copy(), blank.copy(), protein_054066.copy()]
+    repair_054066(headers_054066, rows_054066, [])
+    for row in rows_054066:
+        assert first_value(headers_054066, row, "comment[sample preparation batch]") == "not available"
+    for row in rows_054066[:4]:
         for header in (
             "characteristics[individual]",
             "characteristics[cell type]",
             "characteristics[cell line]",
             "characteristics[material type]",
         ):
-            assert first_value(headers, row, header) == "not applicable"
-        assert first_value(headers, row, "characteristics[organism part]") == "cell culture"
-        assert first_value(headers, row, "characteristics[single cell isolation protocol]") == "cellenONE"
-        assert first_value(headers, row, "characteristics[cell identifier]") == "empty"
-    assert first_value(headers, rows[4], "characteristics[cell line]") == "HeLa"
+            assert first_value(headers_054066, row, header) == "not applicable"
+        assert first_value(headers_054066, row, "characteristics[organism part]") == "cell culture"
+        assert (
+            first_value(headers_054066, row, "characteristics[single cell isolation protocol]")
+            == "cellenONE"
+        )
+        assert first_value(headers_054066, row, "characteristics[cell identifier]") == "empty"
+    assert first_value(headers_054066, rows_054066[4], "characteristics[cell line]") == "HeLa"
 
     with tempfile.TemporaryDirectory() as td:
         p = Path(td) / "roundtrip.tsv"
-        write_sdrf(p, headers, [protein])
+        write_sdrf(p, headers, rows)
         h2, r2 = read_sdrf(p)
         assert h2 == headers
-        assert r2 == [protein]
+        assert r2 == rows
         assert len(indices(h2, "comment[cleavage agent details]")) == 2
         assert len(indices(h2, "comment[modification parameters]")) == 3
     print("repair_release20_repair4_sdrfs self-test: PASS")

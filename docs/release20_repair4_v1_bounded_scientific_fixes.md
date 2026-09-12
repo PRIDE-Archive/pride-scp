@@ -1,4 +1,4 @@
-# Release20 repair4 v1 — bounded scientific fixes after six-PR reconciliation
+# Release20 repair4 v2 — bounded scientific fixes after six-PR reconciliation
 
 Date: 2026-09-12
 
@@ -12,6 +12,12 @@ The prior release20 repair helper used `csv.DictReader`/`csv.DictWriter`. SDRF a
 for multiple cleavage agents and modification parameters. A dictionary representation collapses those
 columns, which caused the v5 repair to repeat the last cleavage/modification value across every
 occurrence. Repair4 uses positional rows and preserves duplicate headers exactly.
+
+Repair4 v2 also handles the real reviewed legacy layout in which an SDRF contains only two repeated
+`comment[modification parameters]` columns even though source evidence supports three distinct
+modifications. The repair inserts the missing repeated column immediately after the existing
+modification columns, then populates all three source-grounded values. It does not overwrite an
+unrelated field and does not use an accession-specific compatibility exception.
 
 ## PXD019515
 
