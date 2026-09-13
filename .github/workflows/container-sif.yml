@@ -187,8 +187,8 @@ jobs:
           set -euo pipefail
           declare -a aliases=()
 
-          if [[ "${WORKFLOW_HEAD_BRANCH:-}" == main ]]; then
-            aliases+=(main)
+          if [[ "${WORKFLOW_HEAD_BRANCH:-}" == master ]]; then
+            aliases+=(master)
           fi
 
           while IFS= read -r tag; do

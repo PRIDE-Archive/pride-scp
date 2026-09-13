@@ -19,7 +19,7 @@ command -v docker >/dev/null 2>&1 || { echo "ERROR: docker is required to conver
 docker image inspect "$IMAGE" >/dev/null
 
 TMP_ARCHIVE=""
-cleanup() { [[ -n "$TMP_ARCHIVE" ]] && rm -f "$TMP_ARCHIVE"; }
+cleanup() { [[ -z "${TMP_ARCHIVE:-}" ]] || rm -f -- "$TMP_ARCHIVE"; }
 trap cleanup EXIT INT TERM
 
 echo "Building SIF with $CONTAINER_BIN from local Docker image $IMAGE"
