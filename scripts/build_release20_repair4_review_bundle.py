@@ -32,6 +32,7 @@ def main() -> None:
     ap.add_argument("--repair-output", required=True, type=Path)
     ap.add_argument("--output-dir", required=True, type=Path)
     ap.add_argument("--archive", required=True, type=Path)
+    ap.add_argument("--accession", action="append", choices=TARGETS, help="limit review bundle to selected accession(s); default: all Repair4 targets")
     ns = ap.parse_args()
 
     out = ns.output_dir
@@ -39,8 +40,9 @@ def main() -> None:
         shutil.rmtree(out)
     out.mkdir(parents=True)
     rows: list[dict[str, str]] = []
+    targets = ns.accession or TARGETS
 
-    for accession in TARGETS:
+    for accession in targets:
         readiness_json = ns.readiness_output / "accessions" / f"{accession}.readiness.json"
         if not readiness_json.is_file():
             raise SystemExit(f"{accession}: missing readiness JSON")
