@@ -1,13 +1,16 @@
 {
-  "contract_version": "pride-scp-bigbio-readiness-v0.5.14.3",
-  "observed_date": "2026-09-11",
+  "contract_version": "pride-scp-bigbio-readiness-v0.5.14.4",
+  "observed_date": "2026-09-13",
   "policies": {
     "auto_fix_is_accepted_truth": false,
+    "exact_zero_cell_control_identity_normalized_in_projection": true,
     "model_creates_sample_file_channel_mapping": false,
     "model_generates_sdrf": false,
+    "repeated_chemistry_columns_checked_before_review": true,
     "specification_is_normative_over_known_validator_template_drift": true,
     "submission_requires_hash_bound_independent_review": true,
     "validator_can_create_truth": false,
+    "validator_compatible_dia_serialization_applied_in_projection": true,
     "validator_drift_override_requires_exact_known_signature_and_local_spec_contract": true
   },
   "sdrf_pipelines": {
@@ -18,8 +21,8 @@
         "0.1.6"
       ],
       "issue": "https://github.com/bigbio/sdrf-pipelines/issues/345",
-      "policy": "never rewrite a spec-valid value merely to satisfy the stale bundled template; override only the exact known validator signature after local spec-contract checks pass",
-      "scope": "bundled dia-acquisition 1.1.0 rejects the spec-valid recommended NT+AC DIA value"
+      "policy": "preserve the immutable source candidate; serialize already-explicit DIA as bare Data-independent acquisition in the publication derivative while affected validator versions remain in use",
+      "scope": "bundled dia-acquisition 1.1.0 accepts only bare Data-independent acquisition"
     },
     "role": "official structural/template/ontology validator",
     "truth_policy": "necessary_but_not_sufficient",

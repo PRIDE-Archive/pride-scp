@@ -20,7 +20,7 @@ pub const SINGLE_CELL_TEMPLATE_VERSION: &str = "1.0.0";
 pub const SINGLE_CELL_TEMPLATE_URL: &str =
     "https://github.com/bigbio/sdrf-templates/blob/main/single-cell/1.0.0/single-cell.yaml";
 pub const SDRF_SPEC_URL: &str = "https://sdrf.quantms.org/specification.html";
-pub const GENERATOR_VERSION: &str = "pride-scp-sdrf-v0.4.5";
+pub const GENERATOR_VERSION: &str = "pride-scp-sdrf-v0.4.6";
 
 fn sdrf_annotation_tool_value() -> String {
     let version = GENERATOR_VERSION
@@ -2062,7 +2062,7 @@ fn infer_deterministic_metadata_scaffold(
             metadata_scaffold_insert(
                 &mut out,
                 "proteomics_data_acquisition_method",
-                "data-independent acquisition".into(),
+                "Data-independent acquisition".into(),
                 dia_refs,
             );
         }
@@ -2804,6 +2804,57 @@ fn canonical_reserved_alias(value: &str) -> Option<&'static str> {
         "pooled" => Some("pooled"),
         _ => None,
     }
+}
+
+fn validator_compatible_acquisition_method(value: &str) -> String {
+    let text = value.trim();
+    let compact = text.to_ascii_lowercase().replace(" ", "").replace("_", "-");
+    let explicit_dia = compact == "data-independentacquisition"
+        || compact == "nt=data-independentacquisition;ac=pride:0000450"
+        || compact == "nt=data-independentacquisition;ac=pride:0000628"
+        || compact == "diapasef"
+        || compact == "dia-pasef"
+        || compact == "nt=diapasef;ac=pride:0000650"
+        || compact == "swathms"
+        || compact == "nt=swathms;ac=pride:0000447";
+    if explicit_dia {
+        "Data-independent acquisition".to_string()
+    } else {
+        text.to_string()
+    }
+}
+
+fn apply_publication_compatibility_normalization(
+    proposal: &mut SdrfProposal,
+) -> Vec<ValidationIssue> {
+    let mut issues = Vec::new();
+    let old_acq = proposal.proteomics_data_acquisition_method.clone();
+    let new_acq = validator_compatible_acquisition_method(&old_acq);
+    if new_acq != old_acq.trim() {
+        proposal.proteomics_data_acquisition_method = new_acq.clone();
+        issues.push(ValidationIssue {
+            level: "warning".into(),
+            code: "validator_compatible_dia_serialization_applied".into(),
+            row: 0,
+            column: "proteomics_data_acquisition_method".into(),
+            message: format!("serialized explicit DIA value '{}' as '{}' for the current dia-acquisition validator", old_acq, new_acq),
+        });
+    }
+    if proposal
+        .sample_type
+        .trim()
+        .eq_ignore_ascii_case("study sample")
+    {
+        proposal.sample_type = "not available".into();
+        issues.push(ValidationIssue {
+            level: "warning".into(),
+            code: "validator_gap_study_sample_normalized_fail_closed".into(),
+            row: 0,
+            column: "sample_type".into(),
+            message: "normalized unsupported 'study sample' to 'not available' for the maintained validator".into(),
+        });
+    }
+    issues
 }
 
 fn proposal_value_is_reserved(field: &str, value: &str) -> bool {
@@ -5886,6 +5937,7 @@ async fn annotate_one(opts: &SdrfAnnotateOptions, accession: &str) -> Result<Res
         &mut proposal,
         &evidence,
     ));
+    provenance_issues.extend(apply_publication_compatibility_normalization(&mut proposal));
     fs::write(&proposal_path, serde_json::to_string_pretty(&proposal)?)?;
     validate_proposal_refs(&proposal, &evidence)?;
     let proposal_repair_count = provenance_issues.len();
@@ -6661,8 +6713,8 @@ mod tests {
             .iter()
             .position(|h| h == "comment[sdrf annotation tool]")
             .unwrap();
-        assert_eq!(rows[0][annotation_idx], "pride-scp-sdrf v0.4.5");
-        assert_eq!(sdrf_annotation_tool_value(), "pride-scp-sdrf v0.4.5");
+        assert_eq!(rows[0][annotation_idx], "pride-scp-sdrf v0.4.6");
+        assert_eq!(sdrf_annotation_tool_value(), "pride-scp-sdrf v0.4.6");
         let issues = validate_draft(&headers, &rows, &evidence);
         assert!(issues.iter().all(|x| x.level != "error"), "{issues:?}");
     }
@@ -8595,5 +8647,34 @@ mod tests {
         assert!(issues
             .iter()
             .any(|x| x.code == "multiorganism_project_collapsed_to_single_candidate_organism"));
+    }
+
+    #[test]
+    fn publication_compatibility_normalizes_dia_and_study_sample() {
+        assert_eq!(
+            validator_compatible_acquisition_method(
+                "NT=Data-independent acquisition;AC=PRIDE:0000450"
+            ),
+            "Data-independent acquisition"
+        );
+        assert_eq!(
+            validator_compatible_acquisition_method("NT=diaPASEF;AC=PRIDE:0000650"),
+            "Data-independent acquisition"
+        );
+        assert_eq!(
+            validator_compatible_acquisition_method("Data-dependent acquisition"),
+            "Data-dependent acquisition"
+        );
+        let mut proposal = SdrfProposal::default();
+        proposal.proteomics_data_acquisition_method =
+            "NT=Data-independent acquisition;AC=PRIDE:0000450".into();
+        proposal.sample_type = "study sample".into();
+        let issues = apply_publication_compatibility_normalization(&mut proposal);
+        assert_eq!(
+            proposal.proteomics_data_acquisition_method,
+            "Data-independent acquisition"
+        );
+        assert_eq!(proposal.sample_type, "not available");
+        assert_eq!(issues.len(), 2);
     }
 }

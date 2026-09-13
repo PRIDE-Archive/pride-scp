@@ -11,7 +11,8 @@ source-closure signals, then applies the BigBio-facing acceptance stack:
 
 A validator pass is necessary but never treated as proof of scientific truth. Source candidates are
 immutable; the readiness gate may create a hash-audited BigBio-1.1 compatibility derivative containing
-only schema/order/version/template metadata normalization. Missing scientific values remain blockers.
+schema/order/version/template normalization plus a narrowly audited set of publication-compatibility
+serializations that do not invent scientific state. Missing scientific values remain blockers.
 """
 from __future__ import annotations
 
@@ -34,8 +35,8 @@ from typing import Any, Iterable
 from sdrf_scientific_guard import VERSION as SCIENTIFIC_GUARD_VERSION
 from sdrf_scientific_guard import analyze as analyze_scientific_guard
 
-VERSION = "pride-scp-sdrf-readiness-v0.2"
-POLICY_VERSION = "pride-scp-bigbio-readiness-v0.5.14.3"
+VERSION = "pride-scp-sdrf-readiness-v0.3"
+POLICY_VERSION = "pride-scp-bigbio-readiness-v0.5.14.4"
 SDRF_PIPELINES_PIN = "0.1.6"
 
 # Authoritative SDRF-Proteomics contract used by this gate.  The web specification is treated as
@@ -73,10 +74,11 @@ PRIDE_SCP_ANNOTATION_TOOL_VALID_RE = re.compile(
     re.I,
 )
 
-# SDRF 1.1.0, sections 8.1/8.4 and template 14.11.  Keep the recommended NT/AC DIA
-# representation.  sdrf-pipelines 0.1.5/0.1.6 bundle a stale dia-acquisition 1.1.0 template that
-# rejects this *spec-valid* representation (upstream issue #345); that validator drift is handled
-# explicitly rather than by degrading the SDRF to a validator-specific spelling.
+# SDRF 1.1.0, sections 8.1/8.4 and template 14.11. The source candidate may preserve the
+# specification-preferred NT/AC DIA representation. The publication derivative intentionally uses the
+# validator-compatible bare DIA literal while sdrf-pipelines 0.1.5/0.1.6 ship the stale template from
+# upstream issue #345. This is a projection-only compatibility serialization; the immutable source
+# candidate and normalization manifest preserve the more specific source representation.
 DIA_SPEC_ALLOWED_VALUES = {
     "data-independent acquisition",
     "nt=data-independent acquisition;ac=pride:0000450",
@@ -86,6 +88,7 @@ DIA_SPEC_ALLOWED_VALUES = {
     "nt=swath ms;ac=pride:0000447",
 }
 KNOWN_DIA_TEMPLATE_DRIFT_PINS = {"0.1.5", "0.1.6"}
+DIA_VALIDATOR_COMPATIBLE_VALUE = "Data-independent acquisition"
 KNOWN_DIA_TEMPLATE_DRIFT_ERROR_RE = re.compile(
     r"^ERROR: Invalid value 'NT=Data-independent acquisition;AC=PRIDE:0000450' "
     r"- must be one of the allowed values$"
@@ -569,16 +572,49 @@ def _is_dia_acquisition(value: str) -> bool:
 
 
 def _normalize_dia_acquisition_value(value: str) -> str:
+    """Return the publication-compatible serialization for an already explicit DIA method.
+
+    The pinned dia-acquisition template in sdrf-pipelines 0.1.5/0.1.6 accepts only the bare
+    ``Data-independent acquisition`` literal (issue #345). The source candidate is immutable, so the
+    compatibility derivative may safely collapse known DIA spellings to that accepted superclass
+    representation without inventing acquisition mode. DDA/PRM/other methods are never converted.
+    """
     text = norm_value(value)
-    low = text.lower()
-    # Historical PRIDE_SCP drafts used PRIDE:0000628 for the exact label Data-independent acquisition.
-    # SDRF 1.1.0 section 8.4 and dia-acquisition 1.1.0 specify PRIDE:0000450 and recommend NT/AC.
-    # This is a controlled identifier correction only; it never changes DDA to DIA or infers a method.
-    if re.fullmatch(
-        r"nt=data-independent acquisition;\s*ac=pride:0000628", low, re.I
-    ):
-        return "NT=Data-independent acquisition;AC=PRIDE:0000450"
+    key = _contract_key(text)
+    if key == "nt=data-independent acquisition;ac=pride:0000628":
+        return DIA_VALIDATOR_COMPATIBLE_VALUE
+    if key in DIA_SPEC_ALLOWED_VALUES:
+        return DIA_VALIDATOR_COMPATIBLE_VALUE
     return text
+
+
+def _normalize_sample_type_validator_value(value: str) -> str:
+    text = norm_value(value)
+    if text.lower() == "study sample":
+        return "not available"
+    return text
+
+
+ZERO_CELL_SAMPLE_TYPES = {"empty", "blank", "negative control"}
+ZERO_CELL_IDENTITY_HEADERS = (
+    "characteristics[individual]",
+    "characteristics[cell type]",
+    "characteristics[cell line]",
+    "characteristics[cellosaurus accession]",
+    "characteristics[cellosaurus name]",
+    "characteristics[material type]",
+)
+
+
+def _row_values_by_header(headers: list[str], row: list[str], header: str) -> list[str]:
+    return [row[i] if i < len(row) else "" for i in column_indices(headers, header)]
+
+
+def _explicit_zero_cell_control(headers: list[str], row: list[str]) -> bool:
+    sample_types = {norm_value(v).lower() for v in _row_values_by_header(headers, row, "characteristics[sample type]")}
+    cell_ids = {norm_value(v).lower() for v in _row_values_by_header(headers, row, "characteristics[cell identifier]")}
+    cells = {norm_value(v).lower() for v in _row_values_by_header(headers, row, "characteristics[cells per well]")}
+    return bool(sample_types & ZERO_CELL_SAMPLE_TYPES) and "empty" in cell_ids and "0" in cells
 
 
 def _normalize_reserved_word(value: str) -> str:
@@ -842,6 +878,36 @@ def normalize_bigbio_projection(
     if reserved_word_changes:
         info.actions.append(f"normalized_reserved_word_case:{reserved_word_changes}_cells")
 
+    # The current maintained validator cache does not expose the specification's `study sample`
+    # literal. Normalize that exact compatibility gap to the permitted fail-closed sentinel rather
+    # than letting an otherwise source-grounded SDRF fail only after publication.
+    study_sample_changes = 0
+    for idx in column_indices(headers, "characteristics[sample type]"):
+        for row in rows:
+            old_value = row[idx]
+            new_value = _normalize_sample_type_validator_value(old_value)
+            if new_value != old_value:
+                row[idx] = new_value
+                study_sample_changes += 1
+    if study_sample_changes:
+        info.actions.append(f"normalized_validator_gap_study_sample_not_available:{study_sample_changes}_cells")
+        info.warnings.append("study_sample_specificity_removed_for_current_validator_compatibility")
+
+    # Exact zero-cell controls are a deterministic role, not biological material. Only the strict
+    # triple (empty/blank/negative-control role + cell identifier=empty + cells per well=0) authorizes
+    # clearing cell-specific identity. Organism/organism-part/disease context is intentionally kept.
+    zero_control_changes = 0
+    for row in rows:
+        if not _explicit_zero_cell_control(headers, row):
+            continue
+        for header in ZERO_CELL_IDENTITY_HEADERS:
+            for idx in column_indices(headers, header):
+                if norm_value(row[idx]).lower() != "not applicable":
+                    row[idx] = "not applicable"
+                    zero_control_changes += 1
+    if zero_control_changes:
+        info.actions.append(f"normalized_explicit_zero_cell_control_identity:{zero_control_changes}_cells")
+
     # Canonicalize exact known HCD encodings according to SDRF 1.1 section 8.3.  `HCD` is explicitly
     # permitted and avoids legacy/deprecated accession/label combinations without inferring a method.
     hcd_changes = 0
@@ -899,7 +965,7 @@ def normalize_bigbio_projection(
                 row[idx] = new_value
                 dia_value_changes += 1
     if dia_value_changes:
-        info.actions.append(f"normalized_dia_acquisition_accession:{dia_value_changes}_cells")
+        info.actions.append(f"normalized_dia_acquisition_validator_serialization:{dia_value_changes}_cells")
 
     # Replace stale PRIDE_SCP/internal template metadata with valid BigBio template declarations.
     removed_templates = _remove_columns(headers, rows, "comment[sdrf template]")
@@ -1174,9 +1240,9 @@ def evaluate_accession(args: argparse.Namespace, accession: str, reviews: dict[s
         result.state = blocker_state(result.blockers)
         return result
 
-    # Create a BigBio-1.1 compatibility derivative. Only schema/order/version/template metadata are
-    # normalized automatically. Required scientific values that are missing/placeholder remain
-    # blockers; they are never guessed from identifiers, filenames or model output.
+    # Create a BigBio-1.1 compatibility derivative. Schema/order/version/template metadata plus a
+    # small audited set of semantic-preserving validator compatibility serializations are normalized
+    # automatically. Missing scientific values remain blockers and are never guessed.
     normalized = Path(args.output) / "normalized" / accession / f"{accession}.sdrf.tsv"
     normalized_headers, normalized_rows, normalization = normalize_bigbio_projection(
         candidate_path, normalized, templates
@@ -1369,7 +1435,12 @@ def write_outputs(args: argparse.Namespace, results: list[ReadinessResult]) -> d
             "sdrf_skills_fix_auto_applied": False,
             "multiple_templates_validated_in_separate_processes": True,
             "specification_is_normative_over_known_validator_template_drift": True,
+            "validator_compatible_dia_serialization_applied_in_projection": True,
             "validator_drift_override_requires_exact_known_signature_and_local_spec_contract": True,
+            "validator_drift_override_is_fallback_only": True,
+            "exact_zero_cell_control_identity_normalized_in_projection": True,
+            "study_sample_validator_gap_normalized_fail_closed": True,
+            "repeated_chemistry_columns_checked_by_scientific_guard": True,
             "submission_ready_requires_hash_bound_review": True,
             "scientific_guard_runs_before_external_validation": True,
             "blank_single_cell_reserved_words_normalized_without_scientific_inference": True,
@@ -1561,12 +1632,18 @@ def self_test() -> None:
         assert "dia-acquisition" in derive_templates(mixed_acquisition_headers, mixed_acquisition_rows, ["dia-acquisition"])
         assert (
             _normalize_dia_acquisition_value("NT=Data-independent acquisition;AC=PRIDE:0000628")
-            == "NT=Data-independent acquisition;AC=PRIDE:0000450"
+            == "Data-independent acquisition"
         )
+        assert (
+            _normalize_dia_acquisition_value("NT=Data-independent acquisition;AC=PRIDE:0000450")
+            == "Data-independent acquisition"
+        )
+        assert _normalize_dia_acquisition_value("NT=diaPASEF;AC=PRIDE:0000650") == "Data-independent acquisition"
+        assert _normalize_dia_acquisition_value("NT=SWATH MS;AC=PRIDE:0000447") == "Data-independent acquisition"
         assert _normalize_dia_acquisition_value("Data-dependent acquisition") == "Data-dependent acquisition"
 
-        # Encode the normative SDRF 1.1 DIA contract so a stale validator template cannot make us
-        # rewrite a correct NT/AC value into a validator-specific workaround.
+        # Keep the normative source contract encoded even though the publication projection uses the
+        # bare DIA superclass while the pinned validator carries issue #345.
         dia_contract_headers = ["comment[proteomics data acquisition method]"]
         dia_contract_rows = [["NT=Data-independent acquisition;AC=PRIDE:0000450"] for _ in range(2)]
         assert not _dia_spec_contract_errors(dia_contract_headers, dia_contract_rows)
@@ -1595,6 +1672,53 @@ def self_test() -> None:
             "ERROR: some other DIA problem\nThere were validation errors.\n",
         )
         assert not _apply_known_validator_drift_override(contract_file, "dia-acquisition", unrelated).passed
+
+        zero_headers = [
+            "characteristics[sample type]", "characteristics[cell identifier]",
+            "characteristics[cells per well]", "characteristics[individual]",
+            "characteristics[cell type]", "characteristics[cell line]",
+            "characteristics[material type]",
+        ]
+        zero_row = ["empty", "empty", "0", "donor1", "HeLa", "HeLa", "cell"]
+        assert _explicit_zero_cell_control(zero_headers, zero_row)
+        assert _normalize_sample_type_validator_value("study sample") == "not available"
+
+        compatibility_source = root / "compatibility_source.tsv"
+        compatibility_projected = root / "compatibility_projected.tsv"
+        compatibility_headers = [
+            "source name", "characteristics[organism]", "characteristics[organism part]",
+            "characteristics[individual]", "characteristics[cell type]", "characteristics[cell line]",
+            "characteristics[material type]", "characteristics[sample type]",
+            "characteristics[single cell isolation protocol]", "characteristics[cell identifier]",
+            "characteristics[cells per well]", "characteristics[biological replicate]", "assay name",
+            "technology type", "comment[technical replicate]", "comment[proteomics data acquisition method]",
+            "comment[data file]", "comment[fraction identifier]", "comment[label]", "comment[instrument]",
+            "comment[cleavage agent details]", "comment[sdrf annotation tool]",
+        ]
+        compatibility_rows = [
+            ["blank", "Homo sapiens", "pancreas", "donor1", "HeLa", "HeLa", "cell", "empty",
+             "cellenONE", "empty", "0", "1", "blank", "proteomic profiling by mass spectrometry", "1",
+             "NT=Data-independent acquisition;AC=PRIDE:0000450", "blank.raw", "1", "label free sample",
+             "Orbitrap Astral", "NT=Trypsin;AC=MS:1001251", "pride-scp-sdrf pride-scp-sdrf-v0.3.1"],
+            ["study", "Homo sapiens", "brain", "donor2", "neuron", "not applicable", "tissue", "study sample",
+             "FACS", "cell2", "1", "2", "study", "proteomic profiling by mass spectrometry", "1",
+             "NT=Data-independent acquisition;AC=PRIDE:0000450", "study.raw", "1", "label free sample",
+             "Orbitrap Astral", "NT=Trypsin;AC=MS:1001251", "pride-scp-sdrf pride-scp-sdrf-v0.3.1"],
+        ]
+        _write_sdrf(compatibility_source, compatibility_headers, compatibility_rows)
+        ch, cr, ci = normalize_bigbio_projection(
+            compatibility_source, compatibility_projected,
+            ["ms-proteomics", "single-cell", "dia-acquisition", "human"],
+        )
+        cidx = {name: i for i, name in enumerate(ch)}
+        assert all(row[cidx["comment[proteomics data acquisition method]"]] == "Data-independent acquisition" for row in cr)
+        assert cr[0][cidx["characteristics[individual]"]] == "not applicable"
+        assert cr[0][cidx["characteristics[cell type]"]] == "not applicable"
+        assert cr[0][cidx["characteristics[cell line]"]] == "not applicable"
+        assert cr[0][cidx["characteristics[material type]"]] == "not applicable"
+        assert cr[0][cidx["characteristics[organism part]"]] == "pancreas"
+        assert cr[1][cidx["characteristics[sample type]"]] == "not available"
+        assert any(x.startswith("normalized_dia_acquisition_validator_serialization:2") for x in ci.actions)
 
         # Stable representation-only normalizations directly encoded by SDRF 1.1.
         assert _normalize_reserved_word("Not Available") == "not available"

@@ -96,7 +96,7 @@ if [[ -n "$REVIEW_APPROVED_MANIFEST" && ! -f "$REVIEW_APPROVED_MANIFEST" ]]; the
 fi
 
 echo "============================================================"
-echo "PRIDE-SCP v0.5.14.3 SDRF readiness launcher"
+echo "PRIDE-SCP v0.5.14.4 SDRF readiness launcher"
 echo "job_id=${SLURM_JOB_ID:-na} node=${SLURMD_NODENAME:-$(hostname)}"
 echo "sif=$SIF"
 echo "accessions=$ACCESSIONS_FILE"

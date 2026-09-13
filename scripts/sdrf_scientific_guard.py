@@ -8,7 +8,7 @@ from dataclasses import dataclass, field, asdict
 from pathlib import Path
 from typing import Any
 
-VERSION = "pride-scp-sdrf-scientific-guard-v0.3"
+VERSION = "pride-scp-sdrf-scientific-guard-v0.4"
 RESERVED = {"", "not available", "not applicable", "unknown", "pooled", "anonymized"}
 DDA_RE = re.compile(r"(?:^|[_\-.])DDA(?:top\d+)?(?:[_\-.]|$)", re.I)
 DIA_RE = re.compile(r"(?:^|[_\-.])DIA(?:[_\-.]|$)", re.I)
@@ -34,11 +34,39 @@ def _concrete(v: str) -> bool:
     return _low(v) not in RESERVED
 
 
-def _read(path: Path) -> tuple[list[str], list[dict[str, str]]]:
+class DuplicateSafeRow:
+    """Positional SDRF row that preserves repeated headers.
+
+    ``get`` returns the first concrete value (or first literal when all are reserved), while
+    ``values`` exposes every repeated-column value for checks that need full cardinality.
+    """
+    def __init__(self, headers: list[str], values: list[str]):
+        self._values: dict[str, list[str]] = {}
+        for idx, header in enumerate(headers):
+            self._values.setdefault(header, []).append(str(values[idx] if idx < len(values) else ""))
+
+    def values(self, header: str) -> list[str]:
+        return list(self._values.get(header, []))
+
+    def get(self, header: str, default: str = "") -> str:
+        values = self._values.get(header, [])
+        if not values:
+            return default
+        for value in values:
+            if _concrete(value):
+                return value
+        return values[0]
+
+
+def _read(path: Path) -> tuple[list[str], list[DuplicateSafeRow]]:
     with path.open(newline="", encoding="utf-8-sig") as fh:
-        reader = csv.DictReader(fh, delimiter="\t")
-        rows = [{k: str(v or "") for k, v in r.items()} for r in reader]
-        return list(reader.fieldnames or []), rows
+        reader = csv.reader(fh, delimiter="\t")
+        table = list(reader)
+    if not table:
+        return [], []
+    headers = [str(x or "") for x in table[0]]
+    rows = [DuplicateSafeRow(headers, [str(v or "") for v in row]) for row in table[1:]]
+    return headers, rows
 
 
 def _project_values(project: dict[str, Any], key: str) -> list[str]:
@@ -151,7 +179,15 @@ def analyze(path: Path, project_json: Path | None = None) -> GuardResult:
         if cell_id and cell_id not in RESERVED and cell_id != "empty":
             bad.append("characteristics[cell identifier]")
         if bad:
-            add("empty_control_has_concrete_biological_identity", i, headers=bad)
+            exact_zero_control = (
+                role in {"empty", "blank", "negative control"}
+                and cells == "0"
+                and cell_id == "empty"
+            )
+            if exact_zero_control:
+                warn("explicit_zero_cell_control_identity_requires_projection_normalization", i, headers=bad)
+            else:
+                add("empty_control_has_concrete_biological_identity", i, headers=bad)
 
     # 4. Known sample-role ontology delivery gap. The current specification advertises
     #    "study sample", but the maintained PRIDE ontology cache used by sdrf-pipelines does not
@@ -162,11 +198,11 @@ def analyze(path: Path, project_json: Path | None = None) -> GuardResult:
     if "characteristics[sample type]" in headers:
         for i, row in enumerate(rows, 2):
             if _low(row.get("characteristics[sample type]", "")) == "study sample":
-                add(
-                    "sample_type_study_sample_not_currently_validator_backed",
+                warn(
+                    "sample_type_study_sample_requires_projection_normalization",
                     i,
                     value=row.get("characteristics[sample type]", ""),
-                    remediation="use a source-backed PRIDE sample-role term, or 'not available' when the role is not source-resolved",
+                    remediation="publication projection uses 'not available' until the maintained validator exposes this term",
                 )
 
     # 5. Instrument/isolation metadata must be locally compatible with each row.
@@ -196,7 +232,21 @@ def analyze(path: Path, project_json: Path | None = None) -> GuardResult:
             if truncated:
                 add("narrow_metadata_field_contains_truncated_protocol_prose", i, header=h, value=v)
 
-    # 7. Repository-wide project metadata collapse checks. These are contradiction detectors only.
+    # 7. Repeated proteomics chemistry columns are meaningful, but repeating the same concrete
+    # chemistry value in multiple copies is almost always a serialization defect. Detect it before
+    # independent review so repeated-header handling cannot silently collapse/duplicate chemistry.
+    for i, row in enumerate(rows, 2):
+        for header, code in (
+            ("comment[cleavage agent details]", "duplicate_repeated_cleavage_agent"),
+            ("comment[modification parameters]", "duplicate_repeated_modification_parameter"),
+        ):
+            concrete = [_norm(v) for v in row.values(header) if _concrete(v)]
+            keys = [v.lower() for v in concrete]
+            duplicates = sorted({v for v in keys if keys.count(v) > 1})
+            if duplicates:
+                add(code, i, header=header, duplicate_values=duplicates)
+
+    # 8. Repository-wide project metadata collapse checks. These are contradiction detectors only.
     if project_json and project_json.is_file():
         try:
             project = json.loads(project_json.read_text(encoding="utf-8"))
@@ -204,13 +254,17 @@ def analyze(path: Path, project_json: Path | None = None) -> GuardResult:
             result.warnings.append(f"project_metadata_unreadable:{exc}")
         else:
             project_orgs = _project_values(project, "organisms")
-            candidate_orgs = sorted({_norm(r.get("characteristics[organism]", "")) for r in rows if _concrete(r.get("characteristics[organism]", ""))}, key=str.lower)
+            candidate_orgs = sorted({
+                _norm(v) for r in rows for v in r.values("characteristics[organism]") if _concrete(v)
+            }, key=str.lower)
             if len(project_orgs) > 1 and len(candidate_orgs) == 1:
                 add("multiorganism_project_collapsed_to_single_candidate_organism", None,
                     project_organisms=project_orgs, candidate_organisms=candidate_orgs)
 
             project_parts = _project_values(project, "organismParts")
-            candidate_parts = sorted({_norm(r.get("characteristics[organism part]", "")) for r in rows if _concrete(r.get("characteristics[organism part]", ""))}, key=str.lower)
+            candidate_parts = sorted({
+                _norm(v) for r in rows for v in r.values("characteristics[organism part]") if _concrete(v)
+            }, key=str.lower)
             if len(project_parts) > 1 and len(candidate_parts) == 1:
                 # PRIDE organismParts occasionally contains cell-line/cell-type concepts, so this is
                 # useful evidence of heterogeneity but not sufficiently reliable to force a candidate
@@ -246,12 +300,31 @@ def self_test() -> None:
         assert "individual_duplicates_nonindividual_semantic_field" in text
         assert "explicit_dda_conflicts" in text
         assert "truncated_protocol_prose" in text
-        assert "sample_type_study_sample_not_currently_validator_backed" in text
+        assert "sample_type_study_sample_requires_projection_normalization" in " ".join(r.warnings)
         assert "multiorganism_project_collapsed" in text
         assert "q_exactive_row_uses_generic_cid_instead_of_hcd" in text
         assert "lcm_microscope_model_without_lcm_isolation" in text
         assert "empty_control_has_concrete_biological_identity" in text
         assert "wide_window_acquisition_mislabeled_as_dia" in text
+
+        chem = td / "chem.tsv"
+        chem.write_text(
+            "source name\tcomment[cleavage agent details]\tcomment[cleavage agent details]\tcomment[modification parameters]\tcomment[modification parameters]\n"
+            "x\tNT=Trypsin;AC=MS:1001251\tNT=Trypsin;AC=MS:1001251\tNT=Oxidation;AC=UNIMOD:35;TA=M;MT=Variable\tNT=Oxidation;AC=UNIMOD:35;TA=M;MT=Variable\n"
+        )
+        cr = analyze(chem)
+        ctext = " ".join(cr.blockers)
+        assert "duplicate_repeated_cleavage_agent" in ctext
+        assert "duplicate_repeated_modification_parameter" in ctext
+
+        zero = td / "zero.tsv"
+        zero.write_text(
+            "source name\tcharacteristics[sample type]\tcharacteristics[cells per well]\tcharacteristics[cell identifier]\tcharacteristics[individual]\tcharacteristics[cell type]\tcharacteristics[cell line]\tcharacteristics[material type]\n"
+            "blank\tempty\t0\tempty\tdonor1\tHeLa\tHeLa\tcell\n"
+        )
+        zr = analyze(zero)
+        assert not any("empty_control_has_concrete_biological_identity" in x for x in zr.blockers)
+        assert any("explicit_zero_cell_control_identity_requires_projection_normalization" in x for x in zr.warnings)
     print("sdrf_scientific_guard self-test: PASS")
 
 

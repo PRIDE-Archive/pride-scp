@@ -134,13 +134,13 @@ The automation is idempotent:
 - hash mismatch -> no branch/PR;
 - any changed path outside the accession folder -> abort that accession.
 
-## Known DIA validator drift
+## Publication compatibility gate
 
-PRIDE-SCP v0.5.14.3 intentionally preserves the specification-correct DIA
-representation `NT=Data-independent acquisition;AC=PRIDE:0000450`.
-`sdrf-pipelines` issue #345 documents a stale vendored dia-acquisition template
-in 0.1.5/0.1.6. The upstream contribution command currently does not pass an
-explicit leaf template, and this automation uses exactly the contribution-rule
-command. It will never rewrite a valid DIA value merely to make a stale
-validator pass. If current `sdrf-pipelines@main` rejects a file, the automation
-stops that accession instead of opening a knowingly failing PR.
+PRIDE-SCP v0.5.14.4 preserves the source candidate but writes validator-compatible publication
+artifacts before exact hashes are frozen. In particular, already-explicit DIA methods are serialized
+as `Data-independent acquisition` while sdrf-pipelines 0.1.5/0.1.6 retain issue #345.
+
+Before any branch is pushed, `open_sdrf_annotated_dataset_prs.py` now runs both the repository's base
+validation command and separate `ms-proteomics` plus every declared leaf-template validation using
+`--skip-ontology`. This mirrors the upstream review gate closely enough to catch DIA/template failures
+locally rather than after PR creation.

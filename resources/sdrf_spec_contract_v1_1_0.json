@@ -41,8 +41,10 @@
   },
   "validator_compatibility": {
     "known_issue": "https://github.com/bigbio/sdrf-pipelines/issues/345",
-    "policy": "exact-signature override only after local normative DIA contract passes",
-    "sdrf_pipelines_pin": "0.1.6"
+    "policy": "publication derivative serializes already-explicit DIA as bare Data-independent acquisition for sdrf-pipelines 0.1.5/0.1.6; immutable source retains specific value",
+    "publication_dia_value": "Data-independent acquisition",
+    "sdrf_pipelines_pin": "0.1.6",
+    "source_preferred_dia": "NT=Data-independent acquisition;AC=PRIDE:0000450"
   },
   "version": "v1.1.0"
 }

@@ -1,4 +1,4 @@
-# PRIDE-SCP BigBio 1.1 compatibility projection (v0.5.14.3)
+# PRIDE-SCP BigBio 1.1 compatibility projection (v0.5.14.4)
 
 This stage converts an already source-closed PRIDE-SCP SDRF candidate into a separate BigBio-1.1
 compatibility derivative. The source candidate is immutable and remains the scientific provenance
@@ -99,9 +99,9 @@ failures instead of learning them accession by accession:
    implied by the specification. Parent and leaf validators are still run as separate subprocesses.
 5. single-cell projections require `characteristics[single cell isolation protocol]` and
    `characteristics[cell identifier]`; missing scientific values remain blockers and are never filled.
-6. acquisition-method values preserve the specification's preferred ontology encoding. In particular,
-   DIA is `NT=Data-independent acquisition;AC=PRIDE:0000450`; valid NT/AC values are not degraded to
-   free text just to appease a validator implementation.
+6. source-candidate acquisition values preserve the specification's preferred ontology encoding. The
+   v0.5.14.4 publication derivative may use a validator-compatible serialization without modifying the
+   immutable source candidate.
 7. exact known HCD legacy encodings are canonicalized to the specification-allowed short label `HCD`;
    no fragmentation method is inferred. Current SDRF 1.1 documentation identifies MS:1000422 as the
    canonical HCD concept and explicitly allows the short label.
@@ -122,9 +122,12 @@ NT=Data-independent acquisition;AC=PRIDE:0000450
 
 even though both the current specification and upstream DIA 1.1 template list it as valid.
 
-PRIDE_SCP therefore does **not** rewrite the correct SDRF to a bare value as a validator workaround.
-Instead, for sdrf-pipelines 0.1.5/0.1.6 only, a failing DIA-template subprocess is treated as the known
-validator drift **only when all of the following hold**:
+In v0.5.14.3, PRIDE_SCP did **not** rewrite the correct SDRF to a bare value and instead used a narrow
+compatibility override. Release20 upstream CI showed that this still left otherwise publishable PRs red.
+As of v0.5.14.4 the immutable source candidate remains unchanged, but the publication derivative emits
+the validator-compatible bare DIA literal. The old exact-signature override remains only as a fallback
+for diagnostics when validating a non-normalized artifact. That fallback is accepted **only when all of
+the following hold**:
 
 - the failure contains exactly the documented stale-template error and no other validator error;
 - the file independently satisfies the local SDRF 1.1 DIA value/cardinality contract;
@@ -143,6 +146,33 @@ Every compatibility rule above has a self-test. A future change must fail tests 
 - parent+child template declarations where the parent is inherited;
 - non-lowercase SDRF reserved words;
 - known noncanonical HCD encodings;
-- rewriting the spec-valid DIA NT/AC value solely because of validator issue 345; or
+- mutating the immutable source candidate solely because of validator issue 345; or
 - broad validator waivers that are not tied to an exact known upstream defect.
 
+
+
+## v0.5.14.4 release20-derived publication hardening
+
+Release20 upstream CI established that the pinned `sdrf-pipelines` DIA leaf validator accepts only the
+bare literal `Data-independent acquisition` even when the immutable source candidate uses a valid
+NT/AC representation. The publication projection therefore serializes already-explicit DIA methods as
+`Data-independent acquisition` while preserving the source candidate/hash and recording the
+normalization action. This includes the known generic DIA NT/AC values and explicit diaPASEF/SWATH DIA
+spellings; non-DIA acquisition methods are never converted.
+
+Additional generic hardening learned from independent review is applied before publication hashes are
+frozen:
+
+- exact zero-cell controls (`empty`/`blank`/`negative control`, `cell identifier=empty`,
+  `cells per well=0`) clear only cell-specific identity fields to `not applicable`; contextual
+  organism/organism-part/disease metadata is retained;
+- the currently unsupported `study sample` validator literal is projected fail-closed as
+  `not available` rather than discovered only in upstream CI;
+- the scientific guard is duplicate-header safe and blocks repeated identical cleavage-agent or
+  modification values, preventing repeated-column chemistry defects from reaching independent review;
+- the Rust generator emits validator-compatible DIA for newly generated drafts, so future candidates
+  do not recreate the release20 compatibility failure.
+
+These are generic rules. They do not encode accession-specific values and they do not relax the
+source-grounding or independent-review requirements. Missing chemistry, mapping, biological identity,
+or other scientific evidence remains fail-closed.

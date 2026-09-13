@@ -119,6 +119,7 @@ def main() -> None:
     ap.add_argument('--spec-contract', type=pathlib.Path)
     ap.add_argument('--project-snapshot-root', type=pathlib.Path)
     ap.add_argument('--expected-count', type=int, default=20)
+    ap.add_argument('--readiness-policy', default='pride-scp-bigbio-readiness-v0.5.14.4')
     args = ap.parse_args()
 
     approved = read_manifest(args.approved_manifest)
@@ -194,14 +195,14 @@ def main() -> None:
         'release_name': out.name,
         'created_utc': datetime.now(timezone.utc).isoformat(),
         'accessions': len(release_rows),
-        'readiness_policy': 'pride-scp-bigbio-readiness-v0.5.14.3',
+        'readiness_policy': args.readiness_policy,
         'review_policy': 'independent exact-hash scientific review',
         'submission_state': 'submission_ready',
         'upstream_contribution_rules_commit': '1b96296a1dbcf4cd4034440e5f83415a71eeadc5',
     }
     (out / 'release_metadata.json').write_text(json.dumps(release_meta, indent=2, sort_keys=True) + '\n')
 
-    readme = f'''# PRIDE-SCP submission-ready release cohort\n\nThis bundle freezes **{len(release_rows)}** exact-hash SDRF files promoted to `submission_ready` by PRIDE-SCP v0.5.14.3.\n\nEvery `datasets/<ACCESSION>/<ACCESSION>.sdrf.tsv` byte sequence matches the approved independent-review SHA-256 in `release_manifest.tsv`.\n\n## Contribution target\n\nThe files are laid out for `bigbio/sdrf-annotated-datasets` as `datasets/{{ACCESSION}}/{{ACCESSION}}.sdrf.tsv`. The automation must still validate each file with the current upstream `sdrf-pipelines` before opening a pull request.\n\n## Review disclosure\n\nThe cohort was produced with agent-assisted curation and independently agent-reviewed against public repository/publication evidence with exact-hash binding. It has **not** been claimed as human-reviewed; upstream maintainers should be told this explicitly in each PR.\n'''
+    readme = f'''# PRIDE-SCP submission-ready release cohort\n\nThis bundle freezes **{len(release_rows)}** exact-hash SDRF files promoted to `submission_ready` under `{args.readiness_policy}`.\n\nEvery `datasets/<ACCESSION>/<ACCESSION>.sdrf.tsv` byte sequence matches the approved independent-review SHA-256 in `release_manifest.tsv`.\n\n## Contribution target\n\nThe files are laid out for `bigbio/sdrf-annotated-datasets` as `datasets/{{ACCESSION}}/{{ACCESSION}}.sdrf.tsv`. The automation must still validate each file with the current upstream `sdrf-pipelines` before opening a pull request.\n\n## Review disclosure\n\nThe cohort was produced with agent-assisted curation and independently agent-reviewed against public repository/publication evidence with exact-hash binding. It has **not** been claimed as human-reviewed; upstream maintainers should be told this explicitly in each PR.\n'''
     (out / 'README.md').write_text(readme)
     write_checksums(out)
 

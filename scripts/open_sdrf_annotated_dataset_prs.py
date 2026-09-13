@@ -143,6 +143,43 @@ def make_pr_body(meta: dict[str, str], acc: str, hash_: str, action: str) -> str
     return f'''## Summary\n\n{action.capitalize()} the reviewed SDRF annotation for `{acc}`.\n\n{summary_line}\n\n- Rows: {meta.get('rows', '')}\n- Unique data files: {meta.get('unique_data_files', '')}\n- Organism(s): {meta.get('organisms', '')}\n- Declared template(s): {meta.get('templates', '')}\n- Approved exact SHA-256: `{hash_}`\n\n## Public evidence\n\n{chr(10).join(sources)}\n\nThe sample/file relationships and scientific metadata were checked against public repository and associated publication evidence before this exact hash was promoted to `submission_ready`.\n\n## Validation\n\nValidated locally with the same command required by this repository:\n\n```bash\nparse_sdrf validate-sdrf --sdrf_file datasets/{acc}/{acc}.sdrf.tsv --use_ols_cache_only\n```\n\nResult: **PASS**.\n\n## Curation / assistance disclosure\n\nThis annotation was produced with the PRIDE-SCP source-grounded curation pipeline and agent assistance, then independently agent-reviewed against public evidence with exact-hash binding. **It has not been claimed as human-reviewed.** No sample identifiers, raw-file names, or sample-to-file relationships were invented during the submission-readiness step.\n\nContribution workflow checked against `bigbio/sdrf-annotated-datasets` rules at `{RULES_COMMIT}`.\n'''
 
 
+
+
+def declared_template_names(path: pathlib.Path) -> list[str]:
+    """Return declared leaf-template names while preserving repeated SDRF headers."""
+    with path.open(newline='', encoding='utf-8-sig') as fh:
+        rows = list(csv.reader(fh, delimiter='\t'))
+    if not rows:
+        return []
+    headers = rows[0]
+    indices = [i for i, h in enumerate(headers) if h.strip().lower() == 'comment[sdrf template]']
+    names: set[str] = set()
+    for row in rows[1:]:
+        for i in indices:
+            if i >= len(row):
+                continue
+            value = row[i].strip()
+            if not value:
+                continue
+            name = value.split()[0].strip().lower()
+            if name:
+                names.add(name)
+    preferred = ['single-cell', 'dia-acquisition', 'human', 'vertebrates', 'invertebrates', 'plants', 'cell-lines']
+    return sorted(names, key=lambda x: (preferred.index(x) if x in preferred else len(preferred), x))
+
+
+def validate_publication_templates(path: pathlib.Path, cwd: pathlib.Path) -> None:
+    """Mirror the repository review gate before a branch is ever pushed."""
+    run(['parse_sdrf', 'validate-sdrf', '--sdrf_file', str(path), '--skip-ontology'], cwd=cwd)
+    templates = ['ms-proteomics'] + declared_template_names(path)
+    seen: set[str] = set()
+    for template in templates:
+        if template in seen:
+            continue
+        seen.add(template)
+        run(['parse_sdrf', 'validate-sdrf', '--sdrf_file', str(path), '--template', template, '--skip-ontology'], cwd=cwd)
+
+
 def verify_release_checksums(release: pathlib.Path) -> None:
     sums = release / 'SHA256SUMS'
     if not sums.is_file():
@@ -164,6 +201,10 @@ def self_test() -> None:
     assert remote_owner('https://github.com/alice/sdrf-annotated-datasets.git') == 'alice'
     body = make_pr_body({'rows':'1','unique_data_files':'1','templates':'single-cell v1.0.0'}, 'PXD000001', 'a'*64, 'add')
     assert 'PXD000001' in body and 'human-reviewed' in body and 'parse_sdrf' in body
+    t = pathlib.Path(tempfile.gettempdir()) / 'pride_scp_templates_selftest.tsv'
+    t.write_text('source name\tcomment[sdrf template]\tcomment[sdrf template]\na\tsingle-cell v1.0.0\thuman v1.1.0\n')
+    assert declared_template_names(t) == ['single-cell', 'human']
+    t.unlink(missing_ok=True)
 
     # Regression: porcelain status for a tracked modification starts with a space.
     # Ensure changed_paths() preserves the pathname rather than shifting it by one
@@ -194,6 +235,7 @@ def main() -> None:
     ap.add_argument('--upstream-repo', default=UPSTREAM_REPO)
     ap.add_argument('--base', default='auto', help='auto, dev, or main')
     ap.add_argument('--branch-prefix', default='pride-scp')
+    ap.add_argument('--branch-suffix', default='reviewed-v0514_4')
     ap.add_argument('--results', type=pathlib.Path)
     ap.add_argument('--accession', action='append', default=[])
     ap.add_argument('--max-prs', type=int, default=0, help='0 = no limit')
@@ -261,7 +303,7 @@ def main() -> None:
                 if actual != expected:
                     raise RuntimeError(f'{acc}: release SHA mismatch')
 
-                branch = f'{args.branch_prefix}/{acc.lower()}-reviewed-v0514_3'
+                branch = f'{args.branch_prefix}/{acc.lower()}-{args.branch_suffix}'
                 head = f'{owner}:{branch}'
                 if args.submit:
                     existing = current_pr(args.upstream_repo, head)
@@ -293,6 +335,7 @@ def main() -> None:
                         raise RuntimeError(f'{acc}: unexpected changed paths: {bad}')
 
                     run(['parse_sdrf', 'validate-sdrf', '--sdrf_file', str(target), '--use_ols_cache_only'], cwd=wt)
+                    validate_publication_templates(target, wt)
                     run(['git', 'add', f'datasets/{acc}/{acc}.sdrf.tsv'], cwd=wt)
                     staged = output(['git', 'diff', '--cached', '--name-only'], cwd=wt).splitlines()
                     if staged != [f'datasets/{acc}/{acc}.sdrf.tsv']:
