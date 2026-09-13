@@ -1,0 +1,183 @@
+name: Container - Docker
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - 'v*'
+  pull_request:
+    branches:
+      - main
+    paths:
+      - '.github/workflows/container-docker.yml'
+      - '.github/workflows/container-sif.yml'
+      - 'containers/**'
+      - 'crates/**'
+      - 'python/**'
+      - 'scripts/**'
+      - 'resources/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'rust-toolchain.toml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: container-docker-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  PRIDE_SCP_DOCKER_TARGET: runtime
+  PRIDE_SCP_DOCKER_PLATFORM: linux/amd64
+  PRIDE_SCP_BAKE_OLLAMA_MODEL: '0'
+  PRIDE_SCP_OLLAMA_MODEL: 'qwen2.5:3b'
+
+jobs:
+  docker:
+    name: Build and publish linux/amd64
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Require a clean checkout
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -n "$(git status --porcelain --untracked-files=normal)" ]]; then
+            git status --short
+            echo "GitHub Actions checkout is unexpectedly dirty" >&2
+            exit 2
+          fi
+
+      - name: Resolve image and source provenance
+        id: buildinfo
+        shell: bash
+        run: |
+          set -euo pipefail
+          image="ghcr.io/${GITHUB_REPOSITORY,,}"
+          immutable_tag="sha-${GITHUB_SHA}"
+          workspace_version="$(awk -F '"' '/^version = "/ {print $2; exit}' Cargo.toml)"
+          cargo_lock_hash="$(sha256sum Cargo.lock | awk '{print $1}')"
+          source_fingerprint="$(git ls-files -co --exclude-standard -z \
+            | LC_ALL=C sort -z \
+            | xargs -0 sha256sum \
+            | sha256sum \
+            | awk '{print $1}')"
+          {
+            echo "image=${image}"
+            echo "immutable_tag=${immutable_tag}"
+            echo "immutable_image=${image}:${immutable_tag}"
+            echo "workspace_version=${workspace_version}"
+            echo "cargo_lock_hash=${cargo_lock_hash}"
+            echo "source_fingerprint=${source_fingerprint}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Build canonical PRIDE-SCP runtime image
+        shell: bash
+        env:
+          PRIDE_SCP_IMAGE_REPOSITORY: ${{ steps.buildinfo.outputs.image }}
+          PRIDE_SCP_IMAGE_TAG: ${{ steps.buildinfo.outputs.immutable_tag }}
+          PRIDE_SCP_REQUIRE_CLEAN: '1'
+        run: |
+          set -euo pipefail
+          ./containers/build_docker.sh
+          docker image inspect "${PRIDE_SCP_IMAGE_REPOSITORY}:${PRIDE_SCP_IMAGE_TAG}" >/dev/null
+
+      - name: Smoke-test Docker image
+        shell: bash
+        env:
+          IMAGE: ${{ steps.buildinfo.outputs.immutable_image }}
+        run: |
+          set -euo pipefail
+          docker run --rm --entrypoint pride-scp "$IMAGE" --help >/dev/null
+          docker run --rm --entrypoint python "$IMAGE" \
+            /opt/pride-scp/scripts/sdrf_scientific_guard.py --self-test
+          docker run --rm --entrypoint python "$IMAGE" \
+            /opt/pride-scp/scripts/sdrf_bigbio_readiness.py --self-test
+
+      - name: Log in to GHCR
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Publish immutable Docker image
+        if: github.event_name != 'pull_request'
+        shell: bash
+        env:
+          IMAGE: ${{ steps.buildinfo.outputs.image }}
+          IMMUTABLE_TAG: ${{ steps.buildinfo.outputs.immutable_tag }}
+        run: |
+          set -euo pipefail
+          docker push "${IMAGE}:${IMMUTABLE_TAG}"
+          docker buildx imagetools inspect "${IMAGE}:${IMMUTABLE_TAG}"
+
+      - name: Publish Docker aliases
+        if: github.event_name != 'pull_request'
+        shell: bash
+        env:
+          IMAGE: ${{ steps.buildinfo.outputs.image }}
+          IMMUTABLE_TAG: ${{ steps.buildinfo.outputs.immutable_tag }}
+        run: |
+          set -euo pipefail
+          declare -a aliases=()
+
+          if [[ "$GITHUB_REF" == refs/heads/main ]]; then
+            aliases+=(main)
+          fi
+
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            tag="${GITHUB_REF#refs/tags/}"
+            aliases+=("$tag")
+            if [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(\.[0-9]+)?$ ]]; then
+              aliases+=(latest)
+            fi
+          fi
+
+          if ((${#aliases[@]} == 0)); then
+            echo "No mutable Docker aliases requested for this run."
+            exit 0
+          fi
+
+          printf '%s\n' "${aliases[@]}" | awk '!seen[$0]++' | while IFS= read -r alias; do
+            echo "Publishing Docker alias: ${IMAGE}:${alias}"
+            docker tag "${IMAGE}:${IMMUTABLE_TAG}" "${IMAGE}:${alias}"
+            docker push "${IMAGE}:${alias}"
+          done
+
+      - name: Write Docker build record
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > docker-build-record.txt <<EOF
+          image=${{ steps.buildinfo.outputs.image }}
+          immutable_tag=${{ steps.buildinfo.outputs.immutable_tag }}
+          git_sha=${GITHUB_SHA}
+          workspace_version=${{ steps.buildinfo.outputs.workspace_version }}
+          source_fingerprint_sha256=${{ steps.buildinfo.outputs.source_fingerprint }}
+          cargo_lock_sha256=${{ steps.buildinfo.outputs.cargo_lock_hash }}
+          platform=linux/amd64
+          docker_target=${PRIDE_SCP_DOCKER_TARGET}
+          bake_ollama_model=${PRIDE_SCP_BAKE_OLLAMA_MODEL}
+          EOF
+
+      - name: Upload Docker build record
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pride-scp-docker-build-record-${{ github.sha }}
+          path: docker-build-record.txt
+          if-no-files-found: error
+          retention-days: 30

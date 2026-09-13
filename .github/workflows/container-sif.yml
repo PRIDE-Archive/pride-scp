@@ -1,0 +1,234 @@
+name: Container - Singularity SIF
+
+on:
+  workflow_run:
+    workflows:
+      - Container - Docker
+    types:
+      - completed
+  workflow_dispatch:
+    inputs:
+      source_sha:
+        description: 'Full Git commit SHA whose sha-<commit> Docker image should be converted (default: selected ref)'
+        required: false
+        type: string
+      publish_alias:
+        description: 'Optional additional SIF tag to publish (for example dev-test)'
+        required: false
+        type: string
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  APPTAINER_VERSION: '1.5.3'
+
+jobs:
+  sif:
+    name: Convert Docker image to SIF and publish
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event != 'pull_request')
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    steps:
+      - name: Resolve source commit
+        id: source
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          WORKFLOW_RUN_SHA: ${{ github.event.workflow_run.head_sha }}
+          MANUAL_SOURCE_SHA: ${{ inputs.source_sha }}
+        run: |
+          set -euo pipefail
+          if [[ "$EVENT_NAME" == workflow_run ]]; then
+            sha="$WORKFLOW_RUN_SHA"
+          else
+            sha="${MANUAL_SOURCE_SHA:-$GITHUB_SHA}"
+          fi
+          [[ "$sha" =~ ^[0-9a-fA-F]{40}$ ]] || {
+            echo "source_sha must be a full 40-character Git commit SHA: $sha" >&2
+            exit 2
+          }
+          sha="${sha,,}"
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "docker_reference=sha-${sha}" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout exact source revision
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ steps.source.outputs.sha }}
+          fetch-depth: 0
+
+      - name: Resolve GHCR names
+        id: names
+        shell: bash
+        env:
+          SOURCE_SHA: ${{ steps.source.outputs.sha }}
+          DOCKER_REFERENCE: ${{ steps.source.outputs.docker_reference }}
+        run: |
+          set -euo pipefail
+          docker_repo="ghcr.io/${GITHUB_REPOSITORY,,}"
+          sif_repo="${docker_repo}-sif"
+          short_sha="${SOURCE_SHA:0:12}"
+          sif_base="pride-scp_${short_sha}.sif"
+          {
+            echo "docker_repo=$docker_repo"
+            echo "docker_image=${docker_repo}:${DOCKER_REFERENCE}"
+            echo "sif_repo=$sif_repo"
+            echo "sif_base=$sif_base"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Log in to GHCR for Docker pull
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Pull canonical Docker image and resolve digest
+        id: docker
+        shell: bash
+        env:
+          DOCKER_IMAGE: ${{ steps.names.outputs.docker_image }}
+        run: |
+          set -euo pipefail
+          docker pull --platform linux/amd64 "$DOCKER_IMAGE"
+          repo_digest="$(docker image inspect "$DOCKER_IMAGE" --format '{{index .RepoDigests 0}}')"
+          [[ "$repo_digest" == *@sha256:* ]] || {
+            echo "Could not resolve immutable Docker repository digest" >&2
+            exit 2
+          }
+          echo "repo_digest=$repo_digest" >> "$GITHUB_OUTPUT"
+          echo "Canonical Docker source: $repo_digest"
+
+      - name: Set up Apptainer
+        uses: eWaterCycle/setup-apptainer@v2
+        with:
+          apptainer-version: ${{ env.APPTAINER_VERSION }}
+
+      - name: Convert pulled Docker image to SIF
+        shell: bash
+        env:
+          DOCKER_IMAGE: ${{ steps.names.outputs.docker_image }}
+          SIF_BASE: ${{ steps.names.outputs.sif_base }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          ./containers/build_singularity.sh "$DOCKER_IMAGE" "$PWD/dist/$SIF_BASE"
+
+      - name: Verify SIF and source provenance
+        shell: bash
+        env:
+          SIF_BASE: ${{ steps.names.outputs.sif_base }}
+          DOCKER_IMAGE: ${{ steps.names.outputs.docker_image }}
+          DOCKER_DIGEST: ${{ steps.docker.outputs.repo_digest }}
+          SOURCE_SHA: ${{ steps.source.outputs.sha }}
+        run: |
+          set -euo pipefail
+          cd dist
+          sha256sum -c "${SIF_BASE}.sha256"
+          apptainer inspect "$SIF_BASE" >/dev/null
+          apptainer exec "$SIF_BASE" pride-scp --help >/dev/null
+          apptainer exec "$SIF_BASE" python \
+            /opt/pride-scp/scripts/sdrf_scientific_guard.py --self-test
+          apptainer exec "$SIF_BASE" python \
+            /opt/pride-scp/scripts/sdrf_bigbio_readiness.py --self-test
+          cat > "${SIF_BASE}.ghcr-source.txt" <<EOF
+          git_sha=${SOURCE_SHA}
+          docker_image=${DOCKER_IMAGE}
+          docker_repo_digest=${DOCKER_DIGEST}
+          sif_sha256=$(sha256sum "$SIF_BASE" | awk '{print $1}')
+          EOF
+
+      - name: Upload SIF files as GitHub Actions artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: pride-scp-sif-${{ steps.source.outputs.sha }}
+          path: |
+            dist/${{ steps.names.outputs.sif_base }}
+            dist/${{ steps.names.outputs.sif_base }}.sha256
+            dist/${{ steps.names.outputs.sif_base }}.meta.txt
+            dist/${{ steps.names.outputs.sif_base }}.ghcr-source.txt
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Log in to GHCR for ORAS/SIF push
+        shell: bash
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          printf '%s' "$GHCR_TOKEN" \
+            | apptainer registry login --username "$GITHUB_ACTOR" --password-stdin oras://ghcr.io
+
+      - name: Publish immutable SIF to GHCR
+        shell: bash
+        env:
+          SIF_BASE: ${{ steps.names.outputs.sif_base }}
+          SIF_REPO: ${{ steps.names.outputs.sif_repo }}
+          SOURCE_SHA: ${{ steps.source.outputs.sha }}
+        run: |
+          set -euo pipefail
+          apptainer push "dist/$SIF_BASE" "oras://${SIF_REPO}:sha-${SOURCE_SHA}"
+          echo "Published SIF: oras://${SIF_REPO}:sha-${SOURCE_SHA}"
+
+      - name: Publish main/tag aliases
+        shell: bash
+        env:
+          SIF_BASE: ${{ steps.names.outputs.sif_base }}
+          SIF_REPO: ${{ steps.names.outputs.sif_repo }}
+          SOURCE_SHA: ${{ steps.source.outputs.sha }}
+          WORKFLOW_HEAD_BRANCH: ${{ github.event.workflow_run.head_branch }}
+          MANUAL_ALIAS: ${{ inputs.publish_alias }}
+        run: |
+          set -euo pipefail
+          declare -a aliases=()
+
+          if [[ "${WORKFLOW_HEAD_BRANCH:-}" == main ]]; then
+            aliases+=(main)
+          fi
+
+          while IFS= read -r tag; do
+            [[ -n "$tag" ]] || continue
+            if [[ "$tag" == v* ]]; then
+              aliases+=("$tag")
+              if [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(\.[0-9]+)?$ ]]; then
+                aliases+=(latest)
+              fi
+            fi
+          done < <(git tag --points-at "$SOURCE_SHA")
+
+          if [[ -n "${MANUAL_ALIAS:-}" ]]; then
+            [[ "$MANUAL_ALIAS" =~ ^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$ ]] || {
+              echo "Invalid SIF alias: $MANUAL_ALIAS" >&2
+              exit 2
+            }
+            aliases+=("$MANUAL_ALIAS")
+          fi
+
+          if ((${#aliases[@]} == 0)); then
+            echo "No mutable SIF aliases requested for this run."
+            exit 0
+          fi
+
+          printf '%s\n' "${aliases[@]}" | awk '!seen[$0]++' | while IFS= read -r alias; do
+            echo "Publishing SIF alias: oras://${SIF_REPO}:${alias}"
+            apptainer push "dist/$SIF_BASE" "oras://${SIF_REPO}:${alias}"
+          done
+
+      - name: Show pull commands
+        shell: bash
+        env:
+          DOCKER_IMAGE: ${{ steps.names.outputs.docker_image }}
+          DOCKER_DIGEST: ${{ steps.docker.outputs.repo_digest }}
+          SIF_REPO: ${{ steps.names.outputs.sif_repo }}
+          SOURCE_SHA: ${{ steps.source.outputs.sha }}
+        run: |
+          set -euo pipefail
+          echo "Docker immutable tag: docker pull $DOCKER_IMAGE"
+          echo "Docker immutable digest: docker pull $DOCKER_DIGEST"
+          echo "SIF immutable pull: apptainer pull pride-scp.sif oras://${SIF_REPO}:sha-${SOURCE_SHA}"
+          echo "SingularityCE can consume the resulting SIF after it is pulled to disk."
