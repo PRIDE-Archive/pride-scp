@@ -36,7 +36,7 @@ from sdrf_scientific_guard import VERSION as SCIENTIFIC_GUARD_VERSION
 from sdrf_scientific_guard import analyze as analyze_scientific_guard
 
 VERSION = "pride-scp-sdrf-readiness-v0.3"
-POLICY_VERSION = "pride-scp-bigbio-readiness-v0.5.14.5"
+POLICY_VERSION = "pride-scp-bigbio-readiness-v0.5.14.6"
 SDRF_PIPELINES_PIN = "0.1.6"
 
 # Authoritative SDRF-Proteomics contract used by this gate.  The web specification is treated as
@@ -263,6 +263,7 @@ class ReadinessResult:
     parse_sdrf: list[dict[str, Any]] = field(default_factory=list)
     skills_check: dict[str, Any] = field(default_factory=dict)
     skills_score: dict[str, Any] = field(default_factory=dict)
+    skills_diagnostic: dict[str, Any] = field(default_factory=dict)
     review: dict[str, Any] = field(default_factory=dict)
     projected_path: str = ""
     projected_sha256: str = ""
@@ -1084,6 +1085,149 @@ def run_skills(path: Path, root: Path | None, python: str, timeout: int) -> tupl
     return check, score
 
 
+def run_skills_diagnostic(path: Path, root: Path | None, python: str, timeout: int) -> CommandResult:
+    """Return compact machine-readable `tools check` issue objects.
+
+    The upstream CLI intentionally prints only a summary for wrong-ontology findings. Readiness may
+    waive only a small set of documented upstream checker defects, so it must inspect the exact issue
+    signatures rather than infer them from accession-specific expectations or summary counts.
+    """
+    if root is None or not root.is_dir():
+        return CommandResult(
+            "sdrf-skills diagnostic",
+            [],
+            127,
+            "",
+            "sdrf-skills root unavailable",
+            available=False,
+        )
+    env_python = shutil.which(python) or python
+    code = """
+import dataclasses
+import json
+import sys
+from tools.hallucination import detect_hallucinations
+
+report = detect_hallucinations(sys.argv[1], verify_online=True)
+
+def compact(items):
+    out = []
+    for item in items:
+        value = dataclasses.asdict(item)
+        value.pop("rows", None)
+        out.append(value)
+    return out
+
+print(json.dumps({
+    "total_terms_checked": report.total_terms_checked,
+    "verified_count": len(report.verified),
+    "is_clean": report.is_clean,
+    "hallucinated": compact(report.hallucinated),
+    "mismatched": compact(report.mismatched),
+    "wrong_ontology": compact(report.wrong_ontology),
+    "unimod_swaps": compact(report.unimod_swaps),
+}, sort_keys=True))
+""".strip()
+    return run_command([env_python, "-c", code, str(path)], cwd=root, timeout=timeout)
+
+
+def _parse_skills_diagnostic(result: CommandResult) -> dict[str, Any]:
+    if not result.available or result.returncode != 0:
+        return {}
+    try:
+        value = json.loads(result.stdout.strip())
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
+def _known_skills_wrong_ontology(issue: dict[str, Any]) -> str | None:
+    """Classify one exact upstream sdrf-skills wrong-ontology false positive."""
+    column = str(issue.get("column", "")).strip().lower()
+    accession = str(issue.get("accession", "")).strip().upper()
+    actual = str(issue.get("actual_ontology", "")).strip().upper()
+    expected = {str(x).strip().upper() for x in issue.get("expected_ontologies", [])}
+
+    # SDRF 1.1 allows PRIDE CV terms for proteomics labels. The current sdrf-skills map still
+    # constrains comment[label] to MS, yielding verified-term wrong-ontology false positives.
+    if (
+        column == "comment[label]"
+        and accession.startswith("PRIDE:")
+        and actual == "PRIDE"
+        and expected == {"MS"}
+    ):
+        return "sdrf11_comment_label_pride_ontology"
+
+    # SDRF 1.1 sample metadata permits CLO alongside CL/BTO for cell-type annotation. Current
+    # sdrf-skills still reports verified CLO terms in cell-type fields as wrong-ontology findings.
+    if (
+        column in {"characteristics[cell type]", "factor value[cell type]"}
+        and accession.startswith("CLO:")
+        and actual == "CLO"
+        and expected == {"CL", "BTO"}
+    ):
+        return "sdrf11_cell_type_clo_ontology"
+
+    return None
+
+
+def _known_skills_unimod_swap(issue: dict[str, Any]) -> str | None:
+    """Classify the exact upstream static-map defect for UNIMOD:199."""
+    wrong_accession = str(issue.get("wrong_accession", "")).strip().upper()
+    correct_accession = str(issue.get("correct_accession", "")).strip().upper()
+    wrong_name = str(issue.get("wrong_name_for_accession", "")).strip().lower()
+    correct_name = str(issue.get("correct_name", "")).strip().lower()
+    if (
+        wrong_accession == "UNIMOD:199"
+        and correct_accession == "UNIMOD:199"
+        and wrong_name == "dimethyl:2h(4)"
+        and correct_name == "label:13c(6)15n(2)"
+    ):
+        return "sdrf_skills_unimod199_static_name_map_drift"
+    return None
+
+
+def apply_known_skills_drift_override(
+    check: CommandResult, diagnostic: dict[str, Any]
+) -> CommandResult:
+    """Waive only exact, standards-backed sdrf-skills checker defects.
+
+    This function never mutates SDRF bytes and never waives hallucinations or true label mismatches.
+    Every reported wrong-ontology or UNIMOD-swap issue must match a documented generic signature.
+    """
+    if check.passed or not diagnostic:
+        return check
+    if diagnostic.get("is_clean") is True:
+        return check
+    if diagnostic.get("hallucinated") or diagnostic.get("mismatched"):
+        return check
+
+    wrong = diagnostic.get("wrong_ontology") or []
+    swaps = diagnostic.get("unimod_swaps") or []
+    if not isinstance(wrong, list) or not isinstance(swaps, list) or not (wrong or swaps):
+        return check
+
+    reasons: list[str] = []
+    for issue in wrong:
+        if not isinstance(issue, dict):
+            return check
+        reason = _known_skills_wrong_ontology(issue)
+        if reason is None:
+            return check
+        reasons.append(reason)
+    for issue in swaps:
+        if not isinstance(issue, dict):
+            return check
+        reason = _known_skills_unimod_swap(issue)
+        if reason is None:
+            return check
+        reasons.append(reason)
+
+    check.compatibility_override = True
+    check.compatibility_reason = ";".join(sorted(set(reasons)))
+    return check
+
+
 def command_dict(result: CommandResult) -> dict[str, Any]:
     return {
         "label": result.label,
@@ -1321,6 +1465,16 @@ def evaluate_accession(args: argparse.Namespace, accession: str, reviews: dict[s
     skills_root = Path(args.sdrf_skills_root) if args.sdrf_skills_root else None
     if args.skills_mode != "off":
         check, score = run_skills(projected, skills_root, args.python, args.command_timeout)
+        if check.available and not check.passed:
+            diagnostic_result = run_skills_diagnostic(
+                projected, skills_root, args.python, args.command_timeout
+            )
+            diagnostic = _parse_skills_diagnostic(diagnostic_result)
+            result.skills_diagnostic = {
+                "command": command_dict(diagnostic_result),
+                "report": diagnostic,
+            }
+            check = apply_known_skills_drift_override(check, diagnostic)
         result.skills_check = command_dict(check)
         result.skills_score = command_dict(score)
         if args.skills_mode == "required" and not check.available:
@@ -1331,6 +1485,10 @@ def evaluate_accession(args: argparse.Namespace, accession: str, reviews: dict[s
             result.state = "blocked_bigbio_check"
             result.blockers.append("sdrf_skills_check_failed")
             return result
+        if check.compatibility_override:
+            result.warnings.append(
+                "sdrf_skills_compatibility_override:" + check.compatibility_reason
+            )
         if not check.available:
             result.warnings.append("sdrf_skills_not_run")
 
@@ -1445,6 +1603,9 @@ def write_outputs(args: argparse.Namespace, results: list[ReadinessResult]) -> d
             "validator_drift_overrides": sum(
                 1 for r in results for x in r.parse_sdrf if x.get("compatibility_override") is True
             ),
+            "sdrf_skills_compatibility_overrides": sum(
+                1 for r in results if r.skills_check.get("compatibility_override") is True
+            ),
         },
         "policies": {
             "model_generates_sdrf": False,
@@ -1457,6 +1618,9 @@ def write_outputs(args: argparse.Namespace, results: list[ReadinessResult]) -> d
             "normalization_is_hash_audited": True,
             "parse_sdrf_proves_scientific_truth": False,
             "sdrf_skills_fix_auto_applied": False,
+            "sdrf_skills_compatibility_override_requires_exact_issue_objects": True,
+            "sdrf_skills_compatibility_override_never_waives_hallucinations": True,
+            "sdrf_skills_compatibility_override_never_mutates_sdrf": True,
             "multiple_templates_validated_in_separate_processes": True,
             "specification_is_normative_over_known_validator_template_drift": True,
             "validator_compatible_dia_serialization_applied_in_projection": True,
