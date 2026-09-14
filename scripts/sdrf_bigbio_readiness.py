@@ -36,7 +36,7 @@ from sdrf_scientific_guard import VERSION as SCIENTIFIC_GUARD_VERSION
 from sdrf_scientific_guard import analyze as analyze_scientific_guard
 
 VERSION = "pride-scp-sdrf-readiness-v0.3"
-POLICY_VERSION = "pride-scp-bigbio-readiness-v0.5.14.4"
+POLICY_VERSION = "pride-scp-bigbio-readiness-v0.5.14.5"
 SDRF_PIPELINES_PIN = "0.1.6"
 
 # Authoritative SDRF-Proteomics contract used by this gate.  The web specification is treated as
@@ -161,6 +161,10 @@ ACCEPTED_INTERNAL_COMPLETENESS = {
     "valid",
     "source_closed",
     "source_closed_sdrf",
+}
+EXISTING_SDRF_GENERATION_MODES = {
+    "enriched_existing_sdrf",
+    "validated_existing_sdrf",
 }
 
 KNOWN_TEMPLATE_NAMES = set(TEMPLATE_VERSION_HINTS) | {
@@ -1112,6 +1116,23 @@ def classify_missing_candidate(graph: GraphSignals) -> tuple[str, list[str]]:
     return "blocked_internal_evidence", ["no source-closed SDRF candidate is available"]
 
 
+def existing_sdrf_uses_audit_snapshot_inventory(candidate: CandidateInfo) -> bool:
+    """Return whether repository-file linkage is advisory for this candidate.
+
+    Existing/resolved community SDRFs may name logical vendor acquisitions that PRIDE exposes
+    through archive/container records.  The deterministic SDRF auditor therefore treats local
+    snapshot linkage as an audit warning for such artifacts.  Readiness must preserve that policy,
+    while PRIDE-SCP-generated row mappings remain strict.
+    """
+
+    return (
+        candidate.generation_mode in EXISTING_SDRF_GENERATION_MODES
+        and candidate.locally_valid is True
+        and (candidate.internal_validation_errors or 0) == 0
+        and candidate.completeness_status in ACCEPTED_INTERNAL_COMPLETENESS
+    )
+
+
 def internal_candidate_checks(
     candidate: CandidateInfo,
     path: Path,
@@ -1145,7 +1166,10 @@ def internal_candidate_checks(
     inventory_keys = set(inventory)
     unmatched = {v for v in data_files if v not in inventory_keys}
     if data_files and inventory_keys and unmatched:
-        blockers.append("sdrf_data_file_not_in_pride_raw_inventory")
+        if existing_sdrf_uses_audit_snapshot_inventory(candidate):
+            warnings.append("resolved_existing_sdrf_data_file_not_in_pride_raw_inventory")
+        else:
+            blockers.append("sdrf_data_file_not_in_pride_raw_inventory")
     if not inventory_keys:
         warnings.append("pride_raw_inventory_unavailable")
     if not data_files:
