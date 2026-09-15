@@ -4119,7 +4119,10 @@ fn normalize_existing_individual_semantic_leakage(
         ]
         .into_iter()
         .flatten()
-        .any(|j| row.get(j).map_or(false, |value| concrete_semantic_value(value)));
+        .any(|j| {
+            row.get(j)
+                .map_or(false, |value| concrete_semantic_value(value))
+        });
         row[individual_idx] = if is_cell_line_material {
             "not applicable".into()
         } else {
@@ -4333,7 +4336,10 @@ fn merge_existing_sdrf(
         let explicit_bulk_row = explicit_bulk_source && cells_bulk_safe && cell_id_bulk_safe;
         if let Some(j) = sample_type_idx {
             if explicit_bulk_row
-                && matches!(current_sample_type.as_str(), "" | "not available" | "single cell")
+                && matches!(
+                    current_sample_type.as_str(),
+                    "" | "not available" | "single cell"
+                )
             {
                 row[j] = "pooled".into();
             } else if (current_sample_type.is_empty() || current_sample_type == "not available")
@@ -4379,7 +4385,9 @@ fn merge_existing_sdrf(
                     row[j] = "reference".into();
                 } else if sample_type == "empty" {
                     row[j] = "empty".into();
-                } else if ["bulk control", "pooled", "negative control"].contains(&sample_type.as_str()) {
+                } else if ["bulk control", "pooled", "negative control"]
+                    .contains(&sample_type.as_str())
+                {
                     row[j] = "not applicable".into();
                 } else if relation == "one_cell_per_data_file" || sample_type == "single cell" {
                     if let Some(src_j) = source_idx {
