@@ -36,7 +36,7 @@ from sdrf_scientific_guard import VERSION as SCIENTIFIC_GUARD_VERSION
 from sdrf_scientific_guard import analyze as analyze_scientific_guard
 
 VERSION = "pride-scp-sdrf-readiness-v0.3"
-POLICY_VERSION = "pride-scp-bigbio-readiness-v0.5.14.6"
+POLICY_VERSION = "pride-scp-bigbio-readiness-v0.5.14.7"
 SDRF_PIPELINES_PIN = "0.1.6"
 
 # Authoritative SDRF-Proteomics contract used by this gate.  The web specification is treated as
@@ -112,6 +112,14 @@ RESERVED_WORDS_CANONICAL = {
     "anonymized": "anonymized",
     "pooled": "pooled",
 }
+
+BULK_SOURCE_RE = re.compile(r"(?:^|[\s_-])bulk(?:[\s_-]|$)", re.I)
+INDIVIDUAL_SEMANTIC_ALIAS_HEADERS = (
+    "characteristics[organism part]",
+    "characteristics[cell line]",
+    "characteristics[cell type]",
+    "characteristics[developmental stage]",
+)
 
 # Versions observed in the current upstream template manifest on 2026-09-10.  Runtime validation is
 # still delegated to parse_sdrf; these constants are provenance/reporting anchors, not a replacement
@@ -289,6 +297,93 @@ def norm_value(value: str) -> str:
 
 def placeholder(value: str) -> bool:
     return norm_value(value).lower().replace("_", " ") in {x.replace("_", " ") for x in PLACEHOLDERS}
+
+
+def _semantic_concrete(value: str) -> bool:
+    low = norm_value(value).lower().replace("_", " ")
+    reserved = {x.replace("_", " ") for x in PLACEHOLDERS} | {"pooled", "anonymized"}
+    return low not in reserved
+
+
+def _pipe_semantic_tokens(value: str) -> set[str]:
+    tokens = {norm_value(x).lower() for x in str(value or "").split("|") if _semantic_concrete(x)}
+    return tokens if len(tokens) >= 2 else set()
+
+
+def _row_is_cell_line(headers: list[str], row: list[str]) -> bool:
+    for idx in column_indices(headers, "characteristics[material type]"):
+        if norm_value(row[idx]).lower() == "cell line":
+            return True
+    for header in (
+        "characteristics[cell line]",
+        "characteristics[cellosaurus accession]",
+        "characteristics[cellosaurus name]",
+    ):
+        for idx in column_indices(headers, header):
+            if _semantic_concrete(row[idx]):
+                return True
+    return False
+
+
+def _source_name_explicit_bulk(headers: list[str], row: list[str]) -> bool:
+    return any(
+        BULK_SOURCE_RE.search(norm_value(row[idx]))
+        for idx in column_indices(headers, "source name")
+    )
+
+
+def _bulk_projection_safe(headers: list[str], row: list[str]) -> bool:
+    safe = {"", "not available", "not applicable", "pooled"}
+    cells = {norm_value(row[idx]).lower() for idx in column_indices(headers, "characteristics[cells per well]")}
+    cell_ids = {norm_value(row[idx]).lower() for idx in column_indices(headers, "characteristics[cell identifier]")}
+    return (not cells or cells <= safe) and (not cell_ids or cell_ids <= safe)
+
+
+def _individual_leakage_reason(
+    headers: list[str],
+    rows: list[list[str]],
+    row: list[str],
+    individual: str,
+) -> str:
+    if not _semantic_concrete(individual):
+        return ""
+    individual_low = norm_value(individual).lower()
+    for header in INDIVIDUAL_SEMANTIC_ALIAS_HEADERS:
+        for idx in column_indices(headers, header):
+            other = row[idx]
+            if _semantic_concrete(other) and individual_low == norm_value(other).lower():
+                return f"duplicates_row:{header}"
+
+    tokens = _pipe_semantic_tokens(individual)
+    if tokens:
+        for header in INDIVIDUAL_SEMANTIC_ALIAS_HEADERS:
+            indices = column_indices(headers, header)
+            values = {
+                norm_value(r[idx]).lower()
+                for r in rows
+                for idx in indices
+                if _semantic_concrete(r[idx])
+            }
+            if len(values) >= 2 and tokens == values:
+                return f"dataset_values_concatenated:{header}"
+
+    cell_line_values = [
+        row[idx]
+        for idx in column_indices(headers, "characteristics[cell line]")
+        if _semantic_concrete(row[idx])
+    ]
+    if cell_line_values and re.search(r"(?:^|[_ -])donor$", norm_value(individual), re.I):
+        ind = re.sub(r"[^a-z0-9]", "", re.sub(r"(?:[_ -]?donor)$", "", individual, flags=re.I).lower())
+        for cell_line in cell_line_values:
+            cell = re.sub(r"[^a-z0-9]", "", cell_line.lower())
+            prefix = 0
+            for a, b in zip(ind, cell):
+                if a != b:
+                    break
+                prefix += 1
+            if prefix >= 3:
+                return "synthesized_from_cell_line"
+    return ""
 
 
 def collect_accessions(values: Iterable[str], path: Path | None) -> list[str]:
@@ -883,6 +978,45 @@ def normalize_bigbio_projection(
     if reserved_word_changes:
         info.actions.append(f"normalized_reserved_word_case:{reserved_word_changes}_cells")
 
+    # Remove deterministic individual/donor category leakage before external validation. Historical
+    # enrichment sometimes copied a row-local anatomical/cell field into `individual`, or copied the
+    # evidence packet's dataset-wide `A | B` rendering. We never synthesize a donor identity here:
+    # cell-line rows become `not applicable`; all other affected rows fail closed to `not available`.
+    individual_changes = 0
+    individual_reasons: Counter[str] = Counter()
+    for idx in column_indices(headers, "characteristics[individual]"):
+        for row in rows:
+            reason = _individual_leakage_reason(headers, rows, row, row[idx])
+            if not reason:
+                continue
+            replacement = "not applicable" if _row_is_cell_line(headers, row) else "not available"
+            if norm_value(row[idx]).lower() != replacement:
+                row[idx] = replacement
+                individual_changes += 1
+                individual_reasons[reason] += 1
+    if individual_changes:
+        info.actions.append(f"normalized_individual_semantic_leakage_fail_closed:{individual_changes}_cells")
+        for reason, count in sorted(individual_reasons.items()):
+            info.actions.append(f"individual_semantic_leakage_reason:{reason}:{count}_cells")
+        info.warnings.append("individual_false_identity_removed_without_donor_inference")
+
+    # A tokenized `bulk` marker in source name is explicit sample-role metadata, not a data-file
+    # filename heuristic. If the row was labelled single-cell (or left unavailable) while both
+    # cell-specific fields are unavailable/inapplicable, serialize the reserved pooled role.
+    # Concrete cell identity blocks normalization and remains a scientific contradiction in the guard.
+    bulk_role_changes = 0
+    for idx in column_indices(headers, "characteristics[sample type]"):
+        for row in rows:
+            role = norm_value(row[idx]).lower()
+            if role not in {"", "not available", "single cell"}:
+                continue
+            if _source_name_explicit_bulk(headers, row) and _bulk_projection_safe(headers, row):
+                row[idx] = "pooled"
+                bulk_role_changes += 1
+    if bulk_role_changes:
+        info.actions.append(f"normalized_explicit_bulk_source_role_to_pooled:{bulk_role_changes}_cells")
+        info.warnings.append("bulk_sample_role_corrected_without_data_file_filename_inference")
+
     # The current maintained validator cache does not expose the specification's `study sample`
     # literal. Normalize that exact compatibility gap to the permitted fail-closed sentinel rather
     # than letting an otherwise source-grounded SDRF fail only after publication.
@@ -1348,7 +1482,7 @@ def blocker_state(blockers: list[str]) -> str:
         return "blocked_mapping_incomplete"
     if ("metadata" in text or "isolation" in text or "placeholder" in text
             or "individual_" in text or "empty_control" in text or "truncated_protocol" in text
-            or "organism_part_project" in text):
+            or "organism_part_project" in text or "bulk_source_role" in text):
         return "blocked_metadata_incomplete"
     if "branch" in text or "relation" in text:
         return "blocked_branch_conflict"
@@ -1617,6 +1751,9 @@ def write_outputs(args: argparse.Namespace, results: list[ReadinessResult]) -> d
             "candidate_scientific_values_invented_by_gate": False,
             "normalization_is_hash_audited": True,
             "parse_sdrf_proves_scientific_truth": False,
+            "scientific_semantic_repairs_are_accession_independent": True,
+            "individual_semantic_leakage_fails_closed_without_identity_inference": True,
+            "bulk_role_normalization_uses_source_name_not_data_file_name": True,
             "sdrf_skills_fix_auto_applied": False,
             "sdrf_skills_compatibility_override_requires_exact_issue_objects": True,
             "sdrf_skills_compatibility_override_never_waives_hallucinations": True,

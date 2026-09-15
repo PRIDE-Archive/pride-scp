@@ -20,7 +20,7 @@ pub const SINGLE_CELL_TEMPLATE_VERSION: &str = "1.0.0";
 pub const SINGLE_CELL_TEMPLATE_URL: &str =
     "https://github.com/bigbio/sdrf-templates/blob/main/single-cell/1.0.0/single-cell.yaml";
 pub const SDRF_SPEC_URL: &str = "https://sdrf.quantms.org/specification.html";
-pub const GENERATOR_VERSION: &str = "pride-scp-sdrf-v0.4.6";
+pub const GENERATOR_VERSION: &str = "pride-scp-sdrf-v0.4.7";
 
 fn sdrf_annotation_tool_value() -> String {
     let version = GENERATOR_VERSION
@@ -32,7 +32,7 @@ const MANUSCRIPT_SCAN_MAX_CHARS: usize = 2_000_000;
 const MANUSCRIPT_EVIDENCE_MAX_RESERVED_ITEMS: usize = 24;
 const MANUSCRIPT_EVIDENCE_MAX_RESERVED_CHARS: usize = 12_000;
 pub const SDRF_SOURCE_RESOLVER_VERSION: &str = "pride-scp-sdrf-source-resolver-v0.1";
-pub const SDRF_AUDITOR_VERSION: &str = "pride-scp-sdrf-auditor-v0.2";
+pub const SDRF_AUDITOR_VERSION: &str = "pride-scp-sdrf-auditor-v0.3";
 pub const DEFAULT_OLLAMA_URL: &str = "http://localhost:11434/api/generate";
 
 // The linked single-cell template is work-in-progress. Generated drafts pin the
@@ -1740,6 +1740,16 @@ fn raw_file_role(name: &str) -> RawFileRole {
     RawFileRole::Unknown
 }
 
+fn source_name_explicit_bulk_role(name: &str) -> bool {
+    let normalized = name
+        .trim()
+        .to_ascii_lowercase()
+        .replace('-', "_")
+        .replace('.', "_")
+        .replace(' ', "_");
+    normalized.split('_').any(|token| token == "bulk")
+}
+
 fn raw_file_role_label(role: RawFileRole) -> &'static str {
     match role {
         RawFileRole::SingleCell => "single_cell",
@@ -3321,6 +3331,16 @@ fn obviously_invalid_field_value(field: &str, value: &str) -> bool {
         .iter()
         .any(|x| v.contains(x));
     }
+    if field == "individual" {
+        let parts = value
+            .split('|')
+            .map(str::trim)
+            .filter(|x| concrete_semantic_value(x))
+            .collect::<Vec<_>>();
+        if parts.len() >= 2 {
+            return true;
+        }
+    }
     if matches!(field, "fraction_identifier" | "technical_replicate") {
         return !v.chars().all(|c| c.is_ascii_digit());
     }
@@ -4021,6 +4041,95 @@ fn set_missing(row: &mut [String], idx: Option<usize>, value: Option<String>) {
     }
 }
 
+fn normalize_existing_individual_semantic_leakage(
+    headers: &[String],
+    rows: &mut [Vec<String>],
+) -> usize {
+    let Some(individual_idx) = header_first_index(headers, SC_INDIVIDUAL) else {
+        return 0;
+    };
+    let alias_headers = [
+        "characteristics[organism part]",
+        "characteristics[cell line]",
+        "characteristics[cell type]",
+        "characteristics[developmental stage]",
+    ];
+    let alias_values: BTreeMap<&str, BTreeSet<String>> = alias_headers
+        .into_iter()
+        .map(|header| {
+            let values = header_first_index(headers, header)
+                .map(|j| {
+                    rows.iter()
+                        .filter_map(|row| row.get(j))
+                        .filter(|value| concrete_semantic_value(value))
+                        .map(|value| value.trim().to_ascii_lowercase())
+                        .collect::<BTreeSet<_>>()
+                })
+                .unwrap_or_default();
+            (header, values)
+        })
+        .collect();
+
+    let cell_line_idx = header_first_index(headers, "characteristics[cell line]");
+    let cellosaurus_accession_idx =
+        header_first_index(headers, "characteristics[cellosaurus accession]");
+    let cellosaurus_name_idx = header_first_index(headers, "characteristics[cellosaurus name]");
+    let mut changed = 0usize;
+
+    for row in rows.iter_mut() {
+        let individual = row
+            .get(individual_idx)
+            .map(|value| value.trim().to_string())
+            .unwrap_or_default();
+        if !concrete_semantic_value(&individual) {
+            continue;
+        }
+
+        let row_local_duplicate = alias_headers.iter().any(|header| {
+            header_first_index(headers, header)
+                .and_then(|j| row.get(j))
+                .map(|value| {
+                    concrete_semantic_value(value) && individual.eq_ignore_ascii_case(value.trim())
+                })
+                .unwrap_or(false)
+        });
+        let synthesized_from_cell_line = cell_line_idx
+            .and_then(|j| row.get(j))
+            .map(|cell_line| individual_looks_synthesized_from_cell_line(&individual, cell_line))
+            .unwrap_or(false);
+        let pipe_values = individual
+            .split('|')
+            .map(str::trim)
+            .filter(|value| concrete_semantic_value(value))
+            .map(|value| value.to_ascii_lowercase())
+            .collect::<BTreeSet<_>>();
+        let dataset_concatenation = pipe_values.len() >= 2
+            && alias_values
+                .values()
+                .any(|values| values.len() >= 2 && values == &pipe_values);
+
+        if !(row_local_duplicate || synthesized_from_cell_line || dataset_concatenation) {
+            continue;
+        }
+
+        let is_cell_line_material = [
+            cell_line_idx,
+            cellosaurus_accession_idx,
+            cellosaurus_name_idx,
+        ]
+        .into_iter()
+        .flatten()
+        .any(|j| row.get(j).map_or(false, |value| concrete_semantic_value(value)));
+        row[individual_idx] = if is_cell_line_material {
+            "not applicable".into()
+        } else {
+            "not available".into()
+        };
+        changed += 1;
+    }
+    changed
+}
+
 fn data_file_basename(value: &str) -> String {
     let trimmed = value.trim().trim_matches('"');
     let tail = trimmed
@@ -4199,11 +4308,38 @@ fn merge_existing_sdrf(
             .and_then(|j| row.get(j))
             .map(|x| x.trim().to_ascii_lowercase())
             .unwrap_or_default();
-        if current_sample_type.is_empty() || current_sample_type == "not available" {
-            if relation == "one_cell_per_data_file" {
-                if let Some(j) = sample_type_idx {
-                    row[j] = "single cell".into();
-                }
+        let explicit_bulk_source = source_idx
+            .and_then(|j| row.get(j))
+            .map(|x| source_name_explicit_bulk_role(x))
+            .unwrap_or(false);
+        let cells_bulk_safe = cells_idx
+            .and_then(|j| row.get(j))
+            .map(|x| {
+                matches!(
+                    x.trim().to_ascii_lowercase().as_str(),
+                    "" | "not available" | "not applicable" | "pooled"
+                )
+            })
+            .unwrap_or(true);
+        let cell_id_bulk_safe = cell_idx
+            .and_then(|j| row.get(j))
+            .map(|x| {
+                matches!(
+                    x.trim().to_ascii_lowercase().as_str(),
+                    "" | "not available" | "not applicable" | "pooled"
+                )
+            })
+            .unwrap_or(true);
+        let explicit_bulk_row = explicit_bulk_source && cells_bulk_safe && cell_id_bulk_safe;
+        if let Some(j) = sample_type_idx {
+            if explicit_bulk_row
+                && matches!(current_sample_type.as_str(), "" | "not available" | "single cell")
+            {
+                row[j] = "pooled".into();
+            } else if (current_sample_type.is_empty() || current_sample_type == "not available")
+                && relation == "one_cell_per_data_file"
+            {
+                row[j] = "single cell".into();
             }
         }
         let sample_type = sample_type_idx
@@ -4217,6 +4353,7 @@ fn merge_existing_sdrf(
                     "reference",
                     "empty",
                     "bulk control",
+                    "pooled",
                     "negative control",
                 ]
                 .contains(&sample_type.as_str())
@@ -4242,7 +4379,7 @@ fn merge_existing_sdrf(
                     row[j] = "reference".into();
                 } else if sample_type == "empty" {
                     row[j] = "empty".into();
-                } else if ["bulk control", "negative control"].contains(&sample_type.as_str()) {
+                } else if ["bulk control", "pooled", "negative control"].contains(&sample_type.as_str()) {
                     row[j] = "not applicable".into();
                 } else if relation == "one_cell_per_data_file" || sample_type == "single cell" {
                     if let Some(src_j) = source_idx {
@@ -4280,6 +4417,11 @@ fn merge_existing_sdrf(
             }
         }
     }
+
+    // Existing SDRFs can contain a dataset-level semantic summary accidentally serialized as
+    // one individual/donor value. Remove only deterministic category leakage here so newly
+    // enriched candidates fail closed before readiness; do not synthesize donor identity.
+    normalize_existing_individual_semantic_leakage(&headers, &mut rows);
 
     let mode = if headers.len() > original_header_count {
         "enriched_existing_sdrf"
@@ -5179,6 +5321,27 @@ fn validate_draft_with_policy(
         .enumerate()
         .map(|(i, x)| (x.as_str(), i))
         .collect();
+    let individual_alias_values: BTreeMap<&str, BTreeSet<String>> = [
+        "characteristics[organism part]",
+        "characteristics[cell line]",
+        "characteristics[cell type]",
+        "characteristics[developmental stage]",
+    ]
+    .into_iter()
+    .map(|header| {
+        let values = index
+            .get(header)
+            .map(|&j| {
+                rows.iter()
+                    .filter_map(|row| row.get(j))
+                    .filter(|value| concrete_semantic_value(value))
+                    .map(|value| value.trim().to_ascii_lowercase())
+                    .collect::<BTreeSet<_>>()
+            })
+            .unwrap_or_default();
+        (header, values)
+    })
+    .collect();
     for h in &required {
         if !index.contains_key(h) {
             issues.push(ValidationIssue {
@@ -5216,6 +5379,7 @@ fn validate_draft_with_policy(
         "quality control sample",
         "empty",
         "bulk control",
+        "pooled",
         "not applicable",
         "not available",
     ];
@@ -5285,9 +5449,42 @@ fn validate_draft_with_policy(
                 issues.push(ValidationIssue { level: "warning".into(), code: "sample_type_requires_cv_validation".into(), row: ri + 1, column: SC_SAMPLE_TYPE.into(), message: format!("sample type is not in the local common-value set; defer ontology/CV validation to sdrf-pipelines: {}", row[j]) });
             }
         }
+        let row_sample_type = index
+            .get(SC_SAMPLE_TYPE)
+            .and_then(|&j| row.get(j))
+            .map(|value| value.trim().to_ascii_lowercase())
+            .unwrap_or_default();
+        let explicit_bulk_source = index
+            .get("source name")
+            .and_then(|&j| row.get(j))
+            .map(|value| source_name_explicit_bulk_role(value))
+            .unwrap_or(false);
+        if row_sample_type == "single cell" && explicit_bulk_source {
+            let safe_reserved = |header: &str| {
+                index
+                    .get(header)
+                    .and_then(|&j| row.get(j))
+                    .map(|value| {
+                        matches!(
+                            value.trim().to_ascii_lowercase().as_str(),
+                            "" | "not available" | "not applicable" | "pooled"
+                        )
+                    })
+                    .unwrap_or(true)
+            };
+            if safe_reserved(SC_CELLS_PER_WELL) && safe_reserved(SC_CELL_IDENTIFIER) {
+                issues.push(ValidationIssue {
+                    level: "error".into(),
+                    code: "single_cell_sample_type_conflicts_with_explicit_bulk_source_role".into(),
+                    row: ri + 1,
+                    column: SC_SAMPLE_TYPE.into(),
+                    message: "source name explicitly marks a bulk sample while sample type is 'single cell'; use the pooled/non-single-cell role without inferring cell count".into(),
+                });
+            }
+        }
         // Cross-field scientific semantics: an individual/donor is not an organism part,
-        // cell type, or cell line. Downgrading these errors must happen in curation, never by
-        // silently accepting a schema-valid but scientifically contradictory draft.
+        // cell type, or cell line. The native audit reports the contradiction; readiness may only
+        // remove deterministic category leakage with a hash-audited fail-closed projection repair.
         if let Some(&individual_idx) = index.get(SC_INDIVIDUAL) {
             let individual = row[individual_idx].trim();
             if concrete_semantic_value(individual) {
@@ -5326,6 +5523,28 @@ fn validate_draft_with_policy(
                                 "individual/donor value '{individual}' appears synthesized from cell line '{cell_line}' rather than source evidence"
                             ),
                         });
+                    }
+                }
+                let pipe_values = individual
+                    .split('|')
+                    .map(str::trim)
+                    .filter(|value| concrete_semantic_value(value))
+                    .map(|value| value.to_ascii_lowercase())
+                    .collect::<BTreeSet<_>>();
+                if pipe_values.len() >= 2 {
+                    for (header, values) in &individual_alias_values {
+                        if values.len() >= 2 && &pipe_values == values {
+                            issues.push(ValidationIssue {
+                                level: "error".into(),
+                                code: "individual_concatenates_nonindividual_dataset_semantics".into(),
+                                row: ri + 1,
+                                column: SC_INDIVIDUAL.into(),
+                                message: format!(
+                                    "individual/donor value '{individual}' is the dataset-wide concatenation of {header} values; source-specific individual identity is unresolved"
+                                ),
+                            });
+                            break;
+                        }
                     }
                 }
             }
@@ -7238,6 +7457,186 @@ mod tests {
         assert_eq!(rows[0][iso], "cellenONE");
         assert_eq!(rows[0][frac], "1");
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn existing_sdrf_merge_preserves_explicit_bulk_source_role_as_pooled() {
+        let root = tmp();
+        fs::create_dir_all(&root).unwrap();
+        let existing = root.join("bulk-existing.sdrf.tsv");
+        fs::write(
+            &existing,
+            "source name\tcharacteristics[organism]\tassay name\ttechnology type\tcomment[proteomics data acquisition method]\tcomment[label]\tcomment[instrument]\tcomment[cleavage agent details]\tcomment[fraction identifier]\tcomment[technical replicate]\tcomment[data file]\tcharacteristics[sample type]\tcharacteristics[cells per well]\tcharacteristics[cell identifier]\nPC3_parental_bulk_library\tHomo sapiens\trun1\tproteomic profiling by mass spectrometry\tData-independent acquisition\tlabel free sample\tOrbitrap\tNT=Trypsin;AC=MS:1001251\t1\t1\tlib.mzML\tsingle cell\tnot applicable\tnot applicable\n",
+        )
+        .unwrap();
+        let evidence = DatasetEvidence {
+            accession: "PXD999999".into(),
+            project_json_path: String::new(),
+            files_json_path: String::new(),
+            existing_sdrf_path: existing.display().to_string(),
+            raw_files: vec![RawFile {
+                file_name: "lib.mzML".into(),
+                file_uri: String::new(),
+                category: "RAW".into(),
+            }],
+            study_design: StudyDesignScaffold::default(),
+            metadata_scaffold: DeterministicMetadataScaffold::default(),
+            evidence: vec![],
+            manuscript_sources: vec![],
+            annotation_sources: vec![],
+        };
+        let proposal = SdrfProposal {
+            relation_mode: "one_cell_per_data_file".into(),
+            ..Default::default()
+        };
+        let (headers, rows, _) = merge_existing_sdrf(&proposal, &evidence).unwrap();
+        let sample_type = header_first_index(&headers, SC_SAMPLE_TYPE).unwrap();
+        assert_eq!(rows[0][sample_type], "pooled");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn existing_sdrf_merge_fails_closed_on_individual_category_leakage() {
+        let root = tmp();
+        fs::create_dir_all(&root).unwrap();
+        let existing = root.join("individual-leak-existing.sdrf.tsv");
+        fs::write(
+            &existing,
+            "source name\tcharacteristics[organism]\tcharacteristics[organism part]\tcharacteristics[cell line]\tcharacteristics[individual]\tassay name\ttechnology type\tcomment[proteomics data acquisition method]\tcomment[label]\tcomment[instrument]\tcomment[cleavage agent details]\tcomment[fraction identifier]\tcomment[technical replicate]\tcomment[data file]\nXla_cell_1\tXenopus laevis\tanimal hemisphere\tnot applicable\tanimal hemisphere | uterine cervix\trun1\tproteomic profiling by mass spectrometry\tData-independent acquisition\tlabel free sample\tOrbitrap\tNT=Trypsin;AC=MS:1001251\t1\t1\tcell1.mzML\nHeLa_standard_1\tHomo sapiens\tuterine cervix\tHeLa\tanimal hemisphere | uterine cervix\trun2\tproteomic profiling by mass spectrometry\tData-independent acquisition\tlabel free sample\tOrbitrap\tNT=Trypsin;AC=MS:1001251\t1\t1\thela1.mzML\n",
+        )
+        .unwrap();
+        let evidence = DatasetEvidence {
+            accession: "PXD999998".into(),
+            project_json_path: String::new(),
+            files_json_path: String::new(),
+            existing_sdrf_path: existing.display().to_string(),
+            raw_files: vec![],
+            study_design: StudyDesignScaffold::default(),
+            metadata_scaffold: DeterministicMetadataScaffold::default(),
+            evidence: vec![],
+            manuscript_sources: vec![],
+            annotation_sources: vec![],
+        };
+        let proposal = SdrfProposal {
+            relation_mode: "one_cell_per_data_file".into(),
+            ..Default::default()
+        };
+        let (headers, rows, _) = merge_existing_sdrf(&proposal, &evidence).unwrap();
+        let individual = header_first_index(&headers, SC_INDIVIDUAL).unwrap();
+        assert_eq!(rows[0][individual], "not available");
+        assert_eq!(rows[1][individual], "not applicable");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn dataset_wide_individual_pipe_value_is_never_accepted_as_one_individual() {
+        assert!(obviously_invalid_field_value(
+            "individual",
+            "animal hemisphere | uterine cervix"
+        ));
+        assert!(!obviously_invalid_field_value("individual", "donor_1"));
+    }
+
+    #[test]
+    fn native_guard_detects_dataset_semantic_individual_concatenation_and_bulk_role_conflict() {
+        let headers = vec![
+            "source name".into(),
+            "characteristics[organism]".into(),
+            "characteristics[organism part]".into(),
+            SC_SAMPLE_TYPE.into(),
+            SC_ISOLATION_METHOD.into(),
+            SC_CELL_IDENTIFIER.into(),
+            SC_INDIVIDUAL.into(),
+            SC_PREP_BATCH.into(),
+            SC_CELLS_PER_WELL.into(),
+            "assay name".into(),
+            "technology type".into(),
+            "comment[proteomics data acquisition method]".into(),
+            "comment[label]".into(),
+            "comment[instrument]".into(),
+            "comment[cleavage agent details]".into(),
+            "comment[fraction identifier]".into(),
+            "comment[technical replicate]".into(),
+            "comment[data file]".into(),
+            SC_CARRIER_CHANNEL.into(),
+            SC_REFERENCE_CHANNEL.into(),
+        ];
+        let rows = vec![
+            vec![
+                "Xla_cell_1".into(),
+                "Xenopus laevis".into(),
+                "animal hemisphere".into(),
+                "single cell".into(),
+                "manual picking".into(),
+                "cell_1".into(),
+                "animal hemisphere | uterine cervix".into(),
+                "batch1".into(),
+                "1".into(),
+                "run1".into(),
+                "proteomic profiling by mass spectrometry".into(),
+                "Data-dependent acquisition".into(),
+                "label free sample".into(),
+                "Orbitrap".into(),
+                "Trypsin".into(),
+                "1".into(),
+                "1".into(),
+                "run1.raw".into(),
+                "not applicable".into(),
+                "not applicable".into(),
+            ],
+            vec![
+                "PC3_bulk_library".into(),
+                "Homo sapiens".into(),
+                "uterine cervix".into(),
+                "single cell".into(),
+                "not applicable".into(),
+                "not applicable".into(),
+                "animal hemisphere | uterine cervix".into(),
+                "not available".into(),
+                "not applicable".into(),
+                "run2".into(),
+                "proteomic profiling by mass spectrometry".into(),
+                "Data-dependent acquisition".into(),
+                "label free sample".into(),
+                "Orbitrap".into(),
+                "Trypsin".into(),
+                "1".into(),
+                "1".into(),
+                "run2.raw".into(),
+                "not applicable".into(),
+                "not applicable".into(),
+            ],
+        ];
+        let evidence = DatasetEvidence {
+            accession: "PXD999999".into(),
+            project_json_path: String::new(),
+            files_json_path: String::new(),
+            existing_sdrf_path: String::new(),
+            raw_files: vec![
+                RawFile {
+                    file_name: "run1.raw".into(),
+                    file_uri: String::new(),
+                    category: "RAW".into(),
+                },
+                RawFile {
+                    file_name: "run2.raw".into(),
+                    file_uri: String::new(),
+                    category: "RAW".into(),
+                },
+            ],
+            study_design: StudyDesignScaffold::default(),
+            metadata_scaffold: DeterministicMetadataScaffold::default(),
+            evidence: vec![],
+            manuscript_sources: vec![],
+            annotation_sources: vec![],
+        };
+        let issues = validate_draft(&headers, &rows, &evidence);
+        assert!(issues
+            .iter()
+            .any(|x| x.code == "individual_concatenates_nonindividual_dataset_semantics"));
+        assert!(issues
+            .iter()
+            .any(|x| x.code == "single_cell_sample_type_conflicts_with_explicit_bulk_source_role"));
     }
 
     #[test]

@@ -8,11 +8,12 @@ from dataclasses import dataclass, field, asdict
 from pathlib import Path
 from typing import Any
 
-VERSION = "pride-scp-sdrf-scientific-guard-v0.4"
+VERSION = "pride-scp-sdrf-scientific-guard-v0.5"
 RESERVED = {"", "not available", "not applicable", "unknown", "pooled", "anonymized"}
 DDA_RE = re.compile(r"(?:^|[_\-.])DDA(?:top\d+)?(?:[_\-.]|$)", re.I)
 DIA_RE = re.compile(r"(?:^|[_\-.])DIA(?:[_\-.]|$)", re.I)
 TRUNCATED_PROSE_RE = re.compile(r"(?:\[[0-9]+\].*\b(?:and|then|as)\b|\b(?:figure|fig\.?|prepared|described)\b)", re.I)
+BULK_SOURCE_RE = re.compile(r"(?:^|[\s_-])bulk(?:[\s_-]|$)", re.I)
 
 @dataclass
 class GuardResult:
@@ -32,6 +33,36 @@ def _low(v: str) -> str:
 
 def _concrete(v: str) -> bool:
     return _low(v) not in RESERVED
+
+
+def _pipe_tokens(v: str) -> set[str]:
+    parts = {_low(x) for x in str(v or "").split("|") if _concrete(x)}
+    return parts if len(parts) >= 2 else set()
+
+
+def _row_is_cell_line(row: "DuplicateSafeRow") -> bool:
+    material = _low(row.get("characteristics[material type]", ""))
+    if material == "cell line":
+        return True
+    for header in (
+        "characteristics[cell line]",
+        "characteristics[cellosaurus accession]",
+        "characteristics[cellosaurus name]",
+    ):
+        if _concrete(row.get(header, "")):
+            return True
+    return False
+
+
+def _explicit_bulk_source_role(row: "DuplicateSafeRow") -> bool:
+    return bool(BULK_SOURCE_RE.search(_norm(row.get("source name", ""))))
+
+
+def _bulk_role_projection_safe(row: "DuplicateSafeRow") -> bool:
+    cells = _low(row.get("characteristics[cells per well]", ""))
+    cell_id = _low(row.get("characteristics[cell identifier]", ""))
+    safe = {"", "not available", "not applicable", "pooled"}
+    return cells in safe and cell_id in safe
 
 
 class DuplicateSafeRow:
@@ -96,37 +127,110 @@ def analyze(path: Path, project_json: Path | None = None) -> GuardResult:
         result.details.append({"code": code, "row": row_idx, "severity": "warning", **detail})
 
     # 1. Individual/donor semantic leakage from other biological columns.
+    #
+    # Historical enrichment occasionally copied an anatomical/cell semantic into the individual
+    # column, or copied the dataset-wide list rendered by evidence packets as ``A | B``.  Those
+    # are deterministic category errors.  They are eligible for projection-time fail-closed
+    # normalization because removing a false identity does not create a new biological identity.
     aliases = [
         "characteristics[organism part]",
         "characteristics[cell line]",
         "characteristics[cell type]",
         "characteristics[developmental stage]",
     ]
+    alias_sets = {
+        h: {_low(v) for row in rows for v in row.values(h) if _concrete(v)}
+        for h in aliases
+    }
     if "characteristics[individual]" in headers:
         for i, row in enumerate(rows, 2):
             individual = _norm(row.get("characteristics[individual]", ""))
             if not _concrete(individual):
                 continue
+            replacement = "not applicable" if _row_is_cell_line(row) else "not available"
             matched = False
             for h in aliases:
                 other = _norm(row.get(h, ""))
                 if _concrete(other) and _low(individual) == _low(other):
-                    add("individual_duplicates_nonindividual_semantic_field", i,
-                        individual=individual, duplicate_header=h, duplicate_value=other)
+                    warn(
+                        "individual_semantic_leakage_requires_projection_normalization",
+                        i,
+                        individual=individual,
+                        reason="duplicates_row_nonindividual_semantic_field",
+                        duplicate_header=h,
+                        duplicate_value=other,
+                        replacement=replacement,
+                    )
                     matched = True
                     break
-            if not matched:
-                cell_line = _norm(row.get("characteristics[cell line]", ""))
-                if _concrete(cell_line) and re.search(r"(?:^|[_ -])donor$", individual, re.I):
-                    a = re.sub(r"[^a-z0-9]", "", cell_line.lower())
-                    b = re.sub(r"[^a-z0-9]", "", re.sub(r"(?:[_ -]?donor)$", "", individual, flags=re.I).lower())
-                    prefix = 0
-                    for ca, cb in zip(a, b):
-                        if ca != cb:
-                            break
-                        prefix += 1
-                    if prefix >= 3:
-                        add("individual_looks_synthesized_from_cell_line", i, individual=individual, cell_line=cell_line)
+            if matched:
+                continue
+
+            tokens = _pipe_tokens(individual)
+            if tokens:
+                for h, values in alias_sets.items():
+                    if len(values) >= 2 and tokens == values:
+                        warn(
+                            "individual_semantic_leakage_requires_projection_normalization",
+                            i,
+                            individual=individual,
+                            reason="dataset_semantic_values_concatenated",
+                            duplicate_header=h,
+                            dataset_values=sorted(values),
+                            replacement=replacement,
+                        )
+                        matched = True
+                        break
+            if matched:
+                continue
+
+            cell_line = _norm(row.get("characteristics[cell line]", ""))
+            if _concrete(cell_line) and re.search(r"(?:^|[_ -])donor$", individual, re.I):
+                a = re.sub(r"[^a-z0-9]", "", cell_line.lower())
+                b = re.sub(r"[^a-z0-9]", "", re.sub(r"(?:[_ -]?donor)$", "", individual, flags=re.I).lower())
+                prefix = 0
+                for ca, cb in zip(a, b):
+                    if ca != cb:
+                        break
+                    prefix += 1
+                if prefix >= 3:
+                    warn(
+                        "individual_semantic_leakage_requires_projection_normalization",
+                        i,
+                        individual=individual,
+                        reason="synthesized_from_cell_line",
+                        cell_line=cell_line,
+                        replacement="not applicable",
+                    )
+
+    # 1b. Explicit bulk sample roles must not be serialized as single-cell study rows.  Source
+    # name is an SDRF biological/sample identifier, unlike comment[data file]; only a tokenized
+    # ``bulk`` marker there is used.  When cell-specific fields are already unavailable/inapplicable
+    # the correction to the reserved role ``pooled`` is deterministic.  Conflicting concrete cell
+    # identity remains fail-closed.
+    if "characteristics[sample type]" in headers:
+        for i, row in enumerate(rows, 2):
+            if not _explicit_bulk_source_role(row):
+                continue
+            role = _low(row.get("characteristics[sample type]", ""))
+            if role not in {"", "not available", "single cell"}:
+                continue
+            if _bulk_role_projection_safe(row):
+                warn(
+                    "explicit_bulk_source_role_requires_projection_normalization",
+                    i,
+                    source_name=row.get("source name", ""),
+                    sample_type=row.get("characteristics[sample type]", ""),
+                    replacement="pooled",
+                )
+            elif role == "single cell":
+                add(
+                    "explicit_bulk_source_role_conflicts_with_concrete_single_cell_identity",
+                    i,
+                    source_name=row.get("source name", ""),
+                    cells_per_well=row.get("characteristics[cells per well]", ""),
+                    cell_identifier=row.get("characteristics[cell identifier]", ""),
+                )
 
     # 2. Explicit acquisition tokens in deposited file names must not contradict metadata.
     for i, row in enumerate(rows, 2):
@@ -297,7 +401,7 @@ def self_test() -> None:
         project.write_text(json.dumps({"organisms": [{"name":"Homo sapiens"},{"name":"Xenopus laevis"}]}))
         r = analyze(p, project)
         text = " ".join(r.blockers)
-        assert "individual_duplicates_nonindividual_semantic_field" in text
+        assert "individual_semantic_leakage_requires_projection_normalization" in " ".join(r.warnings)
         assert "explicit_dda_conflicts" in text
         assert "truncated_protocol_prose" in text
         assert "sample_type_study_sample_requires_projection_normalization" in " ".join(r.warnings)
@@ -325,6 +429,33 @@ def self_test() -> None:
         zr = analyze(zero)
         assert not any("empty_control_has_concrete_biological_identity" in x for x in zr.blockers)
         assert any("explicit_zero_cell_control_identity_requires_projection_normalization" in x for x in zr.warnings)
+
+        mixed = td / "mixed_individual.tsv"
+        mixed.write_text(
+            "source name\tcharacteristics[organism part]\tcharacteristics[individual]\tcharacteristics[material type]\tcharacteristics[sample type]\tcharacteristics[cells per well]\tcharacteristics[cell identifier]\n"
+            "x1\tanimal hemisphere\tanimal hemisphere | uterine cervix\tcell\tsingle cell\t1\tcell_1\n"
+            "x2\tuterine cervix\tanimal hemisphere | uterine cervix\tcell line\tstandard\tnot applicable\tnot applicable\n"
+        )
+        mr = analyze(mixed)
+        assert not mr.blockers
+        assert sum("individual_semantic_leakage_requires_projection_normalization" in x for x in mr.warnings) == 2
+
+        bulk = td / "bulk.tsv"
+        bulk.write_text(
+            "source name\tcharacteristics[sample type]\tcharacteristics[cells per well]\tcharacteristics[cell identifier]\n"
+            "PC3_parental_bulk_library\tsingle cell\tnot applicable\tnot applicable\n"
+        )
+        br = analyze(bulk)
+        assert not br.blockers
+        assert any("explicit_bulk_source_role_requires_projection_normalization" in x for x in br.warnings)
+
+        bulk_conflict = td / "bulk_conflict.tsv"
+        bulk_conflict.write_text(
+            "source name\tcharacteristics[sample type]\tcharacteristics[cells per well]\tcharacteristics[cell identifier]\n"
+            "PC3_parental_bulk_library\tsingle cell\t1\tcell_1\n"
+        )
+        bcr = analyze(bulk_conflict)
+        assert any("explicit_bulk_source_role_conflicts_with_concrete_single_cell_identity" in x for x in bcr.blockers)
     print("sdrf_scientific_guard self-test: PASS")
 
 
