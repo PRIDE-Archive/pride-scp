@@ -4041,98 +4041,6 @@ fn set_missing(row: &mut [String], idx: Option<usize>, value: Option<String>) {
     }
 }
 
-fn normalize_existing_individual_semantic_leakage(
-    headers: &[String],
-    rows: &mut [Vec<String>],
-) -> usize {
-    let Some(individual_idx) = header_first_index(headers, SC_INDIVIDUAL) else {
-        return 0;
-    };
-    let alias_headers = [
-        "characteristics[organism part]",
-        "characteristics[cell line]",
-        "characteristics[cell type]",
-        "characteristics[developmental stage]",
-    ];
-    let alias_values: BTreeMap<&str, BTreeSet<String>> = alias_headers
-        .into_iter()
-        .map(|header| {
-            let values = header_first_index(headers, header)
-                .map(|j| {
-                    rows.iter()
-                        .filter_map(|row| row.get(j))
-                        .filter(|value| concrete_semantic_value(value))
-                        .map(|value| value.trim().to_ascii_lowercase())
-                        .collect::<BTreeSet<_>>()
-                })
-                .unwrap_or_default();
-            (header, values)
-        })
-        .collect();
-
-    let cell_line_idx = header_first_index(headers, "characteristics[cell line]");
-    let cellosaurus_accession_idx =
-        header_first_index(headers, "characteristics[cellosaurus accession]");
-    let cellosaurus_name_idx = header_first_index(headers, "characteristics[cellosaurus name]");
-    let mut changed = 0usize;
-
-    for row in rows.iter_mut() {
-        let individual = row
-            .get(individual_idx)
-            .map(|value| value.trim().to_string())
-            .unwrap_or_default();
-        if !concrete_semantic_value(&individual) {
-            continue;
-        }
-
-        let row_local_duplicate = alias_headers.iter().any(|header| {
-            header_first_index(headers, header)
-                .and_then(|j| row.get(j))
-                .map(|value| {
-                    concrete_semantic_value(value) && individual.eq_ignore_ascii_case(value.trim())
-                })
-                .unwrap_or(false)
-        });
-        let synthesized_from_cell_line = cell_line_idx
-            .and_then(|j| row.get(j))
-            .map(|cell_line| individual_looks_synthesized_from_cell_line(&individual, cell_line))
-            .unwrap_or(false);
-        let pipe_values = individual
-            .split('|')
-            .map(str::trim)
-            .filter(|value| concrete_semantic_value(value))
-            .map(|value| value.to_ascii_lowercase())
-            .collect::<BTreeSet<_>>();
-        let dataset_concatenation = pipe_values.len() >= 2
-            && alias_values
-                .values()
-                .any(|values| values.len() >= 2 && values == &pipe_values);
-
-        if !(row_local_duplicate || synthesized_from_cell_line || dataset_concatenation) {
-            continue;
-        }
-
-        let is_cell_line_material = [
-            cell_line_idx,
-            cellosaurus_accession_idx,
-            cellosaurus_name_idx,
-        ]
-        .into_iter()
-        .flatten()
-        .any(|j| {
-            row.get(j)
-                .map_or(false, |value| concrete_semantic_value(value))
-        });
-        row[individual_idx] = if is_cell_line_material {
-            "not applicable".into()
-        } else {
-            "not available".into()
-        };
-        changed += 1;
-    }
-    changed
-}
-
 fn data_file_basename(value: &str) -> String {
     let trimmed = value.trim().trim_matches('"');
     let tail = trimmed
@@ -4336,10 +4244,7 @@ fn merge_existing_sdrf(
         let explicit_bulk_row = explicit_bulk_source && cells_bulk_safe && cell_id_bulk_safe;
         if let Some(j) = sample_type_idx {
             if explicit_bulk_row
-                && matches!(
-                    current_sample_type.as_str(),
-                    "" | "not available" | "single cell"
-                )
+                && matches!(current_sample_type.as_str(), "" | "not available" | "single cell")
             {
                 row[j] = "pooled".into();
             } else if (current_sample_type.is_empty() || current_sample_type == "not available")
@@ -4385,9 +4290,7 @@ fn merge_existing_sdrf(
                     row[j] = "reference".into();
                 } else if sample_type == "empty" {
                     row[j] = "empty".into();
-                } else if ["bulk control", "pooled", "negative control"]
-                    .contains(&sample_type.as_str())
-                {
+                } else if ["bulk control", "pooled", "negative control"].contains(&sample_type.as_str()) {
                     row[j] = "not applicable".into();
                 } else if relation == "one_cell_per_data_file" || sample_type == "single cell" {
                     if let Some(src_j) = source_idx {
@@ -4425,11 +4328,6 @@ fn merge_existing_sdrf(
             }
         }
     }
-
-    // Existing SDRFs can contain a dataset-level semantic summary accidentally serialized as
-    // one individual/donor value. Remove only deterministic category leakage here so newly
-    // enriched candidates fail closed before readiness; do not synthesize donor identity.
-    normalize_existing_individual_semantic_leakage(&headers, &mut rows);
 
     let mode = if headers.len() > original_header_count {
         "enriched_existing_sdrf"
@@ -6940,8 +6838,8 @@ mod tests {
             .iter()
             .position(|h| h == "comment[sdrf annotation tool]")
             .unwrap();
-        assert_eq!(rows[0][annotation_idx], "pride-scp-sdrf v0.4.6");
-        assert_eq!(sdrf_annotation_tool_value(), "pride-scp-sdrf v0.4.6");
+        assert_eq!(rows[0][annotation_idx], "pride-scp-sdrf v0.4.7");
+        assert_eq!(sdrf_annotation_tool_value(), "pride-scp-sdrf v0.4.7");
         let issues = validate_draft(&headers, &rows, &evidence);
         assert!(issues.iter().all(|x| x.level != "error"), "{issues:?}");
     }
@@ -7500,39 +7398,6 @@ mod tests {
         let (headers, rows, _) = merge_existing_sdrf(&proposal, &evidence).unwrap();
         let sample_type = header_first_index(&headers, SC_SAMPLE_TYPE).unwrap();
         assert_eq!(rows[0][sample_type], "pooled");
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn existing_sdrf_merge_fails_closed_on_individual_category_leakage() {
-        let root = tmp();
-        fs::create_dir_all(&root).unwrap();
-        let existing = root.join("individual-leak-existing.sdrf.tsv");
-        fs::write(
-            &existing,
-            "source name\tcharacteristics[organism]\tcharacteristics[organism part]\tcharacteristics[cell line]\tcharacteristics[individual]\tassay name\ttechnology type\tcomment[proteomics data acquisition method]\tcomment[label]\tcomment[instrument]\tcomment[cleavage agent details]\tcomment[fraction identifier]\tcomment[technical replicate]\tcomment[data file]\nXla_cell_1\tXenopus laevis\tanimal hemisphere\tnot applicable\tanimal hemisphere | uterine cervix\trun1\tproteomic profiling by mass spectrometry\tData-independent acquisition\tlabel free sample\tOrbitrap\tNT=Trypsin;AC=MS:1001251\t1\t1\tcell1.mzML\nHeLa_standard_1\tHomo sapiens\tuterine cervix\tHeLa\tanimal hemisphere | uterine cervix\trun2\tproteomic profiling by mass spectrometry\tData-independent acquisition\tlabel free sample\tOrbitrap\tNT=Trypsin;AC=MS:1001251\t1\t1\thela1.mzML\n",
-        )
-        .unwrap();
-        let evidence = DatasetEvidence {
-            accession: "PXD999998".into(),
-            project_json_path: String::new(),
-            files_json_path: String::new(),
-            existing_sdrf_path: existing.display().to_string(),
-            raw_files: vec![],
-            study_design: StudyDesignScaffold::default(),
-            metadata_scaffold: DeterministicMetadataScaffold::default(),
-            evidence: vec![],
-            manuscript_sources: vec![],
-            annotation_sources: vec![],
-        };
-        let proposal = SdrfProposal {
-            relation_mode: "one_cell_per_data_file".into(),
-            ..Default::default()
-        };
-        let (headers, rows, _) = merge_existing_sdrf(&proposal, &evidence).unwrap();
-        let individual = header_first_index(&headers, SC_INDIVIDUAL).unwrap();
-        assert_eq!(rows[0][individual], "not available");
-        assert_eq!(rows[1][individual], "not applicable");
         let _ = fs::remove_dir_all(root);
     }
 
