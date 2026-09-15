@@ -35,8 +35,8 @@ from typing import Any, Iterable
 from sdrf_scientific_guard import VERSION as SCIENTIFIC_GUARD_VERSION
 from sdrf_scientific_guard import analyze as analyze_scientific_guard
 
-VERSION = "pride-scp-sdrf-readiness-v0.3"
-POLICY_VERSION = "pride-scp-bigbio-readiness-v0.5.14.7"
+VERSION = "pride-scp-sdrf-readiness-v0.4"
+POLICY_VERSION = "pride-scp-bigbio-readiness-v0.5.14.8"
 SDRF_PIPELINES_PIN = "0.1.6"
 
 # Authoritative SDRF-Proteomics contract used by this gate.  The web specification is treated as
@@ -1128,9 +1128,10 @@ def normalize_bigbio_projection(
                 _add_uniform_column(headers, rows, header, "not available")
                 info.actions.append(f"added_allowed_not_available:{header}")
 
-    # Single-cell recommended metadata must not remain as blank strings when the semantic state is
-    # already explicit.  These are reserved-word/schema normalizations only; no biological value is
-    # invented. For label-free rows, carrier/reference channels are inapplicable by definition.
+    # Single-cell recommended metadata must not remain as blank strings. These are reserved-word/schema
+    # normalizations only; no biological value or channel identity is invented. Carrier/reference channels
+    # are inapplicable for clearly non-isobaric labels (label-free, dimethyl, SILAC). For any other/unknown
+    # label, fail closed to `not available` rather than asserting that a carrier/reference channel is absent.
     if "single-cell" in templates:
         batch_changes = 0
         for idx in column_indices(headers, "comment[sample preparation batch]"):
@@ -1141,18 +1142,28 @@ def normalize_bigbio_projection(
         if batch_changes:
             info.actions.append(f"filled_blank_sample_preparation_batch_not_available:{batch_changes}_cells")
 
-        labels = [norm_value(v).lower() for v in row_values(headers, rows, "comment[label]")]
-        label_free = bool(labels) and all(("label free" in v or "label-free" in v) for v in labels if v)
-        if label_free:
-            for header in ("comment[carrier channel]", "comment[reference channel]"):
-                changes = 0
-                for idx in column_indices(headers, header):
-                    for row in rows:
-                        if not norm_value(row[idx]):
-                            row[idx] = "not applicable"
-                            changes += 1
-                if changes:
-                    info.actions.append(f"filled_blank_label_free_{header}_not_applicable:{changes}_cells")
+        label_indices = column_indices(headers, "comment[label]")
+        channel_indices = {
+            header: column_indices(headers, header)
+            for header in ("comment[carrier channel]", "comment[reference channel]")
+        }
+        channel_counts: Counter[tuple[str, str]] = Counter()
+        for row in rows:
+            labels = [norm_value(row[idx]).lower() for idx in label_indices if norm_value(row[idx])]
+            clearly_nonisobaric = bool(labels) and all(
+                any(token in label for token in ("label free", "label-free", "dimethyl", "silac"))
+                for label in labels
+            )
+            fill_value = "not applicable" if clearly_nonisobaric else "not available"
+            for header, indices in channel_indices.items():
+                for idx in indices:
+                    if not norm_value(row[idx]):
+                        row[idx] = fill_value
+                        channel_counts[(header, fill_value)] += 1
+        for (header, fill_value), changes in sorted(channel_counts.items()):
+            info.actions.append(
+                f"filled_blank_{header}_{fill_value.replace(' ', '_')}:{changes}_cells"
+            )
 
     # Re-run canonical column grouping after metadata/template additions.
     indexed = list(enumerate(headers))

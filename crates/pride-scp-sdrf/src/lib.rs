@@ -20,7 +20,7 @@ pub const SINGLE_CELL_TEMPLATE_VERSION: &str = "1.0.0";
 pub const SINGLE_CELL_TEMPLATE_URL: &str =
     "https://github.com/bigbio/sdrf-templates/blob/main/single-cell/1.0.0/single-cell.yaml";
 pub const SDRF_SPEC_URL: &str = "https://sdrf.quantms.org/specification.html";
-pub const GENERATOR_VERSION: &str = "pride-scp-sdrf-v0.4.7";
+pub const GENERATOR_VERSION: &str = "pride-scp-sdrf-v0.4.8";
 
 fn sdrf_annotation_tool_value() -> String {
     let version = GENERATOR_VERSION
@@ -1748,6 +1748,13 @@ fn source_name_explicit_bulk_role(name: &str) -> bool {
         .replace('.', "_")
         .replace(' ', "_");
     normalized.split('_').any(|token| token == "bulk")
+}
+
+fn label_is_clearly_nonisobaric(label: &str) -> bool {
+    let normalized = label.trim().to_ascii_lowercase();
+    ["label free", "label-free", "dimethyl", "silac"]
+        .iter()
+        .any(|token| normalized.contains(token))
 }
 
 fn raw_file_role_label(role: RawFileRole) -> &'static str {
@@ -4214,6 +4221,31 @@ fn merge_existing_sdrf(
             idx(SC_REFERENCE_CHANNEL),
             concrete_proposal_value(&proposal.reference_channel),
         );
+
+        // Recommended single-cell metadata must never remain blank. This is reserved-word
+        // normalization only: no batch or channel identity is invented. Non-isobaric labels do not
+        // use carrier/reference channels; unknown/isobaric rows fail closed to `not available`.
+        if let Some(j) = idx(SC_PREP_BATCH) {
+            if row[j].trim().is_empty() {
+                row[j] = "not available".into();
+            }
+        }
+        let row_label = idx("comment[label]")
+            .and_then(|j| row.get(j))
+            .map(|value| value.as_str())
+            .unwrap_or_default();
+        let channel_reserved = if label_is_clearly_nonisobaric(row_label) {
+            "not applicable"
+        } else {
+            "not available"
+        };
+        for header in [SC_CARRIER_CHANNEL, SC_REFERENCE_CHANNEL] {
+            if let Some(j) = idx(header) {
+                if row[j].trim().is_empty() {
+                    row[j] = channel_reserved.into();
+                }
+            }
+        }
 
         let current_sample_type = sample_type_idx
             .and_then(|j| row.get(j))
@@ -6843,8 +6875,8 @@ mod tests {
             .iter()
             .position(|h| h == "comment[sdrf annotation tool]")
             .unwrap();
-        assert_eq!(rows[0][annotation_idx], "pride-scp-sdrf v0.4.7");
-        assert_eq!(sdrf_annotation_tool_value(), "pride-scp-sdrf v0.4.7");
+        assert_eq!(rows[0][annotation_idx], "pride-scp-sdrf v0.4.8");
+        assert_eq!(sdrf_annotation_tool_value(), "pride-scp-sdrf v0.4.8");
         let issues = validate_draft(&headers, &rows, &evidence);
         assert!(issues.iter().all(|x| x.level != "error"), "{issues:?}");
     }
@@ -7403,6 +7435,76 @@ mod tests {
         let (headers, rows, _) = merge_existing_sdrf(&proposal, &evidence).unwrap();
         let sample_type = header_first_index(&headers, SC_SAMPLE_TYPE).unwrap();
         assert_eq!(rows[0][sample_type], "pooled");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn existing_sdrf_merge_normalizes_blank_nonisobaric_channels_without_inference() {
+        let root = tmp();
+        fs::create_dir_all(&root).unwrap();
+        let existing = root.join("mixed-label-existing.sdrf.tsv");
+        fs::write(
+            &existing,
+            "source name\tcharacteristics[organism]\tassay name\ttechnology type\tcomment[proteomics data acquisition method]\tcomment[label]\tcomment[instrument]\tcomment[cleavage agent details]\tcomment[fraction identifier]\tcomment[technical replicate]\tcomment[data file]\tcomment[sample preparation batch]\tcomment[carrier channel]\tcomment[reference channel]\ncell_A\tHomo sapiens\trun1\tproteomic profiling by mass spectrometry\tData-dependent acquisition\tNT=label free sample;AC=MS:1002038\tOrbitrap\tNT=Trypsin;AC=MS:1001251\t1\t1\tcell_A.raw\tbatch1\t\t\npool_A\tHomo sapiens\trun2\tproteomic profiling by mass spectrometry\tData-dependent acquisition\tNT=DIMETHYL0;AC=PRIDE:0000848\tOrbitrap\tNT=Trypsin;AC=MS:1001251\t1\t1\tpool_A.raw\tbatch1\t\t\n",
+        )
+        .unwrap();
+        let evidence = DatasetEvidence {
+            accession: "PXD999999".into(),
+            project_json_path: String::new(),
+            files_json_path: String::new(),
+            existing_sdrf_path: existing.display().to_string(),
+            raw_files: vec![],
+            study_design: StudyDesignScaffold::default(),
+            metadata_scaffold: DeterministicMetadataScaffold::default(),
+            evidence: vec![],
+            manuscript_sources: vec![],
+            annotation_sources: vec![],
+        };
+        let proposal = SdrfProposal {
+            relation_mode: "one_cell_per_data_file".into(),
+            ..Default::default()
+        };
+        let (headers, rows, _) = merge_existing_sdrf(&proposal, &evidence).unwrap();
+        let carrier = header_first_index(&headers, SC_CARRIER_CHANNEL).unwrap();
+        let reference = header_first_index(&headers, SC_REFERENCE_CHANNEL).unwrap();
+        assert_eq!(rows[0][carrier], "not applicable");
+        assert_eq!(rows[0][reference], "not applicable");
+        assert_eq!(rows[1][carrier], "not applicable");
+        assert_eq!(rows[1][reference], "not applicable");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn existing_sdrf_merge_unknown_channel_state_fails_closed_not_available() {
+        let root = tmp();
+        fs::create_dir_all(&root).unwrap();
+        let existing = root.join("isobaric-existing.sdrf.tsv");
+        fs::write(
+            &existing,
+            "source name\tcharacteristics[organism]\tassay name\ttechnology type\tcomment[proteomics data acquisition method]\tcomment[label]\tcomment[instrument]\tcomment[cleavage agent details]\tcomment[fraction identifier]\tcomment[technical replicate]\tcomment[data file]\tcomment[carrier channel]\tcomment[reference channel]\ncell_A\tHomo sapiens\trun1\tproteomic profiling by mass spectrometry\tData-dependent acquisition\tTMTpro\tOrbitrap\tNT=Trypsin;AC=MS:1001251\t1\t1\tcell_A.raw\t\t\n",
+        )
+        .unwrap();
+        let evidence = DatasetEvidence {
+            accession: "PXD999999".into(),
+            project_json_path: String::new(),
+            files_json_path: String::new(),
+            existing_sdrf_path: existing.display().to_string(),
+            raw_files: vec![],
+            study_design: StudyDesignScaffold::default(),
+            metadata_scaffold: DeterministicMetadataScaffold::default(),
+            evidence: vec![],
+            manuscript_sources: vec![],
+            annotation_sources: vec![],
+        };
+        let proposal = SdrfProposal {
+            relation_mode: "one_cell_per_data_file".into(),
+            ..Default::default()
+        };
+        let (headers, rows, _) = merge_existing_sdrf(&proposal, &evidence).unwrap();
+        let carrier = header_first_index(&headers, SC_CARRIER_CHANNEL).unwrap();
+        let reference = header_first_index(&headers, SC_REFERENCE_CHANNEL).unwrap();
+        assert_eq!(rows[0][carrier], "not available");
+        assert_eq!(rows[0][reference], "not available");
         let _ = fs::remove_dir_all(root);
     }
 

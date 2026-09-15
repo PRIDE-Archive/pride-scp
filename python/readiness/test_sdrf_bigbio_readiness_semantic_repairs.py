@@ -133,6 +133,72 @@ class SemanticRepairTests(unittest.TestCase):
             self.assertEqual(r[0][sample_type], "single cell")
             self.assertFalse(any(x.startswith("normalized_explicit_bulk_source_role") for x in info.actions))
 
+    def test_mixed_label_free_and_dimethyl_rows_fill_blank_channels_not_applicable(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = pathlib.Path(td)
+            src = root / "source.tsv"
+            out = root / "projected.tsv"
+            headers = [
+                "source name",
+                "comment[label]",
+                "comment[carrier channel]",
+                "comment[reference channel]",
+            ]
+            rows = [
+                ["cell_A", "NT=label free sample;AC=MS:1002038", "", ""],
+                ["pool_A", "NT=DIMETHYL0;AC=PRIDE:0000848", "", ""],
+                ["pool_B", "NT=DIMETHYL8;AC=PRIDE:0000852", "", ""],
+            ]
+            write_table(src, headers, rows)
+            h, r, info = readiness.normalize_bigbio_projection(src, out, ["single-cell"])
+            carrier = h.index("comment[carrier channel]")
+            reference = h.index("comment[reference channel]")
+            self.assertEqual([row[carrier] for row in r], ["not applicable"] * 3)
+            self.assertEqual([row[reference] for row in r], ["not applicable"] * 3)
+            self.assertTrue(any("filled_blank_comment[carrier channel]_not_applicable:3_cells" == x for x in info.actions))
+            self.assertTrue(any("filled_blank_comment[reference channel]_not_applicable:3_cells" == x for x in info.actions))
+
+    def test_unknown_or_isobaric_blank_channels_fail_closed_not_available(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = pathlib.Path(td)
+            src = root / "source.tsv"
+            out = root / "projected.tsv"
+            headers = [
+                "source name",
+                "comment[label]",
+                "comment[carrier channel]",
+                "comment[reference channel]",
+            ]
+            rows = [
+                ["cell_A", "NT=TMTpro 16plex;AC=PRIDE:0000898", "", ""],
+                ["cell_B", "not available", "", ""],
+            ]
+            write_table(src, headers, rows)
+            h, r, _ = readiness.normalize_bigbio_projection(src, out, ["single-cell"])
+            carrier = h.index("comment[carrier channel]")
+            reference = h.index("comment[reference channel]")
+            self.assertEqual([row[carrier] for row in r], ["not available", "not available"])
+            self.assertEqual([row[reference] for row in r], ["not available", "not available"])
+
+    def test_existing_nonblank_channel_values_are_preserved(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = pathlib.Path(td)
+            src = root / "source.tsv"
+            out = root / "projected.tsv"
+            headers = [
+                "source name",
+                "comment[label]",
+                "comment[carrier channel]",
+                "comment[reference channel]",
+            ]
+            rows = [["cell_A", "NT=TMTpro 16plex;AC=PRIDE:0000898", "126N", "127N"]]
+            write_table(src, headers, rows)
+            h, r, _ = readiness.normalize_bigbio_projection(src, out, ["single-cell"])
+            carrier = h.index("comment[carrier channel]")
+            reference = h.index("comment[reference channel]")
+            self.assertEqual(r[0][carrier], "126N")
+            self.assertEqual(r[0][reference], "127N")
+
 
 if __name__ == "__main__":
     unittest.main()
