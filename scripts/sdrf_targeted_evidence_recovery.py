@@ -57,11 +57,12 @@ from pride_scp_pipeline_common import (  # noqa: E402
     text_value,
 )
 
-VERSION = "pride-scp-targeted-evidence-recovery-v0.1.5"
-POLICY_VERSION = "pride-scp-field-directed-evidence-policy-v0.1.5"
+VERSION = "pride-scp-targeted-evidence-recovery-v0.1.6"
+POLICY_VERSION = "pride-scp-field-directed-evidence-policy-v0.1.6"
 EUROPE_PMC_FULLTEXT = "https://www.ebi.ac.uk/europepmc/webservices/rest/{pmcid}/fullTextXML"
 EUROPE_PMC_SUPPLEMENTS = "https://www.ebi.ac.uk/europepmc/webservices/rest/{pmcid}/supplementaryFiles"
 PMC_HTML = "https://pmc.ncbi.nlm.nih.gov/articles/{pmcid}/"
+NCBI_PMC_EFETCH = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi?db=pmc&id={pmc_numeric}&retmode=xml"
 
 TARGETED_FIELDS: dict[str, tuple[str, ...]] = {
     "single_cell_isolation_method": (
@@ -569,6 +570,25 @@ def response_to_text(response, scratch: Path, *, max_bytes: int) -> str:
     return ""
 
 
+def ncbi_pmc_efetch_url(pmcid: str) -> str:
+    """Return the NCBI EFetch full-text XML URL for a PMCID.
+
+    NCBI EFetch accepts the numeric PMC UID and is a more reliable machine
+    endpoint than scraping the interactive PMC HTML page.
+    """
+    norm = normalize_pmcid(pmcid)
+    numeric = norm[3:] if norm.startswith("PMC") else ""
+    return NCBI_PMC_EFETCH.format(pmc_numeric=quote(numeric, safe="")) if numeric else ""
+
+
+def fetch_error_reason(exc: Exception) -> str:
+    response = getattr(exc, "response", None)
+    status = getattr(response, "status_code", None)
+    if status is not None:
+        return f"fetch_error:{type(exc).__name__}:status={status}"
+    return f"fetch_error:{type(exc).__name__}"
+
+
 def fetch_url_evidence(
     session,
     records: list[EvidenceRecord],
@@ -590,7 +610,11 @@ def fetch_url_evidence(
             url,
             timeout=timeout,
             allow_redirects=True,
-            headers={"Accept": "text/html,application/xhtml+xml,application/xml,application/pdf,text/plain,*/*"},
+            headers={
+                "Accept": "text/html,application/xhtml+xml,application/xml,text/xml,application/pdf,text/plain,*/*",
+                "Accept-Language": "en-US,en;q=0.8",
+                "Cache-Control": "no-cache",
+            },
         )
         response.raise_for_status()
         text = response_to_text(response, scratch, max_bytes=max_bytes)
@@ -605,7 +629,7 @@ def fetch_url_evidence(
         audit.append({
             "accession": acc, "field": field, "provider": provider, "source": url,
             "candidate_windows": 0, "accepted_records": 0,
-            "reject_reasons": f"fetch_error:{type(exc).__name__}",
+            "reject_reasons": fetch_error_reason(exc),
         })
 
 
@@ -652,8 +676,19 @@ def fetch_europe_pmc(
             max_bytes=min(max_supp_bytes, 16 * 1024 * 1024), scratch=scratch, audit=audit,
         )
 
+        # NCBI EFetch is the primary machine-readable PMC fallback.  Europe PMC
+        # may know about a PMCID while its /fullTextXML endpoint returns 404 for
+        # NIH author manuscripts; EFetch can still expose the JATS XML.
+        efetch_url = ncbi_pmc_efetch_url(rpmcid)
+        if efetch_url:
+            fetch_url_evidence(
+                session, records, acc, field, "ncbi_pmc_efetch", efetch_url, rdoi, rtitle,
+                timeout=timeout, max_snippets=max_snippets,
+                max_bytes=min(max_supp_bytes, 16 * 1024 * 1024), scratch=scratch, audit=audit,
+            )
+
         # PMC HTML is a deliberate independent fallback.  It catches cases where
-        # Europe-PMC lookup succeeds but its fullTextXML endpoint is absent/stale.
+        # machine-readable endpoints are absent while the article page is public.
         pmc_url = PMC_HTML.format(pmcid=rpmcid)
         fetch_url_evidence(
             session, records, acc, field, "pmc_html", pmc_url, rdoi, rtitle,
@@ -693,7 +728,7 @@ def fetch_europe_pmc(
             audit.append({
                 "accession": acc, "field": field, "provider": "europe_pmc_supplement",
                 "source": supp_url, "candidate_windows": 0, "accepted_records": 0,
-                "reject_reasons": f"fetch_error:{type(exc).__name__}",
+                "reject_reasons": fetch_error_reason(exc),
             })
     return records
 
@@ -860,7 +895,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--timeout", type=float, default=45.0)
     p.add_argument("--max-snippets-per-source", type=int, default=6)
     p.add_argument("--max-supplement-bytes", type=int, default=50 * 1024 * 1024)
-    p.add_argument("--user-agent", default="PRIDE-SCP-targeted-evidence-recovery/0.1.5")
+    p.add_argument("--user-agent", default="PRIDE-SCP-targeted-evidence-recovery/0.1.6")
     p.add_argument("--self-test", action="store_true")
     return p
 

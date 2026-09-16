@@ -58,4 +58,13 @@ ok, _, reason = mod.evidence_relevance(
 )
 assert not ok and reason == "bioinformatics_false_context"
 
+assert mod.ncbi_pmc_efetch_url("PMC10118848").endswith("db=pmc&id=10118848&retmode=xml")
+assert mod.ncbi_pmc_efetch_url("10118848").endswith("db=pmc&id=10118848&retmode=xml")
+
+class _Resp:
+    status_code = 404
+class _Err(Exception):
+    response = _Resp()
+assert mod.fetch_error_reason(_Err()).endswith("status=404")
+
 print("targeted evidence recovery regression: PASS")
