@@ -33,8 +33,8 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Iterable
 
-VERSION = "pride-scp-sdrf-evidence-escalation-v0.1"
-POLICY_VERSION = "pride-scp-evidence-escalation-policy-v0.1"
+VERSION = "pride-scp-sdrf-evidence-escalation-v0.1.2"
+POLICY_VERSION = "pride-scp-evidence-escalation-policy-v0.1.2"
 
 VALID_STATES_NO_ESCALATION = {"submission_ready", "needs_independent_review"}
 
@@ -430,7 +430,19 @@ def self_test() -> None:
         assert p3.lane == "closed" and not p3.model_requested
         assert p4.lane == "validator_compatibility" and not p4.online_requested and not p4.model_requested
         assert content_missing_accessions(pub, ["PXD900001", "PXD900002"]) == ["PXD900002"]
+        assert absolute_without_symlink_resolution(Path("relative/path")).is_absolute()
     print("sdrf_evidence_escalation_harness self-test: PASS")
+
+
+def absolute_without_symlink_resolution(path: Path) -> Path:
+    """Return an absolute path without resolving symlinks.
+
+    This matters on HPC systems where the same shared filesystem may be exposed
+    under an operational path such as /nfs/... whose realpath is /gpfs/....
+    Container bind mounts are path-spelling-sensitive, so canonicalizing the host
+    path can make otherwise valid files disappear inside Singularity.
+    """
+    return Path(os.path.abspath(os.fspath(path)))
 
 
 def main() -> int:
@@ -439,8 +451,8 @@ def main() -> int:
         self_test(); return 0
     if not args.accessions_file:
         raise SystemExit("--accessions-file is required")
-    root = args.repo_root.resolve()
-    out = args.output.resolve()
+    root = absolute_without_symlink_resolution(args.repo_root)
+    out = absolute_without_symlink_resolution(args.output)
     out.mkdir(parents=True, exist_ok=True)
     logs = out / "logs"
     accessions = read_accessions(args.accessions_file)
@@ -499,7 +511,7 @@ def main() -> int:
     write_tsv(out / "evidence_escalation_plan.tsv", plan_rows, fields)
 
     command_records: list[dict[str, Any]] = []
-    current_manifest = args.publication_manifest.resolve() if args.publication_manifest.is_file() else None
+    current_manifest = absolute_without_symlink_resolution(args.publication_manifest) if args.publication_manifest.is_file() else None
     supplementary_links: Path | None = None
 
     if active and args.online_mode != "off" and online:
@@ -566,7 +578,7 @@ def main() -> int:
                     supplementary_links = links
 
     if current_manifest is None:
-        current_manifest = args.publication_manifest.resolve()
+        current_manifest = absolute_without_symlink_resolution(args.publication_manifest)
 
     if mapping and args.fetch_external_analysis:
         evidence_out = out / "generalized_evidence_graph"
@@ -595,12 +607,12 @@ def main() -> int:
             "--workers", "1",
             "--all-valid-content",
             *( ["--force"] if args.force else [] ),
-        ], stage="06_small_llm_publication_annotation", logs=logs, records=command_records, execute=args.execute, required=False)
+        ], stage="06_small_llm_publication_annotation", logs=logs, records=command_records, execute=args.execute, required=args.execute)
 
     annot_out = out / "sdrf_annotation"
     if active:
         cmd = [
-            str((root / args.pride_scp_bin).resolve() if not Path(args.pride_scp_bin).is_absolute() else Path(args.pride_scp_bin)),
+            str(absolute_without_symlink_resolution(root / args.pride_scp_bin) if not Path(args.pride_scp_bin).is_absolute() else absolute_without_symlink_resolution(Path(args.pride_scp_bin))),
             "sdrf-annotate",
             "--accessions-file", str(out / "active_accessions.txt"),
             "--snapshot", str(args.snapshot),
@@ -614,7 +626,7 @@ def main() -> int:
             cmd += ["--resolved-sdrf-dir", str(args.resolved_sdrf_dir)]
         if args.force:
             cmd += ["--force"]
-        run_command(cmd, stage="07_sdrf_annotate", logs=logs, records=command_records, execute=args.execute, required=False)
+        run_command(cmd, stage="07_sdrf_annotate", logs=logs, records=command_records, execute=args.execute, required=args.execute)
 
         results = annot_out / "sdrf_annotation_results.tsv"
         triage = out / "postrun_triage"

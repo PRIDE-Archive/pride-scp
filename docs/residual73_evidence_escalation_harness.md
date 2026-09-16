@@ -139,3 +139,13 @@ The frozen baseline lanes remaining after the 12 PR-ready promotions are approxi
 - 2 parked evidence-insufficient cases.
 
 This is why plan-only mode should be run first: it should send validator/tooling cases to a deterministic lane and concentrate network/LLM work on the publication/evidence-limited cases.
+
+## v0.1.2 HPC path and execution-status fix
+
+The controller preserves the user-supplied absolute filesystem spelling instead of resolving
+symlinks. This is required on HPC installations where `/nfs/...` resolves to `/gpfs/...` but
+Singularity bind mounts expose only the requested `/nfs/...` path inside the container.
+
+Executable model annotation and SDRF annotation stages are now fail-fast. A failed required
+annotation stage causes a non-zero harness exit instead of emitting a misleading successful run.
+Online metadata/full-text recovery remains fail-closed/optional in `online-mode=auto`.
