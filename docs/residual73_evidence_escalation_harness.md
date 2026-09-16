@@ -190,3 +190,14 @@ Outputs include:
 The targeted manifest contains normalized source excerpts only. The augmented manifest can be fed
 directly to `pride-scp sdrf-annotate`. No mapping is generated from filenames, search snippets, or
 model output.
+
+
+## v0.1.4 targeted-evidence relevance guard
+
+Targeted evidence is now filtered before it can enter an LLM packet. For single-cell
+isolation fields, generic tokens such as `sorting`/`sorted` are insufficient. The evidence
+must contain an explicit cell/oocyte isolation technique or action (for example FACS,
+cellenONE, manual picking, micromanipulation, laser-capture microdissection, or an
+explicit statement that cells were isolated/sorted by a named method). Dense numeric or
+protein-expression tables and bioinformatics contexts such as `sorting nexin`, STRINGdb
+networks, or sorted graph layouts are rejected. Missing evidence remains unresolved.

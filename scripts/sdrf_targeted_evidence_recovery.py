@@ -57,20 +57,24 @@ from pride_scp_pipeline_common import (  # noqa: E402
     text_value,
 )
 
-VERSION = "pride-scp-targeted-evidence-recovery-v0.1"
-POLICY_VERSION = "pride-scp-field-directed-evidence-policy-v0.1"
+VERSION = "pride-scp-targeted-evidence-recovery-v0.1.4"
+POLICY_VERSION = "pride-scp-field-directed-evidence-policy-v0.1.4"
 EUROPE_PMC_FULLTEXT = "https://www.ebi.ac.uk/europepmc/webservices/rest/{pmcid}/fullTextXML"
 EUROPE_PMC_SUPPLEMENTS = "https://www.ebi.ac.uk/europepmc/webservices/rest/{pmcid}/supplementaryFiles"
 
 TARGETED_FIELDS: dict[str, tuple[str, ...]] = {
     "single_cell_isolation_method": (
         "single cell isolation", "single-cell isolation", "isolation protocol",
-        "cell isolation", "cell sorting", "sorted", "sorting", "FACS",
-        "fluorescence-activated", "flow cytometry", "cellenone", "cellenONE",
-        "manual picking", "manually picked", "manually isolated", "micromanipulation",
-        "micropipette", "capillary microsampling", "capillary sampling", "aspirat",
-        "laser capture", "microdissection", "nanoPOTS", "nanowell", "dispens",
-        "deposited into", "single cells were isolated", "individual cells were isolated",
+        "cell isolation", "cell sorting", "FACS", "fluorescence-activated",
+        "flow cytometry", "cellenone", "cellenONE", "manual picking",
+        "manually picked", "manually isolated", "micromanipulation",
+        "micropipette", "mouth pipetting", "capillary microsampling",
+        "laser capture", "microdissection", "single-cell sorting",
+        "single cells were isolated", "individual cells were isolated",
+        "individual cells", "single cells", "isolated", "blastomere",
+        "cells were sorted", "oocytes were picked", "oocytes were collected",
+        "oocyte retrieval", "cell loading", "hydrodynamic pressure",
+        "loaded into the capillary", "aspiration needle",
     ),
     "cell_type": ("cell type", "cell line", "cell identity", "single cells"),
     "organism": ("organism", "species", "human", "mouse", "xenopus"),
@@ -81,7 +85,7 @@ TARGETED_FIELDS: dict[str, tuple[str, ...]] = {
 }
 
 FIELD_QUERY_LABELS = {
-    "single_cell_isolation_method": "single cell isolation sorting FACS cellenONE manual picking micromanipulation",
+    "single_cell_isolation_method": "single cell isolation cell sorting FACS cellenONE manual picking micromanipulation oocyte retrieval blastomere dissection capillary loading",
     "cell_type": "cell type cell line",
     "organism": "species organism",
     "organism_part": "tissue organism part",
@@ -92,6 +96,82 @@ FIELD_QUERY_LABELS = {
 
 TEXT_EXTS = {".txt", ".tsv", ".csv", ".xml", ".html", ".htm", ".md"}
 ARCHIVE_TEXT_EXTS = TEXT_EXTS | {".xlsx", ".docx", ".pdf"}
+
+
+ISOLATION_METHOD_REGEXES = tuple(re.compile(p, re.I) for p in (
+    r"\bFACS\b",
+    r"fluorescence[- ]activated cell sort(?:ing|ed)?",
+    r"flow cytometr(?:y|ic)",
+    r"cellen\s*ONE",
+    r"manual(?:ly)? pick(?:ing|ed)?",
+    r"mouth pipett(?:ing|ed)?",
+    r"micro(?:manipulat|pipett)[a-z]*",
+    r"laser capture(?: microdissection)?",
+    r"microdissection",
+    r"capillary microsampl[a-z]*",
+    r"single[- ]cell sort(?:ing|ed)?",
+    r"individual cells? (?:were )?sort(?:ed|ing)",
+    r"cells? (?:were )?sort(?:ed|ing) (?:by|using|with|into)",
+    r"single cells? (?:were )?isolat(?:ed|ion) (?:by|using|with)",
+    r"individual cells? (?:were )?isolat(?:ed|ion) (?:by|using|with)",
+    r"oocytes? (?:were )?(?:manually )?(?:pick(?:ed|ing)|aspirat(?:ed|ion))",
+    r"oocyte retrieval.{0,160}aspiration needle",
+    r"aspiration needle.{0,160}oocytes?",
+    r"individual cells? .{0,80}(?:cut|dissect)[a-z]* .{0,80}(?:knife|loop|forceps)",
+    r"blastomeres? .{0,80}(?:dissect|isolat)[a-z]*",
+    r"(?:manual(?:ly)? )?cell loading .{0,80}hydrodynamic pressure",
+    r"single cells? .{0,100}(?:load|aspirat)[a-z]* .{0,100}capillary",
+))
+
+ISOLATION_FALSE_CONTEXT_REGEXES = tuple(re.compile(p, re.I) for p in (
+    r"sorting nexin",
+    r"degree sorted",
+    r"sorted circle layout",
+    r"STRING(?:db)? (?:network|database|score)",
+    r"protein query",
+    r"gene ontology",
+    r"differentially expressed genes?",
+))
+
+def numeric_table_like(text: str) -> bool:
+    tokens = re.findall(r"\S+", text)
+    if not tokens:
+        return False
+    numeric = sum(bool(re.fullmatch(r"[-+]?\d+(?:\.\d+)?(?:[Ee][-+]?\d+)?[;,]?", t.strip("|()[]{}"))) for t in tokens)
+    pipes = text.count("|")
+    alpha = sum(bool(re.search(r"[A-Za-z]{3,}", t)) for t in tokens)
+    return (numeric / len(tokens) >= 0.42 and alpha / len(tokens) < 0.35) or pipes >= 24
+
+def evidence_relevance(field: str, snippet: str) -> tuple[bool, int, str]:
+    """Conservative field-specific relevance gate before evidence reaches an LLM."""
+    text = normalized_text(snippet)
+    low = text.lower()
+    if not text:
+        return False, 0, "empty"
+    if field == "single_cell_isolation_method":
+        if any(rx.search(text) for rx in ISOLATION_FALSE_CONTEXT_REGEXES):
+            return False, 0, "bioinformatics_false_context"
+        if numeric_table_like(text):
+            return False, 0, "numeric_or_protein_table"
+        method_hits = sum(bool(rx.search(text)) for rx in ISOLATION_METHOD_REGEXES)
+        # A generic occurrence of 'sorting'/'sorted' is never enough. Require an
+        # explicit isolation technique/action linked to cells/oocytes.
+        biological_subject = bool(re.search(r"\b(?:single[- ]?cells?|individual cells?|cells?|oocytes?|blastomeres?)\b", text, re.I))
+        action = bool(re.search(r"\b(?:isolat(?:ed|ion)|sort(?:ed|ing)|pick(?:ed|ing)|aspirat(?:ed|ion)|pipett(?:ed|ing)|microdissection)\b", text, re.I))
+        score = method_hits * 4 + int(biological_subject) + int(action)
+        if method_hits <= 0:
+            return False, score, "no_explicit_isolation_method"
+        if not biological_subject:
+            return False, score, "no_cell_or_oocyte_subject"
+        return True, score, "explicit_isolation_method"
+
+    # Generic scientific fields: reject obvious dense numeric tables, and require
+    # at least one field term to occur in natural-language text.
+    if numeric_table_like(text):
+        return False, 0, "numeric_table"
+    terms = TARGETED_FIELDS.get(field, (field.replace("_", " "),))
+    hits = sum(term.lower() in low for term in terms)
+    return (hits > 0), hits, "field_term" if hits > 0 else "no_field_term"
 
 
 @dataclass(frozen=True)
@@ -371,7 +451,13 @@ def evidence_record(acc: str, field: str, provider: str, source: str, doi: str, 
 def add_snippets(records: list[EvidenceRecord], acc: str, field: str, provider: str, source: str, doi: str, title: str, text: str, max_snippets: int) -> None:
     terms = TARGETED_FIELDS.get(field, (field.replace("_", " "),))
     existing = {r.evidence_sha256 for r in records if r.accession == acc and r.field == field}
-    for snippet in snippet_windows(text, terms, max_snippets=max_snippets):
+    ranked: list[tuple[int, str]] = []
+    for snippet in snippet_windows(text, terms, max_snippets=max(max_snippets * 4, 12)):
+        accepted, score, _reason = evidence_relevance(field, snippet)
+        if accepted:
+            ranked.append((score, snippet))
+    ranked.sort(key=lambda x: (-x[0], len(x[1])))
+    for _score, snippet in ranked[:max_snippets]:
         rec = evidence_record(acc, field, provider, source, doi, title, snippet)
         if rec.evidence_sha256 not in existing:
             records.append(rec)
@@ -587,7 +673,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--timeout", type=float, default=45.0)
     p.add_argument("--max-snippets-per-source", type=int, default=6)
     p.add_argument("--max-supplement-bytes", type=int, default=50 * 1024 * 1024)
-    p.add_argument("--user-agent", default="PRIDE-SCP-targeted-evidence-recovery/0.1")
+    p.add_argument("--user-agent", default="PRIDE-SCP-targeted-evidence-recovery/0.1.4")
     p.add_argument("--self-test", action="store_true")
     return p
 
@@ -616,6 +702,14 @@ def self_test() -> None:
         recs: list[EvidenceRecord] = []
         add_snippets(recs, "PXD900001", "single_cell_isolation_method", "local_publication", str(content), "10.1/test", "Synthetic", content.read_text(), 6)
         assert recs and "FACS" in recs[0].evidence_text
+        junk = "4079969999999 | 19.8 | 22.2 | SNX12 | sorting nexin 12 | ENSG00000147164 | 13 | 7.1E-145 | 27.5 | 27.7 " * 4
+        junk_records: list[EvidenceRecord] = []
+        add_snippets(junk_records, "PXD900001", "single_cell_isolation_method", "supplement", "junk.xlsx", "10.1/test", "Synthetic", junk, 6)
+        assert not junk_records
+        bioinfo = "The degree sorted circle layout was chosen for the STRINGdb network using a protein query and gene ontology analysis." * 8
+        bio_records: list[EvidenceRecord] = []
+        add_snippets(bio_records, "PXD900001", "single_cell_isolation_method", "fulltext", "paper.xml", "10.1/test", "Synthetic", bioinfo, 6)
+        assert not bio_records
         packet = packet_text("PXD900001", {"single_cell_isolation_method": recs}, {"single_cell_isolation_method": make_queries("PXD900001", "single_cell_isolation_method", "10.1/test", "Synthetic")})
         assert "FIELD: single_cell_isolation_method" in packet and "TE001" in packet
         assert rows["PXD900001"]

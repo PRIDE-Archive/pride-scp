@@ -39,4 +39,23 @@ check(
 
 assert "FACS" in mod.TARGETED_FIELDS["single_cell_isolation_method"]
 assert mod.make_queries("PXD025634", "single_cell_isolation_method", "10.1/x", "A paper")
+
+ok, score, reason = mod.evidence_relevance(
+    "single_cell_isolation_method",
+    "Individual cells were isolated by FACS and deposited into wells for proteomic preparation.",
+)
+assert ok and score > 0 and reason == "explicit_isolation_method"
+
+ok, _, reason = mod.evidence_relevance(
+    "single_cell_isolation_method",
+    "SNX12 | sorting nexin 12 | ENSG00000147164 | 19.3 | 22.4 | 7.1E-145 | 27.5 | 26.8",
+)
+assert not ok and reason in {"bioinformatics_false_context", "numeric_or_protein_table", "no_explicit_isolation_method"}
+
+ok, _, reason = mod.evidence_relevance(
+    "single_cell_isolation_method",
+    "The degree sorted circle layout was used for the STRINGdb network with a protein query.",
+)
+assert not ok and reason == "bioinformatics_false_context"
+
 print("targeted evidence recovery regression: PASS")
