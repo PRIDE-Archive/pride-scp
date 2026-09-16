@@ -3718,6 +3718,7 @@ def post_ollama_json(
                 "prompt": prompt,
                 "format": schema,
                 "stream": False,
+                "think": False,
                 "keep_alive": "30m",
                 "options": options,
             },

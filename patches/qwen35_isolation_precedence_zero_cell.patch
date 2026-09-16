@@ -1,0 +1,344 @@
+diff --git a/crates/pride-scp-sdrf/src/lib.rs b/crates/pride-scp-sdrf/src/lib.rs
+index d6bc14c..bc6116b 100644
+--- a/crates/pride-scp-sdrf/src/lib.rs
++++ b/crates/pride-scp-sdrf/src/lib.rs
+@@ -2003,10 +2003,119 @@ fn manual_picking_evidence(hay: &str) -> bool {
+         || hay.contains("dissect single")
+         || hay.contains("dissected single")
+         || hay.contains("identify and dissect")
++        || hay.contains("eyebrow-hair knife")
++        || hay.contains("eyebrow hair knife")
++        || ((hay.contains("individual cell") || hay.contains("individual cells"))
++            && hay.contains("cut and isolated"))
++        || (hay.contains("hydrodynamic")
++            && (hay.contains("single cell") || hay.contains("single-cell"))
++            && (hay.contains("load") || hay.contains("inject")))
+         || (hay.contains("mechanically dissociated") && hay.contains("tweezer"))
+         || (hay.contains("mechanically dissociated") && hay.contains("individually transferred"))
+ }
+ 
++fn isolation_evidence_source_score(item: &EvidenceItem) -> i32 {
++    let label = item.source_label.to_ascii_lowercase();
++    let mut score = match item.source_kind.as_str() {
++        "existing_sdrf_structured" => 120,
++        "manuscript_semantic_evidence" => 100,
++        "existing_annotation" => 90,
++        "manuscript_text" => 80,
++        "pride_project" => 50,
++        _ => 40,
++    };
++    if label.contains("single_cell_isolation_method")
++        || label.contains("single cell isolation")
++        || label.contains("isolation method")
++    {
++        score += 30;
++    } else if label.contains("method") || label.contains("isolation") {
++        score += 10;
++    }
++    score
++}
++
++fn explicit_facs_evidence(hay: &str) -> bool {
++    let has_method = hay.contains("facs") || hay.contains("fluorescence-activated cell sort");
++    let has_context = hay.contains("cell")
++        && (hay.contains("sort")
++            || hay.contains("isolat")
++            || hay.contains("collect")
++            || hay.contains("enrich"));
++    has_method && has_context
++}
++
++fn infer_isolation_method_scaffold(evidence: &[EvidenceItem]) -> Option<(String, Vec<String>)> {
++    let mut candidates: BTreeMap<String, (i32, Vec<String>)> = BTreeMap::new();
++
++    for item in evidence {
++        if !evidence_relevant_to_field("single_cell_isolation_method", item) {
++            continue;
++        }
++        let hay = evidence_hay(item);
++        let source_score = isolation_evidence_source_score(item);
++        let mut observed: Vec<(&str, i32)> = Vec::new();
++
++        if manual_picking_evidence(&hay) {
++            observed.push(("manual picking", 30));
++        }
++        if explicit_facs_evidence(&hay) {
++            observed.push(("FACS", 20));
++        }
++        if hay.contains("cellenone") {
++            observed.push(("cellenONE", 25));
++        }
++        if hay.contains("laser capture microdissection")
++            || (hay.contains("laser capture") && hay.contains("cell"))
++            || (hay.contains(" lcm ") && hay.contains("cell"))
++        {
++            observed.push(("laser capture microdissection", 25));
++        }
++        if hay.contains("nanopots") {
++            observed.push(("nanoPOTS", 15));
++        }
++        if hay.contains("droplet microfluid") {
++            observed.push(("droplet microfluidics", 20));
++        }
++        if hay.contains("acoustic droplet") {
++            observed.push(("acoustic droplet ejection", 20));
++        }
++        if hay.contains("microfluid") && !hay.contains("droplet microfluid") {
++            observed.push(("microfluidics", 10));
++        }
++
++        for (value, method_score) in observed {
++            let score = source_score + method_score;
++            let entry = candidates
++                .entry(value.to_string())
++                .or_insert_with(|| (score, Vec::new()));
++            if score > entry.0 {
++                entry.0 = score;
++                entry.1.clear();
++            }
++            if score == entry.0 && entry.1.len() < 8 && !entry.1.contains(&item.id) {
++                entry.1.push(item.id.clone());
++            }
++        }
++    }
++
++    let mut ranked = candidates
++        .into_iter()
++        .filter(|(_, (score, refs))| *score >= 70 && !refs.is_empty())
++        .collect::<Vec<_>>();
++    ranked.sort_by(|a, b| b.1.0.cmp(&a.1.0).then_with(|| a.0.cmp(&b.0)));
++
++    let (value, (top_score, refs)) = ranked.first()?.clone();
++    if let Some((_, (second_score, _))) = ranked.get(1) {
++        // Conflicting high-quality isolation methods are a branch/mapping problem,
++        // not a reason to lock one dataset-wide value deterministically.
++        if top_score - *second_score < 15 {
++            return None;
++        }
++    }
++    Some((value, refs))
++}
++
+ fn infer_deterministic_metadata_scaffold(
+     evidence: &[EvidenceItem],
+     design: &StudyDesignScaffold,
+@@ -2080,65 +2189,15 @@ fn infer_deterministic_metadata_scaffold(
+         );
+     }
+ 
+-    let isolation_candidates: [(&str, &str, &[&str]); 7] = [
+-        (
+-            "FACS",
+-            "FACS",
+-            &["facs", "fluorescence-activated cell sort", "flow cytometr"],
+-        ),
+-        ("cellenONE", "cellenONE", &["cellenone"]),
+-        (
+-            "laser capture microdissection",
+-            "laser capture microdissection",
+-            &["laser capture", " lcm "],
+-        ),
+-        ("nanoPOTS", "nanoPOTS", &["nanopots"]),
+-        (
+-            "droplet microfluidics",
+-            "droplet microfluidics",
+-            &["droplet microfluid"],
+-        ),
+-        (
+-            "acoustic droplet ejection",
+-            "acoustic droplet ejection",
+-            &["acoustic droplet"],
+-        ),
+-        ("microfluidics", "microfluidics", &["microfluid"]),
+-    ];
+     let mut isolation_set = false;
+-    for (_observed, template_value, terms) in isolation_candidates {
+-        let refs = refs_for_predicate(evidence, "single_cell_isolation_method", |hay| {
+-            terms.iter().any(|term| hay.contains(term))
+-        });
+-        if !refs.is_empty() {
+-            metadata_scaffold_insert(
+-                &mut out,
+-                "single_cell_isolation_method",
+-                template_value.to_string(),
+-                refs,
+-            );
+-            isolation_set = true;
+-            break;
+-        }
+-    }
+-    if !isolation_set {
+-        // `manual picking` requires an explicit manual action or instrumentation
+-        // cue. A generic repository statement that a sample was "taken" is not
+-        // enough to claim a specific isolation protocol.
+-        let manual_refs = refs_for_predicate(
+-            evidence,
++    if let Some((value, refs)) = infer_isolation_method_scaffold(evidence) {
++        metadata_scaffold_insert(
++            &mut out,
+             "single_cell_isolation_method",
+-            manual_picking_evidence,
++            value,
++            refs,
+         );
+-        if !manual_refs.is_empty() {
+-            metadata_scaffold_insert(
+-                &mut out,
+-                "single_cell_isolation_method",
+-                "manual picking".to_string(),
+-                manual_refs,
+-            );
+-            isolation_set = true;
+-        }
++        isolation_set = true;
+     }
+     if !isolation_set {
+         let unsupported = [
+@@ -2771,6 +2830,7 @@ async fn call_ollama(
+         "model": opts.model,
+         "prompt": prompt_for(evidence, opts.max_files_in_prompt),
+         "stream": false,
++        "think": false,
+         "format": proposal_schema(),
+         "options": {"temperature": 0.0}
+     });
+@@ -3532,7 +3592,7 @@ fn repair_proposal_provenance(
+                 code: "proposal_locked_field_discarded".into(),
+                 row: 0,
+                 column: field.into(),
+-                message: format!("discarded model value '{original}' because {field} is already represented by the deposited SDRF"),
++                message: format!("discarded model value '{original}' because {field} is already locked by deterministic structured evidence or an existing SDRF"),
+             });
+             return;
+         }
+@@ -4254,6 +4314,33 @@ fn merge_existing_sdrf(
+                 }
+             }
+         }
++        let current_cells_per_well = cells_idx
++            .and_then(|j| row.get(j))
++            .map(|x| x.trim().to_ascii_lowercase())
++            .unwrap_or_default();
++        let current_source_name = source_idx
++            .and_then(|j| row.get(j))
++            .map(|x| x.trim().to_ascii_lowercase())
++            .unwrap_or_default();
++        let empty_control = matches!(sample_type.as_str(), "empty" | "blank" | "negative control")
++            || current_cells_per_well == "0"
++            || current_source_name.contains("blank");
++        if empty_control {
++            for header in [
++                SC_INDIVIDUAL,
++                "characteristics[cell type]",
++                "characteristics[cell line]",
++                "characteristics[cellosaurus accession]",
++                "characteristics[cellosaurus name]",
++                "characteristics[material type]",
++            ] {
++                if let Some(j) = idx(header) {
++                    if concrete_semantic_value(&row[j]) {
++                        row[j] = "not applicable".into();
++                    }
++                }
++            }
++        }
+         if let Some(j) = idx("technology type") {
+             if is_missing_cell_value(&row[j]) {
+                 row[j] = "proteomic profiling by mass spectrometry".into();
+@@ -8088,6 +8175,84 @@ mod tests {
+         );
+     }
+ 
++    #[test]
++    fn eyebrow_hair_microdissection_maps_to_manual_picking() {
++        let item = EvidenceItem {
++            id: "E0001".into(),
++            source_kind: "manuscript_text".into(),
++            source_label: "methods isolation".into(),
++            text: "Individual cells were cut and isolated from whole embryos using an eyebrow-hair knife and loop.".into(),
++        };
++        let design = StudyDesignScaffold {
++            relation_mode_hint: "one_cell_per_data_file".into(),
++            ..Default::default()
++        };
++        let scaffold = infer_deterministic_metadata_scaffold(&[item], &design);
++        assert_eq!(
++            scaffold
++                .values
++                .get("single_cell_isolation_method")
++                .map(String::as_str),
++            Some("manual picking")
++        );
++    }
++
++    #[test]
++    fn hydrodynamic_single_cell_loading_maps_to_manual_picking() {
++        let item = EvidenceItem {
++            id: "E0001".into(),
++            source_kind: "manuscript_text".into(),
++            source_label: "methods isolation".into(),
++            text: "Single cells were loaded onto the capillary manually using low flow generated by hydrodynamic pressure.".into(),
++        };
++        let design = StudyDesignScaffold {
++            relation_mode_hint: "one_cell_per_data_file".into(),
++            ..Default::default()
++        };
++        let scaffold = infer_deterministic_metadata_scaffold(&[item], &design);
++        assert_eq!(
++            scaffold
++                .values
++                .get("single_cell_isolation_method")
++                .map(String::as_str),
++            Some("manual picking")
++        );
++    }
++
++    #[test]
++    fn explicit_manual_isolation_beats_generic_facs_metadata() {
++        let evidence = vec![
++            EvidenceItem {
++                id: "E0001".into(),
++                source_kind: "pride_project".into(),
++                source_label: "project.description".into(),
++                text: "The project includes FACS sorted control cells.".into(),
++            },
++            EvidenceItem {
++                id: "E0002".into(),
++                source_kind: "manuscript_semantic_evidence".into(),
++                source_label: "single_cell_isolation_method".into(),
++                text: "Single cells were loaded manually using hydrodynamic pressure under a microscope.".into(),
++            },
++        ];
++        let design = StudyDesignScaffold {
++            relation_mode_hint: "one_cell_per_data_file".into(),
++            ..Default::default()
++        };
++        let scaffold = infer_deterministic_metadata_scaffold(&evidence, &design);
++        assert_eq!(
++            scaffold
++                .values
++                .get("single_cell_isolation_method")
++                .map(String::as_str),
++            Some("manual picking")
++        );
++        assert_eq!(
++            scaffold.evidence_refs.get("single_cell_isolation_method"),
++            Some(&vec!["E0002".to_string()])
++        );
++    }
++
+     #[test]
+     fn repository_description_without_manual_action_does_not_claim_manual_picking() {
+         let item = EvidenceItem {
+diff --git a/python/stages/pride_scp_targeted_ollama.py b/python/stages/pride_scp_targeted_ollama.py
+index 299f553..ede8f12 100644
+--- a/python/stages/pride_scp_targeted_ollama.py
++++ b/python/stages/pride_scp_targeted_ollama.py
+@@ -3718,6 +3718,7 @@ def post_ollama_json(
+                 "prompt": prompt,
+                 "format": schema,
+                 "stream": False,
++                "think": False,
+                 "keep_alive": "30m",
+                 "options": options,
+             },
