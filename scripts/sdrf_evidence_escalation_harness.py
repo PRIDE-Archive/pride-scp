@@ -33,8 +33,8 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Iterable
 
-VERSION = "pride-scp-sdrf-evidence-escalation-v0.1.2"
-POLICY_VERSION = "pride-scp-evidence-escalation-policy-v0.1.2"
+VERSION = "pride-scp-sdrf-evidence-escalation-v0.1.3"
+POLICY_VERSION = "pride-scp-evidence-escalation-policy-v0.1.3"
 
 VALID_STATES_NO_ESCALATION = {"submission_ready", "needs_independent_review"}
 
@@ -371,6 +371,25 @@ def content_missing_accessions(manifest: Path, accessions: Iterable[str]) -> lis
     return missing
 
 
+def snapshot_missing_inputs(snapshot: Path, accessions: Iterable[str]) -> dict[str, list[str]]:
+    missing_projects: list[str] = []
+    missing_files: list[str] = []
+    for acc in accessions:
+        if not (snapshot / "projects" / f"{acc}.json").is_file():
+            missing_projects.append(acc)
+        if not (snapshot / "files" / f"{acc}.json").is_file():
+            missing_files.append(acc)
+    return {"projects": missing_projects, "files": missing_files}
+
+
+def annotation_result_counts(path: Path) -> dict[str, int]:
+    rows = read_tsv(path)
+    success = sum((r.get("status") or "").strip().lower() == "success" for r in rows)
+    errors = sum((r.get("status") or "").strip().lower() == "error" for r in rows)
+    locally_valid = sum((r.get("locally_valid") or "").strip().lower() == "true" for r in rows)
+    return {"rows": len(rows), "success": success, "errors": errors, "locally_valid": locally_valid}
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--accessions-file", type=Path, required=False)
@@ -430,6 +449,7 @@ def self_test() -> None:
         assert p3.lane == "closed" and not p3.model_requested
         assert p4.lane == "validator_compatibility" and not p4.online_requested and not p4.model_requested
         assert content_missing_accessions(pub, ["PXD900001", "PXD900002"]) == ["PXD900002"]
+        assert snapshot_missing_inputs(snap, ["PXD900001"] ) == {"projects": [], "files": []}
         assert absolute_without_symlink_resolution(Path("relative/path")).is_absolute()
     print("sdrf_evidence_escalation_harness self-test: PASS")
 
@@ -472,6 +492,12 @@ def main() -> int:
         for acc in accessions
     ]
     active = [p.accession for p in plans if p.lane != "closed"]
+    snapshot_missing = snapshot_missing_inputs(args.snapshot, active)
+    if args.execute and (snapshot_missing["projects"] or snapshot_missing["files"]):
+        raise RuntimeError(
+            "snapshot preflight failed before evidence/model execution: "
+            f"missing projects={snapshot_missing['projects']} files={snapshot_missing['files']}"
+        )
     online = [p.accession for p in plans if p.online_requested]
     mapping = [p.accession for p in plans if p.external_analysis_requested]
     model = [p.accession for p in plans if p.model_requested]
@@ -629,6 +655,15 @@ def main() -> int:
         run_command(cmd, stage="07_sdrf_annotate", logs=logs, records=command_records, execute=args.execute, required=args.execute)
 
         results = annot_out / "sdrf_annotation_results.tsv"
+        if args.execute:
+            if not results.is_file():
+                raise RuntimeError("07_sdrf_annotate returned success but did not write sdrf_annotation_results.tsv")
+            result_counts = annotation_result_counts(results)
+            if result_counts["rows"] == 0 or result_counts["success"] == 0:
+                raise RuntimeError(
+                    "07_sdrf_annotate produced no successful accession rows: "
+                    + json.dumps(result_counts, sort_keys=True)
+                )
         triage = out / "postrun_triage"
         if not args.execute or results.is_file():
             cmd = [
@@ -654,6 +689,10 @@ def main() -> int:
         "lane_counts": {lane: sum(p.lane == lane for p in plans) for lane in sorted({p.lane for p in plans})},
         "online_mode": args.online_mode,
         "execute": args.execute,
+        "snapshot_preflight": {
+            "missing_projects": snapshot_missing["projects"],
+            "missing_files": snapshot_missing["files"],
+        },
         "non_generative_mapping": True,
         "gt_runtime_truth_used": False,
         "network_policy": "bounded public evidence retrieval only; online failures fail closed",
