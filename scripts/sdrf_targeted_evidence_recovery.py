@@ -57,10 +57,11 @@ from pride_scp_pipeline_common import (  # noqa: E402
     text_value,
 )
 
-VERSION = "pride-scp-targeted-evidence-recovery-v0.1.4"
-POLICY_VERSION = "pride-scp-field-directed-evidence-policy-v0.1.4"
+VERSION = "pride-scp-targeted-evidence-recovery-v0.1.5"
+POLICY_VERSION = "pride-scp-field-directed-evidence-policy-v0.1.5"
 EUROPE_PMC_FULLTEXT = "https://www.ebi.ac.uk/europepmc/webservices/rest/{pmcid}/fullTextXML"
 EUROPE_PMC_SUPPLEMENTS = "https://www.ebi.ac.uk/europepmc/webservices/rest/{pmcid}/supplementaryFiles"
+PMC_HTML = "https://pmc.ncbi.nlm.nih.gov/articles/{pmcid}/"
 
 TARGETED_FIELDS: dict[str, tuple[str, ...]] = {
     "single_cell_isolation_method": (
@@ -448,66 +449,252 @@ def evidence_record(acc: str, field: str, provider: str, source: str, doi: str, 
     return EvidenceRecord(acc, field, provider, source, doi, title, snippet, hashlib.sha256(snippet.encode()).hexdigest())
 
 
-def add_snippets(records: list[EvidenceRecord], acc: str, field: str, provider: str, source: str, doi: str, title: str, text: str, max_snippets: int) -> None:
+def add_snippets(
+    records: list[EvidenceRecord],
+    acc: str,
+    field: str,
+    provider: str,
+    source: str,
+    doi: str,
+    title: str,
+    text: str,
+    max_snippets: int,
+    audit: list[dict[str, Any]] | None = None,
+) -> None:
     terms = TARGETED_FIELDS.get(field, (field.replace("_", " "),))
     existing = {r.evidence_sha256 for r in records if r.accession == acc and r.field == field}
     ranked: list[tuple[int, str]] = []
-    for snippet in snippet_windows(text, terms, max_snippets=max(max_snippets * 4, 12)):
-        accepted, score, _reason = evidence_relevance(field, snippet)
+    reject_reasons: Counter[str] = Counter()
+    windows = snippet_windows(text, terms, max_snippets=max(max_snippets * 8, 32))
+    for snippet in windows:
+        accepted, score, reason = evidence_relevance(field, snippet)
         if accepted:
             ranked.append((score, snippet))
+        else:
+            reject_reasons[reason] += 1
     ranked.sort(key=lambda x: (-x[0], len(x[1])))
+    accepted_count = 0
     for _score, snippet in ranked[:max_snippets]:
         rec = evidence_record(acc, field, provider, source, doi, title, snippet)
         if rec.evidence_sha256 not in existing:
             records.append(rec)
             existing.add(rec.evidence_sha256)
+            accepted_count += 1
+    if audit is not None:
+        audit.append({
+            "accession": acc,
+            "field": field,
+            "provider": provider,
+            "source": source,
+            "candidate_windows": len(windows),
+            "accepted_records": accepted_count,
+            "reject_reasons": ";".join(f"{k}:{v}" for k, v in sorted(reject_reasons.items())),
+        })
 
 
-def fetch_europe_pmc(session, acc: str, field: str, doi: str, pmid: str, pmcid: str, title: str, *, timeout: float, max_snippets: int, max_supp_bytes: int, scratch: Path) -> list[EvidenceRecord]:
+
+def _norm_title(value: Any) -> str:
+    return re.sub(r"[^a-z0-9]+", " ", text_value(value).lower()).strip()
+
+
+def europe_pmc_exact_candidates(session, *, doi: str, pmid: str, pmcid: str, title: str, timeout: float) -> list[dict[str, Any]]:
+    """Return only Europe-PMC records that exactly match a supplied identifier/title.
+
+    This deliberately gathers multiple exact candidates instead of trusting a single
+    lookup result, because some Europe-PMC records expose PMCID inconsistently across
+    DOI/title query forms.
+    """
+    norm_doi = normalize_doi(doi)
+    norm_pmid = text_value(pmid)
+    norm_pmcid = normalize_pmcid(pmcid)
+    norm_title = _norm_title(title)
+    queries: list[str] = []
+    if norm_doi:
+        queries.extend([f"DOI:{norm_doi}", f'DOI:"{norm_doi}"'])
+    if norm_pmid:
+        queries.extend([f"EXT_ID:{norm_pmid} AND SRC:MED", f"EXT_ID:{norm_pmid}"])
+    if norm_pmcid:
+        queries.append(f"EXT_ID:{norm_pmcid}")
+    if title:
+        queries.append(f'TITLE:"{title.replace(chr(34), " ")}"')
+
+    out: list[dict[str, Any]] = []
+    seen: set[tuple[str, str, str]] = set()
+    for query in dict.fromkeys(queries):
+        try:
+            results = _europe_pmc_search(session, query, timeout=timeout, page_size=10)
+        except Exception:
+            continue
+        for rec in results:
+            rdoi = normalize_doi(rec.get("doi"))
+            rpmid = text_value(rec.get("pmid"))
+            rpmcid = normalize_pmcid(rec.get("pmcid"))
+            rtitle = _norm_title(rec.get("title"))
+            exact = bool(
+                (norm_doi and rdoi == norm_doi)
+                or (norm_pmid and rpmid == norm_pmid)
+                or (norm_pmcid and rpmcid == norm_pmcid)
+                or (norm_title and rtitle == norm_title)
+            )
+            if not exact:
+                continue
+            key = (rdoi, rpmid, rpmcid)
+            if key not in seen:
+                seen.add(key)
+                out.append(rec)
+    if not out:
+        rec = europe_pmc_lookup(session, doi=doi, pmid=pmid, title=title, timeout=timeout)
+        if rec:
+            out.append(rec)
+    return out
+
+
+def response_to_text(response, scratch: Path, *, max_bytes: int) -> str:
+    data = response.content
+    if not data or len(data) > max_bytes:
+        return ""
+    ctype = (response.headers.get("Content-Type") or "").lower()
+    url = str(getattr(response, "url", ""))
+    suffix = Path(url.split("?", 1)[0]).suffix.lower()
+    if "pdf" in ctype or suffix == ".pdf" or data.startswith(b"%PDF"):
+        scratch.mkdir(parents=True, exist_ok=True)
+        pdf = scratch / (hashlib.sha256(data).hexdigest()[:16] + ".pdf")
+        pdf.write_bytes(data)
+        text, _, _ = extract_pdf_text(pdf)
+        return text
+    if "xml" in ctype or suffix == ".xml":
+        return xml_text(data)
+    if "html" in ctype or suffix in {".html", ".htm", ""}:
+        return xml_text(data)
+    return ""
+
+
+def fetch_url_evidence(
+    session,
+    records: list[EvidenceRecord],
+    acc: str,
+    field: str,
+    provider: str,
+    url: str,
+    doi: str,
+    title: str,
+    *,
+    timeout: float,
+    max_snippets: int,
+    max_bytes: int,
+    scratch: Path,
+    audit: list[dict[str, Any]],
+) -> None:
+    try:
+        response = session.get(
+            url,
+            timeout=timeout,
+            allow_redirects=True,
+            headers={"Accept": "text/html,application/xhtml+xml,application/xml,application/pdf,text/plain,*/*"},
+        )
+        response.raise_for_status()
+        text = response_to_text(response, scratch, max_bytes=max_bytes)
+        if not text:
+            audit.append({
+                "accession": acc, "field": field, "provider": provider, "source": url,
+                "candidate_windows": 0, "accepted_records": 0, "reject_reasons": "empty_or_unsupported_response",
+            })
+            return
+        add_snippets(records, acc, field, provider, str(response.url), doi, title, text, max_snippets, audit)
+    except Exception as exc:
+        audit.append({
+            "accession": acc, "field": field, "provider": provider, "source": url,
+            "candidate_windows": 0, "accepted_records": 0,
+            "reject_reasons": f"fetch_error:{type(exc).__name__}",
+        })
+
+
+def fetch_europe_pmc(
+    session,
+    acc: str,
+    field: str,
+    doi: str,
+    pmid: str,
+    pmcid: str,
+    title: str,
+    *,
+    timeout: float,
+    max_snippets: int,
+    max_supp_bytes: int,
+    scratch: Path,
+    audit: list[dict[str, Any]],
+) -> list[EvidenceRecord]:
     records: list[EvidenceRecord] = []
-    rec = europe_pmc_lookup(session, doi=doi, pmid=pmid, title=title, timeout=timeout)
-    if not rec:
-        results = _europe_pmc_search(session, f'"{acc}"', timeout=timeout, page_size=5)
-        rec = results[0] if results else None
-    if not rec:
-        return records
-    rdoi = normalize_doi(rec.get("doi")) or doi
-    rtitle = text_value(rec.get("title")) or title
-    rpmcid = normalize_pmcid(rec.get("pmcid")) or pmcid
-    if not rpmcid:
-        return records
+    candidates = europe_pmc_exact_candidates(
+        session, doi=doi, pmid=pmid, pmcid=pmcid, title=title, timeout=timeout
+    )
+    if not candidates and acc:
+        try:
+            candidates = _europe_pmc_search(session, f'"{acc}"', timeout=timeout, page_size=5)
+        except Exception:
+            candidates = []
 
-    url = EUROPE_PMC_FULLTEXT.format(pmcid=rpmcid)
-    try:
-        response = session.get(url, timeout=timeout, headers={"Accept": "application/xml,text/xml,*/*"})
-        response.raise_for_status()
-        fulltext = xml_text(response.content)
-        add_snippets(records, acc, field, "europe_pmc_fulltext", url, rdoi, rtitle, fulltext, max_snippets)
-    except Exception:
-        pass
+    seen_pmcids: set[str] = set()
+    for rec in candidates:
+        rdoi = normalize_doi(rec.get("doi")) or doi
+        rtitle = text_value(rec.get("title")) or title
+        rpmcid = normalize_pmcid(rec.get("pmcid")) or normalize_pmcid(pmcid)
+        if not rpmcid or rpmcid in seen_pmcids:
+            continue
+        seen_pmcids.add(rpmcid)
 
-    supp_url = EUROPE_PMC_SUPPLEMENTS.format(pmcid=rpmcid)
-    try:
-        response = session.get(supp_url, timeout=timeout, headers={"Accept": "application/zip,*/*"}, stream=True)
-        response.raise_for_status()
-        data = response.content
-        if len(data) <= max_supp_bytes and zipfile.is_zipfile(io.BytesIO(data)):
-            zf = zipfile.ZipFile(io.BytesIO(data))
-            for info in zf.infolist():
-                if info.is_dir() or info.file_size > min(max_supp_bytes, 8 * 1024 * 1024):
-                    continue
-                if Path(info.filename).suffix.lower() not in ARCHIVE_TEXT_EXTS:
-                    continue
-                try:
-                    blob = zf.read(info)
-                except Exception:
-                    continue
-                text = member_text(info.filename, blob, scratch)
-                if text:
-                    add_snippets(records, acc, field, "europe_pmc_supplement", f"{supp_url}#{info.filename}", rdoi, rtitle, text, max_snippets)
-    except Exception:
-        pass
+        # Europe PMC XML is preferred because it is compact and preserves the
+        # full Methods text for open-access/author-manuscript records.
+        xml_url = EUROPE_PMC_FULLTEXT.format(pmcid=rpmcid)
+        fetch_url_evidence(
+            session, records, acc, field, "europe_pmc_fulltext", xml_url, rdoi, rtitle,
+            timeout=timeout, max_snippets=max_snippets,
+            max_bytes=min(max_supp_bytes, 16 * 1024 * 1024), scratch=scratch, audit=audit,
+        )
+
+        # PMC HTML is a deliberate independent fallback.  It catches cases where
+        # Europe-PMC lookup succeeds but its fullTextXML endpoint is absent/stale.
+        pmc_url = PMC_HTML.format(pmcid=rpmcid)
+        fetch_url_evidence(
+            session, records, acc, field, "pmc_html", pmc_url, rdoi, rtitle,
+            timeout=timeout, max_snippets=max_snippets,
+            max_bytes=min(max_supp_bytes, 16 * 1024 * 1024), scratch=scratch, audit=audit,
+        )
+
+        supp_url = EUROPE_PMC_SUPPLEMENTS.format(pmcid=rpmcid)
+        try:
+            response = session.get(
+                supp_url,
+                timeout=timeout,
+                headers={"Accept": "application/zip,*/*"},
+                stream=True,
+            )
+            response.raise_for_status()
+            data = response.content
+            if len(data) <= max_supp_bytes and zipfile.is_zipfile(io.BytesIO(data)):
+                zf = zipfile.ZipFile(io.BytesIO(data))
+                for info in zf.infolist():
+                    if info.is_dir() or info.file_size > min(max_supp_bytes, 8 * 1024 * 1024):
+                        continue
+                    if Path(info.filename).suffix.lower() not in ARCHIVE_TEXT_EXTS:
+                        continue
+                    try:
+                        blob = zf.read(info)
+                    except Exception:
+                        continue
+                    text = member_text(info.filename, blob, scratch)
+                    if text:
+                        add_snippets(
+                            records, acc, field, "europe_pmc_supplement",
+                            f"{supp_url}#{info.filename}", rdoi, rtitle, text,
+                            max_snippets, audit,
+                        )
+        except Exception as exc:
+            audit.append({
+                "accession": acc, "field": field, "provider": "europe_pmc_supplement",
+                "source": supp_url, "candidate_windows": 0, "accepted_records": 0,
+                "reject_reasons": f"fetch_error:{type(exc).__name__}",
+            })
     return records
 
 
@@ -540,7 +727,7 @@ def crossref_related_queries(session, doi: str, title: str, *, timeout: float) -
 
 
 
-def fetch_biorxiv_preprint(session, acc: str, field: str, doi: str, title: str, *, timeout: float, max_snippets: int) -> list[EvidenceRecord]:
+def fetch_biorxiv_preprint(session, acc: str, field: str, doi: str, title: str, *, timeout: float, max_snippets: int, audit: list[dict[str, Any]] | None = None) -> list[EvidenceRecord]:
     """Recover a bioRxiv/medRxiv alternate version for a published DOI when available.
 
     The public bioRxiv API accepts either a preprint DOI or a published DOI through
@@ -595,7 +782,7 @@ def fetch_biorxiv_preprint(session, acc: str, field: str, doi: str, title: str, 
             item_title = text_value(item.get("title")) or preprint_title
             abstract = text_value(item.get("abstract"))
             if abstract:
-                add_snippets(out, acc, field, f"{server}_abstract", detail_url, preprint_doi, item_title, abstract, max_snippets)
+                add_snippets(out, acc, field, f"{server}_abstract", detail_url, preprint_doi, item_title, abstract, max_snippets, audit)
             jats = text_value(item.get("jatsxml") or item.get("jats_xml") or item.get("jats xml path"))
             if jats:
                 if jats.startswith("//"):
@@ -606,7 +793,7 @@ def fetch_biorxiv_preprint(session, acc: str, field: str, doi: str, title: str, 
                     try:
                         full = session.get(jats, timeout=timeout, headers={"Accept": "application/xml,text/xml,*/*"})
                         full.raise_for_status()
-                        add_snippets(out, acc, field, f"{server}_jats", jats, preprint_doi, item_title, xml_text(full.content), max_snippets)
+                        add_snippets(out, acc, field, f"{server}_jats", jats, preprint_doi, item_title, xml_text(full.content), max_snippets, audit)
                     except Exception:
                         pass
     return out
@@ -673,7 +860,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--timeout", type=float, default=45.0)
     p.add_argument("--max-snippets-per-source", type=int, default=6)
     p.add_argument("--max-supplement-bytes", type=int, default=50 * 1024 * 1024)
-    p.add_argument("--user-agent", default="PRIDE-SCP-targeted-evidence-recovery/0.1.4")
+    p.add_argument("--user-agent", default="PRIDE-SCP-targeted-evidence-recovery/0.1.5")
     p.add_argument("--self-test", action="store_true")
     return p
 
@@ -746,6 +933,7 @@ def main() -> int:
     evidence: list[EvidenceRecord] = []
     query_map: dict[tuple[str, str], list[str]] = {}
     crossref_links: list[dict[str, str]] = []
+    retrieval_audit: list[dict[str, Any]] = []
 
     for (acc, field), field_issues in sorted(grouped.items()):
         if not any(x.category == "evidence_search" for x in field_issues):
@@ -761,7 +949,10 @@ def main() -> int:
 
         for path in content_paths(rows):
             text = read_text_artifact(path)
-            add_snippets(evidence, acc, field, "local_publication", str(path), doi, title, text, args.max_snippets_per_source)
+            add_snippets(
+                evidence, acc, field, "local_publication", str(path), doi, title, text,
+                args.max_snippets_per_source, retrieval_audit,
+            )
 
         if args.online:
             evidence.extend(fetch_europe_pmc(
@@ -770,12 +961,35 @@ def main() -> int:
                 max_snippets=args.max_snippets_per_source,
                 max_supp_bytes=args.max_supplement_bytes,
                 scratch=out / "scratch",
+                audit=retrieval_audit,
             ))
             evidence.extend(fetch_biorxiv_preprint(
                 session, acc, field, doi, title,
                 timeout=args.timeout,
                 max_snippets=args.max_snippets_per_source,
+                audit=retrieval_audit,
             ))
+
+            # Fetch the canonical DOI landing page and any Crossref full-text/TDM
+            # links as independent fallbacks.  These are bounded by content size and
+            # still pass the same strict field-specific relevance gate.
+            candidate_links: list[tuple[str, str]] = []
+            if doi:
+                candidate_links.append(("doi_landing", f"https://doi.org/{doi}"))
+            candidate_links.extend(("crossref_link", u) for u in links)
+            seen_links: set[str] = set()
+            for provider, url in candidate_links:
+                if not url or url in seen_links:
+                    continue
+                seen_links.add(url)
+                fetch_url_evidence(
+                    session, evidence, acc, field, provider, url, doi, title,
+                    timeout=args.timeout,
+                    max_snippets=args.max_snippets_per_source,
+                    max_bytes=min(args.max_supplement_bytes, 16 * 1024 * 1024),
+                    scratch=out / "scratch",
+                    audit=retrieval_audit,
+                )
 
     # Deduplicate evidence globally.
     unique: dict[tuple[str, str, str], EvidenceRecord] = {}
@@ -812,6 +1026,11 @@ def main() -> int:
         for (acc, field), qs in sorted(query_map.items()) for q in qs
     ], ["accession","field","query"])
     write_tsv(out / "crossref_fulltext_links.tsv", crossref_links, ["accession","field","url"])
+    write_tsv(
+        out / "targeted_retrieval_audit.tsv",
+        retrieval_audit,
+        ["accession", "field", "provider", "source", "candidate_windows", "accepted_records", "reject_reasons"],
+    )
 
     targeted_manifest_rows: list[dict[str, str]] = []
     packet_paths: dict[str, str] = {}
@@ -879,6 +1098,7 @@ def main() -> int:
             "targeted_manifest": str(out / "targeted_publication_manifest.tsv"),
             "augmented_manifest": str(out / "augmented_publication_manifest.tsv"),
             "packets": str(packet_dir),
+            "retrieval_audit": str(out / "targeted_retrieval_audit.tsv"),
         },
     }
     (out / "targeted_evidence_summary.json").write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")

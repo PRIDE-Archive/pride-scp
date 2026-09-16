@@ -201,3 +201,26 @@ cellenONE, manual picking, micromanipulation, laser-capture microdissection, or 
 explicit statement that cells were isolated/sorted by a named method). Dense numeric or
 protein-expression tables and bioinformatics contexts such as `sorting nexin`, STRINGdb
 networks, or sorted graph layouts are rejected. Missing evidence remains unresolved.
+
+## v0.1.5 targeted evidence provider-resolution hardening
+
+v0.1.4 correctly rejected false-positive isolation evidence but exposed an under-recall
+problem: valid method statements present in PMC/publisher copies were not always reached.
+
+v0.1.5 keeps the strict field-specific relevance gate and broadens only the source
+resolution layer:
+
+1. gather all exact Europe-PMC matches across DOI, PMID, PMCID and exact title forms;
+2. fetch Europe-PMC `fullTextXML` for every exact PMCID;
+3. independently fetch the corresponding PMC HTML article;
+4. fetch the canonical DOI landing page;
+5. fetch bounded Crossref full-text/TDM links;
+6. retain bioRxiv/medRxiv alternate-version recovery;
+7. pass every recovered text snippet through the same conservative relevance gate.
+
+The stage additionally writes `targeted_retrieval_audit.tsv` with provider/source,
+candidate-window count, accepted-record count and rejection-reason counts.  This makes a
+zero-evidence result distinguishable between fetch failure and a genuine lack of
+field-specific evidence.
+
+No LLM-generated sample/file/channel mapping is authorized by these changes.
