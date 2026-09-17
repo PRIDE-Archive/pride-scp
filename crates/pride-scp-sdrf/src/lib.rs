@@ -20,8 +20,9 @@ pub const SINGLE_CELL_TEMPLATE_VERSION: &str = "1.0.0";
 pub const SINGLE_CELL_TEMPLATE_URL: &str =
     "https://github.com/bigbio/sdrf-templates/blob/main/single-cell/1.0.0/single-cell.yaml";
 pub const SDRF_SPEC_URL: &str = "https://sdrf.quantms.org/specification.html";
-pub const GENERATOR_VERSION: &str = "pride-scp-sdrf-v0.4.9";
-pub const DESIGN_AGENT_VERSION: &str = "pride-scp-design-agent-v0.1";
+pub const GENERATOR_VERSION: &str = "pride-scp-sdrf-v0.5.0";
+pub const DESIGN_AGENT_VERSION: &str = "pride-scp-design-agent-v0.2";
+const DESIGN_AGENT_MAX_ROUNDS: usize = 3;
 
 fn sdrf_annotation_tool_value() -> String {
     let version = GENERATOR_VERSION
@@ -359,17 +360,32 @@ struct EvidenceActionRequest {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 struct EvidenceActionResult {
+    round: usize,
     action: String,
     query: String,
+    outcome: String,
     #[serde(default)]
     matched_evidence_refs: Vec<String>,
     summary: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct FieldScopeClaim {
+    field: String,
+    scope: String,
+    #[serde(default)]
+    evidence_refs: Vec<String>,
+    confidence: String,
+    reason: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 struct CandidateDesignGroup {
     id: String,
     description: String,
+    status: String,
+    source_basis: String,
+    confidence: String,
     #[serde(default)]
     evidence_refs: Vec<String>,
     #[serde(default)]
@@ -388,16 +404,13 @@ struct DatasetDesignAssessment {
     #[serde(default)]
     candidate_groups: Vec<CandidateDesignGroup>,
     #[serde(default)]
-    project_global_fields: Vec<String>,
-    #[serde(default)]
-    row_local_fields: Vec<String>,
+    field_scopes: Vec<FieldScopeClaim>,
     #[serde(default)]
     conflicts: Vec<String>,
     #[serde(default)]
     missing_linkages: Vec<String>,
     #[serde(default)]
     next_evidence_actions: Vec<EvidenceActionRequest>,
-    confidence: String,
     notes: String,
 }
 
@@ -407,6 +420,7 @@ struct DesignAgentTrace {
     #[serde(default)]
     evidence_action_results: Vec<EvidenceActionResult>,
     final_assessment: DatasetDesignAssessment,
+    rounds_completed: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -2763,6 +2777,26 @@ fn build_evidence(opts: &SdrfAnnotateOptions, accession: &str) -> Result<Dataset
 }
 
 fn design_assessment_schema() -> Value {
+    let canonical_fields = vec![
+        "relation_mode",
+        "organism",
+        "organism_part",
+        "disease",
+        "cell_type",
+        "sample_type",
+        "single_cell_isolation_method",
+        "individual",
+        "sample_preparation_batch",
+        "cells_per_well",
+        "proteomics_data_acquisition_method",
+        "label",
+        "instrument",
+        "cleavage_agent_details",
+        "fraction_identifier",
+        "technical_replicate",
+        "carrier_channel",
+        "reference_channel",
+    ];
     json!({
         "type": "object",
         "properties": {
@@ -2773,24 +2807,31 @@ fn design_assessment_schema() -> Value {
             "candidate_groups": {"type":"array","maxItems":24,"items":{"type":"object","properties":{
                 "id":{"type":"string","maxLength":40},
                 "description":{"type":"string","maxLength":300},
+                "status":{"type":"string","enum":["supported","search_hint","rejected"]},
+                "source_basis":{"type":"string","enum":["source_evidence","filename_hint"]},
+                "confidence":{"type":"string","enum":["high","medium","low"]},
                 "evidence_refs":{"type":"array","items":{"type":"string","pattern":"^E[0-9]{4}$"},"maxItems":16},
                 "linked_raw_files":{"type":"array","items":{"type":"string","maxLength":300},"maxItems":64},
                 "linkage_status":{"type":"string","enum":["supported","partial","unresolved"]}
-            },"required":["id","description","evidence_refs","linked_raw_files","linkage_status"],"additionalProperties":false}},
-            "project_global_fields": {"type":"array","items":{"type":"string","maxLength":100},"maxItems":32},
-            "row_local_fields": {"type":"array","items":{"type":"string","maxLength":100},"maxItems":32},
+            },"required":["id","description","status","source_basis","confidence","evidence_refs","linked_raw_files","linkage_status"],"additionalProperties":false}},
+            "field_scopes": {"type":"array","maxItems":32,"items":{"type":"object","properties":{
+                "field":{"type":"string","enum":canonical_fields.clone()},
+                "scope":{"type":"string","enum":["project","group","row","unresolved"]},
+                "evidence_refs":{"type":"array","items":{"type":"string","pattern":"^E[0-9]{4}$"},"maxItems":12},
+                "confidence":{"type":"string","enum":["high","medium","low"]},
+                "reason":{"type":"string","maxLength":300}
+            },"required":["field","scope","evidence_refs","confidence","reason"],"additionalProperties":false}},
             "conflicts": {"type":"array","items":{"type":"string","maxLength":300},"maxItems":24},
             "missing_linkages": {"type":"array","items":{"type":"string","maxLength":300},"maxItems":24},
             "next_evidence_actions": {"type":"array","maxItems":6,"items":{"type":"object","properties":{
                 "action":{"type":"string","enum":["SEARCH_PUBLICATION","SEARCH_SUPPLEMENT","SEARCH_STRUCTURED_DESIGN","SEARCH_REPOSITORY_METADATA","SEARCH_EXACT_RAW_NAME","EXPAND_EVIDENCE_CONTEXT","LOOKUP_KG_TERM","COMPARE_CONFLICTING_EVIDENCE","ABSTAIN"]},
                 "reason":{"type":"string","maxLength":300},
-                "target_fields":{"type":"array","items":{"type":"string","maxLength":100},"maxItems":12},
+                "target_fields":{"type":"array","items":{"type":"string","enum":canonical_fields.clone()},"maxItems":12},
                 "queries":{"type":"array","items":{"type":"string","maxLength":200},"maxItems":8}
             },"required":["action","reason","target_fields","queries"],"additionalProperties":false}},
-            "confidence": {"type":"string","enum":["high","medium","low"]},
             "notes": {"type":"string","maxLength":1200}
         },
-        "required": ["agent_version","design_homogeneous","biological_axes","experimental_axes","candidate_groups","project_global_fields","row_local_fields","conflicts","missing_linkages","next_evidence_actions","confidence","notes"],
+        "required": ["agent_version","design_homogeneous","biological_axes","experimental_axes","candidate_groups","field_scopes","conflicts","missing_linkages","next_evidence_actions","notes"],
         "additionalProperties": false
     })
 }
@@ -2835,8 +2876,8 @@ fn design_assessment_prompt(
             .iter()
             .map(|r| {
                 format!(
-                    "- {} query={:?} refs={:?}: {}",
-                    r.action, r.query, r.matched_evidence_refs, r.summary
+                    "- round={} {} query={:?} outcome={} refs={:?}: {}",
+                    r.round, r.action, r.query, r.outcome, r.matched_evidence_refs, r.summary
                 )
             })
             .collect::<Vec<_>>()
@@ -2844,20 +2885,23 @@ fn design_assessment_prompt(
     };
     format!(
         "You are the evidence-planning stage of a provenance-first SDRF annotation agent for dataset {acc}.\n\n\
-Your job is NOT to fill SDRF values yet. First reconstruct the experimental design, decide which metadata are truly project-global versus row/group-local, identify conflicts and missing row/run linkage, and request bounded evidence actions when needed.\n\n\
+Your job is NOT to fill SDRF values yet. Reconstruct the experimental design, assign canonical SDRF fields to project/group/row/unresolved scope, identify conflicts and missing linkage, and request bounded evidence actions when needed.\n\n\
 SCIENTIFIC CONTRACT:\n\
-1. Never treat a filename token as biological truth. A filename may suggest a search query, but cannot itself establish organism, cell type, disease, cell count, isolation method, or sample identity.\n\
-2. Distinguish project-level facts from group/row-local facts. If multiple organisms, cell lines, sample roles, cell counts, or isolation/loading regimes are plausible, mark the affected fields row-local.\n\
-3. Candidate groups require evidence references. linked_raw_files may be populated only when the supplied evidence explicitly links those RAW names/files to the group; otherwise leave it empty and linkage_status='unresolved'.\n\
-4. If evidence is insufficient, request the smallest useful evidence action. Do not invent a mapping to make the SDRF complete.\n\
-5. SEARCH_EXACT_RAW_NAME is appropriate when a source-backed RAW-to-condition link is missing. SEARCH_STRUCTURED_DESIGN is appropriate for supplementary design tables/manifests. LOOKUP_KG_TERM is for concept meaning/synonyms, never accession-specific truth.\n\
-6. ABSTAIN is a valid action when the remaining mapping is not recoverable from available evidence.\n\
-7. Keep retrieval bounded: request at most six actions and only queries that could resolve a stated conflict or missing linkage.\n\n\
+1. Never treat a filename token as biological truth. Filename-derived possibilities must be candidate_groups with status='search_hint', source_basis='filename_hint', empty evidence_refs, empty linked_raw_files, and linkage_status='unresolved'. They may generate retrieval queries only.\n\
+2. A candidate group may have status='supported' only when one or more supplied E#### references directly support the biological/experimental group. source_basis must then be 'source_evidence'.\n\
+3. linked_raw_files may be populated only when cited evidence explicitly names or otherwise source-links those RAW files to that group. Filename resemblance alone is insufficient.\n\
+4. Use field_scopes with canonical field identifiers only. scope='project' is allowed only when the same concrete value is supported across the entire dataset and no conflict/missing linkage could make it group- or row-specific. If multiple organisms/cell lines/sample roles/regimes exist, affected fields must be group, row, or unresolved. Field_scopes must include one claim for every canonical field that could be populated in this dataset; when unsure use scope='unresolved' rather than omitting the field.\n\
+5. Every field-scope claim and every supported group needs evidence refs. A low-confidence unsupported possibility should be unresolved/search_hint, not promoted to scientific metadata.\n\
+6. If evidence is insufficient, request the smallest useful evidence action. SEARCH_EXACT_RAW_NAME tests direct linkage; if it fails, do not repeat the same action/query. Escalate to SEARCH_STRUCTURED_DESIGN, SEARCH_SUPPLEMENT, SEARCH_PUBLICATION, LOOKUP_KG_TERM, or ABSTAIN as appropriate.\n\
+7. The ACTION HISTORY below is authoritative. Any action/query pair with outcome=no_match or duplicate_skipped MUST NOT be requested again. Repetition is a planning error.\n\
+8. LOOKUP_KG_TERM may clarify terminology/synonyms but never accession-specific row mapping.\n\
+9. ABSTAIN is a scientifically valid terminal action when no trusted source can resolve the remaining mapping.\n\
+10. Keep retrieval bounded: at most six actions in this assessment.\n\n\
 DETERMINISTIC STUDY-DESIGN HINT (diagnostic, not unquestionable truth):\n\
 relation_mode_hint={relation}; confidence={confidence}; repository_file_mode={repo_mode}; note={note}\n\n\
-RAW FILE COUNT: {nfiles}\nRAW FILE SAMPLE (context/search terms only; max {max_files}):\n{files}\n\n\
+RAW FILE COUNT: {nfiles}\nRAW FILE SAMPLE (search context only; max {max_files}):\n{files}\n\n\
 EVIDENCE INVENTORY:\n{evidence_block}\n\n\
-RESULTS FROM REQUESTED EVIDENCE ACTIONS:\n{results}\n\n\
+ACTION HISTORY / RESULTS:\n{results}\n\n\
 Return a structured DatasetDesignAssessment. Set agent_version exactly to {agent_version}.",
         acc=evidence.accession,
         relation=evidence.study_design.relation_mode_hint,
@@ -2911,10 +2955,154 @@ async fn call_ollama_design_assessment(
     }
     let mut assessment: DatasetDesignAssessment =
         serde_json::from_str(raw).context("parse structured Ollama design assessment")?;
-    assessment.agent_version = DESIGN_AGENT_VERSION.into();
+    normalize_design_assessment(evidence, &mut assessment);
     Ok(assessment)
 }
 
+fn is_canonical_design_field(field: &str) -> bool {
+    matches!(
+        field,
+        "relation_mode"
+            | "organism"
+            | "organism_part"
+            | "disease"
+            | "cell_type"
+            | "sample_type"
+            | "single_cell_isolation_method"
+            | "individual"
+            | "sample_preparation_batch"
+            | "cells_per_well"
+            | "proteomics_data_acquisition_method"
+            | "label"
+            | "instrument"
+            | "cleavage_agent_details"
+            | "fraction_identifier"
+            | "technical_replicate"
+            | "carrier_channel"
+            | "reference_channel"
+    )
+}
+
+fn normalize_design_assessment(
+    evidence: &DatasetEvidence,
+    assessment: &mut DatasetDesignAssessment,
+) {
+    assessment.agent_version = DESIGN_AGENT_VERSION.into();
+    let valid_refs: BTreeSet<&str> = evidence
+        .evidence
+        .iter()
+        .map(|item| item.id.as_str())
+        .collect();
+
+    for group in &mut assessment.candidate_groups {
+        group
+            .evidence_refs
+            .retain(|r| valid_refs.contains(r.as_str()));
+        group.evidence_refs.sort();
+        group.evidence_refs.dedup();
+
+        if group.evidence_refs.is_empty() {
+            group.status = "search_hint".into();
+            group.source_basis = "filename_hint".into();
+            group.linked_raw_files.clear();
+            group.linkage_status = "unresolved".into();
+            if group.confidence == "high" {
+                group.confidence = "low".into();
+            }
+            continue;
+        }
+
+        if group.status == "supported" {
+            group.source_basis = "source_evidence".into();
+        }
+
+        if !group.linked_raw_files.is_empty() {
+            let refs = group
+                .evidence_refs
+                .iter()
+                .filter_map(|id| evidence.evidence.iter().find(|item| item.id == id.as_str()))
+                .collect::<Vec<_>>();
+            let all_explicit = group.linked_raw_files.iter().all(|raw| {
+                let raw_lc = raw.to_ascii_lowercase();
+                refs.iter().any(|item| {
+                    format!("{}\n{}", item.source_label, item.text)
+                        .to_ascii_lowercase()
+                        .contains(&raw_lc)
+                })
+            });
+            if !all_explicit {
+                group.linked_raw_files.clear();
+                group.linkage_status = "unresolved".into();
+            }
+        }
+    }
+
+    assessment.field_scopes.retain_mut(|claim| {
+        claim
+            .evidence_refs
+            .retain(|r| valid_refs.contains(r.as_str()));
+        claim.evidence_refs.sort();
+        claim.evidence_refs.dedup();
+        if claim.scope == "project" && claim.evidence_refs.is_empty() {
+            claim.scope = "unresolved".into();
+            claim.confidence = "low".into();
+            claim.reason = format!(
+                "project scope downgraded because no trusted evidence reference supports it; {}",
+                claim.reason
+            );
+        }
+        is_canonical_design_field(&claim.field)
+    });
+
+    let mut seen = BTreeSet::new();
+    assessment
+        .field_scopes
+        .retain(|claim| seen.insert(claim.field.clone()));
+
+    for field in [
+        "relation_mode",
+        "organism",
+        "organism_part",
+        "disease",
+        "cell_type",
+        "sample_type",
+        "single_cell_isolation_method",
+        "individual",
+        "sample_preparation_batch",
+        "cells_per_well",
+        "proteomics_data_acquisition_method",
+        "label",
+        "instrument",
+        "cleavage_agent_details",
+        "fraction_identifier",
+        "technical_replicate",
+        "carrier_channel",
+        "reference_channel",
+    ] {
+        if !assessment
+            .field_scopes
+            .iter()
+            .any(|claim| claim.field == field)
+        {
+            assessment.field_scopes.push(FieldScopeClaim {
+                field: field.into(),
+                scope: "unresolved".into(),
+                evidence_refs: Vec::new(),
+                confidence: "low".into(),
+                reason: "field scope omitted by planner; fail closed until explicitly scoped"
+                    .into(),
+            });
+        }
+    }
+}
+
+fn action_history_key(action: &str, query: &str) -> String {
+    format!(
+        "{}\t{}",
+        action.trim().to_ascii_uppercase(),
+        query.trim().to_ascii_lowercase()
+    )
+}
 fn evidence_item_matches_action(item: &EvidenceItem, action: &str) -> bool {
     let kind = item.source_kind.to_ascii_lowercase();
     let label = item.source_label.to_ascii_lowercase();
@@ -2942,16 +3130,112 @@ fn evidence_item_matches_action(item: &EvidenceItem, action: &str) -> bool {
     }
 }
 
+fn next_agent_evidence_id(evidence: &DatasetEvidence) -> String {
+    let mut n = evidence.evidence.len() + 1;
+    loop {
+        let id = format!("E{n:04}");
+        if !evidence.evidence.iter().any(|item| item.id == id) {
+            return id;
+        }
+        n += 1;
+    }
+}
+
+fn source_file_is_relevant_to_action(path: &Path, action: &str) -> bool {
+    let name = path
+        .file_name()
+        .and_then(|x| x.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    match action {
+        "SEARCH_PUBLICATION" => true,
+        "SEARCH_SUPPLEMENT" => name.contains("supp") || name.contains("support"),
+        "SEARCH_STRUCTURED_DESIGN" => {
+            name.contains("design")
+                || name.ends_with(".csv")
+                || name.ends_with(".tsv")
+                || name.ends_with(".json")
+        }
+        "SEARCH_EXACT_RAW_NAME" | "EXPAND_EVIDENCE_CONTEXT" | "COMPARE_CONFLICTING_EVIDENCE" => {
+            true
+        }
+        "LOOKUP_KG_TERM" => {
+            name.contains("semantic") || name.contains("graph") || name.contains("kg")
+        }
+        _ => false,
+    }
+}
+
+fn source_match_snippet(text: &str, query: &str, radius: usize) -> Option<String> {
+    if query.trim().is_empty() {
+        return None;
+    }
+    let lower = text.to_ascii_lowercase();
+    let q = query.to_ascii_lowercase();
+    let pos = lower.find(&q)?;
+    let mut start = pos.saturating_sub(radius);
+    let mut end = (pos + query.len() + radius).min(text.len());
+    while start > 0 && !text.is_char_boundary(start) {
+        start -= 1;
+    }
+    while end < text.len() && !text.is_char_boundary(end) {
+        end += 1;
+    }
+    Some(text[start..end].replace('\0', " ").replace('\n', " "))
+}
+
+fn retrieve_from_registered_sources(
+    evidence: &mut DatasetEvidence,
+    action: &str,
+    query: &str,
+) -> Vec<String> {
+    let mut paths = evidence
+        .manuscript_sources
+        .iter()
+        .chain(evidence.annotation_sources.iter())
+        .map(PathBuf::from)
+        .filter(|p| p.is_file() && source_file_is_relevant_to_action(p, action))
+        .collect::<Vec<_>>();
+    paths.sort();
+    paths.dedup();
+
+    let mut refs = Vec::new();
+    for path in paths.into_iter().take(24) {
+        let Ok(text) = fs::read_to_string(&path) else {
+            continue;
+        };
+        let Some(snippet) = source_match_snippet(&text, query, 600) else {
+            continue;
+        };
+        let id = next_agent_evidence_id(evidence);
+        evidence.evidence.push(EvidenceItem {
+            id: id.clone(),
+            source_kind: format!("agent_retrieval:{}", action.to_ascii_lowercase()),
+            source_label: path.display().to_string(),
+            text: snippet,
+        });
+        refs.push(id);
+        if refs.len() >= 6 {
+            break;
+        }
+    }
+    refs
+}
+
 fn execute_evidence_actions(
-    evidence: &DatasetEvidence,
+    evidence: &mut DatasetEvidence,
     actions: &[EvidenceActionRequest],
+    round: usize,
+    attempted: &mut BTreeSet<String>,
 ) -> Vec<EvidenceActionResult> {
     let mut out = Vec::new();
     for request in actions.iter().take(6) {
         if request.action == "ABSTAIN" {
             out.push(EvidenceActionResult {
+                round,
                 action: request.action.clone(),
                 query: String::new(),
+                outcome: "abstain".into(),
                 matched_evidence_refs: Vec::new(),
                 summary: format!("agent abstained: {}", request.reason),
             });
@@ -2963,6 +3247,21 @@ fn execute_evidence_actions(
             request.queries.iter().take(8).cloned().collect::<Vec<_>>()
         };
         for query in queries {
+            let key = action_history_key(&request.action, &query);
+            if !attempted.insert(key) {
+                out.push(EvidenceActionResult {
+                    round,
+                    action: request.action.clone(),
+                    query,
+                    outcome: "duplicate_skipped".into(),
+                    matched_evidence_refs: Vec::new(),
+                    summary: format!(
+                        "duplicate action/query blocked; choose a different evidence source or ABSTAIN; reason={}",
+                        request.reason
+                    ),
+                });
+                continue;
+            }
             let q = query.trim().to_ascii_lowercase();
             let mut refs = Vec::new();
             for item in &evidence.evidence {
@@ -2984,21 +3283,44 @@ fn execute_evidence_actions(
                     }
                 }
             }
-            let summary = if refs.is_empty() {
-                format!(
-                    "no matching trusted evidence found for requested action; reason={}",
-                    request.reason
+            if refs.is_empty() && !q.is_empty() {
+                refs = retrieve_from_registered_sources(evidence, &request.action, &query);
+            }
+            let (outcome, summary) = if refs.is_empty() {
+                (
+                    "no_match".to_string(),
+                    format!(
+                        "no matching trusted evidence found in the evidence packet or registered full source files; do not repeat this action/query; reason={}",
+                        request.reason
+                    ),
                 )
             } else {
-                format!(
-                    "matched {} evidence item(s) for requested action; reason={}",
-                    refs.len(),
-                    request.reason
+                let preview = refs
+                    .iter()
+                    .filter_map(|id| evidence.evidence.iter().find(|item| item.id == id.as_str()))
+                    .take(3)
+                    .map(|item| {
+                        let text = item.text.replace('\n', " ");
+                        let excerpt = text.chars().take(260).collect::<String>();
+                        format!("{} [{}] {}", item.id, item.source_label, excerpt)
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" || ");
+                (
+                    "matched".to_string(),
+                    format!(
+                        "matched {} evidence item(s); evidence_preview={}; reason={}",
+                        refs.len(),
+                        preview,
+                        request.reason
+                    ),
                 )
             };
             out.push(EvidenceActionResult {
+                round,
                 action: request.action.clone(),
                 query,
+                outcome,
                 matched_evidence_refs: refs,
                 summary,
             });
@@ -3033,20 +3355,31 @@ fn proposal_field_mut<'a>(proposal: &'a mut SdrfProposal, field: &str) -> Option
     }
 }
 
+fn design_field_allows_project_broadcast(
+    assessment: Option<&DatasetDesignAssessment>,
+    field: &str,
+) -> bool {
+    let Some(assessment) = assessment else {
+        return true;
+    };
+    assessment
+        .field_scopes
+        .iter()
+        .find(|claim| claim.field == field)
+        .map(|claim| claim.scope == "project")
+        .unwrap_or(false)
+}
+
 fn apply_design_assessment_guard(
     proposal: &mut SdrfProposal,
     assessment: &DatasetDesignAssessment,
 ) -> Vec<ValidationIssue> {
-    let globals: BTreeSet<&str> = assessment
-        .project_global_fields
-        .iter()
-        .map(String::as_str)
-        .collect();
     let mut issues = Vec::new();
-    for field in &assessment.row_local_fields {
-        if globals.contains(field.as_str()) {
+    for claim in &assessment.field_scopes {
+        if claim.scope == "project" {
             continue;
         }
+        let field = claim.field.as_str();
         let Some(value) = proposal_field_mut(proposal, field) else {
             continue;
         };
@@ -3065,10 +3398,13 @@ fn apply_design_assessment_guard(
             proposal.evidence_refs.remove(field);
             issues.push(ValidationIssue {
                 level: "warning".into(),
-                code: "agent_row_local_value_not_broadcast".into(),
+                code: "agent_nonproject_value_not_broadcast".into(),
                 row: 0,
-                column: field.clone(),
-                message: format!("design agent marked '{field}' as row/group-local, so dataset-level proposal '{previous}' was not broadcast without proven row/group linkage"),
+                column: field.into(),
+                message: format!(
+                    "design agent scoped '{field}' as {} (confidence={}, refs={:?}), so dataset-level proposal '{previous}' was not broadcast; reason={}",
+                    claim.scope, claim.confidence, claim.evidence_refs, claim.reason
+                ),
             });
         }
     }
@@ -3079,6 +3415,22 @@ fn apply_design_assessment_guard(
             row: 0,
             column: "design_assessment".into(),
             message: assessment.missing_linkages.join(" | "),
+        });
+    }
+    for group in assessment
+        .candidate_groups
+        .iter()
+        .filter(|g| g.status == "search_hint")
+    {
+        issues.push(ValidationIssue {
+            level: "warning".into(),
+            code: "agent_filename_hint_not_annotation_truth".into(),
+            row: 0,
+            column: "design_assessment".into(),
+            message: format!(
+                "candidate group '{}' remains a search hint only and cannot drive SDRF annotation without source evidence: {}",
+                group.id, group.description
+            ),
         });
     }
     issues
@@ -3208,7 +3560,7 @@ PRECOMPUTED STUDY-DESIGN SCAFFOLD (deterministic Rust; do not contradict a non-u
 - multiplex_mapping_status: {multiplex_mapping_status}\n\
 - carrier_channel_hints: {carrier_hints}\n\
 - reference_channel_hints: {reference_hints}\n\n\
-DESIGN-ASSESSMENT AGENT OUTPUT (use this to distinguish project-global from row/group-local values; do not broadcast row-local values without proven linkage):\n{design_assessment}\n\n\
+DESIGN-ASSESSMENT AGENT OUTPUT (canonical field scopes and group provenance):\n{design_assessment}\n\nOnly candidate_groups with status='supported' may influence metadata. Groups marked search_hint are retrieval hypotheses only. A concrete dataset-level proposal is allowed only for fields whose field_scopes entry has scope='project'.\n\n\
 TARGET FIELDS: {target_list}\n\
 LOCKED/ALREADY-STRUCTURED FIELDS: {locked_list}\n\n\
 RULES:\n\
@@ -3221,10 +3573,11 @@ RULES:\n\
 7. proteomics_data_acquisition_method describes MS acquisition (for example DDA, DIA, diaPASEF, PRM), not analysis/search software.\n\
 8. instrument is the mass spectrometer/instrument, not software.\n\
 9. Do not infer a per-cell identifier from filenames here. Rust constructs identifiers only when the row relationship is deterministically supported.\n\
-10. Dataset-level biological values may vary by row. Return a concrete value only if the evidence supports a single dataset-wide value; otherwise use 'not available'.\n\
-11. Return factors=[] in this version. Per-row factor reconstruction is deferred.\n\
-12. Repository labels (PRIDE, PXD accessions, fileCategory, URLs) and analysis software must never be copied into biological/MS fields.\n\
-13. Uncertainty is preferable to hallucination.\n\n\
+10. Dataset-level values may vary by row. Return a concrete value only when the design assessment gives that canonical field scope='project' and field-specific evidence supports the value; otherwise use 'not available' (or relation_mode='uncertain').\n\
+11. search_hint candidate groups must never be converted into metadata.\n\
+12. Return factors=[] in this version. Per-row factor reconstruction is deferred.\n\
+13. Repository labels (PRIDE, PXD accessions, fileCategory, URLs) and analysis software must never be copied into biological/MS fields.\n\
+14. Uncertainty is preferable to hallucination.\n\n\
 RAW FILE COUNT: {nfiles}\n\
 RAW FILE SAMPLE (context only; max {max_files}):\n{files}\n\n\
 FIELD-SPECIFIC EVIDENCE:\n{sections}",
@@ -4264,50 +4617,126 @@ fn apply_metadata_scaffold_field(
 fn apply_deterministic_metadata_scaffold(
     proposal: &mut SdrfProposal,
     evidence: &DatasetEvidence,
+    assessment: Option<&DatasetDesignAssessment>,
 ) -> Vec<ValidationIssue> {
     let mut issues = Vec::new();
-    apply_metadata_scaffold_field(
-        "organism",
-        &mut proposal.organism,
-        &evidence.metadata_scaffold,
-        &mut proposal.evidence_refs,
-        &mut issues,
-    );
-    apply_metadata_scaffold_field(
-        "instrument",
-        &mut proposal.instrument,
-        &evidence.metadata_scaffold,
-        &mut proposal.evidence_refs,
-        &mut issues,
-    );
-    apply_metadata_scaffold_field(
-        "label",
-        &mut proposal.label,
-        &evidence.metadata_scaffold,
-        &mut proposal.evidence_refs,
-        &mut issues,
-    );
-    apply_metadata_scaffold_field(
-        "proteomics_data_acquisition_method",
-        &mut proposal.proteomics_data_acquisition_method,
-        &evidence.metadata_scaffold,
-        &mut proposal.evidence_refs,
-        &mut issues,
-    );
-    apply_metadata_scaffold_field(
-        "cleavage_agent_details",
-        &mut proposal.cleavage_agent_details,
-        &evidence.metadata_scaffold,
-        &mut proposal.evidence_refs,
-        &mut issues,
-    );
-    apply_metadata_scaffold_field(
-        "single_cell_isolation_method",
-        &mut proposal.single_cell_isolation_method,
-        &evidence.metadata_scaffold,
-        &mut proposal.evidence_refs,
-        &mut issues,
-    );
+    if design_field_allows_project_broadcast(assessment, "organism") {
+        apply_metadata_scaffold_field(
+            "organism",
+            &mut proposal.organism,
+            &evidence.metadata_scaffold,
+            &mut proposal.evidence_refs,
+            &mut issues,
+        );
+    } else if assessment.is_some() && evidence.metadata_scaffold.values.contains_key("organism") {
+        issues.push(ValidationIssue {
+            level: "warning".into(),
+            code: "agent_blocks_project_scaffold_broadcast".into(),
+            row: 0,
+            column: "organism".into(),
+            message: "design agent did not establish project-wide scope; deterministic dataset-level scaffold value was not broadcast".into(),
+        });
+    }
+    if design_field_allows_project_broadcast(assessment, "instrument") {
+        apply_metadata_scaffold_field(
+            "instrument",
+            &mut proposal.instrument,
+            &evidence.metadata_scaffold,
+            &mut proposal.evidence_refs,
+            &mut issues,
+        );
+    } else if assessment.is_some() && evidence.metadata_scaffold.values.contains_key("instrument") {
+        issues.push(ValidationIssue {
+            level: "warning".into(),
+            code: "agent_blocks_project_scaffold_broadcast".into(),
+            row: 0,
+            column: "instrument".into(),
+            message: "design agent did not establish project-wide scope; deterministic dataset-level scaffold value was not broadcast".into(),
+        });
+    }
+    if design_field_allows_project_broadcast(assessment, "label") {
+        apply_metadata_scaffold_field(
+            "label",
+            &mut proposal.label,
+            &evidence.metadata_scaffold,
+            &mut proposal.evidence_refs,
+            &mut issues,
+        );
+    } else if assessment.is_some() && evidence.metadata_scaffold.values.contains_key("label") {
+        issues.push(ValidationIssue {
+            level: "warning".into(),
+            code: "agent_blocks_project_scaffold_broadcast".into(),
+            row: 0,
+            column: "label".into(),
+            message: "design agent did not establish project-wide scope; deterministic dataset-level scaffold value was not broadcast".into(),
+        });
+    }
+    if design_field_allows_project_broadcast(assessment, "proteomics_data_acquisition_method") {
+        apply_metadata_scaffold_field(
+            "proteomics_data_acquisition_method",
+            &mut proposal.proteomics_data_acquisition_method,
+            &evidence.metadata_scaffold,
+            &mut proposal.evidence_refs,
+            &mut issues,
+        );
+    } else if assessment.is_some()
+        && evidence
+            .metadata_scaffold
+            .values
+            .contains_key("proteomics_data_acquisition_method")
+    {
+        issues.push(ValidationIssue {
+            level: "warning".into(),
+            code: "agent_blocks_project_scaffold_broadcast".into(),
+            row: 0,
+            column: "proteomics_data_acquisition_method".into(),
+            message: "design agent did not establish project-wide scope; deterministic dataset-level scaffold value was not broadcast".into(),
+        });
+    }
+    if design_field_allows_project_broadcast(assessment, "cleavage_agent_details") {
+        apply_metadata_scaffold_field(
+            "cleavage_agent_details",
+            &mut proposal.cleavage_agent_details,
+            &evidence.metadata_scaffold,
+            &mut proposal.evidence_refs,
+            &mut issues,
+        );
+    } else if assessment.is_some()
+        && evidence
+            .metadata_scaffold
+            .values
+            .contains_key("cleavage_agent_details")
+    {
+        issues.push(ValidationIssue {
+            level: "warning".into(),
+            code: "agent_blocks_project_scaffold_broadcast".into(),
+            row: 0,
+            column: "cleavage_agent_details".into(),
+            message: "design agent did not establish project-wide scope; deterministic dataset-level scaffold value was not broadcast".into(),
+        });
+    }
+    if design_field_allows_project_broadcast(assessment, "single_cell_isolation_method") {
+        apply_metadata_scaffold_field(
+            "single_cell_isolation_method",
+            &mut proposal.single_cell_isolation_method,
+            &evidence.metadata_scaffold,
+            &mut proposal.evidence_refs,
+            &mut issues,
+        );
+    } else if assessment.is_some()
+        && evidence
+            .metadata_scaffold
+            .values
+            .contains_key("single_cell_isolation_method")
+    {
+        issues.push(ValidationIssue {
+            level: "warning".into(),
+            code: "agent_blocks_project_scaffold_broadcast".into(),
+            row: 0,
+            column: "single_cell_isolation_method".into(),
+            message: "design agent did not establish project-wide scope; deterministic dataset-level scaffold value was not broadcast".into(),
+        });
+    }
 
     for gap in &evidence.metadata_scaffold.template_gaps {
         issues.push(ValidationIssue {
@@ -6501,7 +6930,7 @@ async fn annotate_one(opts: &SdrfAnnotateOptions, accession: &str) -> Result<Res
             });
         }
     }
-    let evidence = build_evidence(opts, accession)?;
+    let mut evidence = build_evidence(opts, accession)?;
     let explicit_mappings = if let Some(path) = opts.explicit_row_mapping_manifest.as_deref() {
         if !path.is_file() {
             bail!(
@@ -6532,37 +6961,62 @@ async fn annotate_one(opts: &SdrfAnnotateOptions, accession: &str) -> Result<Res
         proposal_path.with_file_name(format!("{accession}.evidence_actions.json"));
     let mut design_trace: Option<DesignAgentTrace> = None;
 
-    let (mut proposal, ollama_used) =
-        if let Some(proposal) = deterministic_existing_sdrf_proposal(&evidence) {
-            (proposal, false)
-        } else {
-            let initial_assessment = call_ollama_design_assessment(opts, &evidence, &[]).await?;
-            let evidence_action_results =
-                execute_evidence_actions(&evidence, &initial_assessment.next_evidence_actions);
-            let final_assessment = if initial_assessment.next_evidence_actions.is_empty() {
-                initial_assessment.clone()
-            } else {
-                call_ollama_design_assessment(opts, &evidence, &evidence_action_results).await?
-            };
-            let trace = DesignAgentTrace {
-                initial_assessment,
-                evidence_action_results,
-                final_assessment: final_assessment.clone(),
-            };
-            fs::write(
-                &design_assessment_path,
-                serde_json::to_string_pretty(&trace)?,
-            )?;
-            fs::write(
-                &evidence_actions_path,
-                serde_json::to_string_pretty(&trace.evidence_action_results)?,
-            )?;
-            design_trace = Some(trace);
-            (
-                call_ollama(opts, &evidence, Some(&final_assessment)).await?,
-                true,
-            )
+    let (mut proposal, ollama_used) = if let Some(proposal) =
+        deterministic_existing_sdrf_proposal(&evidence)
+    {
+        (proposal, false)
+    } else {
+        let initial_assessment = call_ollama_design_assessment(opts, &evidence, &[]).await?;
+        let mut current_assessment = initial_assessment.clone();
+        let mut evidence_action_results = Vec::new();
+        let mut attempted_actions = BTreeSet::new();
+        let mut rounds_completed = 0usize;
+
+        for round in 1..=DESIGN_AGENT_MAX_ROUNDS {
+            if current_assessment.next_evidence_actions.is_empty() {
+                break;
+            }
+            let round_results = execute_evidence_actions(
+                &mut evidence,
+                &current_assessment.next_evidence_actions,
+                round,
+                &mut attempted_actions,
+            );
+            if round_results.is_empty() {
+                break;
+            }
+            rounds_completed = round;
+            let terminal_abstain = round_results.iter().any(|r| r.outcome == "abstain");
+            evidence_action_results.extend(round_results);
+            if terminal_abstain {
+                break;
+            }
+            current_assessment =
+                call_ollama_design_assessment(opts, &evidence, &evidence_action_results).await?;
+        }
+
+        let final_assessment = current_assessment;
+        fs::write(&evidence_path, serde_json::to_string_pretty(&evidence)?)?;
+        let trace = DesignAgentTrace {
+            initial_assessment,
+            evidence_action_results,
+            final_assessment: final_assessment.clone(),
+            rounds_completed,
         };
+        fs::write(
+            &design_assessment_path,
+            serde_json::to_string_pretty(&trace)?,
+        )?;
+        fs::write(
+            &evidence_actions_path,
+            serde_json::to_string_pretty(&trace.evidence_action_results)?,
+        )?;
+        design_trace = Some(trace);
+        (
+            call_ollama(opts, &evidence, Some(&final_assessment)).await?,
+            true,
+        )
+    };
     // Preserve the model response verbatim when Ollama was used, then construct a
     // provenance-safe proposal. Existing SDRFs that already provide every target
     // field skip Ollama entirely and are validated deterministically.
@@ -6601,6 +7055,10 @@ async fn annotate_one(opts: &SdrfAnnotateOptions, accession: &str) -> Result<Res
     }
     if evidence.existing_sdrf_path.is_empty()
         && study_design_has_assertive_relation_hint(&evidence.study_design)
+        && design_field_allows_project_broadcast(
+            design_trace.as_ref().map(|trace| &trace.final_assessment),
+            "relation_mode",
+        )
     {
         let hint = evidence.study_design.relation_mode_hint.clone();
         if proposal.relation_mode != hint {
@@ -6644,6 +7102,7 @@ async fn annotate_one(opts: &SdrfAnnotateOptions, accession: &str) -> Result<Res
     provenance_issues.extend(apply_deterministic_metadata_scaffold(
         &mut proposal,
         &evidence,
+        design_trace.as_ref().map(|trace| &trace.final_assessment),
     ));
     provenance_issues.extend(apply_publication_compatibility_normalization(&mut proposal));
     fs::write(&proposal_path, serde_json::to_string_pretty(&proposal)?)?;
@@ -7424,8 +7883,8 @@ mod tests {
             .iter()
             .position(|h| h == "comment[sdrf annotation tool]")
             .unwrap();
-        assert_eq!(rows[0][annotation_idx], "pride-scp-sdrf v0.4.9");
-        assert_eq!(sdrf_annotation_tool_value(), "pride-scp-sdrf v0.4.9");
+        assert_eq!(rows[0][annotation_idx], "pride-scp-sdrf v0.5.0");
+        assert_eq!(sdrf_annotation_tool_value(), "pride-scp-sdrf v0.5.0");
         let issues = validate_draft(&headers, &rows, &evidence);
         assert!(issues.iter().all(|x| x.level != "error"), "{issues:?}");
     }
@@ -9767,7 +10226,7 @@ mod tests {
 
     #[test]
     fn exact_raw_action_does_not_invent_filename_linkage() {
-        let evidence = DatasetEvidence {
+        let mut evidence = DatasetEvidence {
             accession: "PXD000001".into(),
             project_json_path: String::new(),
             files_json_path: String::new(),
@@ -9794,9 +10253,122 @@ mod tests {
             target_fields: vec!["cell_type".into()],
             queries: vec!["sample_THX_1.raw".into()],
         }];
-        let results = execute_evidence_actions(&evidence, &actions);
+        let mut attempted = BTreeSet::new();
+        let results = execute_evidence_actions(&mut evidence, &actions, 1, &mut attempted);
         assert_eq!(results.len(), 1);
+        assert_eq!(results[0].outcome, "no_match");
         assert!(results[0].matched_evidence_refs.is_empty());
+    }
+
+    #[test]
+    fn repeated_failed_evidence_action_is_blocked() {
+        let mut evidence = DatasetEvidence {
+            accession: "PXD000001".into(),
+            project_json_path: String::new(),
+            files_json_path: String::new(),
+            existing_sdrf_path: String::new(),
+            raw_files: vec![],
+            study_design: StudyDesignScaffold::default(),
+            metadata_scaffold: DeterministicMetadataScaffold::default(),
+            evidence: vec![],
+            manuscript_sources: vec![],
+            annotation_sources: vec![],
+        };
+        let actions = vec![EvidenceActionRequest {
+            action: "SEARCH_EXACT_RAW_NAME".into(),
+            reason: "need linkage".into(),
+            target_fields: vec!["cell_type".into()],
+            queries: vec!["a.raw".into()],
+        }];
+        let mut attempted = BTreeSet::new();
+        let first = execute_evidence_actions(&mut evidence, &actions, 1, &mut attempted);
+        let second = execute_evidence_actions(&mut evidence, &actions, 2, &mut attempted);
+        assert_eq!(first[0].outcome, "no_match");
+        assert_eq!(second[0].outcome, "duplicate_skipped");
+    }
+
+    #[test]
+    fn filename_only_group_is_normalized_to_search_hint() {
+        let mut evidence = DatasetEvidence {
+            accession: "PXD000001".into(),
+            project_json_path: String::new(),
+            files_json_path: String::new(),
+            existing_sdrf_path: String::new(),
+            raw_files: vec![RawFile {
+                file_name: "32cell_hint.raw".into(),
+                file_uri: String::new(),
+                category: String::new(),
+            }],
+            study_design: StudyDesignScaffold::default(),
+            metadata_scaffold: DeterministicMetadataScaffold::default(),
+            evidence: vec![],
+            manuscript_sources: vec![],
+            annotation_sources: vec![],
+        };
+        let mut assessment = DatasetDesignAssessment {
+            candidate_groups: vec![CandidateDesignGroup {
+                id: "g1".into(),
+                description: "filename-derived group".into(),
+                status: "supported".into(),
+                source_basis: "source_evidence".into(),
+                confidence: "high".into(),
+                evidence_refs: vec![],
+                linked_raw_files: vec!["32cell_hint.raw".into()],
+                linkage_status: "supported".into(),
+            }],
+            ..DatasetDesignAssessment::default()
+        };
+        normalize_design_assessment(&evidence, &mut assessment);
+        let group = &assessment.candidate_groups[0];
+        assert_eq!(group.status, "search_hint");
+        assert_eq!(group.source_basis, "filename_hint");
+        assert_eq!(group.linkage_status, "unresolved");
+        assert!(group.linked_raw_files.is_empty());
+    }
+
+    #[test]
+    fn design_scope_blocks_deterministic_project_scaffold_broadcast() {
+        let mut proposal = SdrfProposal::default();
+        let mut scaffold = DeterministicMetadataScaffold::default();
+        scaffold
+            .values
+            .insert("organism".into(), "Homo sapiens (human)".into());
+        scaffold
+            .evidence_refs
+            .insert("organism".into(), vec!["E0001".into()]);
+        let evidence = DatasetEvidence {
+            accession: "PXD000001".into(),
+            project_json_path: String::new(),
+            files_json_path: String::new(),
+            existing_sdrf_path: String::new(),
+            raw_files: vec![],
+            study_design: StudyDesignScaffold::default(),
+            metadata_scaffold: scaffold,
+            evidence: vec![EvidenceItem {
+                id: "E0001".into(),
+                source_kind: "pride_project".into(),
+                source_label: "project".into(),
+                text: "multiple biological branches".into(),
+            }],
+            manuscript_sources: vec![],
+            annotation_sources: vec![],
+        };
+        let assessment = DatasetDesignAssessment {
+            field_scopes: vec![FieldScopeClaim {
+                field: "organism".into(),
+                scope: "group".into(),
+                evidence_refs: vec!["E0001".into()],
+                confidence: "high".into(),
+                reason: "organism varies by group".into(),
+            }],
+            ..DatasetDesignAssessment::default()
+        };
+        let issues =
+            apply_deterministic_metadata_scaffold(&mut proposal, &evidence, Some(&assessment));
+        assert!(proposal.organism.is_empty());
+        assert!(issues
+            .iter()
+            .any(|x| x.code == "agent_blocks_project_scaffold_broadcast"));
     }
 
     #[test]
@@ -9810,7 +10382,29 @@ mod tests {
         let assessment = DatasetDesignAssessment {
             agent_version: DESIGN_AGENT_VERSION.into(),
             design_homogeneous: false,
-            row_local_fields: vec!["relation_mode".into(), "cell_type".into(), "disease".into()],
+            field_scopes: vec![
+                FieldScopeClaim {
+                    field: "relation_mode".into(),
+                    scope: "group".into(),
+                    confidence: "high".into(),
+                    reason: "multiple regimes".into(),
+                    ..FieldScopeClaim::default()
+                },
+                FieldScopeClaim {
+                    field: "cell_type".into(),
+                    scope: "group".into(),
+                    confidence: "high".into(),
+                    reason: "multiple cell lines".into(),
+                    ..FieldScopeClaim::default()
+                },
+                FieldScopeClaim {
+                    field: "disease".into(),
+                    scope: "unresolved".into(),
+                    confidence: "low".into(),
+                    reason: "row mapping missing".into(),
+                    ..FieldScopeClaim::default()
+                },
+            ],
             missing_linkages: vec!["RAW-to-cell-line mapping unavailable".into()],
             ..DatasetDesignAssessment::default()
         };
@@ -9820,7 +10414,7 @@ mod tests {
         assert_eq!(proposal.disease, "not available");
         assert!(issues
             .iter()
-            .any(|x| x.code == "agent_row_local_value_not_broadcast"));
+            .any(|x| x.code == "agent_nonproject_value_not_broadcast"));
         assert!(issues.iter().any(|x| x.code == "agent_missing_row_linkage"));
     }
 }
