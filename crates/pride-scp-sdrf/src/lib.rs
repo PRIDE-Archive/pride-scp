@@ -20,8 +20,8 @@ pub const SINGLE_CELL_TEMPLATE_VERSION: &str = "1.0.0";
 pub const SINGLE_CELL_TEMPLATE_URL: &str =
     "https://github.com/bigbio/sdrf-templates/blob/main/single-cell/1.0.0/single-cell.yaml";
 pub const SDRF_SPEC_URL: &str = "https://sdrf.quantms.org/specification.html";
-pub const GENERATOR_VERSION: &str = "pride-scp-sdrf-v0.5.1";
-pub const DESIGN_AGENT_VERSION: &str = "pride-scp-design-agent-v0.3";
+pub const GENERATOR_VERSION: &str = "pride-scp-sdrf-v0.5.2";
+pub const DESIGN_AGENT_VERSION: &str = "pride-scp-design-agent-v0.4";
 const DESIGN_AGENT_MAX_ROUNDS: usize = 3;
 
 fn sdrf_annotation_tool_value() -> String {
@@ -374,6 +374,8 @@ struct EvidenceActionRequest {
 struct EvidenceActionResult {
     round: usize,
     action: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    normalized_from_action: String,
     query: EvidenceQuery,
     outcome: String,
     #[serde(default)]
@@ -2958,8 +2960,8 @@ SCIENTIFIC CONTRACT:\n\
 1. Never treat a filename token as biological truth. Filename-derived possibilities must be candidate_groups with status='search_hint', source_basis='filename_hint', empty evidence_refs, empty linked_raw_files, and linkage_status='unresolved'. They may generate retrieval queries only.\n\
 2. A candidate group may have status='supported' only when one or more supplied E#### references directly support the biological/experimental group. source_basis must then be 'source_evidence'.\n\
 3. linked_raw_files may be populated only when cited evidence explicitly names or otherwise source-links those RAW files to that group. Filename resemblance alone is insufficient.\n\
-4. relation_assessment is REQUIRED on every pass. It is separate from ordinary field_scopes because it controls row serialization. Use mode='one_cell_per_data_file' only when one biological sample/cell maps to one acquisition file at the relevant scope; use multiplexed_cells_per_data_file only with locally linked reporter/channel evidence; use mixed for multiple relation regimes; use unresolved only when trusted evidence cannot establish the architecture. scope='branch' is appropriate for heterogeneous studies. Missing organism/cell-line/condition identity for a RAW file does NOT by itself make the relation/cardinality unresolved when one-sample-per-acquisition is independently established. Cite relation evidence refs whenever available.\n\
-5. The deterministic relation hint below is diagnostic evidence, not unquestionable truth. If it has high confidence, cites trusted evidence, and you find no contradictory evidence, you SHOULD normally adopt the same relation mode/scope rather than omit the relation decision. If you disagree, explain the conflict explicitly.\n\
+4. relation_assessment is REQUIRED on every pass and answers ACQUISITION CARDINALITY ONLY: how many biological acquisition units/channels are represented by each data file. It does NOT answer which organism, condition, sex, cell type, treatment, replicate, or other biological identity belongs to a file. Use one_cell_per_data_file when one biological acquisition unit/sample contributes to one acquisition file; despite the legacy name, the unit may be a cell, fiber, digest, or other sample. Use multiplexed_cells_per_data_file only with locally linked reporter/channel evidence. Use mixed only when trusted evidence shows genuinely different acquisition-cardinality regimes (for example one-sample-per-file plus pooled/composite or reporter-multiplexed acquisitions). Use unresolved only when acquisition cardinality itself cannot be established. Missing control-vs-stroke, HeLa-vs-THP1, organism, sex, condition, replicate, or other row-attribute linkage MUST NOT by itself change a concrete relation mode to mixed/unresolved. scope='project' means the same acquisition cardinality applies across all repository acquisitions even if biological groups differ; scope='branch' is only for a cardinality conclusion that is established for one acquisition branch but not the others. Cite relation evidence refs whenever available.\n\
+5. The deterministic relation hint below is diagnostic evidence, not unquestionable truth. If it has high confidence, cites trusted evidence, and you find no contradictory ACQUISITION-CARDINALITY evidence, you SHOULD normally adopt the same relation mode. Biological heterogeneity alone is not a contradiction. If the same cardinality applies to every repository acquisition, prefer scope='project'; use scope='branch' only when another acquisition branch has a different or unresolved cardinality. If you disagree with the deterministic hint, explain the acquisition-structure conflict explicitly.\n\
 6. Use field_scopes with canonical field identifiers only. Each model-produced claim must have claim_origin='model_explicit'. scope='project' is allowed only when the same concrete value is supported across the dataset. If multiple organisms/cell lines/sample roles/regimes exist, affected fields must be group, row, or unresolved. You MAY omit an ordinary field scope when you have no scientific opinion; Rust treats omission as DEFER rather than a veto of deterministic evidence.\n\
 7. A model-explicit non-project claim is a scientific veto of dataset-wide broadcasting. Use it only when supported by evidence/conflict, not merely because a field was not discussed.\n\
 8. Evidence queries are TYPED. Do not write natural-language search instructions inside a query. Use match='raw_exact' with value equal to an actual RAW/mzML basename shown below; use phrase for a literal phrase; terms_all/terms_any with short atomic terms; identifier for sample/accession identifiers; doi for a DOI. document_hint may contain a DOI or source identifier.\n\
@@ -3491,6 +3493,19 @@ fn retrieve_from_registered_sources(
             .map(PathBuf::from)
             .filter(|p| p.is_file())
             .collect::<Vec<_>>()
+    } else if action == "SEARCH_EXACT_RAW_NAME" {
+        [&evidence.project_json_path, &evidence.files_json_path]
+            .into_iter()
+            .map(PathBuf::from)
+            .chain(
+                evidence
+                    .manuscript_sources
+                    .iter()
+                    .chain(evidence.annotation_sources.iter())
+                    .map(PathBuf::from),
+            )
+            .filter(|p| p.is_file() && source_file_is_relevant_to_action(p, action))
+            .collect::<Vec<_>>()
     } else {
         evidence
             .manuscript_sources
@@ -3532,6 +3547,24 @@ fn retrieve_from_registered_sources(
     refs
 }
 
+fn canonicalize_action_for_query(
+    evidence: &DatasetEvidence,
+    requested_action: &str,
+    query: &EvidenceQuery,
+) -> (String, String) {
+    if query.match_kind == "raw_exact" && requested_action != "SEARCH_EXACT_RAW_NAME" {
+        let requested = query.value.trim();
+        if evidence
+            .raw_files
+            .iter()
+            .any(|raw| raw.file_name.eq_ignore_ascii_case(requested))
+        {
+            return ("SEARCH_EXACT_RAW_NAME".into(), requested_action.into());
+        }
+    }
+    (requested_action.into(), String::new())
+}
+
 fn execute_evidence_actions(
     evidence: &mut DatasetEvidence,
     actions: &[EvidenceActionRequest],
@@ -3544,6 +3577,7 @@ fn execute_evidence_actions(
             out.push(EvidenceActionResult {
                 round,
                 action: request.action.clone(),
+                normalized_from_action: String::new(),
                 query: EvidenceQuery::default(),
                 outcome: "abstain".into(),
                 matched_evidence_refs: Vec::new(),
@@ -3557,33 +3591,45 @@ fn execute_evidence_actions(
             request.queries.iter().take(8).cloned().collect::<Vec<_>>()
         };
         for query in queries {
-            let key = action_history_key(&request.action, &query);
+            let (effective_action, normalized_from_action) =
+                canonicalize_action_for_query(evidence, &request.action, &query);
+            let normalization_note = if normalized_from_action.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    "action_normalized from '{}' to '{}'; ",
+                    normalized_from_action, effective_action
+                )
+            };
+            let key = action_history_key(&effective_action, &query);
             if !attempted.insert(key) {
                 out.push(EvidenceActionResult {
                     round,
-                    action: request.action.clone(),
+                    action: effective_action,
+                    normalized_from_action,
                     query,
                     outcome: "duplicate_skipped".into(),
                     matched_evidence_refs: Vec::new(),
                     summary: format!(
-                        "duplicate typed action/query blocked; choose a different evidence source or ABSTAIN; reason={}",
-                        request.reason
+                        "{}duplicate typed action/query blocked; choose a different evidence source or ABSTAIN; reason={}",
+                        normalization_note, request.reason
                     ),
                 });
                 continue;
             }
             if let Err(reason) =
-                validate_evidence_query_for_action(evidence, &request.action, &query)
+                validate_evidence_query_for_action(evidence, &effective_action, &query)
             {
                 out.push(EvidenceActionResult {
                     round,
-                    action: request.action.clone(),
+                    action: effective_action,
+                    normalized_from_action,
                     query,
                     outcome: "invalid_query".into(),
                     matched_evidence_refs: Vec::new(),
                     summary: format!(
-                        "typed query rejected without retrieval: {}; planner must reformulate or ABSTAIN; reason={}",
-                        reason, request.reason
+                        "{}typed query rejected without retrieval: {}; planner must reformulate or ABSTAIN; reason={}",
+                        normalization_note, reason, request.reason
                     ),
                 });
                 continue;
@@ -3591,7 +3637,7 @@ fn execute_evidence_actions(
 
             let mut refs = Vec::new();
             for item in &evidence.evidence {
-                if !evidence_item_matches_action(item, &request.action) {
+                if !evidence_item_matches_action(item, &effective_action) {
                     continue;
                 }
                 let hay = format!("{}\n{}", item.source_label, item.text);
@@ -3603,14 +3649,16 @@ fn execute_evidence_actions(
                 }
             }
             if refs.is_empty() {
-                refs = retrieve_from_registered_sources(evidence, &request.action, &query);
+                refs = retrieve_from_registered_sources(evidence, &effective_action, &query);
             }
             let (outcome, summary) = if refs.is_empty() {
                 (
                     "no_match".to_string(),
                     format!(
-                        "no matching trusted evidence found for typed query {}; do not repeat this action/query; reason={}",
-                        evidence_query_display(&query), request.reason
+                        "{}no matching trusted evidence found for typed query {}; do not repeat this action/query; reason={}",
+                        normalization_note,
+                        evidence_query_display(&query),
+                        request.reason
                     ),
                 )
             } else {
@@ -3628,14 +3676,19 @@ fn execute_evidence_actions(
                 (
                     "matched".to_string(),
                     format!(
-                        "matched {} evidence item(s) for typed query {}; evidence_preview={}; reason={}",
-                        refs.len(), evidence_query_display(&query), preview, request.reason
+                        "{}matched {} evidence item(s) for typed query {}; evidence_preview={}; reason={}",
+                        normalization_note,
+                        refs.len(),
+                        evidence_query_display(&query),
+                        preview,
+                        request.reason
                     ),
                 )
             };
             out.push(EvidenceActionResult {
                 round,
-                action: request.action.clone(),
+                action: effective_action,
+                normalized_from_action,
                 query,
                 outcome,
                 matched_evidence_refs: refs,
@@ -3703,33 +3756,99 @@ fn design_field_project_arbitration(
     }
 }
 
-fn relation_project_arbitration(assessment: Option<&DatasetDesignAssessment>) -> ScopeArbitration {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RelationArbitration {
+    Allow,
+    AllowConfirm,
+    BlockProjectRelation,
+    BlockConflict,
+    BlockUnresolved,
+    Defer,
+}
+
+fn relation_mode_is_concrete(mode: &str) -> bool {
+    matches!(
+        mode,
+        "one_cell_per_data_file" | "multiplexed_cells_per_data_file"
+    )
+}
+
+fn relation_arbitration_allows_scaffold(arbitration: RelationArbitration) -> bool {
+    matches!(
+        arbitration,
+        RelationArbitration::Allow | RelationArbitration::AllowConfirm | RelationArbitration::Defer
+    )
+}
+
+fn relation_scaffold_arbitration(
+    assessment: Option<&DatasetDesignAssessment>,
+    deterministic_hint: &str,
+) -> RelationArbitration {
     let Some(assessment) = assessment else {
-        return ScopeArbitration::Allow;
+        return RelationArbitration::Allow;
     };
     let relation = &assessment.relation_assessment;
     if relation.claim_origin == "default_missing" || relation.mode.trim().is_empty() {
-        return ScopeArbitration::Defer;
+        return RelationArbitration::Defer;
     }
-    if relation.scope == "project"
-        && matches!(
-            relation.mode.as_str(),
-            "one_cell_per_data_file" | "multiplexed_cells_per_data_file"
-        )
-    {
-        ScopeArbitration::Allow
-    } else {
-        ScopeArbitration::Block
+
+    let deterministic_hint = deterministic_hint.trim();
+    let deterministic_is_concrete = relation_mode_is_concrete(deterministic_hint);
+
+    if relation.mode == "mixed" {
+        return RelationArbitration::BlockProjectRelation;
     }
+    if relation.mode == "unresolved" {
+        return if relation.evidence_refs.is_empty() {
+            RelationArbitration::Defer
+        } else {
+            RelationArbitration::BlockUnresolved
+        };
+    }
+    if relation_mode_is_concrete(&relation.mode) {
+        if deterministic_is_concrete {
+            return if relation.mode == deterministic_hint {
+                RelationArbitration::AllowConfirm
+            } else {
+                RelationArbitration::BlockConflict
+            };
+        }
+        return if relation.scope == "project" {
+            RelationArbitration::Allow
+        } else {
+            RelationArbitration::BlockProjectRelation
+        };
+    }
+    RelationArbitration::Defer
+}
+
+fn relation_allows_global_row_serialization(
+    assessment: Option<&DatasetDesignAssessment>,
+    relation_mode: &str,
+) -> bool {
+    if relation_mode != "one_cell_per_data_file" {
+        return false;
+    }
+    let Some(assessment) = assessment else {
+        return true;
+    };
+    let relation = &assessment.relation_assessment;
+    if relation.claim_origin == "default_missing" {
+        return false;
+    }
+    relation.mode == "one_cell_per_data_file" && relation.scope == "project"
 }
 
 fn apply_design_assessment_guard(
     proposal: &mut SdrfProposal,
     assessment: &DatasetDesignAssessment,
+    deterministic_relation_hint: &str,
 ) -> Vec<ValidationIssue> {
     let mut issues = Vec::new();
 
-    if relation_project_arbitration(Some(assessment)) == ScopeArbitration::Block
+    let relation_arbitration =
+        relation_scaffold_arbitration(Some(assessment), deterministic_relation_hint);
+    if !relation_arbitration_allows_scaffold(relation_arbitration)
         && proposal.relation_mode != "uncertain"
         && !proposal.relation_mode.trim().is_empty()
     {
@@ -3738,15 +3857,17 @@ fn apply_design_assessment_guard(
         proposal.evidence_refs.remove("relation_mode");
         issues.push(ValidationIssue {
             level: "warning".into(),
-            code: "agent_nonproject_relation_not_broadcast".into(),
+            code: "agent_relation_conflict_not_broadcast".into(),
             row: 0,
             column: "relation_mode".into(),
             message: format!(
-                "design agent explicitly assessed relation mode='{}' scope='{}' (confidence={}, refs={:?}), so dataset-level proposal '{}' was not broadcast; reason={}",
+                "design agent explicitly assessed relation mode='{}' scope='{}' (confidence={}, refs={:?}); deterministic_hint='{}'; arbitration={:?}; dataset-level proposal '{}' was not broadcast; reason={}",
                 assessment.relation_assessment.mode,
                 assessment.relation_assessment.scope,
                 assessment.relation_assessment.confidence,
                 assessment.relation_assessment.evidence_refs,
+                deterministic_relation_hint,
+                relation_arbitration,
                 previous,
                 assessment.relation_assessment.reason
             ),
@@ -3939,12 +4060,12 @@ RULES:\n\
 2. Fields in LOCKED/ALREADY-STRUCTURED FIELDS must be returned exactly as 'not available' with an empty evidence_refs list; for relation_mode use 'uncertain'. Rust preserves existing SDRF values deterministically.\n\
 3. If a TARGET field is not supported by its own evidence section, return exactly 'not available' (or relation_mode='uncertain').\n\
 4. Every concrete TARGET value must cite one or more E#### refs from that SAME field section.\n\
-5. relation_mode means sample-to-RAW design: one_cell_per_data_file, multiplexed_cells_per_data_file, mixed, or uncertain. Do not infer it merely from the phrase 'single-cell'.\n\
+5. relation_mode means acquisition cardinality, not biological row identity: one_cell_per_data_file, multiplexed_cells_per_data_file, mixed, or uncertain. Do not infer it merely from the phrase 'single-cell', and do not downgrade a concrete one-sample-per-file relation merely because organism, condition, sex, cell type, treatment, or replicate linkage is unresolved.\n\
 6. For single_cell_isolation_method, use only a method faithfully represented by the pinned template vocabulary (for example FACS, cellenONE, microfluidics, laser capture microdissection, manual picking, nanoPOTS, droplet microfluidics, or acoustic droplet ejection). If the evidence instead supports a method such as patch-clamp aspiration or capillary microsampling that the pinned vocabulary cannot represent faithfully, return 'not available'; Rust records the template-compatibility gap separately. Software such as MaxQuant is never an isolation method.\n\
 7. proteomics_data_acquisition_method describes MS acquisition (for example DDA, DIA, diaPASEF, PRM), not analysis/search software.\n\
 8. instrument is the mass spectrometer/instrument, not software.\n\
 9. Do not infer a per-cell identifier from filenames here. Rust constructs identifiers only when the row relationship is deterministically supported.\n\
-10. Dataset-level values may vary by row. For ordinary fields, return a concrete value only when the design assessment gives scope='project' with claim_origin='model_explicit' and field-specific evidence supports the value; otherwise use 'not available'. For relation_mode, follow relation_assessment: return a concrete project relation only when relation_assessment.scope='project' and its mode is concrete; otherwise return 'uncertain'.\n\
+10. Dataset-level values may vary by row. For ordinary fields, return a concrete value only when the design assessment gives scope='project' with claim_origin='model_explicit' and field-specific evidence supports the value; otherwise use 'not available'. relation_mode is different: it represents acquisition cardinality. A concrete project-scoped relation may be returned directly. A branch-scoped concrete relation must not be changed merely because biological row attributes are unresolved; Rust separately arbitrates it against the deterministic relation scaffold and separately tracks whether branch membership/row mapping is safe to serialize.\n\
 11. search_hint candidate groups must never be converted into metadata.\n\
 12. Return factors=[] in this version. Per-row factor reconstruction is deferred.\n\
 13. Repository labels (PRIDE, PXD accessions, fileCategory, URLs) and analysis software must never be copied into biological/MS fields.\n\
@@ -7093,6 +7214,8 @@ fn validate_incomplete_mapping_scaffold(
     headers: &[String],
     rows: &[Vec<String>],
     evidence: &DatasetEvidence,
+    relation_mode: &str,
+    relation_global_row_serialization: bool,
 ) -> Vec<ValidationIssue> {
     let mut issues = Vec::new();
     if rows.is_empty() {
@@ -7148,15 +7271,22 @@ fn validate_incomplete_mapping_scaffold(
                 evidence.study_design.generic_archive_files
             ),
         )
-    } else if evidence.study_design.relation_mode_hint == "multiplexed_cells_per_data_file" {
+    } else if relation_mode == "multiplexed_cells_per_data_file"
+        || evidence.study_design.relation_mode_hint == "multiplexed_cells_per_data_file"
+    {
         (
             "sample_to_channel_mapping_unresolved",
             format!(
                 "{} design detected (chemistry='{}', mapping_status='{}'); per-channel/per-sample SDRF rows are intentionally not fabricated",
-                evidence.study_design.relation_mode_hint,
+                relation_mode,
                 evidence.study_design.multiplex_chemistry_hint,
                 evidence.study_design.multiplex_mapping_status
             ),
+        )
+    } else if relation_mode == "one_cell_per_data_file" && !relation_global_row_serialization {
+        (
+            "sample_to_file_branch_mapping_unresolved",
+            "acquisition cardinality is one biological acquisition unit per data file, but the relation is established only at branch scope; exact branch membership / biological row linkage is unresolved, so source and cell identifiers are intentionally not fabricated from filenames".to_string(),
         )
     } else {
         (
@@ -7271,6 +7401,7 @@ fn derive_readiness_dimensions(
     explicit_mapping_rows: usize,
     raw_file_count: usize,
     relation_mode: &str,
+    relation_global_row_serialization: bool,
     repository_file_mode: &str,
     has_template_gap: bool,
     issues: &[ValidationIssue],
@@ -7283,9 +7414,12 @@ fn derive_readiness_dimensions(
     } else if explicit_mapping_rows > 0 {
         "partial_explicit_mapping"
     } else if relation_mode == "one_cell_per_data_file"
+        && relation_global_row_serialization
         && repository_file_mode != "generic_archives_only"
     {
         "resolved_one_cell_per_file"
+    } else if relation_mode == "one_cell_per_data_file" {
+        "relation_resolved_branch_mapping_unresolved"
     } else if relation_mode == "multiplexed_cells_per_data_file" {
         "unresolved_channel_mapping"
     } else if relation_mode == "mixed" {
@@ -7493,6 +7627,7 @@ async fn annotate_one(opts: &SdrfAnnotateOptions, accession: &str) -> Result<Res
         provenance_issues.extend(apply_design_assessment_guard(
             &mut proposal,
             &trace.final_assessment,
+            &evidence.study_design.relation_mode_hint,
         ));
     }
     if !evidence.existing_sdrf_path.is_empty() {
@@ -7513,11 +7648,13 @@ async fn annotate_one(opts: &SdrfAnnotateOptions, accession: &str) -> Result<Res
             }
         }
     }
-    let relation_arbitration =
-        relation_project_arbitration(design_trace.as_ref().map(|trace| &trace.final_assessment));
+    let relation_arbitration = relation_scaffold_arbitration(
+        design_trace.as_ref().map(|trace| &trace.final_assessment),
+        &evidence.study_design.relation_mode_hint,
+    );
     if evidence.existing_sdrf_path.is_empty()
         && study_design_has_assertive_relation_hint(&evidence.study_design)
-        && relation_arbitration != ScopeArbitration::Block
+        && relation_arbitration_allows_scaffold(relation_arbitration)
     {
         let hint = evidence.study_design.relation_mode_hint.clone();
         if proposal.relation_mode != hint {
@@ -7531,10 +7668,14 @@ async fn annotate_one(opts: &SdrfAnnotateOptions, accession: &str) -> Result<Res
             }
             provenance_issues.push(ValidationIssue {
                 level: "warning".into(),
-                code: if relation_arbitration == ScopeArbitration::Defer {
-                    "agent_relation_deferred_to_deterministic_scaffold".into()
-                } else {
-                    "relation_mode_determined_from_study_design_scaffold".into()
+                code: match relation_arbitration {
+                    RelationArbitration::AllowConfirm => {
+                        "agent_relation_consensus_confirms_scaffold".into()
+                    }
+                    RelationArbitration::Defer => {
+                        "agent_relation_deferred_to_deterministic_scaffold".into()
+                    }
+                    _ => "relation_mode_determined_from_study_design_scaffold".into(),
                 },
                 row: 0,
                 column: "relation_mode".into(),
@@ -7547,7 +7688,7 @@ async fn annotate_one(opts: &SdrfAnnotateOptions, accession: &str) -> Result<Res
         }
     } else if evidence.existing_sdrf_path.is_empty()
         && study_design_has_assertive_relation_hint(&evidence.study_design)
-        && relation_arbitration == ScopeArbitration::Block
+        && !relation_arbitration_allows_scaffold(relation_arbitration)
     {
         let relation = design_trace
             .as_ref()
@@ -7559,15 +7700,17 @@ async fn annotate_one(opts: &SdrfAnnotateOptions, accession: &str) -> Result<Res
             column: "relation_mode".into(),
             message: match relation {
                 Some(relation) => format!(
-                    "design agent explicitly assessed relation mode='{}' scope='{}' (origin={}, confidence={}, refs={:?}); deterministic relation scaffold was not broadcast; reason={}",
+                    "design agent explicitly assessed relation mode='{}' scope='{}' (origin={}, confidence={}, refs={:?}); deterministic_hint='{}'; arbitration={:?}; deterministic relation scaffold was not broadcast; reason={}",
                     relation.mode,
                     relation.scope,
                     relation.claim_origin,
                     relation.confidence,
                     relation.evidence_refs,
+                    evidence.study_design.relation_mode_hint,
+                    relation_arbitration,
                     relation.reason
                 ),
-                None => "design agent explicitly blocked project-wide relation scope; deterministic relation scaffold was not broadcast".into(),
+                None => "design agent explicitly blocked deterministic relation scope; deterministic relation scaffold was not broadcast".into(),
             },
         });
     } else if evidence.existing_sdrf_path.is_empty()
@@ -7599,8 +7742,31 @@ async fn annotate_one(opts: &SdrfAnnotateOptions, accession: &str) -> Result<Res
     let proposal_repair_count = provenance_issues.len();
     let existing = !evidence.existing_sdrf_path.is_empty();
 
-    let (headers, rows, generation_mode) =
-        draft_rows_with_explicit_mappings(&proposal, &evidence, &explicit_mappings)?;
+    let relation_global_row_serialization = relation_allows_global_row_serialization(
+        design_trace.as_ref().map(|trace| &trace.final_assessment),
+        &proposal.relation_mode,
+    );
+    let mut row_proposal = proposal.clone();
+    if evidence.existing_sdrf_path.is_empty()
+        && explicit_mappings.is_empty()
+        && proposal.relation_mode == "one_cell_per_data_file"
+        && !relation_global_row_serialization
+    {
+        // Acquisition cardinality may be resolved at branch scope while branch
+        // membership / biological row linkage is still unresolved. Preserve the
+        // concrete relation in the audit/proposal, but do not let it authorize
+        // filename-derived source/cell identifiers across the entire repository.
+        row_proposal.relation_mode = "uncertain".into();
+    }
+    let (headers, rows, mut generation_mode) =
+        draft_rows_with_explicit_mappings(&row_proposal, &evidence, &explicit_mappings)?;
+    if evidence.existing_sdrf_path.is_empty()
+        && explicit_mappings.is_empty()
+        && proposal.relation_mode == "one_cell_per_data_file"
+        && !relation_global_row_serialization
+    {
+        generation_mode = "generated_relation_resolved_branch_mapping_unresolved".into();
+    }
     write_sdrf(&draft_path, &headers, &rows)?;
     let mut issues = provenance_issues;
     if !explicit_mappings.is_empty() {
@@ -7667,10 +7833,15 @@ async fn annotate_one(opts: &SdrfAnnotateOptions, accession: &str) -> Result<Res
     if !existing
         && explicit_mappings.is_empty()
         && (proposal.relation_mode != "one_cell_per_data_file"
+            || !relation_global_row_serialization
             || evidence.study_design.repository_file_mode == "generic_archives_only")
     {
         issues.extend(validate_incomplete_mapping_scaffold(
-            &headers, &rows, &evidence,
+            &headers,
+            &rows,
+            &evidence,
+            &proposal.relation_mode,
+            relation_global_row_serialization,
         ));
     } else {
         issues.extend(validate_annotation_draft(
@@ -7702,7 +7873,9 @@ async fn annotate_one(opts: &SdrfAnnotateOptions, accession: &str) -> Result<Res
         "locally_valid_draft"
     } else if !explicit_mappings.is_empty() {
         "incomplete_required_metadata"
-    } else if proposal.relation_mode != "one_cell_per_data_file" {
+    } else if proposal.relation_mode != "one_cell_per_data_file"
+        || !relation_global_row_serialization
+    {
         "incomplete_sample_to_file_or_channel_mapping"
     } else if has_isolation_template_gap {
         "incomplete_template_isolation_method_gap"
@@ -7717,6 +7890,7 @@ async fn annotate_one(opts: &SdrfAnnotateOptions, accession: &str) -> Result<Res
             explicit_mappings.len(),
             evidence.raw_files.len(),
             &proposal.relation_mode,
+            relation_global_row_serialization,
             &evidence.study_design.repository_file_mode,
             has_template_gap,
             &issues,
@@ -8405,8 +8579,8 @@ mod tests {
             .iter()
             .position(|h| h == "comment[sdrf annotation tool]")
             .unwrap();
-        assert_eq!(rows[0][annotation_idx], "pride-scp-sdrf v0.5.1");
-        assert_eq!(sdrf_annotation_tool_value(), "pride-scp-sdrf v0.5.1");
+        assert_eq!(rows[0][annotation_idx], "pride-scp-sdrf v0.5.2");
+        assert_eq!(sdrf_annotation_tool_value(), "pride-scp-sdrf v0.5.2");
         let issues = validate_draft(&headers, &rows, &evidence);
         assert!(issues.iter().all(|x| x.level != "error"), "{issues:?}");
     }
@@ -10269,7 +10443,8 @@ mod tests {
             annotation_sources: vec![],
         };
         let (headers, rows, _) = draft_rows(&proposal, &evidence).unwrap();
-        let issues = validate_incomplete_mapping_scaffold(&headers, &rows, &evidence);
+        let issues =
+            validate_incomplete_mapping_scaffold(&headers, &rows, &evidence, "uncertain", false);
         assert_eq!(issues.iter().filter(|x| x.level == "error").count(), 1);
         assert!(issues
             .iter()
@@ -10304,7 +10479,8 @@ mod tests {
             annotation_sources: vec![],
         };
         let (headers, rows, _) = draft_rows(&proposal, &evidence).unwrap();
-        let issues = validate_incomplete_mapping_scaffold(&headers, &rows, &evidence);
+        let issues =
+            validate_incomplete_mapping_scaffold(&headers, &rows, &evidence, "uncertain", false);
         assert_eq!(issues.iter().filter(|x| x.level == "error").count(), 1);
         assert!(issues
             .iter()
@@ -10737,7 +10913,7 @@ mod tests {
     }
 
     #[test]
-    fn design_assessment_schema_exposes_v03_contract() {
+    fn design_assessment_schema_exposes_v04_contract() {
         let schema = design_assessment_schema();
         let text = schema.to_string();
         assert!(text.contains("relation_assessment"));
@@ -11070,13 +11246,14 @@ mod tests {
             missing_linkages: vec!["RAW-to-cell-line mapping unavailable".into()],
             ..DatasetDesignAssessment::default()
         };
-        let issues = apply_design_assessment_guard(&mut proposal, &assessment);
+        let issues =
+            apply_design_assessment_guard(&mut proposal, &assessment, "one_cell_per_data_file");
         assert_eq!(proposal.relation_mode, "uncertain");
         assert_eq!(proposal.cell_type, "not available");
         assert_eq!(proposal.disease, "not available");
         assert!(issues
             .iter()
-            .any(|x| x.code == "agent_nonproject_relation_not_broadcast"));
+            .any(|x| x.code == "agent_relation_conflict_not_broadcast"));
         assert!(issues
             .iter()
             .any(|x| x.code == "agent_nonproject_value_not_broadcast"));
@@ -11097,9 +11274,230 @@ mod tests {
             ..DatasetDesignAssessment::default()
         };
         assert_eq!(
-            relation_project_arbitration(Some(&assessment)),
-            ScopeArbitration::Defer
+            relation_scaffold_arbitration(Some(&assessment), "one_cell_per_data_file"),
+            RelationArbitration::Defer
         );
+    }
+
+    #[test]
+    fn branch_relation_matching_deterministic_hint_confirms_scaffold() {
+        let assessment = DatasetDesignAssessment {
+            relation_assessment: RelationAssessment {
+                mode: "one_cell_per_data_file".into(),
+                scope: "branch".into(),
+                evidence_refs: vec!["E0001".into()],
+                confidence: "high".into(),
+                reason: "one acquisition unit per file".into(),
+                claim_origin: "model_explicit".into(),
+            },
+            ..DatasetDesignAssessment::default()
+        };
+        assert_eq!(
+            relation_scaffold_arbitration(Some(&assessment), "one_cell_per_data_file"),
+            RelationArbitration::AllowConfirm
+        );
+    }
+
+    #[test]
+    fn design_guard_keeps_branch_relation_when_deterministic_hint_agrees() {
+        let mut proposal = SdrfProposal {
+            relation_mode: "one_cell_per_data_file".into(),
+            ..SdrfProposal::default()
+        };
+        let assessment = DatasetDesignAssessment {
+            relation_assessment: RelationAssessment {
+                mode: "one_cell_per_data_file".into(),
+                scope: "branch".into(),
+                evidence_refs: vec!["E0001".into()],
+                confidence: "high".into(),
+                reason: "one acquisition unit per file".into(),
+                claim_origin: "model_explicit".into(),
+            },
+            ..DatasetDesignAssessment::default()
+        };
+        let issues =
+            apply_design_assessment_guard(&mut proposal, &assessment, "one_cell_per_data_file");
+        assert_eq!(proposal.relation_mode, "one_cell_per_data_file");
+        assert!(!issues
+            .iter()
+            .any(|x| x.code == "agent_relation_conflict_not_broadcast"));
+    }
+
+    #[test]
+    fn relation_conflict_blocks_deterministic_scaffold() {
+        let assessment = DatasetDesignAssessment {
+            relation_assessment: RelationAssessment {
+                mode: "multiplexed_cells_per_data_file".into(),
+                scope: "branch".into(),
+                evidence_refs: vec!["E0001".into()],
+                confidence: "high".into(),
+                reason: "reporter multiplexing".into(),
+                claim_origin: "model_explicit".into(),
+            },
+            ..DatasetDesignAssessment::default()
+        };
+        assert_eq!(
+            relation_scaffold_arbitration(Some(&assessment), "one_cell_per_data_file"),
+            RelationArbitration::BlockConflict
+        );
+    }
+
+    #[test]
+    fn mixed_relation_blocks_project_relation_scaffold() {
+        let assessment = DatasetDesignAssessment {
+            relation_assessment: RelationAssessment {
+                mode: "mixed".into(),
+                scope: "branch".into(),
+                evidence_refs: vec!["E0001".into()],
+                confidence: "high".into(),
+                reason: "different acquisition cardinalities".into(),
+                claim_origin: "model_explicit".into(),
+            },
+            ..DatasetDesignAssessment::default()
+        };
+        assert_eq!(
+            relation_scaffold_arbitration(Some(&assessment), "one_cell_per_data_file"),
+            RelationArbitration::BlockProjectRelation
+        );
+    }
+
+    #[test]
+    fn branch_relation_does_not_authorize_global_row_serialization() {
+        let assessment = DatasetDesignAssessment {
+            relation_assessment: RelationAssessment {
+                mode: "one_cell_per_data_file".into(),
+                scope: "branch".into(),
+                evidence_refs: vec!["E0001".into()],
+                confidence: "high".into(),
+                reason: "branch cardinality is resolved".into(),
+                claim_origin: "model_explicit".into(),
+            },
+            ..DatasetDesignAssessment::default()
+        };
+        assert!(!relation_allows_global_row_serialization(
+            Some(&assessment),
+            "one_cell_per_data_file"
+        ));
+    }
+
+    #[test]
+    fn project_relation_authorizes_global_row_serialization() {
+        let assessment = DatasetDesignAssessment {
+            relation_assessment: RelationAssessment {
+                mode: "one_cell_per_data_file".into(),
+                scope: "project".into(),
+                evidence_refs: vec!["E0001".into()],
+                confidence: "high".into(),
+                reason: "same acquisition cardinality applies to every file".into(),
+                claim_origin: "model_explicit".into(),
+            },
+            ..DatasetDesignAssessment::default()
+        };
+        assert!(relation_allows_global_row_serialization(
+            Some(&assessment),
+            "one_cell_per_data_file"
+        ));
+    }
+
+    #[test]
+    fn raw_exact_repository_request_is_normalized_to_exact_raw_action() {
+        let evidence = DatasetEvidence {
+            accession: "PXD000001".into(),
+            project_json_path: String::new(),
+            files_json_path: String::new(),
+            existing_sdrf_path: String::new(),
+            raw_files: vec![RawFile {
+                file_name: "sample_01.raw".into(),
+                file_uri: String::new(),
+                category: "RAW".into(),
+            }],
+            study_design: StudyDesignScaffold::default(),
+            metadata_scaffold: DeterministicMetadataScaffold::default(),
+            evidence: vec![],
+            manuscript_sources: vec![],
+            annotation_sources: vec![],
+        };
+        let query = EvidenceQuery {
+            match_kind: "raw_exact".into(),
+            value: "sample_01.raw".into(),
+            terms: vec![],
+            document_hint: String::new(),
+        };
+        let (action, from) =
+            canonicalize_action_for_query(&evidence, "SEARCH_REPOSITORY_METADATA", &query);
+        assert_eq!(action, "SEARCH_EXACT_RAW_NAME");
+        assert_eq!(from, "SEARCH_REPOSITORY_METADATA");
+        assert!(validate_evidence_query_for_action(&evidence, &action, &query).is_ok());
+    }
+
+    #[test]
+    fn normalized_raw_exact_request_executes_under_exact_raw_action() {
+        let mut evidence = DatasetEvidence {
+            accession: "PXD000001".into(),
+            project_json_path: String::new(),
+            files_json_path: String::new(),
+            existing_sdrf_path: String::new(),
+            raw_files: vec![RawFile {
+                file_name: "sample_01.raw".into(),
+                file_uri: String::new(),
+                category: "RAW".into(),
+            }],
+            study_design: StudyDesignScaffold::default(),
+            metadata_scaffold: DeterministicMetadataScaffold::default(),
+            evidence: vec![EvidenceItem {
+                id: "E0001".into(),
+                source_kind: "pride_files".into(),
+                source_label: "repository:file".into(),
+                text: "sample_01.raw".into(),
+            }],
+            manuscript_sources: vec![],
+            annotation_sources: vec![],
+        };
+        let actions = vec![EvidenceActionRequest {
+            action: "SEARCH_REPOSITORY_METADATA".into(),
+            reason: "verify the exact repository acquisition".into(),
+            target_fields: vec!["sample_type".into()],
+            queries: vec![EvidenceQuery {
+                match_kind: "raw_exact".into(),
+                value: "sample_01.raw".into(),
+                terms: vec![],
+                document_hint: String::new(),
+            }],
+        }];
+        let mut attempted = BTreeSet::new();
+        let results = execute_evidence_actions(&mut evidence, &actions, 1, &mut attempted);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].action, "SEARCH_EXACT_RAW_NAME");
+        assert_eq!(
+            results[0].normalized_from_action,
+            "SEARCH_REPOSITORY_METADATA"
+        );
+        assert!(results[0].summary.contains("action_normalized"));
+        assert_ne!(results[0].outcome, "invalid_query");
+    }
+
+    #[test]
+    fn branch_relation_is_resolved_without_claiming_row_mapping_resolved() {
+        let issues = vec![ValidationIssue {
+            level: "error".into(),
+            code: "sample_to_file_branch_mapping_unresolved".into(),
+            row: 0,
+            column: "characteristics[cell identifier]".into(),
+            message: "branch mapping unresolved".into(),
+        }];
+        let (mapping, _, metadata, _, _) = derive_readiness_dimensions(
+            false,
+            0,
+            10,
+            "one_cell_per_data_file",
+            false,
+            "direct_acquisitions",
+            false,
+            &issues,
+            None,
+        );
+        assert_eq!(mapping, "relation_resolved_branch_mapping_unresolved");
+        assert_eq!(metadata, "validator_complete_except_mapping");
     }
 
     #[test]
@@ -11123,6 +11521,7 @@ mod tests {
             0,
             10,
             "uncertain",
+            false,
             "raw_acquisitions",
             true,
             &issues,
