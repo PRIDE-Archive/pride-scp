@@ -20,9 +20,13 @@ pub const SINGLE_CELL_TEMPLATE_VERSION: &str = "1.0.0";
 pub const SINGLE_CELL_TEMPLATE_URL: &str =
     "https://github.com/bigbio/sdrf-templates/blob/main/single-cell/1.0.0/single-cell.yaml";
 pub const SDRF_SPEC_URL: &str = "https://sdrf.quantms.org/specification.html";
-pub const GENERATOR_VERSION: &str = "pride-scp-sdrf-v0.5.2";
+pub const GENERATOR_VERSION: &str = "pride-scp-sdrf-v0.5.3";
 pub const DESIGN_AGENT_VERSION: &str = "pride-scp-design-agent-v0.4";
+pub const VALIDATOR_REPAIR_AGENT_VERSION: &str = "pride-scp-validator-repair-v0.1";
 const DESIGN_AGENT_MAX_ROUNDS: usize = 3;
+const VALIDATOR_REPAIR_MAX_ROUNDS: usize = 1;
+const VALIDATOR_REPAIR_MAX_TASKS: usize = 4;
+const VALIDATOR_REPAIR_MAX_QUERIES_PER_TASK: usize = 4;
 
 fn sdrf_annotation_tool_value() -> String {
     let version = GENERATOR_VERSION
@@ -494,6 +498,57 @@ struct ValidationIssue {
     message: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct ValidatorRepairTask {
+    field: String,
+    #[serde(default)]
+    error_codes: Vec<String>,
+    error_count: usize,
+    #[serde(default)]
+    representative_rows: Vec<usize>,
+    #[serde(default)]
+    representative_messages: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct ValidatorRepairDecision {
+    field: String,
+    resolution: String,
+    scope: String,
+    value: String,
+    #[serde(default)]
+    evidence_refs: Vec<String>,
+    confidence: String,
+    reason: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct ValidatorRepairAssessment {
+    repair_agent_version: String,
+    #[serde(default)]
+    decisions: Vec<ValidatorRepairDecision>,
+    #[serde(default)]
+    next_evidence_actions: Vec<EvidenceActionRequest>,
+    terminal_status: String,
+    notes: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct ValidatorRepairTrace {
+    repair_agent_version: String,
+    #[serde(default)]
+    tasks: Vec<ValidatorRepairTask>,
+    initial_assessment: ValidatorRepairAssessment,
+    #[serde(default)]
+    evidence_action_results: Vec<EvidenceActionResult>,
+    final_assessment: ValidatorRepairAssessment,
+    rounds_completed: usize,
+    #[serde(default)]
+    applied_fields: Vec<String>,
+    #[serde(default)]
+    deterministic_repairs: Vec<String>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DataFileValidationPolicy {
     /// Generated SDRFs are owned by this tool, so every data-file value must map
@@ -545,6 +600,16 @@ struct DatasetAudit {
     design_assessment_path: String,
     #[serde(default)]
     evidence_actions_path: String,
+    #[serde(default)]
+    validator_repair_agent_version: String,
+    #[serde(default)]
+    validator_repair_path: String,
+    #[serde(default)]
+    validator_repair_actions_path: String,
+    #[serde(default)]
+    validator_repair_rounds: usize,
+    #[serde(default)]
+    validator_repair_task_count: usize,
     draft_path: String,
     proposal_path: String,
     evidence_path: String,
@@ -3926,6 +3991,446 @@ fn apply_design_assessment_guard(
         });
     }
     issues
+}
+
+fn repairable_field_for_issue(code: &str) -> Option<&'static str> {
+    match code {
+        "single_cell_isolation_unresolved" => Some("single_cell_isolation_method"),
+        "multiorganism_project_collapsed_to_single_candidate_organism" => Some("organism"),
+        "individual_duplicates_nonindividual_semantic_field" => Some("individual"),
+        "data_file_name_acquisition_contradiction" => Some("proteomics_data_acquisition_method"),
+        _ => None,
+    }
+}
+
+fn cluster_validator_repair_tasks(issues: &[ValidationIssue]) -> Vec<ValidatorRepairTask> {
+    let mut grouped: BTreeMap<String, ValidatorRepairTask> = BTreeMap::new();
+    for issue in issues.iter().filter(|issue| issue.level == "error") {
+        let Some(field) = repairable_field_for_issue(&issue.code) else {
+            continue;
+        };
+        let task = grouped
+            .entry(field.to_string())
+            .or_insert_with(|| ValidatorRepairTask {
+                field: field.to_string(),
+                ..ValidatorRepairTask::default()
+            });
+        task.error_count += 1;
+        if !task.error_codes.iter().any(|code| code == &issue.code) {
+            task.error_codes.push(issue.code.clone());
+        }
+        if task.representative_rows.len() < 6 && !task.representative_rows.contains(&issue.row) {
+            task.representative_rows.push(issue.row);
+        }
+        if task.representative_messages.len() < 4
+            && !task.representative_messages.contains(&issue.message)
+        {
+            task.representative_messages.push(issue.message.clone());
+        }
+    }
+    let mut tasks = grouped.into_values().collect::<Vec<_>>();
+    tasks.sort_by(|a, b| {
+        b.error_count
+            .cmp(&a.error_count)
+            .then_with(|| a.field.cmp(&b.field))
+    });
+    tasks.truncate(VALIDATOR_REPAIR_MAX_TASKS);
+    tasks
+}
+
+fn individual_value_is_nonindividual_semantic(value: &str, proposal: &SdrfProposal) -> bool {
+    let normalized = value.trim().to_ascii_lowercase();
+    if normalized.is_empty() || proposal_value_is_reserved("individual", value) {
+        return false;
+    }
+    for other in [
+        proposal.organism.as_str(),
+        proposal.organism_part.as_str(),
+        proposal.disease.as_str(),
+        proposal.cell_type.as_str(),
+        proposal.sample_type.as_str(),
+    ] {
+        let other = other.trim().to_ascii_lowercase();
+        if !other.is_empty()
+            && !proposal_value_is_reserved("individual", &other)
+            && normalized == other
+        {
+            return true;
+        }
+    }
+    matches!(
+        normalized.as_str(),
+        "embryo"
+            | "brain"
+            | "brainstem"
+            | "neuron"
+            | "cell"
+            | "cell line"
+            | "single cell"
+            | "tissue"
+            | "hela"
+            | "thp1"
+            | "thp-1"
+            | "k562"
+            | "mcf-7"
+            | "mouse"
+            | "human"
+            | "mus musculus"
+            | "mus musculus (mouse)"
+            | "homo sapiens"
+            | "homo sapiens (human)"
+            | "xenopus laevis"
+            | "xenopus laevis (african clawed frog)"
+    )
+}
+
+fn sanitize_nonindividual_semantic_proposal(
+    proposal: &mut SdrfProposal,
+) -> Option<ValidationIssue> {
+    if !individual_value_is_nonindividual_semantic(&proposal.individual, proposal) {
+        return None;
+    }
+    let previous = proposal.individual.clone();
+    proposal.individual = "not available".into();
+    proposal.evidence_refs.remove("individual");
+    Some(ValidationIssue {
+        level: "warning".into(),
+        code: "validator_repair_individual_semantic_sanitized".into(),
+        row: 0,
+        column: SC_INDIVIDUAL.into(),
+        message: format!(
+            "dataset-level individual/donor value '{previous}' denotes a non-individual semantic concept or duplicates another biological field; sanitized to 'not available' before row serialization"
+        ),
+    })
+}
+
+fn validator_repair_schema() -> Value {
+    let repair_fields = vec![
+        "single_cell_isolation_method",
+        "organism",
+        "individual",
+        "proteomics_data_acquisition_method",
+    ];
+    let evidence_query = json!({
+        "type":"object",
+        "properties":{
+            "match":{"type":"string","enum":["raw_exact","phrase","terms_all","terms_any","identifier","doi"]},
+            "value":{"type":"string","maxLength":300},
+            "terms":{"type":"array","items":{"type":"string","maxLength":120},"maxItems":12},
+            "document_hint":{"type":"string","maxLength":240}
+        },
+        "required":["match","value","terms","document_hint"],
+        "additionalProperties":false
+    });
+    json!({
+        "type":"object",
+        "properties":{
+            "repair_agent_version":{"type":"string","maxLength":80},
+            "decisions":{"type":"array","maxItems":4,"items":{"type":"object","properties":{
+                "field":{"type":"string","enum":repair_fields.clone()},
+                "resolution":{"type":"string","enum":["set_project_value","keep_unresolved","template_gap","row_mapping_required","no_change"]},
+                "scope":{"type":"string","enum":["project","role","row","unresolved"]},
+                "value":{"type":"string","maxLength":200},
+                "evidence_refs":{"type":"array","items":{"type":"string","pattern":"^E[0-9]{4}$"},"maxItems":12},
+                "confidence":{"type":"string","enum":["high","medium","low"]},
+                "reason":{"type":"string","maxLength":500}
+            },"required":["field","resolution","scope","value","evidence_refs","confidence","reason"],"additionalProperties":false}},
+            "next_evidence_actions":{"type":"array","maxItems":4,"items":{"type":"object","properties":{
+                "action":{"type":"string","enum":["SEARCH_PUBLICATION","SEARCH_SUPPLEMENT","SEARCH_STRUCTURED_DESIGN","SEARCH_REPOSITORY_METADATA","SEARCH_EXACT_RAW_NAME","EXPAND_EVIDENCE_CONTEXT","LOOKUP_KG_TERM","COMPARE_CONFLICTING_EVIDENCE","ABSTAIN"]},
+                "reason":{"type":"string","maxLength":300},
+                "target_fields":{"type":"array","items":{"type":"string","enum":repair_fields.clone()},"maxItems":4},
+                "queries":{"type":"array","items":evidence_query,"maxItems":4}
+            },"required":["action","reason","target_fields","queries"],"additionalProperties":false}},
+            "terminal_status":{"type":"string","enum":["continue","resolved","partial","abstained"]},
+            "notes":{"type":"string","maxLength":900}
+        },
+        "required":["repair_agent_version","decisions","next_evidence_actions","terminal_status","notes"],
+        "additionalProperties":false
+    })
+}
+
+fn validator_repair_prompt(
+    evidence: &DatasetEvidence,
+    proposal: &SdrfProposal,
+    design_assessment: Option<&DatasetDesignAssessment>,
+    tasks: &[ValidatorRepairTask],
+    action_results: &[EvidenceActionResult],
+) -> String {
+    let task_json = serde_json::to_string_pretty(tasks).unwrap_or_else(|_| "[]".into());
+    let proposal_json = serde_json::to_string_pretty(proposal).unwrap_or_else(|_| "{}".into());
+    let design_json = design_assessment
+        .map(|assessment| serde_json::to_string_pretty(assessment).unwrap_or_else(|_| "{}".into()))
+        .unwrap_or_else(|| "not available".into());
+    let action_history = if action_results.is_empty() {
+        "none (initial repair planning pass)".into()
+    } else {
+        action_results
+            .iter()
+            .map(|result| {
+                format!(
+                    "- round={} action={} query={} outcome={} refs={:?}: {}",
+                    result.round,
+                    result.action,
+                    evidence_query_display(&result.query),
+                    result.outcome,
+                    result.matched_evidence_refs,
+                    result.summary
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    format!(
+        "You are the bounded validator-repair stage of a provenance-first SDRF annotation agent for dataset {accession}.\n\n\
+TASK:\n\
+Repair only the clustered scientific validation failures listed below. Do not redesign the dataset, change relation_mode, or modify fields that are not repair tasks. This stage gets ONE bounded evidence-retrieval round. If trusted evidence cannot support a safe repair, explicitly keep the field unresolved or require row mapping.\n\n\
+HARD SCIENTIFIC CONSTRAINTS:\n\
+1. Never use filename semantics alone as biological truth. Filename acquisition tokens may trigger evidence retrieval, but they cannot by themselves set DDA/DIA or biological identity.\n\
+2. single_cell_isolation_method: set a project value only when trusted evidence supports the SAME representable isolation method for all affected study/single-cell rows. Do not propagate across unrelated branches. If a real method is outside the pinned template vocabulary, use resolution='template_gap'.\n\
+3. organism: if repository/project evidence exposes multiple organisms, NEVER collapse to one project value. Use row_mapping_required unless explicit trusted source linkage resolves rows/groups. This repair stage does not invent row mapping.\n\
+4. individual: donor/individual identity must not be an organism part, developmental stage, cell type, cell line, or other semantic field. Do not invent donor IDs. Rust deterministically sanitizes obvious semantic aliases; use keep_unresolved when donor identity is absent.\n\
+5. proteomics_data_acquisition_method: filename DDA/DIA tokens are contradiction detectors only. Set a project value only when trusted publication/repository/structured evidence corroborates one acquisition mode across all affected rows. Otherwise use row_mapping_required or keep_unresolved.\n\
+6. set_project_value requires scope='project', one or more E#### refs, and direct field-relevant support. No evidence refs means no concrete repair.\n\
+7. A previous design-agent project/group/row scope remains a safety constraint. Do not override an explicit group/row design claim with a project-wide repair.\n\
+8. Request at most {max_tasks} actions and at most {max_queries} queries per action. Prefer targeted terms/identifiers/DOIs.\n\
+9. Success is binary per task: source-backed repair, explicit template gap, explicit row-mapping requirement, or honest unresolved/abstain. Do not optimize for validator-green output.\n\n\
+CLUSTERED VALIDATION TASKS:\n{task_json}\n\n\
+CURRENT PROPOSAL (context; only task fields may change):\n{proposal_json}\n\n\
+FINAL DESIGN ASSESSMENT (scope safety):\n{design_json}\n\n\
+TRUSTED EVIDENCE INVENTORY:\n{evidence_block}\n\n\
+REPAIR ACTION HISTORY:\n{action_history}\n\n\
+Return the structured ValidatorRepairAssessment. Set repair_agent_version exactly to {repair_version}.",
+        accession = evidence.accession,
+        max_tasks = VALIDATOR_REPAIR_MAX_TASKS,
+        max_queries = VALIDATOR_REPAIR_MAX_QUERIES_PER_TASK,
+        evidence_block = design_evidence_block(evidence, 42),
+        repair_version = VALIDATOR_REPAIR_AGENT_VERSION,
+    )
+}
+
+fn normalize_validator_repair_assessment(
+    evidence: &DatasetEvidence,
+    tasks: &[ValidatorRepairTask],
+    assessment: &mut ValidatorRepairAssessment,
+) {
+    assessment.repair_agent_version = VALIDATOR_REPAIR_AGENT_VERSION.into();
+    let task_fields = tasks
+        .iter()
+        .map(|task| task.field.as_str())
+        .collect::<BTreeSet<_>>();
+    let valid_refs = evidence
+        .evidence
+        .iter()
+        .map(|item| item.id.as_str())
+        .collect::<BTreeSet<_>>();
+    assessment.decisions.retain_mut(|decision| {
+        decision.field = decision.field.trim().to_string();
+        decision.resolution = decision.resolution.trim().to_ascii_lowercase();
+        decision.scope = decision.scope.trim().to_ascii_lowercase();
+        decision.value = decision.value.trim().to_string();
+        decision
+            .evidence_refs
+            .retain(|reference| valid_refs.contains(reference.as_str()));
+        decision.evidence_refs.sort();
+        decision.evidence_refs.dedup();
+        task_fields.contains(decision.field.as_str())
+    });
+    let mut seen = BTreeSet::new();
+    assessment
+        .decisions
+        .retain(|decision| seen.insert(decision.field.clone()));
+    assessment.decisions.truncate(VALIDATOR_REPAIR_MAX_TASKS);
+    assessment.next_evidence_actions.retain_mut(|action| {
+        action
+            .target_fields
+            .retain(|field| task_fields.contains(field.as_str()));
+        action
+            .queries
+            .truncate(VALIDATOR_REPAIR_MAX_QUERIES_PER_TASK);
+        for query in &mut action.queries {
+            normalize_evidence_query(query);
+        }
+        !action.target_fields.is_empty() || action.action == "ABSTAIN"
+    });
+    assessment
+        .next_evidence_actions
+        .truncate(VALIDATOR_REPAIR_MAX_TASKS);
+    if !matches!(
+        assessment.terminal_status.as_str(),
+        "continue" | "resolved" | "partial" | "abstained"
+    ) {
+        assessment.terminal_status = "partial".into();
+    }
+}
+
+async fn call_ollama_validator_repair(
+    opts: &SdrfAnnotateOptions,
+    evidence: &DatasetEvidence,
+    proposal: &SdrfProposal,
+    design_assessment: Option<&DatasetDesignAssessment>,
+    tasks: &[ValidatorRepairTask],
+    action_results: &[EvidenceActionResult],
+) -> Result<ValidatorRepairAssessment> {
+    let client = Client::builder()
+        .timeout(Duration::from_secs(opts.timeout_seconds))
+        .build()?;
+    let payload = json!({
+        "model": opts.model,
+        "prompt": validator_repair_prompt(evidence, proposal, design_assessment, tasks, action_results),
+        "stream": false,
+        "think": false,
+        "format": validator_repair_schema(),
+        "options": {"temperature": 0.0}
+    });
+    let response = client
+        .post(&opts.ollama_url)
+        .json(&payload)
+        .send()
+        .await
+        .with_context(|| format!("Ollama validator-repair request for {}", evidence.accession))?;
+    let status = response.status();
+    let body: Value = response
+        .json()
+        .await
+        .context("decode Ollama validator-repair response")?;
+    if !status.is_success() {
+        bail!("Ollama validator-repair HTTP {status}: {body}");
+    }
+    let raw = body.get("response").and_then(Value::as_str).unwrap_or("");
+    if raw.trim().is_empty() {
+        bail!("Ollama returned empty validator-repair assessment");
+    }
+    let mut assessment: ValidatorRepairAssessment =
+        serde_json::from_str(raw).context("parse structured Ollama validator-repair assessment")?;
+    normalize_validator_repair_assessment(evidence, tasks, &mut assessment);
+    Ok(assessment)
+}
+
+fn decision_refs_are_field_relevant(
+    evidence: &DatasetEvidence,
+    field: &str,
+    refs: &[String],
+) -> bool {
+    !refs.is_empty()
+        && refs.iter().all(|reference| {
+            evidence
+                .evidence
+                .iter()
+                .find(|item| item.id.as_str() == reference.as_str())
+                .map_or(false, |item| evidence_relevant_to_field(field, item))
+        })
+}
+
+fn apply_validator_repair_decisions(
+    proposal: &mut SdrfProposal,
+    evidence: &DatasetEvidence,
+    design_assessment: Option<&DatasetDesignAssessment>,
+    tasks: &[ValidatorRepairTask],
+    assessment: &ValidatorRepairAssessment,
+) -> (Vec<ValidationIssue>, Vec<String>) {
+    let task_fields = tasks
+        .iter()
+        .map(|task| task.field.as_str())
+        .collect::<BTreeSet<_>>();
+    let mut issues = Vec::new();
+    let mut applied_fields = Vec::new();
+    for decision in &assessment.decisions {
+        if !task_fields.contains(decision.field.as_str()) {
+            continue;
+        }
+        if decision.resolution != "set_project_value" {
+            issues.push(ValidationIssue {
+                level: "warning".into(),
+                code: format!("validator_repair_{}", decision.resolution),
+                row: 0,
+                column: decision.field.clone(),
+                message: format!(
+                    "validator repair left field '{}' without a project-wide value (scope={}, confidence={}): {}",
+                    decision.field, decision.scope, decision.confidence, decision.reason
+                ),
+            });
+            continue;
+        }
+        if !matches!(
+            decision.field.as_str(),
+            "single_cell_isolation_method" | "proteomics_data_acquisition_method"
+        ) {
+            issues.push(ValidationIssue {
+                level: "warning".into(),
+                code: "validator_repair_project_value_rejected_for_mapping_field".into(),
+                row: 0,
+                column: decision.field.clone(),
+                message: format!(
+                    "validator repair cannot assign project-wide '{}' because this failure requires source-grounded row/group mapping: {}",
+                    decision.field, decision.reason
+                ),
+            });
+            continue;
+        }
+        if decision.scope != "project"
+            || design_field_project_arbitration(design_assessment, &decision.field)
+                == ScopeArbitration::Block
+            || !decision_refs_are_field_relevant(evidence, &decision.field, &decision.evidence_refs)
+            || obviously_invalid_field_value(&decision.field, &decision.value)
+        {
+            issues.push(ValidationIssue {
+                level: "warning".into(),
+                code: "validator_repair_project_value_rejected_by_provenance_guard".into(),
+                row: 0,
+                column: decision.field.clone(),
+                message: format!(
+                    "validator repair proposed '{}'='{}' but project-wide application was rejected by scope/provenance/semantic guards (scope={}, refs={:?}): {}",
+                    decision.field, decision.value, decision.scope, decision.evidence_refs, decision.reason
+                ),
+            });
+            continue;
+        }
+        if evidence
+            .metadata_scaffold
+            .template_gaps
+            .iter()
+            .any(|gap| gap.field == decision.field)
+        {
+            issues.push(ValidationIssue {
+                level: "warning".into(),
+                code: "validator_repair_blocked_by_template_vocabulary_gap".into(),
+                row: 0,
+                column: decision.field.clone(),
+                message: format!(
+                    "validator repair did not apply '{}' because a source-backed method is outside the pinned template vocabulary: {}",
+                    decision.field, decision.reason
+                ),
+            });
+            continue;
+        }
+        let Some(slot) = proposal_field_mut(proposal, &decision.field) else {
+            continue;
+        };
+        let previous = slot.clone();
+        *slot = decision.value.clone();
+        proposal
+            .evidence_refs
+            .insert(decision.field.clone(), decision.evidence_refs.clone());
+        applied_fields.push(decision.field.clone());
+        issues.push(ValidationIssue {
+            level: "warning".into(),
+            code: "validator_repair_project_value_applied".into(),
+            row: 0,
+            column: decision.field.clone(),
+            message: format!(
+                "bounded validator repair changed '{}' from '{}' to '{}' using refs {:?} (confidence={}): {}",
+                decision.field,
+                previous,
+                decision.value,
+                decision.evidence_refs,
+                decision.confidence,
+                decision.reason
+            ),
+        });
+    }
+    applied_fields.sort();
+    applied_fields.dedup();
+    (issues, applied_fields)
 }
 
 fn proposal_schema() -> Value {
@@ -7527,7 +8032,13 @@ async fn annotate_one(opts: &SdrfAnnotateOptions, accession: &str) -> Result<Res
         proposal_path.with_file_name(format!("{accession}.design_assessment.json"));
     let evidence_actions_path =
         proposal_path.with_file_name(format!("{accession}.evidence_actions.json"));
+    let validator_repair_path =
+        proposal_path.with_file_name(format!("{accession}.validator_repair.json"));
+    let validator_repair_actions_path =
+        proposal_path.with_file_name(format!("{accession}.validator_repair_actions.json"));
     let mut design_trace: Option<DesignAgentTrace> = None;
+    let mut validator_repair_trace: Option<ValidatorRepairTrace> = None;
+    let mut deterministic_validator_repairs = Vec::new();
 
     let (mut proposal, ollama_used) = if let Some(proposal) =
         deterministic_existing_sdrf_proposal(&evidence)
@@ -7737,9 +8248,13 @@ async fn annotate_one(opts: &SdrfAnnotateOptions, accession: &str) -> Result<Res
         design_trace.as_ref().map(|trace| &trace.final_assessment),
     ));
     provenance_issues.extend(apply_publication_compatibility_normalization(&mut proposal));
+    if let Some(issue) = sanitize_nonindividual_semantic_proposal(&mut proposal) {
+        deterministic_validator_repairs.push(issue.code.clone());
+        provenance_issues.push(issue);
+    }
     fs::write(&proposal_path, serde_json::to_string_pretty(&proposal)?)?;
     validate_proposal_refs(&proposal, &evidence)?;
-    let proposal_repair_count = provenance_issues.len();
+    let mut proposal_repair_count = provenance_issues.len();
     let existing = !evidence.existing_sdrf_path.is_empty();
 
     let relation_global_row_serialization = relation_allows_global_row_serialization(
@@ -7758,7 +8273,7 @@ async fn annotate_one(opts: &SdrfAnnotateOptions, accession: &str) -> Result<Res
         // filename-derived source/cell identifiers across the entire repository.
         row_proposal.relation_mode = "uncertain".into();
     }
-    let (headers, rows, mut generation_mode) =
+    let (mut headers, mut rows, mut generation_mode) =
         draft_rows_with_explicit_mappings(&row_proposal, &evidence, &explicit_mappings)?;
     if evidence.existing_sdrf_path.is_empty()
         && explicit_mappings.is_empty()
@@ -7830,24 +8345,179 @@ async fn annotate_one(opts: &SdrfAnnotateOptions, accession: &str) -> Result<Res
             ),
         });
     }
-    if !existing
+    let base_issues = issues.clone();
+    let initial_validation_issues = if !existing
         && explicit_mappings.is_empty()
         && (proposal.relation_mode != "one_cell_per_data_file"
             || !relation_global_row_serialization
             || evidence.study_design.repository_file_mode == "generic_archives_only")
     {
-        issues.extend(validate_incomplete_mapping_scaffold(
+        validate_incomplete_mapping_scaffold(
             &headers,
             &rows,
             &evidence,
             &proposal.relation_mode,
             relation_global_row_serialization,
-        ));
+        )
     } else {
-        issues.extend(validate_annotation_draft(
-            &headers, &rows, &evidence, existing,
-        ));
+        validate_annotation_draft(&headers, &rows, &evidence, existing)
+    };
+    issues.extend(initial_validation_issues);
+
+    let repair_tasks = cluster_validator_repair_tasks(&issues);
+    if !existing && ollama_used && !repair_tasks.is_empty() {
+        let initial_repair = call_ollama_validator_repair(
+            opts,
+            &evidence,
+            &proposal,
+            design_trace.as_ref().map(|trace| &trace.final_assessment),
+            &repair_tasks,
+            &[],
+        )
+        .await?;
+        let mut final_repair = initial_repair.clone();
+        let mut action_results = Vec::new();
+        let mut rounds_completed = 0usize;
+        if VALIDATOR_REPAIR_MAX_ROUNDS > 0
+            && final_repair.terminal_status == "continue"
+            && !final_repair.next_evidence_actions.is_empty()
+        {
+            let mut attempted_actions = BTreeSet::new();
+            action_results = execute_evidence_actions(
+                &mut evidence,
+                &final_repair.next_evidence_actions,
+                1,
+                &mut attempted_actions,
+            );
+            rounds_completed = 1;
+            if action_results
+                .iter()
+                .any(|result| result.outcome == "abstain")
+            {
+                final_repair.terminal_status = "abstained".into();
+                final_repair.next_evidence_actions.clear();
+            } else {
+                final_repair = call_ollama_validator_repair(
+                    opts,
+                    &evidence,
+                    &proposal,
+                    design_trace.as_ref().map(|trace| &trace.final_assessment),
+                    &repair_tasks,
+                    &action_results,
+                )
+                .await?;
+            }
+        }
+        if final_repair.terminal_status == "continue" {
+            final_repair.terminal_status = "partial".into();
+            final_repair.next_evidence_actions.clear();
+        }
+        let (repair_issues, applied_fields) = apply_validator_repair_decisions(
+            &mut proposal,
+            &evidence,
+            design_trace.as_ref().map(|trace| &trace.final_assessment),
+            &repair_tasks,
+            &final_repair,
+        );
+        proposal_repair_count += repair_issues.len();
+
+        if !applied_fields.is_empty() {
+            validate_proposal_refs(&proposal, &evidence)?;
+            fs::write(&proposal_path, serde_json::to_string_pretty(&proposal)?)?;
+            fs::write(&evidence_path, serde_json::to_string_pretty(&evidence)?)?;
+            let mut repaired_row_proposal = proposal.clone();
+            if evidence.existing_sdrf_path.is_empty()
+                && explicit_mappings.is_empty()
+                && proposal.relation_mode == "one_cell_per_data_file"
+                && !relation_global_row_serialization
+            {
+                repaired_row_proposal.relation_mode = "uncertain".into();
+            }
+            let (new_headers, new_rows, new_generation_mode) = draft_rows_with_explicit_mappings(
+                &repaired_row_proposal,
+                &evidence,
+                &explicit_mappings,
+            )?;
+            headers = new_headers;
+            rows = new_rows;
+            generation_mode = new_generation_mode;
+            if evidence.existing_sdrf_path.is_empty()
+                && explicit_mappings.is_empty()
+                && proposal.relation_mode == "one_cell_per_data_file"
+                && !relation_global_row_serialization
+            {
+                generation_mode = "generated_relation_resolved_branch_mapping_unresolved".into();
+            }
+            write_sdrf(&draft_path, &headers, &rows)?;
+            issues = base_issues.clone();
+            issues.extend(repair_issues.clone());
+            let repaired_validation_issues = if !existing
+                && explicit_mappings.is_empty()
+                && (proposal.relation_mode != "one_cell_per_data_file"
+                    || !relation_global_row_serialization
+                    || evidence.study_design.repository_file_mode == "generic_archives_only")
+            {
+                validate_incomplete_mapping_scaffold(
+                    &headers,
+                    &rows,
+                    &evidence,
+                    &proposal.relation_mode,
+                    relation_global_row_serialization,
+                )
+            } else {
+                validate_annotation_draft(&headers, &rows, &evidence, existing)
+            };
+            issues.extend(repaired_validation_issues);
+        } else {
+            issues.extend(repair_issues.clone());
+            fs::write(&evidence_path, serde_json::to_string_pretty(&evidence)?)?;
+        }
+
+        let trace = ValidatorRepairTrace {
+            repair_agent_version: VALIDATOR_REPAIR_AGENT_VERSION.into(),
+            tasks: repair_tasks.clone(),
+            initial_assessment: initial_repair,
+            evidence_action_results: action_results.clone(),
+            final_assessment: final_repair,
+            rounds_completed,
+            applied_fields,
+            deterministic_repairs: deterministic_validator_repairs.clone(),
+        };
+        fs::write(
+            &validator_repair_path,
+            serde_json::to_string_pretty(&trace)?,
+        )?;
+        fs::write(
+            &validator_repair_actions_path,
+            serde_json::to_string_pretty(&trace.evidence_action_results)?,
+        )?;
+        validator_repair_trace = Some(trace);
+    } else if !deterministic_validator_repairs.is_empty() {
+        let trace = ValidatorRepairTrace {
+            repair_agent_version: VALIDATOR_REPAIR_AGENT_VERSION.into(),
+            tasks: repair_tasks,
+            initial_assessment: ValidatorRepairAssessment {
+                repair_agent_version: VALIDATOR_REPAIR_AGENT_VERSION.into(),
+                terminal_status: "resolved".into(),
+                notes: "deterministic semantic sanitization required no LLM repair pass".into(),
+                ..ValidatorRepairAssessment::default()
+            },
+            final_assessment: ValidatorRepairAssessment {
+                repair_agent_version: VALIDATOR_REPAIR_AGENT_VERSION.into(),
+                terminal_status: "resolved".into(),
+                notes: "deterministic semantic sanitization required no LLM repair pass".into(),
+                ..ValidatorRepairAssessment::default()
+            },
+            deterministic_repairs: deterministic_validator_repairs.clone(),
+            ..ValidatorRepairTrace::default()
+        };
+        fs::write(
+            &validator_repair_path,
+            serde_json::to_string_pretty(&trace)?,
+        )?;
+        validator_repair_trace = Some(trace);
     }
+
     write_review(&review_path, &issues)?;
     let errors = issues.iter().filter(|x| x.level == "error").count();
     let locally_valid = errors == 0;
@@ -7911,6 +8581,11 @@ async fn annotate_one(opts: &SdrfAnnotateOptions, accession: &str) -> Result<Res
         design_agent_version: if design_trace.is_some() { DESIGN_AGENT_VERSION.into() } else { String::new() },
         design_assessment_path: if design_trace.is_some() { design_assessment_path.display().to_string() } else { String::new() },
         evidence_actions_path: if design_trace.is_some() { evidence_actions_path.display().to_string() } else { String::new() },
+        validator_repair_agent_version: if validator_repair_trace.is_some() { VALIDATOR_REPAIR_AGENT_VERSION.into() } else { String::new() },
+        validator_repair_path: if validator_repair_trace.is_some() { validator_repair_path.display().to_string() } else { String::new() },
+        validator_repair_actions_path: validator_repair_trace.as_ref().filter(|trace| !trace.evidence_action_results.is_empty()).map(|_| validator_repair_actions_path.display().to_string()).unwrap_or_default(),
+        validator_repair_rounds: validator_repair_trace.as_ref().map(|trace| trace.rounds_completed).unwrap_or(0),
+        validator_repair_task_count: validator_repair_trace.as_ref().map(|trace| trace.tasks.len()).unwrap_or(0),
         draft_path: draft_path.display().to_string(), proposal_path: proposal_path.display().to_string(), evidence_path: evidence_path.display().to_string(),
         review_path: review_path.display().to_string(), validation_issue_count: issues.len(), validation_error_count: errors, proposal_repair_count,
         explicit_row_mapping_manifest: opts.explicit_row_mapping_manifest.as_ref().map(|p| p.display().to_string()).unwrap_or_default(),
@@ -8579,8 +9254,8 @@ mod tests {
             .iter()
             .position(|h| h == "comment[sdrf annotation tool]")
             .unwrap();
-        assert_eq!(rows[0][annotation_idx], "pride-scp-sdrf v0.5.2");
-        assert_eq!(sdrf_annotation_tool_value(), "pride-scp-sdrf v0.5.2");
+        assert_eq!(rows[0][annotation_idx], "pride-scp-sdrf v0.5.3");
+        assert_eq!(sdrf_annotation_tool_value(), "pride-scp-sdrf v0.5.3");
         let issues = validate_draft(&headers, &rows, &evidence);
         assert!(issues.iter().all(|x| x.level != "error"), "{issues:?}");
     }
@@ -11532,5 +12207,337 @@ mod tests {
         assert_eq!(metadata, "validator_complete_except_mapping");
         assert_eq!(evidence, "evidence_exhausted");
         assert_eq!(terminal, "evidence_exhausted");
+    }
+
+    #[test]
+    fn validator_repair_clusters_row_storms_by_field() {
+        let mut issues = Vec::new();
+        for row in 1..=7 {
+            issues.push(ValidationIssue {
+                level: "error".into(),
+                code: "single_cell_isolation_unresolved".into(),
+                row,
+                column: SC_ISOLATION_METHOD.into(),
+                message: "isolation unresolved".into(),
+            });
+        }
+        for row in 1..=3 {
+            issues.push(ValidationIssue {
+                level: "error".into(),
+                code: "individual_duplicates_nonindividual_semantic_field".into(),
+                row,
+                column: SC_INDIVIDUAL.into(),
+                message: "individual duplicates organism part".into(),
+            });
+        }
+        let tasks = cluster_validator_repair_tasks(&issues);
+        assert_eq!(tasks.len(), 2);
+        assert_eq!(tasks[0].field, "single_cell_isolation_method");
+        assert_eq!(tasks[0].error_count, 7);
+        assert!(tasks[0].representative_rows.len() <= 6);
+        assert_eq!(tasks[1].field, "individual");
+        assert_eq!(tasks[1].error_count, 3);
+    }
+
+    #[test]
+    fn validator_repair_ignores_nonrepairable_validation_errors() {
+        let issues = vec![ValidationIssue {
+            level: "error".into(),
+            code: "required_integer_invalid".into(),
+            row: 1,
+            column: "comment[technical replicate]".into(),
+            message: "not an integer".into(),
+        }];
+        assert!(cluster_validator_repair_tasks(&issues).is_empty());
+    }
+
+    #[test]
+    fn validator_repair_individual_semantic_sanitizer_removes_embryo_alias() {
+        let mut proposal = SdrfProposal {
+            organism_part: "Embryo".into(),
+            individual: "Embryo".into(),
+            ..SdrfProposal::default()
+        };
+        proposal
+            .evidence_refs
+            .insert("individual".into(), vec!["E0001".into()]);
+        let issue = sanitize_nonindividual_semantic_proposal(&mut proposal)
+            .expect("embryo alias should be sanitized");
+        assert_eq!(proposal.individual, "not available");
+        assert!(!proposal.evidence_refs.contains_key("individual"));
+        assert_eq!(issue.code, "validator_repair_individual_semantic_sanitized");
+    }
+
+    #[test]
+    fn validator_repair_individual_semantic_sanitizer_preserves_donor_identifier() {
+        let mut proposal = SdrfProposal {
+            organism_part: "Brain".into(),
+            individual: "animal_01".into(),
+            ..SdrfProposal::default()
+        };
+        assert!(sanitize_nonindividual_semantic_proposal(&mut proposal).is_none());
+        assert_eq!(proposal.individual, "animal_01");
+    }
+
+    #[test]
+    fn validator_repair_cannot_project_assign_multiorganism_mapping() {
+        let evidence = DatasetEvidence {
+            accession: "PXD000001".into(),
+            project_json_path: String::new(),
+            files_json_path: String::new(),
+            existing_sdrf_path: String::new(),
+            raw_files: vec![],
+            study_design: StudyDesignScaffold::default(),
+            metadata_scaffold: DeterministicMetadataScaffold::default(),
+            evidence: vec![EvidenceItem {
+                id: "E0001".into(),
+                source_kind: "pride_project".into(),
+                source_label: "project:organisms[0].name".into(),
+                text: "Homo sapiens".into(),
+            }],
+            manuscript_sources: vec![],
+            annotation_sources: vec![],
+        };
+        let tasks = vec![ValidatorRepairTask {
+            field: "organism".into(),
+            error_codes: vec![
+                "multiorganism_project_collapsed_to_single_candidate_organism".into(),
+            ],
+            error_count: 1,
+            representative_rows: vec![0],
+            representative_messages: vec!["multiple organisms".into()],
+        }];
+        let assessment = ValidatorRepairAssessment {
+            repair_agent_version: VALIDATOR_REPAIR_AGENT_VERSION.into(),
+            decisions: vec![ValidatorRepairDecision {
+                field: "organism".into(),
+                resolution: "set_project_value".into(),
+                scope: "project".into(),
+                value: "Homo sapiens".into(),
+                evidence_refs: vec!["E0001".into()],
+                confidence: "high".into(),
+                reason: "one source mentions human".into(),
+            }],
+            terminal_status: "resolved".into(),
+            ..ValidatorRepairAssessment::default()
+        };
+        let mut proposal = SdrfProposal::default();
+        let (issues, applied) =
+            apply_validator_repair_decisions(&mut proposal, &evidence, None, &tasks, &assessment);
+        assert!(applied.is_empty());
+        assert!(
+            issues
+                .iter()
+                .any(|issue| issue.code
+                    == "validator_repair_project_value_rejected_for_mapping_field")
+        );
+        assert!(proposal.organism.is_empty());
+    }
+
+    #[test]
+    fn validator_repair_applies_project_isolation_with_relevant_evidence() {
+        let evidence = DatasetEvidence {
+            accession: "PXD000001".into(),
+            project_json_path: String::new(),
+            files_json_path: String::new(),
+            existing_sdrf_path: String::new(),
+            raw_files: vec![],
+            study_design: StudyDesignScaffold::default(),
+            metadata_scaffold: DeterministicMetadataScaffold::default(),
+            evidence: vec![EvidenceItem {
+                id: "E0001".into(),
+                source_kind: "publication".into(),
+                source_label: "methods:isolation".into(),
+                text: "Individual cells were isolated by manual picking with a micropipette."
+                    .into(),
+            }],
+            manuscript_sources: vec![],
+            annotation_sources: vec![],
+        };
+        let tasks = vec![ValidatorRepairTask {
+            field: "single_cell_isolation_method".into(),
+            error_codes: vec!["single_cell_isolation_unresolved".into()],
+            error_count: 12,
+            representative_rows: vec![1, 2, 3],
+            representative_messages: vec!["isolation unresolved".into()],
+        }];
+        let assessment = ValidatorRepairAssessment {
+            repair_agent_version: VALIDATOR_REPAIR_AGENT_VERSION.into(),
+            decisions: vec![ValidatorRepairDecision {
+                field: "single_cell_isolation_method".into(),
+                resolution: "set_project_value".into(),
+                scope: "project".into(),
+                value: "manual picking".into(),
+                evidence_refs: vec!["E0001".into()],
+                confidence: "high".into(),
+                reason: "methods explicitly state manual picking".into(),
+            }],
+            terminal_status: "resolved".into(),
+            ..ValidatorRepairAssessment::default()
+        };
+        let mut proposal = SdrfProposal {
+            single_cell_isolation_method: "not available".into(),
+            ..SdrfProposal::default()
+        };
+        let (issues, applied) =
+            apply_validator_repair_decisions(&mut proposal, &evidence, None, &tasks, &assessment);
+        assert_eq!(applied, vec!["single_cell_isolation_method"]);
+        assert_eq!(proposal.single_cell_isolation_method, "manual picking");
+        assert_eq!(
+            proposal.evidence_refs.get("single_cell_isolation_method"),
+            Some(&vec!["E0001".into()])
+        );
+        assert!(issues
+            .iter()
+            .any(|issue| issue.code == "validator_repair_project_value_applied"));
+    }
+
+    #[test]
+    fn validator_repair_respects_explicit_group_scope() {
+        let evidence = DatasetEvidence {
+            accession: "PXD000001".into(),
+            project_json_path: String::new(),
+            files_json_path: String::new(),
+            existing_sdrf_path: String::new(),
+            raw_files: vec![],
+            study_design: StudyDesignScaffold::default(),
+            metadata_scaffold: DeterministicMetadataScaffold::default(),
+            evidence: vec![EvidenceItem {
+                id: "E0001".into(),
+                source_kind: "publication".into(),
+                source_label: "methods:isolation".into(),
+                text: "A subset of cells was isolated by manual picking.".into(),
+            }],
+            manuscript_sources: vec![],
+            annotation_sources: vec![],
+        };
+        let design = DatasetDesignAssessment {
+            field_scopes: vec![FieldScopeClaim {
+                field: "single_cell_isolation_method".into(),
+                scope: "group".into(),
+                evidence_refs: vec!["E0001".into()],
+                confidence: "high".into(),
+                reason: "only one branch uses manual picking".into(),
+                claim_origin: "model_explicit".into(),
+            }],
+            ..DatasetDesignAssessment::default()
+        };
+        let tasks = vec![ValidatorRepairTask {
+            field: "single_cell_isolation_method".into(),
+            error_codes: vec!["single_cell_isolation_unresolved".into()],
+            error_count: 5,
+            representative_rows: vec![1],
+            representative_messages: vec!["isolation unresolved".into()],
+        }];
+        let assessment = ValidatorRepairAssessment {
+            repair_agent_version: VALIDATOR_REPAIR_AGENT_VERSION.into(),
+            decisions: vec![ValidatorRepairDecision {
+                field: "single_cell_isolation_method".into(),
+                resolution: "set_project_value".into(),
+                scope: "project".into(),
+                value: "manual picking".into(),
+                evidence_refs: vec!["E0001".into()],
+                confidence: "high".into(),
+                reason: "attempted project broadcast".into(),
+            }],
+            terminal_status: "resolved".into(),
+            ..ValidatorRepairAssessment::default()
+        };
+        let mut proposal = SdrfProposal {
+            single_cell_isolation_method: "not available".into(),
+            ..SdrfProposal::default()
+        };
+        let (issues, applied) = apply_validator_repair_decisions(
+            &mut proposal,
+            &evidence,
+            Some(&design),
+            &tasks,
+            &assessment,
+        );
+        assert!(applied.is_empty());
+        assert_eq!(proposal.single_cell_isolation_method, "not available");
+        assert!(issues.iter().any(|issue| {
+            issue.code == "validator_repair_project_value_rejected_by_provenance_guard"
+        }));
+    }
+
+    #[test]
+    fn validator_repair_normalization_enforces_bounded_action_budget() {
+        let evidence = DatasetEvidence {
+            accession: "PXD000001".into(),
+            project_json_path: String::new(),
+            files_json_path: String::new(),
+            existing_sdrf_path: String::new(),
+            raw_files: vec![],
+            study_design: StudyDesignScaffold::default(),
+            metadata_scaffold: DeterministicMetadataScaffold::default(),
+            evidence: vec![],
+            manuscript_sources: vec![],
+            annotation_sources: vec![],
+        };
+        let tasks = vec![ValidatorRepairTask {
+            field: "single_cell_isolation_method".into(),
+            error_codes: vec!["single_cell_isolation_unresolved".into()],
+            error_count: 1,
+            representative_rows: vec![1],
+            representative_messages: vec!["isolation unresolved".into()],
+        }];
+        let query = EvidenceQuery {
+            match_kind: "terms_any".into(),
+            value: String::new(),
+            terms: vec!["isolation".into()],
+            document_hint: String::new(),
+        };
+        let action = EvidenceActionRequest {
+            action: "SEARCH_PUBLICATION".into(),
+            reason: "find isolation evidence".into(),
+            target_fields: vec!["single_cell_isolation_method".into()],
+            queries: vec![query; 8],
+        };
+        let mut assessment = ValidatorRepairAssessment {
+            next_evidence_actions: vec![action; 8],
+            terminal_status: "continue".into(),
+            ..ValidatorRepairAssessment::default()
+        };
+        normalize_validator_repair_assessment(&evidence, &tasks, &mut assessment);
+        assert_eq!(
+            assessment.next_evidence_actions.len(),
+            VALIDATOR_REPAIR_MAX_TASKS
+        );
+        assert!(assessment
+            .next_evidence_actions
+            .iter()
+            .all(|action| action.queries.len() <= VALIDATOR_REPAIR_MAX_QUERIES_PER_TASK));
+    }
+
+    #[test]
+    fn validator_repair_prompt_exposes_one_round_fail_closed_contract() {
+        let evidence = DatasetEvidence {
+            accession: "PXD000001".into(),
+            project_json_path: String::new(),
+            files_json_path: String::new(),
+            existing_sdrf_path: String::new(),
+            raw_files: vec![],
+            study_design: StudyDesignScaffold::default(),
+            metadata_scaffold: DeterministicMetadataScaffold::default(),
+            evidence: vec![],
+            manuscript_sources: vec![],
+            annotation_sources: vec![],
+        };
+        let tasks = vec![ValidatorRepairTask {
+            field: "organism".into(),
+            error_codes: vec![
+                "multiorganism_project_collapsed_to_single_candidate_organism".into(),
+            ],
+            error_count: 1,
+            representative_rows: vec![0],
+            representative_messages: vec!["multiple organisms".into()],
+        }];
+        let prompt =
+            validator_repair_prompt(&evidence, &SdrfProposal::default(), None, &tasks, &[]);
+        assert!(prompt.contains("ONE bounded evidence-retrieval round"));
+        assert!(prompt.contains("Do not optimize for validator-green output"));
+        assert!(prompt.contains("NEVER collapse to one project value"));
+        assert!(prompt.contains(VALIDATOR_REPAIR_AGENT_VERSION));
     }
 }
