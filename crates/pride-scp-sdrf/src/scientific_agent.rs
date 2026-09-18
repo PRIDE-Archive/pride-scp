@@ -1,6 +1,6 @@
 use super::*;
 
-pub const SCIENTIFIC_AGENT_HARNESS_VERSION: &str = "pride-scp-scientific-agent-v0.2";
+pub const SCIENTIFIC_AGENT_HARNESS_VERSION: &str = "pride-scp-scientific-agent-v0.3";
 #[derive(Debug, Clone)]
 pub struct SdrfScientificAgentOptions {
     pub snapshot_dir: PathBuf,
@@ -121,6 +121,41 @@ struct ScientificClaim {
     reason: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "outcome", rename_all = "snake_case")]
+enum ClaimAdjudication {
+    Canonical {
+        value: String,
+        evidence_refs: Vec<String>,
+    },
+    TemplateGap {
+        observed_value: String,
+        evidence_refs: Vec<String>,
+        reason: String,
+    },
+    SupportedConcept {
+        value: String,
+        evidence_refs: Vec<String>,
+    },
+    Unresolved {
+        reason: String,
+    },
+    Conflict {
+        reason: String,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ClaimAdjudicationRecord {
+    concept_type: String,
+    scope: String,
+    branch_id: String,
+    model_status: String,
+    proposed_value: String,
+    evidence_refs: Vec<String>,
+    adjudication: ClaimAdjudication,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 struct AgentEvidenceAction {
     action: String,
@@ -188,6 +223,7 @@ struct CompiledWorkspace {
     generation_mode: String,
     issues: Vec<ValidationIssue>,
     deterministic_repairs: Vec<String>,
+    adjudications: Vec<ClaimAdjudicationRecord>,
     fingerprint: String,
 }
 
@@ -353,8 +389,8 @@ HARD SCIENTIFIC CONTRACT:\n\
 3. Keep project, branch, row, and unresolved scopes distinct. A project claim means the same scientific value holds across every relevant branch.\n\
 4. Biological heterogeneity is separate from acquisition cardinality.\n\
 5. Do not collapse multiple organisms or acquisition regimes into one project claim. Represent separate branches and leave file linkage unresolved when evidence is insufficient.\n\
-6. For isolation and acquisition, describe the scientific intent faithfully. Rust canonicalizes the final SDRF value.\n\
-7. A supported claim requires source evidence. Hypotheses may guide retrieval but are never serialized.\n\
+6. For isolation and acquisition, describe the scientific intent faithfully and cite the strongest direct method evidence. Rust—not you—decides whether the refs canonicalize to one supported value, prove a template gap, conflict, or remain unresolved. Distinguish the act that isolates/selects a single cell from downstream lysis, digestion, droplet handling, or injection of an already isolated lysate; those downstream steps are not isolation evidence by themselves.\n\
+7. Model status is advisory. For isolation_method and acquisition_mode you MAY return status='hypothesis' when the scientific interpretation is source-grounded but the exact controlled term is uncertain; Rust independently adjudicates the cited evidence and may canonicalize it. Other hypothesis concepts remain non-publishable.\n\
 8. Do not use sample_preparation as a dumping ground for every method detail. Emit one concise claim only when the concept is genuinely needed for SDRF annotation; procedural detail belongs in notes unless it changes a typed scientific concept.\n\
 9. Prefer explicit open_questions over guessed values.\n\
 10. Use next_step='search' only with executable actions. Use 'compile' only after a material workspace change. Use 'finish' when no further safe retrieval is needed. Use 'abstain' when evidence cannot safely resolve remaining study design.\n\
@@ -846,38 +882,164 @@ fn evidence_subset(evidence: &DatasetEvidence, refs: &[String]) -> Vec<EvidenceI
         .collect()
 }
 
-fn canonical_claim_value(
+fn field_relevant_claim_refs(
     evidence: &DatasetEvidence,
-    claim: &ScientificClaim,
-) -> Option<(String, Vec<String>)> {
-    if claim.status != "supported"
-        || !claim_refs_are_relevant(evidence, &claim.concept_type, &claim.evidence_refs)
+    concept_type: &str,
+    refs: &[String],
+) -> Vec<String> {
+    let Some(field) = concept_to_sdrf_field(concept_type) else {
+        return valid_evidence_refs(evidence, refs);
+    };
+    refs.iter()
+        .filter_map(|id| {
+            evidence
+                .evidence
+                .iter()
+                .find(|item| item.id == id.as_str())
+                .filter(|item| evidence_relevant_to_field(field, item))
+                .map(|item| item.id.clone())
+        })
+        .collect()
+}
+
+fn adjudicate_claim(evidence: &DatasetEvidence, claim: &ScientificClaim) -> ClaimAdjudication {
+    if claim.scope == "unresolved" || claim.status == "unresolved" || claim.value.trim().is_empty()
     {
-        return None;
+        return ClaimAdjudication::Unresolved {
+            reason: "claim is explicitly unresolved or has no proposed scientific value".into(),
+        };
     }
-    let subset = evidence_subset(evidence, &claim.evidence_refs);
+
+    let relevant_refs =
+        field_relevant_claim_refs(evidence, &claim.concept_type, &claim.evidence_refs);
+    if relevant_refs.is_empty() {
+        return ClaimAdjudication::Unresolved {
+            reason: "claim has no field-relevant trusted evidence refs".into(),
+        };
+    }
+    let subset = evidence_subset(evidence, &relevant_refs);
+
+    if claim.scope == "project"
+        && claim.concept_type == "isolation_method"
+        && evidence_project_values(evidence, "organisms").len() > 1
+    {
+        return ClaimAdjudication::Unresolved {
+            reason: "project contains multiple explicit organisms; isolation evidence must be represented at branch/row scope or explicitly prove the same method across every biological branch before project broadcast".into(),
+        };
+    }
+
     match claim.concept_type.as_str() {
-        "isolation_method" => infer_isolation_method_scaffold(&subset),
-        "acquisition_mode" => infer_acquisition_method_repair(&subset),
+        "isolation_method" => {
+            // Scientific fidelity precedes validator convenience. If the cited
+            // evidence describes a real isolation method outside the pinned
+            // template vocabulary, record the gap instead of coercing it into
+            // the nearest allowed value.
+            if let Some(gap) = infer_isolation_template_gap(&subset) {
+                return ClaimAdjudication::TemplateGap {
+                    observed_value: gap.observed_value,
+                    evidence_refs: gap.evidence_refs,
+                    reason: gap.reason,
+                };
+            }
+            if let Some((value, refs)) = infer_isolation_method_scaffold(&subset) {
+                return ClaimAdjudication::Canonical {
+                    value,
+                    evidence_refs: refs,
+                };
+            }
+            ClaimAdjudication::Unresolved {
+                reason: "trusted isolation evidence does not deterministically map to one supported single-cell isolation vocabulary value".into(),
+            }
+        }
+        "acquisition_mode" => {
+            if let Some((value, refs)) = infer_acquisition_method_repair(&subset) {
+                return ClaimAdjudication::Canonical {
+                    value,
+                    evidence_refs: refs,
+                };
+            }
+            ClaimAdjudication::Conflict {
+                reason: "trusted acquisition evidence is absent, ambiguous, or supports both DDA and DIA; keep acquisition scope unresolved".into(),
+            }
+        }
         _ => {
+            // For concepts without a deterministic scientific canonicalizer,
+            // the model may suggest hypotheses but cannot publish them. A
+            // supported claim still needs all cited evidence to be relevant.
+            if claim.status != "supported"
+                || !claim_refs_are_relevant(evidence, &claim.concept_type, &claim.evidence_refs)
+            {
+                return ClaimAdjudication::Unresolved {
+                    reason: "non-canonicalized concepts require a model-supported claim with field-relevant evidence".into(),
+                };
+            }
             let value = match canonical_reserved_alias(claim.value.trim()) {
                 Some(value) => value.to_string(),
                 None => claim.value.trim().to_string(),
             };
             if value.is_empty() || value == "not available" {
-                None
+                ClaimAdjudication::Unresolved {
+                    reason: "supported claim does not contain a concrete publishable value".into(),
+                }
             } else {
-                Some((value, claim.evidence_refs.clone()))
+                ClaimAdjudication::SupportedConcept {
+                    value,
+                    evidence_refs: claim.evidence_refs.clone(),
+                }
             }
         }
     }
 }
 
-fn branch_claims_exist(state: &ScientificWorkspaceState, concept_type: &str) -> bool {
+fn adjudication_record(
+    evidence: &DatasetEvidence,
+    claim: &ScientificClaim,
+) -> ClaimAdjudicationRecord {
+    ClaimAdjudicationRecord {
+        concept_type: claim.concept_type.clone(),
+        scope: claim.scope.clone(),
+        branch_id: claim.branch_id.clone(),
+        model_status: claim.status.clone(),
+        proposed_value: claim.value.clone(),
+        evidence_refs: claim.evidence_refs.clone(),
+        adjudication: adjudicate_claim(evidence, claim),
+    }
+}
+
+fn canonical_claim_value(
+    evidence: &DatasetEvidence,
+    claim: &ScientificClaim,
+) -> Option<(String, Vec<String>)> {
+    match adjudicate_claim(evidence, claim) {
+        ClaimAdjudication::Canonical {
+            value,
+            evidence_refs,
+        }
+        | ClaimAdjudication::SupportedConcept {
+            value,
+            evidence_refs,
+        } => Some((value, evidence_refs)),
+        ClaimAdjudication::TemplateGap { .. }
+        | ClaimAdjudication::Unresolved { .. }
+        | ClaimAdjudication::Conflict { .. } => None,
+    }
+}
+
+fn branch_claims_require_project_mask(
+    evidence: &DatasetEvidence,
+    state: &ScientificWorkspaceState,
+    concept_type: &str,
+) -> bool {
     state.claims.iter().any(|claim| {
-        claim.concept_type == concept_type
-            && claim.status == "supported"
-            && matches!(claim.scope.as_str(), "branch" | "row")
+        if claim.concept_type != concept_type || !matches!(claim.scope.as_str(), "branch" | "row") {
+            return false;
+        }
+        matches!(
+            adjudicate_claim(evidence, claim),
+            ClaimAdjudication::Canonical { .. }
+                | ClaimAdjudication::TemplateGap { .. }
+                | ClaimAdjudication::SupportedConcept { .. }
+        )
     })
 }
 
@@ -932,6 +1094,69 @@ fn proposal_field_value<'a>(proposal: &'a SdrfProposal, field: &str) -> Option<&
     .map(String::as_str)
 }
 
+fn apply_dynamic_semantic_bootstrap(
+    proposal: &mut SdrfProposal,
+    evidence: &DatasetEvidence,
+    issues: &mut Vec<ValidationIssue>,
+) {
+    let isolation_current = proposal.single_cell_isolation_method.trim();
+    let isolation_unresolved =
+        isolation_current.is_empty() || canonical_reserved_alias(isolation_current).is_some();
+    if isolation_unresolved {
+        if let Some(gap) = infer_isolation_template_gap(&evidence.evidence) {
+            issues.push(ValidationIssue {
+                level: "warning".into(),
+                code: "scientific_agent_semantic_bootstrap_template_gap".into(),
+                row: 0,
+                column: SC_ISOLATION_METHOD.into(),
+                message: format!(
+                    "dynamic trusted evidence supports isolation method '{}' outside the pinned template vocabulary; keep SDRF value unresolved rather than substitute a false allowed term; refs={:?}",
+                    gap.observed_value, gap.evidence_refs
+                ),
+            });
+        } else if evidence_project_values(evidence, "organisms").len() <= 1 {
+            if let Some((value, refs)) = infer_isolation_method_scaffold(&evidence.evidence) {
+                proposal.single_cell_isolation_method = value.clone();
+                proposal
+                    .evidence_refs
+                    .insert("single_cell_isolation_method".into(), refs.clone());
+                issues.push(ValidationIssue {
+                    level: "warning".into(),
+                    code: "scientific_agent_semantic_bootstrap_canonicalized".into(),
+                    row: 0,
+                    column: SC_ISOLATION_METHOD.into(),
+                    message: format!(
+                        "dynamic trusted evidence deterministically supplied single_cell_isolation_method='{}' from refs {:?}",
+                        value, refs
+                    ),
+                });
+            }
+        }
+    }
+
+    let acquisition_current = proposal.proteomics_data_acquisition_method.trim();
+    let acquisition_unresolved =
+        acquisition_current.is_empty() || canonical_reserved_alias(acquisition_current).is_some();
+    if acquisition_unresolved {
+        if let Some((value, refs)) = infer_acquisition_method_repair(&evidence.evidence) {
+            proposal.proteomics_data_acquisition_method = value.clone();
+            proposal
+                .evidence_refs
+                .insert("proteomics_data_acquisition_method".into(), refs.clone());
+            issues.push(ValidationIssue {
+                level: "warning".into(),
+                code: "scientific_agent_semantic_bootstrap_canonicalized".into(),
+                row: 0,
+                column: "comment[proteomics data acquisition method]".into(),
+                message: format!(
+                    "dynamic trusted evidence deterministically supplied proteomics_data_acquisition_method='{}' from refs {:?}",
+                    value, refs
+                ),
+            });
+        }
+    }
+}
+
 fn apply_scientific_overlay(
     proposal: &mut SdrfProposal,
     evidence: &DatasetEvidence,
@@ -945,7 +1170,7 @@ fn apply_scientific_overlay(
         let Some(field) = concept_to_sdrf_field(concept) else {
             continue;
         };
-        if branch_claims_exist(state, concept)
+        if branch_claims_require_project_mask(evidence, state, concept)
             || branch_claims_are_heterogeneous(evidence, state, concept)
         {
             let previous = proposal_field_value(proposal, field)
@@ -966,10 +1191,10 @@ fn apply_scientific_overlay(
     }
 
     for claim in &state.claims {
-        if claim.scope != "project" || claim.status != "supported" {
+        if claim.scope != "project" {
             continue;
         }
-        if branch_claims_exist(state, &claim.concept_type)
+        if branch_claims_require_project_mask(evidence, state, &claim.concept_type)
             || branch_claims_are_heterogeneous(evidence, state, &claim.concept_type)
         {
             continue;
@@ -977,6 +1202,45 @@ fn apply_scientific_overlay(
         let Some(field) = concept_to_sdrf_field(&claim.concept_type) else {
             continue;
         };
+        match adjudicate_claim(evidence, claim) {
+            ClaimAdjudication::TemplateGap {
+                observed_value,
+                evidence_refs,
+                reason,
+            } => {
+                issues.push(ValidationIssue {
+                    level: "warning".into(),
+                    code: "scientific_agent_claim_template_gap_adjudicated".into(),
+                    row: 0,
+                    column: field_existing_header(field).unwrap_or(field).into(),
+                    message: format!(
+                        "compiler adjudicated typed {} claim '{}' as a source-backed template gap using refs {:?}: {}",
+                        claim.concept_type, observed_value, evidence_refs, reason
+                    ),
+                });
+                continue;
+            }
+            ClaimAdjudication::Unresolved { ref reason }
+            | ClaimAdjudication::Conflict { ref reason } => {
+                if matches!(
+                    claim.concept_type.as_str(),
+                    "isolation_method" | "acquisition_mode"
+                ) {
+                    issues.push(ValidationIssue {
+                        level: "warning".into(),
+                        code: "scientific_agent_claim_adjudication_unresolved".into(),
+                        row: 0,
+                        column: field_existing_header(field).unwrap_or(field).into(),
+                        message: format!(
+                            "typed {} claim was not publishable after deterministic evidence adjudication: {}",
+                            claim.concept_type, reason
+                        ),
+                    });
+                }
+                continue;
+            }
+            ClaimAdjudication::Canonical { .. } | ClaimAdjudication::SupportedConcept { .. } => {}
+        }
         let Some((value, refs)) = canonical_claim_value(evidence, claim) else {
             continue;
         };
@@ -996,7 +1260,7 @@ fn apply_scientific_overlay(
                 row: 0,
                 column: field_existing_header(field).unwrap_or(field).into(),
                 message: format!(
-                    "typed supported project claim supplied {}='{}' over an unresolved deterministic baseline",
+                    "compiler-adjudicated project claim supplied {}='{}' over an unresolved deterministic baseline",
                     field, value
                 ),
             });
@@ -1012,7 +1276,7 @@ fn apply_scientific_overlay(
                 row: 0,
                 column: field_existing_header(field).unwrap_or(field).into(),
                 message: format!(
-                    "supported project claim proposed {}='{}' but deterministic baseline already has source-backed value '{}'; baseline retained and conflict exposed for review",
+                    "compiler-adjudicated project claim proposed {}='{}' but deterministic baseline already has source-backed value '{}'; baseline retained and conflict exposed for review",
                     field, value, current
                 ),
             });
@@ -1222,6 +1486,7 @@ fn compile_workspace(
         evidence,
         None,
     ));
+    apply_dynamic_semantic_bootstrap(&mut proposal, evidence, &mut issues);
     apply_scientific_overlay(&mut proposal, evidence, state, &mut issues);
     issues.extend(apply_publication_compatibility_normalization(&mut proposal));
     if let Some(issue) = sanitize_nonindividual_semantic_proposal(&mut proposal) {
@@ -1317,6 +1582,11 @@ fn compile_workspace(
     }
 
     issues.extend(validate_annotation_draft(&headers, &rows, evidence, false));
+    let adjudications = state
+        .claims
+        .iter()
+        .map(|claim| adjudication_record(evidence, claim))
+        .collect::<Vec<_>>();
     let fingerprint = compiled_workspace_fingerprint(&proposal, &headers, &rows);
     Ok(CompiledWorkspace {
         proposal,
@@ -1325,6 +1595,7 @@ fn compile_workspace(
         generation_mode,
         issues,
         deterministic_repairs,
+        adjudications,
         fingerprint,
     })
 }
@@ -1349,6 +1620,39 @@ fn validation_cycle(cycle: usize, issues: &[ValidationIssue]) -> AgentValidation
         validation_warnings: issues.iter().filter(|i| i.level == "warning").count(),
         error_counts,
         representative_messages: representatives,
+    }
+}
+
+fn append_adjudication_feedback(
+    feedback: &mut Vec<String>,
+    compiled: &CompiledWorkspace,
+    turn: usize,
+) {
+    for record in &compiled.adjudications {
+        if !matches!(
+            record.concept_type.as_str(),
+            "isolation_method" | "acquisition_mode"
+        ) {
+            continue;
+        }
+        let message = match &record.adjudication {
+            ClaimAdjudication::Canonical { value, evidence_refs } => format!(
+                "turn {} compiler adjudicated {} claim '{}' -> canonical '{}' from refs {:?}",
+                turn, record.concept_type, record.proposed_value, value, evidence_refs
+            ),
+            ClaimAdjudication::TemplateGap { observed_value, evidence_refs, .. } => format!(
+                "turn {} compiler adjudicated {} claim '{}' as template gap '{}' from refs {:?}; do not substitute a nearby allowed value",
+                turn, record.concept_type, record.proposed_value, observed_value, evidence_refs
+            ),
+            ClaimAdjudication::Unresolved { reason } | ClaimAdjudication::Conflict { reason } => format!(
+                "turn {} compiler could not publish {} claim '{}' from refs {:?}: {}; search for direct field-specific method evidence or leave unresolved",
+                turn, record.concept_type, record.proposed_value, record.evidence_refs, reason
+            ),
+            ClaimAdjudication::SupportedConcept { .. } => continue,
+        };
+        if !feedback.iter().any(|existing| existing == &message) {
+            feedback.push(message);
+        }
     }
 }
 
@@ -1470,6 +1774,10 @@ async fn run_one_scientific_agent(
     // the actual unresolved scientific tasks instead of inventing a parallel
     // replacement for already-working row structure.
     let baseline = compile_workspace(&evidence, &state, &explicit_mappings)?;
+    fs::write(
+        workspace_dir.join("adjudications.json"),
+        serde_json::to_string_pretty(&baseline.adjudications)?,
+    )?;
     write_sdrf(&draft_path, &baseline.headers, &baseline.rows)?;
     write_validation_review(&review_path, &baseline.issues)?;
     trace.validator_cycles_completed = 1;
@@ -1552,6 +1860,11 @@ async fn run_one_scientific_agent(
             }
 
             let compiled_now = compile_workspace(&evidence, &state, &explicit_mappings)?;
+            fs::write(
+                workspace_dir.join("adjudications.json"),
+                serde_json::to_string_pretty(&compiled_now.adjudications)?,
+            )?;
+            append_adjudication_feedback(&mut trace.harness_feedback, &compiled_now, turn);
             if last_compile_fingerprint
                 .as_deref()
                 .is_some_and(|previous| previous == compiled_now.fingerprint.as_str())
@@ -1605,6 +1918,15 @@ async fn run_one_scientific_agent(
 
     if compiled.is_none() {
         let compiled_now = compile_workspace(&evidence, &state, &explicit_mappings)?;
+        fs::write(
+            workspace_dir.join("adjudications.json"),
+            serde_json::to_string_pretty(&compiled_now.adjudications)?,
+        )?;
+        append_adjudication_feedback(
+            &mut trace.harness_feedback,
+            &compiled_now,
+            trace.turns_completed,
+        );
         write_sdrf(&draft_path, &compiled_now.headers, &compiled_now.rows)?;
         write_validation_review(&review_path, &compiled_now.issues)?;
         trace.validator_cycles_completed += 1;
@@ -1655,6 +1977,7 @@ async fn run_one_scientific_agent(
         "validation_errors": validation_errors,
         "branches": state.branches.clone(),
         "claims": state.claims.clone(),
+        "claim_adjudications": compiled.adjudications.clone(),
         "open_questions": state.open_questions.clone(),
         "conflicts": state.conflicts.clone(),
         "harness_feedback": trace.harness_feedback.clone(),
@@ -1810,12 +2133,22 @@ mod tests {
     }
 
     fn claim(concept_type: &str, value: &str, scope: &str, branch_id: &str) -> ScientificClaim {
+        claim_with_status(concept_type, value, scope, branch_id, "supported")
+    }
+
+    fn claim_with_status(
+        concept_type: &str,
+        value: &str,
+        scope: &str,
+        branch_id: &str,
+        status: &str,
+    ) -> ScientificClaim {
         ScientificClaim {
             concept_type: concept_type.into(),
             value: value.into(),
             scope: scope.into(),
             branch_id: branch_id.into(),
-            status: "supported".into(),
+            status: status.into(),
             evidence_refs: vec!["E0001".into()],
             confidence: "high".into(),
             reason: "test".into(),
@@ -1868,15 +2201,132 @@ mod tests {
     }
 
     #[test]
-    fn project_value_is_not_broadcast_when_branch_claim_exists() {
+    fn hydrodynamic_hypothesis_is_promoted_by_rust_evidence_adjudication() {
+        let evidence = evidence_with(
+            vec![EvidenceItem {
+                id: "E0001".into(),
+                source_kind: "manuscript_semantic_evidence".into(),
+                source_label: "single cell isolation method".into(),
+                text: "single cells were loaded into the capillary by hydrodynamic injection"
+                    .into(),
+            }],
+            vec!["runA.raw"],
+        );
+        let claim = claim_with_status(
+            "isolation_method",
+            "hydrodynamic capillary loading",
+            "project",
+            "",
+            "hypothesis",
+        );
+        match adjudicate_claim(&evidence, &claim) {
+            ClaimAdjudication::Canonical {
+                value,
+                evidence_refs,
+            } => {
+                assert_eq!(value, "manual picking");
+                assert_eq!(evidence_refs, vec!["E0001"]);
+            }
+            other => panic!("expected canonical adjudication, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn source_backed_microwell_hypothesis_is_template_gap_not_false_canonical_value() {
+        let evidence = evidence_with(
+            vec![EvidenceItem {
+                id: "E0001".into(),
+                source_kind: "manuscript_semantic_evidence".into(),
+                source_label: "single cell isolation method".into(),
+                text: "single cells were transferred to the microwell chip for analysis".into(),
+            }],
+            vec!["runA.raw"],
+        );
+        let claim = claim_with_status(
+            "isolation_method",
+            "microwell chip",
+            "project",
+            "",
+            "hypothesis",
+        );
+        match adjudicate_claim(&evidence, &claim) {
+            ClaimAdjudication::TemplateGap { observed_value, .. } => {
+                assert_eq!(observed_value, "microwell-chip single-cell transfer");
+            }
+            other => panic!("expected template gap, got {other:?}"),
+        }
+        assert!(canonical_claim_value(&evidence, &claim).is_none());
+    }
+
+    #[test]
+    fn generic_hypothesis_is_not_promoted_without_deterministic_canonicalizer() {
+        let evidence = evidence_with(
+            vec![EvidenceItem {
+                id: "E0001".into(),
+                source_kind: "manuscript_semantic_evidence".into(),
+                source_label: "organism".into(),
+                text: "Homo sapiens cells were analyzed".into(),
+            }],
+            vec!["runA.raw"],
+        );
+        let claim = claim_with_status("organism", "Homo sapiens", "project", "", "hypothesis");
+        assert!(matches!(
+            adjudicate_claim(&evidence, &claim),
+            ClaimAdjudication::Unresolved { .. }
+        ));
+    }
+
+    #[test]
+    fn dynamic_semantic_bootstrap_uses_newly_retrieved_isolation_evidence() {
+        let evidence = evidence_with(
+            vec![EvidenceItem {
+                id: "E0001".into(),
+                source_kind: "manuscript_semantic_evidence".into(),
+                source_label: "single cell isolation method".into(),
+                text: "single cells were loaded into the capillary using hydrodynamic pressure"
+                    .into(),
+            }],
+            vec!["runA.raw"],
+        );
+        let mut proposal = SdrfProposal::default();
+        let mut issues = Vec::new();
+        apply_dynamic_semantic_bootstrap(&mut proposal, &evidence, &mut issues);
+        assert_eq!(proposal.single_cell_isolation_method, "manual picking");
+        assert_eq!(
+            proposal.evidence_refs["single_cell_isolation_method"],
+            vec!["E0001"]
+        );
+        assert!(issues
+            .iter()
+            .any(|issue| { issue.code == "scientific_agent_semantic_bootstrap_canonicalized" }));
+    }
+
+    #[test]
+    fn adjudicated_branch_hypothesis_can_mask_unsafe_project_value() {
+        let evidence = evidence_with(
+            vec![EvidenceItem {
+                id: "E0001".into(),
+                source_kind: "manuscript_semantic_evidence".into(),
+                source_label: "single cell isolation method".into(),
+                text: "single cells were loaded by hydrodynamic injection".into(),
+            }],
+            vec!["runA.raw"],
+        );
         let state = ScientificWorkspaceState {
-            claims: vec![
-                claim("organism", "Homo sapiens", "project", ""),
-                claim("organism", "Xenopus laevis", "branch", "xeno"),
-            ],
+            claims: vec![claim_with_status(
+                "isolation_method",
+                "hydrodynamic loading",
+                "branch",
+                "b1",
+                "hypothesis",
+            )],
             ..Default::default()
         };
-        assert!(branch_claims_exist(&state, "organism"));
+        assert!(branch_claims_require_project_mask(
+            &evidence,
+            &state,
+            "isolation_method"
+        ));
     }
 
     #[test]
