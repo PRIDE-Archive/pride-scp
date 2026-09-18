@@ -1,6 +1,6 @@
 use super::*;
 
-pub const SCIENTIFIC_AGENT_HARNESS_VERSION: &str = "pride-scp-scientific-agent-v0.1";
+pub const SCIENTIFIC_AGENT_HARNESS_VERSION: &str = "pride-scp-scientific-agent-v0.2";
 #[derive(Debug, Clone)]
 pub struct SdrfScientificAgentOptions {
     pub snapshot_dir: PathBuf,
@@ -109,8 +109,8 @@ struct AgentBranch {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
-struct AgentAssertion {
-    field: String,
+struct ScientificClaim {
+    concept_type: String,
     value: String,
     scope: String,
     branch_id: String,
@@ -122,6 +122,16 @@ struct AgentAssertion {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct AgentEvidenceAction {
+    action: String,
+    reason: String,
+    #[serde(default)]
+    target_concepts: Vec<String>,
+    #[serde(default)]
+    queries: Vec<EvidenceQuery>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 struct ScientificWorkspaceState {
     harness_version: String,
     accession: String,
@@ -130,13 +140,13 @@ struct ScientificWorkspaceState {
     #[serde(default)]
     branches: Vec<AgentBranch>,
     #[serde(default)]
-    assertions: Vec<AgentAssertion>,
+    claims: Vec<ScientificClaim>,
     #[serde(default)]
     open_questions: Vec<String>,
     #[serde(default)]
     conflicts: Vec<String>,
     #[serde(default)]
-    next_evidence_actions: Vec<EvidenceActionRequest>,
+    next_evidence_actions: Vec<AgentEvidenceAction>,
     next_step: String,
     notes: String,
 }
@@ -162,6 +172,8 @@ struct ScientificAgentTrace {
     evidence_action_results: Vec<EvidenceActionResult>,
     #[serde(default)]
     validation_history: Vec<AgentValidationCycle>,
+    #[serde(default)]
+    harness_feedback: Vec<String>,
     terminal_status: String,
     turns_completed: usize,
     tool_actions_completed: usize,
@@ -176,32 +188,54 @@ struct CompiledWorkspace {
     generation_mode: String,
     issues: Vec<ValidationIssue>,
     deterministic_repairs: Vec<String>,
+    fingerprint: String,
 }
 
-fn canonical_agent_fields() -> Vec<&'static str> {
+fn scientific_concept_types() -> Vec<&'static str> {
     vec![
         "organism",
         "organism_part",
         "disease",
         "cell_type",
+        "cell_line",
         "sample_type",
-        "single_cell_isolation_method",
+        "isolation_method",
         "individual",
-        "sample_preparation_batch",
-        "cells_per_well",
-        "proteomics_data_acquisition_method",
-        "label",
+        "sample_preparation",
+        "acquisition_mode",
+        "labeling",
         "instrument",
-        "cleavage_agent_details",
-        "fraction_identifier",
-        "technical_replicate",
-        "carrier_channel",
-        "reference_channel",
+        "cleavage_agent",
+        "control_role",
+        "biological_condition",
     ]
 }
 
+fn concept_to_sdrf_field(concept: &str) -> Option<&'static str> {
+    match concept {
+        "organism" => Some("organism"),
+        "organism_part" => Some("organism_part"),
+        "disease" => Some("disease"),
+        "cell_type" => Some("cell_type"),
+        "sample_type" => Some("sample_type"),
+        "isolation_method" => Some("single_cell_isolation_method"),
+        "individual" => Some("individual"),
+        "sample_preparation" => Some("sample_preparation_batch"),
+        "acquisition_mode" => Some("proteomics_data_acquisition_method"),
+        "labeling" => Some("label"),
+        "instrument" => Some("instrument"),
+        "cleavage_agent" => Some("cleavage_agent_details"),
+        // cell_line, control_role, and biological_condition are first-class
+        // scientific concepts in the workspace, but the current SdrfProposal
+        // has no safe one-to-one project field for them. They therefore remain
+        // scientific state until a deterministic compiler mapping exists.
+        "cell_line" | "control_role" | "biological_condition" => None,
+        _ => None,
+    }
+}
+
 fn scientific_agent_schema() -> Value {
-    let fields = canonical_agent_fields();
+    let concepts = scientific_concept_types();
     let query = json!({
         "type":"object",
         "properties":{
@@ -235,8 +269,8 @@ fn scientific_agent_schema() -> Value {
                 "linkage_status":{"type":"string","enum":["supported","partial","unresolved"]},
                 "notes":{"type":"string","maxLength":600}
             },"required":["id","label","status","evidence_refs","linked_raw_files","linkage_status","notes"],"additionalProperties":false}},
-            "assertions":{"type":"array","maxItems":96,"items":{"type":"object","properties":{
-                "field":{"type":"string","enum":fields.clone()},
+            "claims":{"type":"array","maxItems":64,"items":{"type":"object","properties":{
+                "concept_type":{"type":"string","enum":concepts.clone()},
                 "value":{"type":"string","maxLength":500},
                 "scope":{"type":"string","enum":["project","branch","row","unresolved"]},
                 "branch_id":{"type":"string","maxLength":50},
@@ -244,19 +278,19 @@ fn scientific_agent_schema() -> Value {
                 "evidence_refs":{"type":"array","items":{"type":"string","pattern":"^E[0-9]{4}$"},"maxItems":16},
                 "confidence":{"type":"string","enum":["high","medium","low"]},
                 "reason":{"type":"string","maxLength":600}
-            },"required":["field","value","scope","branch_id","status","evidence_refs","confidence","reason"],"additionalProperties":false}},
+            },"required":["concept_type","value","scope","branch_id","status","evidence_refs","confidence","reason"],"additionalProperties":false}},
             "open_questions":{"type":"array","items":{"type":"string","maxLength":400},"maxItems":32},
             "conflicts":{"type":"array","items":{"type":"string","maxLength":400},"maxItems":32},
             "next_evidence_actions":{"type":"array","maxItems":8,"items":{"type":"object","properties":{
                 "action":{"type":"string","enum":["SEARCH_PUBLICATION","SEARCH_SUPPLEMENT","SEARCH_STRUCTURED_DESIGN","SEARCH_REPOSITORY_METADATA","SEARCH_EXACT_RAW_NAME","EXPAND_EVIDENCE_CONTEXT","LOOKUP_KG_TERM","COMPARE_CONFLICTING_EVIDENCE","ABSTAIN"]},
                 "reason":{"type":"string","maxLength":400},
-                "target_fields":{"type":"array","items":{"type":"string","enum":fields.clone()},"maxItems":8},
+                "target_concepts":{"type":"array","items":{"type":"string","enum":concepts.clone()},"maxItems":8},
                 "queries":{"type":"array","items":query,"maxItems":8}
-            },"required":["action","reason","target_fields","queries"],"additionalProperties":false}},
+            },"required":["action","reason","target_concepts","queries"],"additionalProperties":false}},
             "next_step":{"type":"string","enum":["search","compile","finish","abstain"]},
             "notes":{"type":"string","maxLength":1400}
         },
-        "required":["harness_version","accession","turn","relation","branches","assertions","open_questions","conflicts","next_evidence_actions","next_step","notes"],
+        "required":["harness_version","accession","turn","relation","branches","claims","open_questions","conflicts","next_evidence_actions","next_step","notes"],
         "additionalProperties":false
     })
 }
@@ -288,6 +322,7 @@ fn scientific_agent_prompt(
     previous: &ScientificWorkspaceState,
     actions: &[EvidenceActionResult],
     validations: &[AgentValidationCycle],
+    harness_feedback: &[String],
     turn: usize,
 ) -> String {
     let files = evidence
@@ -300,21 +335,31 @@ fn scientific_agent_prompt(
     let previous_json = serde_json::to_string_pretty(previous).unwrap_or_else(|_| "{}".into());
     let action_json = serde_json::to_string_pretty(actions).unwrap_or_else(|_| "[]".into());
     let validation_json = serde_json::to_string_pretty(validations).unwrap_or_else(|_| "[]".into());
+    let feedback_json =
+        serde_json::to_string_pretty(harness_feedback).unwrap_or_else(|_| "[]".into());
     format!(
         "You are the scientific annotation agent for PRIDE single-cell proteomics dataset {acc}.\n\n\
-Your job is to behave like a careful coding/research agent: inspect evidence, maintain a persistent study-design model, request tools when information is missing, compile only when the current design is coherent enough to test, inspect validator feedback, revise the study model, and stop when the SDRF is valid or the evidence/action budget is exhausted.\n\n\
-You are NOT directly writing SDRF rows. Rust deterministically compiles your supported study-design assertions into SDRF after checking provenance, scope, exact file linkage, controlled vocabulary, and conflicts.\n\n\
+Behave like a careful coding/research agent operating on a persistent scientific workspace. Inspect evidence, maintain branches and typed scientific claims, request tools when evidence is missing, compile only when the current study model has materially changed, inspect validator feedback, revise, and stop when the SDRF is valid or the evidence budget is exhausted.\n\n\
+IMPORTANT COMPILER CONTRACT:\n\
+- You are NOT rebuilding an SDRF from scratch. Rust starts from a proven deterministic baseline containing relation/cardinality, repository/file structure, row identifiers, fraction/technical replicate defaults, and deterministic metadata scaffolds.\n\
+- Your claims are a semantic overlay. Omitting a field does NOT erase a valid deterministic baseline value.\n\
+- If a field genuinely differs across biological/acquisition branches, represent branch-scoped claims. Rust will then mask an unsafe project-wide baseline value, but will serialize branch values only when file-to-branch linkage is source-grounded.\n\
+- Use typed scientific concepts, not arbitrary SDRF columns. Rust owns the final mapping to SDRF fields and controlled vocabulary.\n\n\
+SCIENTIFIC CONCEPTS:\n\
+organism, organism_part, disease, cell_type, cell_line, sample_type, isolation_method, individual, sample_preparation, acquisition_mode, labeling, instrument, cleavage_agent, control_role, biological_condition.\n\n\
 HARD SCIENTIFIC CONTRACT:\n\
 1. Never use GT labels or hidden benchmark truth.\n\
 2. Filename words are search hints and contradiction detectors, NOT biological identity. A branch may list linked_raw_files only when cited E#### source evidence explicitly names or otherwise source-links those exact RAW basenames.\n\
-3. Keep project, branch, row, and unresolved scopes distinct. A project assertion means the same scientific value holds across every relevant acquisition branch.\n\
-4. Biological heterogeneity (organism, condition, sex, cell type) is separate from acquisition cardinality.\n\
-5. Do not collapse multiple organisms or acquisition regimes into one project value. Represent separate branches and leave file linkage unresolved when evidence is insufficient.\n\
-6. For isolation and acquisition, describe the scientific intent faithfully; Rust owns final SDRF controlled-vocabulary canonicalization.\n\
-7. A supported assertion requires field-relevant E#### refs. Hypotheses may guide retrieval but cannot be serialized.\n\
-8. Prefer explicit open_questions over guessed values.\n\
-9. Use next_step='search' only with executable evidence actions. Use 'compile' when the current graph is coherent enough to test. Use 'finish' when no further safe retrieval is needed. Use 'abstain' when evidence cannot safely resolve the remaining design.\n\
-10. Validator feedback is evidence about the draft/compiler state, not permission to invent metadata. If validation exposes a scientific ambiguity, return to evidence and update branches/assertions before compiling again.\n\n\
+3. Keep project, branch, row, and unresolved scopes distinct. A project claim means the same scientific value holds across every relevant branch.\n\
+4. Biological heterogeneity is separate from acquisition cardinality.\n\
+5. Do not collapse multiple organisms or acquisition regimes into one project claim. Represent separate branches and leave file linkage unresolved when evidence is insufficient.\n\
+6. For isolation and acquisition, describe the scientific intent faithfully. Rust canonicalizes the final SDRF value.\n\
+7. A supported claim requires source evidence. Hypotheses may guide retrieval but are never serialized.\n\
+8. Do not use sample_preparation as a dumping ground for every method detail. Emit one concise claim only when the concept is genuinely needed for SDRF annotation; procedural detail belongs in notes unless it changes a typed scientific concept.\n\
+9. Prefer explicit open_questions over guessed values.\n\
+10. Use next_step='search' only with executable actions. Use 'compile' only after a material workspace change. Use 'finish' when no further safe retrieval is needed. Use 'abstain' when evidence cannot safely resolve remaining study design.\n\
+11. Validator feedback is feedback about the compiled draft, not permission to invent metadata. Structural fields such as cell identifier, fraction identifier, and technical replicate are deterministic compiler responsibilities and should NOT become scientific claims.\n\
+12. If HARNESS FEEDBACK says the previous compile was unchanged, do not request compile again without changing claims/branches; search, finish, or abstain instead.\n\n\
 ACCEPTED DETERMINISTIC RELATION HINT (cardinality only):\n\
 mode={relation}; confidence={relation_confidence}; refs={relation_refs:?}; repository_file_mode={repo_mode}; note={design_note}\n\n\
 RAW FILE COUNT: {nfiles}\nRAW FILE SAMPLE (context/search hints only):\n{files}\n\n\
@@ -322,7 +367,8 @@ EVIDENCE INVENTORY:\n{evidence_block}\n\n\
 PREVIOUS WORKSPACE STATE:\n{previous_json}\n\n\
 TOOL/ACTION HISTORY:\n{action_json}\n\n\
 VALIDATION HISTORY:\n{validation_json}\n\n\
-This is agent turn {turn}. Return the COMPLETE updated workspace state, not a patch. Keep notes concise and decision-oriented.",
+HARNESS FEEDBACK:\n{feedback_json}\n\n\
+This is agent turn {turn}. Return the COMPLETE updated workspace state, not a patch. Keep claims deduplicated, concise, and decision-oriented.",
         acc = evidence.accession,
         relation = evidence.study_design.relation_mode_hint,
         relation_confidence = evidence.study_design.relation_confidence,
@@ -335,6 +381,7 @@ This is agent turn {turn}. Return the COMPLETE updated workspace state, not a pa
         previous_json = previous_json,
         action_json = action_json,
         validation_json = validation_json,
+        feedback_json = feedback_json,
         turn = turn,
     )
 }
@@ -345,6 +392,7 @@ async fn call_scientific_agent(
     previous: &ScientificWorkspaceState,
     actions: &[EvidenceActionResult],
     validations: &[AgentValidationCycle],
+    harness_feedback: &[String],
     turn: usize,
 ) -> Result<ScientificWorkspaceState> {
     let client = Client::builder()
@@ -352,7 +400,15 @@ async fn call_scientific_agent(
         .build()?;
     let payload = json!({
         "model": opts.model,
-        "prompt": scientific_agent_prompt(opts, evidence, previous, actions, validations, turn),
+        "prompt": scientific_agent_prompt(
+            opts,
+            evidence,
+            previous,
+            actions,
+            validations,
+            harness_feedback,
+            turn,
+        ),
         "stream": false,
         "think": false,
         "format": scientific_agent_schema(),
@@ -430,20 +486,228 @@ fn branch_file_is_source_grounded(
     })
 }
 
-fn assertion_refs_are_field_relevant(
+fn claim_refs_are_relevant(
     evidence: &DatasetEvidence,
-    field: &str,
+    concept_type: &str,
     refs: &[String],
 ) -> bool {
-    !refs.is_empty()
-        && refs.iter().all(|id| {
+    if refs.is_empty() {
+        return false;
+    }
+    match concept_to_sdrf_field(concept_type) {
+        Some(field) => refs.iter().all(|id| {
             evidence
                 .evidence
                 .iter()
                 .find(|item| item.id == id.as_str())
                 .map(|item| evidence_relevant_to_field(field, item))
                 .unwrap_or(false)
-        })
+        }),
+        None => refs
+            .iter()
+            .all(|id| evidence.evidence.iter().any(|item| item.id == id.as_str())),
+    }
+}
+
+fn confidence_rank(value: &str) -> usize {
+    match value {
+        "high" => 3,
+        "medium" => 2,
+        "low" => 1,
+        _ => 0,
+    }
+}
+
+fn status_rank(value: &str) -> usize {
+    match value {
+        "supported" => 4,
+        "hypothesis" => 3,
+        "unresolved" => 2,
+        "rejected" => 1,
+        _ => 0,
+    }
+}
+
+fn dedup_strings(values: &mut Vec<String>, max_items: usize) {
+    let mut seen = BTreeSet::new();
+    values.retain(|value| {
+        let trimmed = value.trim();
+        if trimmed.is_empty() {
+            return false;
+        }
+        seen.insert(trimmed.to_ascii_lowercase())
+    });
+    values.truncate(max_items);
+}
+
+fn reduce_scientific_claims(
+    evidence: &DatasetEvidence,
+    branch_ids: &BTreeSet<&str>,
+    claims: &mut Vec<ScientificClaim>,
+    conflicts: &mut Vec<String>,
+) {
+    let allowed = scientific_concept_types()
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+    for claim in claims.iter_mut() {
+        claim.concept_type = claim.concept_type.trim().to_ascii_lowercase();
+        claim.value = claim.value.trim().to_string();
+        claim.branch_id = claim.branch_id.trim().to_string();
+        claim.evidence_refs = valid_evidence_refs(evidence, &claim.evidence_refs);
+        if !allowed.contains(claim.concept_type.as_str()) {
+            claim.status = "rejected".into();
+            claim.value.clear();
+            continue;
+        }
+        if claim.scope == "branch" && !branch_ids.contains(claim.branch_id.as_str()) {
+            claim.scope = "unresolved".into();
+            claim.status = "unresolved".into();
+            claim.value.clear();
+        }
+        if matches!(claim.scope.as_str(), "project" | "branch" | "row")
+            && claim.status == "supported"
+            && !claim_refs_are_relevant(evidence, &claim.concept_type, &claim.evidence_refs)
+        {
+            claim.status = "hypothesis".into();
+        }
+        if claim.status == "unresolved" || claim.scope == "unresolved" {
+            claim.value.clear();
+            claim.scope = "unresolved".into();
+        }
+    }
+    claims.retain(|claim| claim.status != "rejected" && !claim.concept_type.is_empty());
+
+    let mut reduced: BTreeMap<(String, String, String, String), ScientificClaim> = BTreeMap::new();
+    for claim in claims.drain(..) {
+        let key = (
+            claim.concept_type.clone(),
+            claim.scope.clone(),
+            claim.branch_id.clone(),
+            claim.value.to_ascii_lowercase(),
+        );
+        match reduced.get_mut(&key) {
+            None => {
+                reduced.insert(key, claim);
+            }
+            Some(existing) => {
+                existing.evidence_refs.extend(claim.evidence_refs);
+                existing.evidence_refs.sort();
+                existing.evidence_refs.dedup();
+                if status_rank(&claim.status) > status_rank(&existing.status) {
+                    existing.status = claim.status;
+                }
+                if confidence_rank(&claim.confidence) > confidence_rank(&existing.confidence) {
+                    existing.confidence = claim.confidence;
+                }
+                if claim.reason.len() > existing.reason.len() {
+                    existing.reason = claim.reason;
+                }
+            }
+        }
+    }
+    *claims = reduced.into_values().collect();
+
+    let mut supported_values: BTreeMap<(String, String, String), BTreeSet<String>> =
+        BTreeMap::new();
+    for claim in claims.iter() {
+        if claim.status != "supported" || claim.value.trim().is_empty() {
+            continue;
+        }
+        supported_values
+            .entry((
+                claim.concept_type.clone(),
+                claim.scope.clone(),
+                claim.branch_id.clone(),
+            ))
+            .or_default()
+            .insert(claim.value.trim().to_ascii_lowercase());
+    }
+    let conflicting_keys = supported_values
+        .iter()
+        .filter(|(_, values)| values.len() > 1)
+        .map(|(key, values)| (key.clone(), values.clone()))
+        .collect::<Vec<_>>();
+    for ((concept, scope, branch), values) in conflicting_keys {
+        conflicts.push(format!(
+            "conflicting supported values for concept={} scope={} branch={}: {:?}",
+            concept, scope, branch, values
+        ));
+        for claim in claims.iter_mut().filter(|claim| {
+            claim.concept_type == concept && claim.scope == scope && claim.branch_id == branch
+        }) {
+            if claim.status == "supported" {
+                claim.status = "hypothesis".into();
+            }
+        }
+    }
+    claims.sort_by(|a, b| {
+        a.concept_type
+            .cmp(&b.concept_type)
+            .then_with(|| a.scope.cmp(&b.scope))
+            .then_with(|| a.branch_id.cmp(&b.branch_id))
+            .then_with(|| a.value.cmp(&b.value))
+    });
+    claims.truncate(48);
+}
+
+fn normalize_scientific_agent_action(evidence: &DatasetEvidence, action: &mut AgentEvidenceAction) {
+    let allowed = scientific_concept_types()
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+    action.target_concepts = action
+        .target_concepts
+        .iter()
+        .map(|value| value.trim().to_ascii_lowercase())
+        .filter(|value| allowed.contains(value.as_str()))
+        .collect();
+    action.target_concepts.sort();
+    action.target_concepts.dedup();
+
+    for query in &mut action.queries {
+        normalize_evidence_query(query);
+        if query.match_kind == "raw_exact" {
+            let exact = evidence
+                .raw_files
+                .iter()
+                .any(|raw| raw.file_name.eq_ignore_ascii_case(query.value.trim()));
+            if exact {
+                action.action = "SEARCH_EXACT_RAW_NAME".into();
+            } else {
+                // A phrase such as "BS01-BS09 HeLa files" is a useful search
+                // hint but is not an exact repository basename. Reformulate it
+                // into a normal typed search rather than wasting a tool turn on
+                // an impossible SEARCH_EXACT_RAW_NAME request.
+                query.match_kind = if query.terms.is_empty() {
+                    "phrase".into()
+                } else {
+                    "terms_all".into()
+                };
+                if query.value.split_whitespace().count() > 16 && !query.terms.is_empty() {
+                    query.value.clear();
+                }
+            }
+        }
+        if action.action == "SEARCH_EXACT_RAW_NAME" && query.match_kind != "raw_exact" {
+            action.action = "SEARCH_REPOSITORY_METADATA".into();
+        }
+    }
+}
+
+fn agent_action_to_request(action: &AgentEvidenceAction) -> EvidenceActionRequest {
+    EvidenceActionRequest {
+        action: action.action.clone(),
+        reason: action.reason.clone(),
+        target_fields: action
+            .target_concepts
+            .iter()
+            .map(|concept| {
+                concept_to_sdrf_field(concept)
+                    .unwrap_or(concept)
+                    .to_string()
+            })
+            .collect(),
+        queries: action.queries.clone(),
+    }
 }
 
 fn normalize_workspace_state(
@@ -479,11 +743,11 @@ fn normalize_workspace_state(
         .iter()
         .map(|f| f.file_name.to_ascii_lowercase())
         .collect::<BTreeSet<_>>();
-    let mut seen_branch_ids = BTreeSet::new();
-    state.branches.retain_mut(|branch| {
+    let mut branch_map: BTreeMap<String, AgentBranch> = BTreeMap::new();
+    for mut branch in state.branches.drain(..) {
         branch.id = branch.id.trim().to_string();
-        if branch.id.is_empty() || !seen_branch_ids.insert(branch.id.clone()) {
-            return false;
+        if branch.id.is_empty() {
+            continue;
         }
         branch.evidence_refs = valid_evidence_refs(evidence, &branch.evidence_refs);
         if branch.status == "supported" && branch.evidence_refs.is_empty() {
@@ -515,75 +779,44 @@ fn normalize_workspace_state(
         } else {
             "unresolved".into()
         };
-        true
-    });
-    state.branches.truncate(24);
+        match branch_map.get_mut(&branch.id) {
+            None => {
+                branch_map.insert(branch.id.clone(), branch);
+            }
+            Some(existing) => {
+                existing.evidence_refs.extend(branch.evidence_refs);
+                existing.evidence_refs.sort();
+                existing.evidence_refs.dedup();
+                existing.linked_raw_files.extend(branch.linked_raw_files);
+                existing.linked_raw_files.sort();
+                existing.linked_raw_files.dedup();
+                if status_rank(&branch.status) > status_rank(&existing.status) {
+                    existing.status = branch.status;
+                }
+                if branch.notes.len() > existing.notes.len() {
+                    existing.notes = branch.notes;
+                }
+            }
+        }
+    }
+    state.branches = branch_map.into_values().take(24).collect();
 
     let branch_ids = state
         .branches
         .iter()
         .map(|b| b.id.as_str())
         .collect::<BTreeSet<_>>();
-    state.assertions.retain_mut(|assertion| {
-        if !is_canonical_design_field(assertion.field.trim()) {
-            return false;
-        }
-        assertion.field = assertion.field.trim().to_string();
-        assertion.evidence_refs = valid_evidence_refs(evidence, &assertion.evidence_refs);
-        if assertion.scope == "branch" && !branch_ids.contains(assertion.branch_id.as_str()) {
-            assertion.scope = "unresolved".into();
-            assertion.status = "unresolved".into();
-            assertion.value.clear();
-        }
-        if matches!(assertion.scope.as_str(), "project" | "branch" | "row")
-            && assertion.status == "supported"
-            && !assertion_refs_are_field_relevant(
-                evidence,
-                &assertion.field,
-                &assertion.evidence_refs,
-            )
-        {
-            assertion.status = "hypothesis".into();
-        }
-        if assertion.status == "unresolved" || assertion.scope == "unresolved" {
-            assertion.value.clear();
-            assertion.scope = "unresolved".into();
-        }
-        true
-    });
-    state.assertions.truncate(96);
+    reduce_scientific_claims(
+        evidence,
+        &branch_ids,
+        &mut state.claims,
+        &mut state.conflicts,
+    );
 
-    let mut project_values: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
-    for assertion in &state.assertions {
-        if assertion.status == "supported" && assertion.scope == "project" {
-            project_values
-                .entry(assertion.field.clone())
-                .or_default()
-                .insert(assertion.value.trim().to_ascii_lowercase());
-        }
-    }
-    let conflicting_fields = project_values
-        .iter()
-        .filter(|(_, values)| values.len() > 1)
-        .map(|(field, _)| field.clone())
-        .collect::<BTreeSet<_>>();
-    for assertion in &mut state.assertions {
-        if conflicting_fields.contains(&assertion.field) && assertion.scope == "project" {
-            assertion.scope = "unresolved".into();
-            assertion.status = "unresolved".into();
-            assertion.value.clear();
-        }
-    }
-
+    dedup_strings(&mut state.open_questions, 32);
+    dedup_strings(&mut state.conflicts, 32);
     for action in &mut state.next_evidence_actions {
-        action
-            .target_fields
-            .retain(|field| is_canonical_design_field(field));
-        action.target_fields.sort();
-        action.target_fields.dedup();
-        for query in &mut action.queries {
-            normalize_evidence_query(query);
-        }
+        normalize_scientific_agent_action(evidence, action);
     }
     state.next_evidence_actions.truncate(8);
     if !matches!(
@@ -601,85 +834,6 @@ fn normalize_workspace_state(
     }
 }
 
-fn workspace_as_design_assessment(state: &ScientificWorkspaceState) -> DatasetDesignAssessment {
-    let mut fields = BTreeSet::new();
-    let mut field_scopes = Vec::new();
-    for assertion in &state.assertions {
-        if !fields.insert(assertion.field.clone()) {
-            continue;
-        }
-        let relevant = state
-            .assertions
-            .iter()
-            .filter(|a| a.field == assertion.field && a.status == "supported")
-            .collect::<Vec<_>>();
-        let scope = if relevant.iter().any(|a| a.scope == "row") {
-            "row"
-        } else if relevant.iter().any(|a| a.scope == "branch") {
-            "group"
-        } else if relevant.iter().any(|a| a.scope == "project") {
-            "project"
-        } else {
-            "unresolved"
-        };
-        let refs = relevant
-            .iter()
-            .flat_map(|a| a.evidence_refs.iter().cloned())
-            .collect::<BTreeSet<_>>()
-            .into_iter()
-            .collect::<Vec<_>>();
-        field_scopes.push(FieldScopeClaim {
-            field: assertion.field.clone(),
-            scope: scope.into(),
-            evidence_refs: refs,
-            confidence: "high".into(),
-            reason: "scientific-agent workspace scope".into(),
-            claim_origin: "model_explicit".into(),
-        });
-    }
-    let candidate_groups = state
-        .branches
-        .iter()
-        .map(|b| CandidateDesignGroup {
-            id: b.id.clone(),
-            description: b.label.clone(),
-            status: if b.status == "supported" {
-                "supported".into()
-            } else {
-                "search_hint".into()
-            },
-            source_basis: if b.status == "supported" {
-                "source_evidence".into()
-            } else {
-                "filename_hint".into()
-            },
-            confidence: "high".into(),
-            evidence_refs: b.evidence_refs.clone(),
-            linked_raw_files: b.linked_raw_files.clone(),
-            linkage_status: b.linkage_status.clone(),
-        })
-        .collect();
-    DatasetDesignAssessment {
-        agent_version: SCIENTIFIC_AGENT_HARNESS_VERSION.into(),
-        design_homogeneous: state.branches.len() <= 1,
-        relation_assessment: RelationAssessment {
-            mode: state.relation.mode.clone(),
-            scope: state.relation.scope.clone(),
-            evidence_refs: state.relation.evidence_refs.clone(),
-            confidence: state.relation.confidence.clone(),
-            reason: state.relation.reason.clone(),
-            claim_origin: "model_explicit".into(),
-        },
-        candidate_groups,
-        field_scopes,
-        conflicts: state.conflicts.clone(),
-        missing_linkages: state.open_questions.clone(),
-        terminal_status: "partial".into(),
-        notes: state.notes.clone(),
-        ..Default::default()
-    }
-}
-
 fn evidence_subset(evidence: &DatasetEvidence, refs: &[String]) -> Vec<EvidenceItem> {
     refs.iter()
         .filter_map(|id| {
@@ -692,37 +846,348 @@ fn evidence_subset(evidence: &DatasetEvidence, refs: &[String]) -> Vec<EvidenceI
         .collect()
 }
 
-fn canonical_assertion_value(
+fn canonical_claim_value(
     evidence: &DatasetEvidence,
-    assertion: &AgentAssertion,
+    claim: &ScientificClaim,
 ) -> Option<(String, Vec<String>)> {
-    if assertion.status != "supported"
-        || !assertion_refs_are_field_relevant(evidence, &assertion.field, &assertion.evidence_refs)
+    if claim.status != "supported"
+        || !claim_refs_are_relevant(evidence, &claim.concept_type, &claim.evidence_refs)
     {
         return None;
     }
-    let subset = evidence_subset(evidence, &assertion.evidence_refs);
-    match assertion.field.as_str() {
-        "single_cell_isolation_method" => infer_isolation_method_scaffold(&subset),
-        "proteomics_data_acquisition_method" => infer_acquisition_method_repair(&subset),
+    let subset = evidence_subset(evidence, &claim.evidence_refs);
+    match claim.concept_type.as_str() {
+        "isolation_method" => infer_isolation_method_scaffold(&subset),
+        "acquisition_mode" => infer_acquisition_method_repair(&subset),
         _ => {
-            let value = match canonical_reserved_alias(assertion.value.trim()) {
+            let value = match canonical_reserved_alias(claim.value.trim()) {
                 Some(value) => value.to_string(),
-                None => assertion.value.trim().to_string(),
+                None => claim.value.trim().to_string(),
             };
             if value.is_empty() || value == "not available" {
                 None
             } else {
-                Some((value, assertion.evidence_refs.clone()))
+                Some((value, claim.evidence_refs.clone()))
             }
         }
     }
 }
 
-fn branch_assertions_exist(state: &ScientificWorkspaceState, field: &str) -> bool {
-    state.assertions.iter().any(|a| {
-        a.field == field && a.status == "supported" && matches!(a.scope.as_str(), "branch" | "row")
+fn branch_claims_exist(state: &ScientificWorkspaceState, concept_type: &str) -> bool {
+    state.claims.iter().any(|claim| {
+        claim.concept_type == concept_type
+            && claim.status == "supported"
+            && matches!(claim.scope.as_str(), "branch" | "row")
     })
+}
+
+fn branch_claims_are_heterogeneous(
+    evidence: &DatasetEvidence,
+    state: &ScientificWorkspaceState,
+    concept_type: &str,
+) -> bool {
+    let values = state
+        .claims
+        .iter()
+        .filter(|claim| {
+            claim.concept_type == concept_type
+                && claim.scope == "branch"
+                && matches!(claim.status.as_str(), "supported" | "hypothesis")
+                && !claim.value.trim().is_empty()
+                && claim_refs_are_relevant(evidence, &claim.concept_type, &claim.evidence_refs)
+        })
+        .map(|claim| claim.value.trim().to_ascii_lowercase())
+        .collect::<BTreeSet<_>>();
+    values.len() > 1
+}
+
+fn clear_proposal_field(proposal: &mut SdrfProposal, field: &str) {
+    if let Some(slot) = proposal_field_mut(proposal, field) {
+        *slot = "not available".into();
+    }
+    proposal.evidence_refs.remove(field);
+}
+
+fn proposal_field_value<'a>(proposal: &'a SdrfProposal, field: &str) -> Option<&'a str> {
+    match field {
+        "organism" => Some(&proposal.organism),
+        "organism_part" => Some(&proposal.organism_part),
+        "disease" => Some(&proposal.disease),
+        "cell_type" => Some(&proposal.cell_type),
+        "sample_type" => Some(&proposal.sample_type),
+        "single_cell_isolation_method" => Some(&proposal.single_cell_isolation_method),
+        "individual" => Some(&proposal.individual),
+        "sample_preparation_batch" => Some(&proposal.sample_preparation_batch),
+        "cells_per_well" => Some(&proposal.cells_per_well),
+        "proteomics_data_acquisition_method" => Some(&proposal.proteomics_data_acquisition_method),
+        "label" => Some(&proposal.label),
+        "instrument" => Some(&proposal.instrument),
+        "cleavage_agent_details" => Some(&proposal.cleavage_agent_details),
+        "fraction_identifier" => Some(&proposal.fraction_identifier),
+        "technical_replicate" => Some(&proposal.technical_replicate),
+        "carrier_channel" => Some(&proposal.carrier_channel),
+        "reference_channel" => Some(&proposal.reference_channel),
+        _ => None,
+    }
+    .map(String::as_str)
+}
+
+fn apply_scientific_overlay(
+    proposal: &mut SdrfProposal,
+    evidence: &DatasetEvidence,
+    state: &ScientificWorkspaceState,
+    issues: &mut Vec<ValidationIssue>,
+) {
+    // Branch heterogeneity has precedence over a project-wide deterministic
+    // metadata guess. Mask only the affected field; branch values are applied
+    // later and only to source-linked RAW files.
+    for concept in scientific_concept_types() {
+        let Some(field) = concept_to_sdrf_field(concept) else {
+            continue;
+        };
+        if branch_claims_exist(state, concept)
+            || branch_claims_are_heterogeneous(evidence, state, concept)
+        {
+            let previous = proposal_field_value(proposal, field)
+                .unwrap_or("")
+                .to_string();
+            clear_proposal_field(proposal, field);
+            issues.push(ValidationIssue {
+                level: "warning".into(),
+                code: "scientific_agent_branch_scope_masks_project_value".into(),
+                row: 0,
+                column: field_existing_header(field).unwrap_or(field).into(),
+                message: format!(
+                    "typed branch-scoped '{}' claims prevent safe project-wide broadcast; masked baseline value '{}' until trusted file-to-branch linkage is available",
+                    concept, previous
+                ),
+            });
+        }
+    }
+
+    for claim in &state.claims {
+        if claim.scope != "project" || claim.status != "supported" {
+            continue;
+        }
+        if branch_claims_exist(state, &claim.concept_type)
+            || branch_claims_are_heterogeneous(evidence, state, &claim.concept_type)
+        {
+            continue;
+        }
+        let Some(field) = concept_to_sdrf_field(&claim.concept_type) else {
+            continue;
+        };
+        let Some((value, refs)) = canonical_claim_value(evidence, claim) else {
+            continue;
+        };
+        let current = proposal_field_value(proposal, field)
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        let current_reserved = canonical_reserved_alias(&current).is_some() || current.is_empty();
+        if current_reserved {
+            if let Some(slot) = proposal_field_mut(proposal, field) {
+                *slot = value.clone();
+            }
+            proposal.evidence_refs.insert(field.into(), refs);
+            issues.push(ValidationIssue {
+                level: "warning".into(),
+                code: "scientific_agent_supported_project_claim_applied".into(),
+                row: 0,
+                column: field_existing_header(field).unwrap_or(field).into(),
+                message: format!(
+                    "typed supported project claim supplied {}='{}' over an unresolved deterministic baseline",
+                    field, value
+                ),
+            });
+        } else if current.eq_ignore_ascii_case(&value) {
+            let entry = proposal.evidence_refs.entry(field.into()).or_default();
+            entry.extend(refs);
+            entry.sort();
+            entry.dedup();
+        } else {
+            issues.push(ValidationIssue {
+                level: "warning".into(),
+                code: "scientific_agent_project_claim_conflicts_with_deterministic_baseline".into(),
+                row: 0,
+                column: field_existing_header(field).unwrap_or(field).into(),
+                message: format!(
+                    "supported project claim proposed {}='{}' but deterministic baseline already has source-backed value '{}'; baseline retained and conflict exposed for review",
+                    field, value, current
+                ),
+            });
+        }
+    }
+}
+
+fn row_value_is_unresolved(value: &str) -> bool {
+    let trimmed = value.trim();
+    trimmed.is_empty() || trimmed.eq_ignore_ascii_case("not available")
+}
+
+fn set_row_if_unresolved(
+    row: &mut [String],
+    header_index: &HashMap<&str, usize>,
+    header: &str,
+    value: String,
+) {
+    let Some(&idx) = header_index.get(header) else {
+        return;
+    };
+    if idx < row.len() && row_value_is_unresolved(&row[idx]) {
+        row[idx] = value;
+    }
+}
+
+fn enforce_deterministic_row_scaffold(
+    headers: &[String],
+    rows: &mut [Vec<String>],
+    evidence: &DatasetEvidence,
+    relation_mode: &str,
+) -> Vec<ValidationIssue> {
+    let mut issues = Vec::new();
+    if relation_mode != "one_cell_per_data_file" || !evidence.existing_sdrf_path.is_empty() {
+        return issues;
+    }
+    let header_index = headers
+        .iter()
+        .enumerate()
+        .map(|(index, header)| (header.as_str(), index))
+        .collect::<HashMap<_, _>>();
+    let Some(&data_file_idx) = header_index.get("comment[data file]") else {
+        return issues;
+    };
+
+    for row in rows.iter_mut() {
+        let raw = row.get(data_file_idx).cloned().unwrap_or_default();
+        if raw.trim().is_empty() {
+            continue;
+        }
+        let stem = safe_identifier_from_file(&raw);
+        let role = match raw_file_role(&raw) {
+            RawFileRole::Unknown => RawFileRole::SingleCell,
+            role => role,
+        };
+        set_row_if_unresolved(
+            row,
+            &header_index,
+            "comment[fraction identifier]",
+            "1".into(),
+        );
+        set_row_if_unresolved(
+            row,
+            &header_index,
+            "comment[technical replicate]",
+            "1".into(),
+        );
+        match role {
+            RawFileRole::SingleCell | RawFileRole::Unknown => {
+                set_row_if_unresolved(row, &header_index, SC_SAMPLE_TYPE, "single cell".into());
+                set_row_if_unresolved(row, &header_index, SC_CELL_IDENTIFIER, stem);
+                set_row_if_unresolved(row, &header_index, SC_CELLS_PER_WELL, "1".into());
+            }
+            RawFileRole::FewCell(n) => {
+                set_row_if_unresolved(row, &header_index, SC_SAMPLE_TYPE, "not available".into());
+                set_row_if_unresolved(
+                    row,
+                    &header_index,
+                    SC_ISOLATION_METHOD,
+                    "not applicable".into(),
+                );
+                set_row_if_unresolved(
+                    row,
+                    &header_index,
+                    SC_CELL_IDENTIFIER,
+                    "not applicable".into(),
+                );
+                set_row_if_unresolved(row, &header_index, SC_CELLS_PER_WELL, n.to_string());
+            }
+            RawFileRole::Blank => {
+                set_row_if_unresolved(row, &header_index, SC_SAMPLE_TYPE, "empty".into());
+                set_row_if_unresolved(
+                    row,
+                    &header_index,
+                    SC_ISOLATION_METHOD,
+                    "not applicable".into(),
+                );
+                set_row_if_unresolved(row, &header_index, SC_CELL_IDENTIFIER, "empty".into());
+                set_row_if_unresolved(
+                    row,
+                    &header_index,
+                    SC_CELLS_PER_WELL,
+                    "not applicable".into(),
+                );
+            }
+            RawFileRole::QualityControl => {
+                set_row_if_unresolved(
+                    row,
+                    &header_index,
+                    SC_SAMPLE_TYPE,
+                    "quality control sample".into(),
+                );
+                set_row_if_unresolved(
+                    row,
+                    &header_index,
+                    SC_ISOLATION_METHOD,
+                    "not applicable".into(),
+                );
+                set_row_if_unresolved(
+                    row,
+                    &header_index,
+                    SC_CELL_IDENTIFIER,
+                    "not applicable".into(),
+                );
+                set_row_if_unresolved(
+                    row,
+                    &header_index,
+                    SC_CELLS_PER_WELL,
+                    "not applicable".into(),
+                );
+            }
+            RawFileRole::Bulk => {
+                set_row_if_unresolved(row, &header_index, SC_SAMPLE_TYPE, "bulk control".into());
+                set_row_if_unresolved(
+                    row,
+                    &header_index,
+                    SC_ISOLATION_METHOD,
+                    "not applicable".into(),
+                );
+                set_row_if_unresolved(
+                    row,
+                    &header_index,
+                    SC_CELL_IDENTIFIER,
+                    "not applicable".into(),
+                );
+                set_row_if_unresolved(
+                    row,
+                    &header_index,
+                    SC_CELLS_PER_WELL,
+                    "not applicable".into(),
+                );
+            }
+        }
+    }
+    issues.push(ValidationIssue {
+        level: "warning".into(),
+        code: "scientific_agent_deterministic_row_scaffold_preserved".into(),
+        row: 0,
+        column: "comment[data file]".into(),
+        message: "preserved deterministic one-cell-per-file row identifiers and structural replicate fields independently of model claims".into(),
+    });
+    issues
+}
+
+fn compiled_workspace_fingerprint(
+    proposal: &SdrfProposal,
+    headers: &[String],
+    rows: &[Vec<String>],
+) -> String {
+    serde_json::to_string(&json!({
+        "proposal": proposal,
+        "headers": headers,
+        "rows": rows,
+    }))
+    .unwrap_or_default()
 }
 
 fn compile_workspace(
@@ -734,6 +1199,9 @@ fn compile_workspace(
     let mut issues = Vec::new();
     let mut deterministic_repairs = Vec::new();
 
+    // Baseline preservation: deterministic repository/publication scaffolds are
+    // compiled without model scope arbitration. The agent is an overlay, not a
+    // replacement for already-working row construction and metadata inference.
     if study_design_has_assertive_relation_hint(&evidence.study_design) {
         proposal.relation_mode = evidence.study_design.relation_mode_hint.clone();
         proposal.evidence_refs.insert(
@@ -749,43 +1217,44 @@ fn compile_workspace(
         proposal.relation_mode = "uncertain".into();
     }
 
-    let design = workspace_as_design_assessment(state);
     issues.extend(apply_deterministic_metadata_scaffold(
         &mut proposal,
         evidence,
-        Some(&design),
+        None,
     ));
-
-    for assertion in &state.assertions {
-        if assertion.scope != "project" || assertion.status != "supported" {
-            continue;
-        }
-        if branch_assertions_exist(state, &assertion.field) {
-            continue;
-        }
-        let Some((value, refs)) = canonical_assertion_value(evidence, assertion) else {
-            continue;
-        };
-        if let Some(slot) = proposal_field_mut(&mut proposal, &assertion.field) {
-            *slot = value;
-            proposal.evidence_refs.insert(assertion.field.clone(), refs);
-        }
-    }
-
+    apply_scientific_overlay(&mut proposal, evidence, state, &mut issues);
     issues.extend(apply_publication_compatibility_normalization(&mut proposal));
     if let Some(issue) = sanitize_nonindividual_semantic_proposal(&mut proposal) {
         deterministic_repairs.push(issue.code.clone());
         issues.push(issue);
     }
     issues.extend(repair_proposal_provenance(&mut proposal, evidence));
+
+    // The deterministic relation hint is frozen after all overlays. Scientific
+    // concepts may alter branch scope, but biological heterogeneity must not
+    // erase acquisition cardinality.
+    if study_design_has_assertive_relation_hint(&evidence.study_design) {
+        proposal.relation_mode = evidence.study_design.relation_mode_hint.clone();
+        proposal.evidence_refs.insert(
+            "relation_mode".into(),
+            evidence.study_design.relation_evidence_refs.clone(),
+        );
+    }
     validate_proposal_refs(&proposal, evidence)?;
 
     let (headers, mut rows, generation_mode) =
         draft_rows_with_explicit_mappings(&proposal, evidence, explicit_mappings)?;
+    issues.extend(enforce_deterministic_row_scaffold(
+        &headers,
+        &mut rows,
+        evidence,
+        &proposal.relation_mode,
+    ));
+
     let header_index = headers
         .iter()
         .enumerate()
-        .map(|(i, h)| (h.as_str(), i))
+        .map(|(index, header)| (header.as_str(), index))
         .collect::<HashMap<_, _>>();
     let data_file_idx = header_index.get("comment[data file]").copied();
 
@@ -813,16 +1282,21 @@ fn compile_workspace(
             let Some(Some(branch)) = file_to_branch.get(&raw.to_ascii_lowercase()) else {
                 continue;
             };
-            for assertion in state.assertions.iter().filter(|a| {
-                a.status == "supported" && a.scope == "branch" && a.branch_id == branch.id
+            for claim in state.claims.iter().filter(|claim| {
+                claim.status == "supported"
+                    && claim.scope == "branch"
+                    && claim.branch_id == branch.id
             }) {
-                let Some(header) = field_existing_header(&assertion.field) else {
+                let Some(field) = concept_to_sdrf_field(&claim.concept_type) else {
+                    continue;
+                };
+                let Some(header) = field_existing_header(field) else {
                     continue;
                 };
                 let Some(&idx) = header_index.get(header) else {
                     continue;
                 };
-                let Some((value, _)) = canonical_assertion_value(evidence, assertion) else {
+                let Some((value, _)) = canonical_claim_value(evidence, claim) else {
                     continue;
                 };
                 if idx < row.len() {
@@ -834,7 +1308,7 @@ fn compile_workspace(
                         column: header.into(),
                         message: format!(
                             "source-grounded branch '{}' applied {}='{}' to RAW {}",
-                            branch.id, assertion.field, value, raw
+                            branch.id, field, value, raw
                         ),
                     });
                 }
@@ -843,6 +1317,7 @@ fn compile_workspace(
     }
 
     issues.extend(validate_annotation_draft(&headers, &rows, evidence, false));
+    let fingerprint = compiled_workspace_fingerprint(&proposal, &headers, &rows);
     Ok(CompiledWorkspace {
         proposal,
         headers,
@@ -850,6 +1325,7 @@ fn compile_workspace(
         generation_mode,
         issues,
         deterministic_repairs,
+        fingerprint,
     })
 }
 
@@ -877,7 +1353,7 @@ fn validation_cycle(cycle: usize, issues: &[ValidationIssue]) -> AgentValidation
 }
 
 fn trim_actions_to_budget(
-    actions: &[EvidenceActionRequest],
+    actions: &[AgentEvidenceAction],
     remaining: usize,
 ) -> Vec<EvidenceActionRequest> {
     let mut left = remaining;
@@ -886,16 +1362,16 @@ fn trim_actions_to_budget(
         if left == 0 {
             break;
         }
-        if action.action == "ABSTAIN" {
-            out.push(action.clone());
+        let mut request = agent_action_to_request(action);
+        if request.action == "ABSTAIN" {
+            out.push(request);
             left = left.saturating_sub(1);
             continue;
         }
-        let mut action = action.clone();
-        action.queries.truncate(left.min(8));
-        if !action.queries.is_empty() {
-            left = left.saturating_sub(action.queries.len());
-            out.push(action);
+        request.queries.truncate(left.min(8));
+        if !request.queries.is_empty() {
+            left = left.saturating_sub(request.queries.len());
+            out.push(request);
         }
     }
     out
@@ -945,6 +1421,8 @@ async fn run_one_scientific_agent(
         fs::create_dir_all(path)?;
     }
     fs::write(&evidence_path, serde_json::to_string_pretty(&evidence)?)?;
+    fs::write(workspace_dir.join("action_history.json"), "[]\n")?;
+    fs::write(workspace_dir.join("validation_history.json"), "[]\n")?;
 
     let mut state = ScientificWorkspaceState {
         harness_version: SCIENTIFIC_AGENT_HARNESS_VERSION.into(),
@@ -973,81 +1451,155 @@ async fn run_one_scientific_agent(
         accession: accession.into(),
         ..Default::default()
     };
+    trace.states.push(state.clone());
+    fs::write(
+        workspace_dir.join("state.turn00.json"),
+        serde_json::to_string_pretty(&state)?,
+    )?;
+    fs::write(
+        workspace_dir.join("state.json"),
+        serde_json::to_string_pretty(&state)?,
+    )?;
     let mut attempted = BTreeSet::new();
-    let mut compiled: Option<CompiledWorkspace> = None;
     let max_turns = opts.max_agent_turns.max(1);
     let max_actions = opts.max_tool_actions.max(1);
     let max_validator_cycles = opts.max_validator_cycles.max(1);
 
-    for turn in 1..=max_turns {
-        let next = call_scientific_agent(
-            opts,
-            &evidence,
-            &state,
-            &trace.evidence_action_results,
-            &trace.validation_history,
-            turn,
-        )
-        .await?;
-        state = next;
-        trace.states.push(state.clone());
-        trace.turns_completed = turn;
+    // Codex-style bootstrap: compile and validate the deterministic baseline
+    // before asking the model to reason. The first agent turn therefore sees
+    // the actual unresolved scientific tasks instead of inventing a parallel
+    // replacement for already-working row structure.
+    let baseline = compile_workspace(&evidence, &state, &explicit_mappings)?;
+    write_sdrf(&draft_path, &baseline.headers, &baseline.rows)?;
+    write_validation_review(&review_path, &baseline.issues)?;
+    trace.validator_cycles_completed = 1;
+    let baseline_cycle = validation_cycle(1, &baseline.issues);
+    let baseline_errors = baseline_cycle.validation_errors;
+    trace.validation_history.push(baseline_cycle);
+    trace.harness_feedback.push(format!(
+        "deterministic baseline compiled before agent turn 1 with {} validation error(s); preserve working baseline fields and focus only on unresolved scientific concepts",
+        baseline_errors
+    ));
+    fs::write(
+        workspace_dir.join("validation_history.json"),
+        serde_json::to_string_pretty(&trace.validation_history)?,
+    )?;
+    let mut last_compile_fingerprint: Option<String> = Some(baseline.fingerprint.clone());
+    let mut compiled: Option<CompiledWorkspace> = Some(baseline);
+    if baseline_errors == 0 {
+        trace.terminal_status = "resolved_baseline".into();
+        state.next_step = "finish".into();
+        state.notes =
+            "deterministic baseline validated without scientific-agent intervention".into();
+        trace.states[0] = state.clone();
         fs::write(
-            workspace_dir.join(format!("state.turn{turn:02}.json")),
+            workspace_dir.join("state.turn00.json"),
             serde_json::to_string_pretty(&state)?,
         )?;
         fs::write(
             workspace_dir.join("state.json"),
             serde_json::to_string_pretty(&state)?,
         )?;
+    }
 
-        if state.next_step == "search" {
-            let remaining = max_actions.saturating_sub(trace.tool_actions_completed);
-            if remaining == 0 {
-                trace.terminal_status = "evidence_exhausted".into();
+    if trace.terminal_status.is_empty() {
+        for turn in 1..=max_turns {
+            let next = call_scientific_agent(
+                opts,
+                &evidence,
+                &state,
+                &trace.evidence_action_results,
+                &trace.validation_history,
+                &trace.harness_feedback,
+                turn,
+            )
+            .await?;
+            state = next;
+            trace.states.push(state.clone());
+            trace.turns_completed = turn;
+            fs::write(
+                workspace_dir.join(format!("state.turn{turn:02}.json")),
+                serde_json::to_string_pretty(&state)?,
+            )?;
+            fs::write(
+                workspace_dir.join("state.json"),
+                serde_json::to_string_pretty(&state)?,
+            )?;
+
+            if state.next_step == "search" {
+                let remaining = max_actions.saturating_sub(trace.tool_actions_completed);
+                if remaining == 0 {
+                    trace.terminal_status = "evidence_exhausted".into();
+                    break;
+                }
+                let actions = trim_actions_to_budget(&state.next_evidence_actions, remaining);
+                if actions.is_empty() {
+                    trace.harness_feedback.push(
+                    "search requested but no executable typed action remained after normalization; choose a different search, compile only after a material state change, finish, or abstain".into(),
+                );
+                    continue;
+                }
+                let round_results =
+                    execute_evidence_actions(&mut evidence, &actions, turn, &mut attempted);
+                trace.tool_actions_completed += round_results.len();
+                trace.evidence_action_results.extend(round_results);
+                fs::write(&evidence_path, serde_json::to_string_pretty(&evidence)?)?;
+                fs::write(
+                    workspace_dir.join("action_history.json"),
+                    serde_json::to_string_pretty(&trace.evidence_action_results)?,
+                )?;
+                continue;
+            }
+
+            let compiled_now = compile_workspace(&evidence, &state, &explicit_mappings)?;
+            if last_compile_fingerprint
+                .as_deref()
+                .is_some_and(|previous| previous == compiled_now.fingerprint.as_str())
+            {
+                compiled = Some(compiled_now);
+                if state.next_step == "abstain" {
+                    trace.terminal_status = "abstained".into();
+                    break;
+                }
+                if state.next_step == "finish" {
+                    trace.terminal_status = "partial".into();
+                    break;
+                }
+                trace.harness_feedback.push(format!(
+                "turn {} compile blocked: normalized scientific state produced the same deterministic draft as the previous validated compile; do not compile again without changing evidence-backed claims/branches",
+                turn
+            ));
+                continue;
+            }
+            last_compile_fingerprint = Some(compiled_now.fingerprint.clone());
+            write_sdrf(&draft_path, &compiled_now.headers, &compiled_now.rows)?;
+            write_validation_review(&review_path, &compiled_now.issues)?;
+            trace.validator_cycles_completed += 1;
+            let cycle = validation_cycle(trace.validator_cycles_completed, &compiled_now.issues);
+            let errors = cycle.validation_errors;
+            trace.validation_history.push(cycle);
+            fs::write(
+                workspace_dir.join("validation_history.json"),
+                serde_json::to_string_pretty(&trace.validation_history)?,
+            )?;
+            compiled = Some(compiled_now);
+
+            if errors == 0 {
+                trace.terminal_status = "resolved".into();
                 break;
             }
-            let actions = trim_actions_to_budget(&state.next_evidence_actions, remaining);
-            let round_results =
-                execute_evidence_actions(&mut evidence, &actions, turn, &mut attempted);
-            trace.tool_actions_completed += round_results.len();
-            trace.evidence_action_results.extend(round_results);
-            fs::write(&evidence_path, serde_json::to_string_pretty(&evidence)?)?;
-            fs::write(
-                workspace_dir.join("action_history.json"),
-                serde_json::to_string_pretty(&trace.evidence_action_results)?,
-            )?;
-            continue;
-        }
-
-        let compiled_now = compile_workspace(&evidence, &state, &explicit_mappings)?;
-        write_sdrf(&draft_path, &compiled_now.headers, &compiled_now.rows)?;
-        write_validation_review(&review_path, &compiled_now.issues)?;
-        trace.validator_cycles_completed += 1;
-        let cycle = validation_cycle(trace.validator_cycles_completed, &compiled_now.issues);
-        let errors = cycle.validation_errors;
-        trace.validation_history.push(cycle);
-        fs::write(
-            workspace_dir.join("validation_history.json"),
-            serde_json::to_string_pretty(&trace.validation_history)?,
-        )?;
-        compiled = Some(compiled_now);
-
-        if errors == 0 {
-            trace.terminal_status = "resolved".into();
-            break;
-        }
-        if state.next_step == "abstain" {
-            trace.terminal_status = "abstained".into();
-            break;
-        }
-        if state.next_step == "finish" {
-            trace.terminal_status = "partial".into();
-            break;
-        }
-        if trace.validator_cycles_completed >= max_validator_cycles {
-            trace.terminal_status = "validation_exhausted".into();
-            break;
+            if state.next_step == "abstain" {
+                trace.terminal_status = "abstained".into();
+                break;
+            }
+            if state.next_step == "finish" {
+                trace.terminal_status = "partial".into();
+                break;
+            }
+            if trace.validator_cycles_completed >= max_validator_cycles {
+                trace.terminal_status = "validation_exhausted".into();
+                break;
+            }
         }
     }
 
@@ -1060,6 +1612,10 @@ async fn run_one_scientific_agent(
             trace.validator_cycles_completed,
             &compiled_now.issues,
         ));
+        fs::write(
+            workspace_dir.join("validation_history.json"),
+            serde_json::to_string_pretty(&trace.validation_history)?,
+        )?;
         compiled = Some(compiled_now);
     }
     if trace.terminal_status.is_empty() {
@@ -1098,7 +1654,10 @@ async fn run_one_scientific_agent(
         "locally_valid": locally_valid,
         "validation_errors": validation_errors,
         "branches": state.branches.clone(),
+        "claims": state.claims.clone(),
         "open_questions": state.open_questions.clone(),
+        "conflicts": state.conflicts.clone(),
+        "harness_feedback": trace.harness_feedback.clone(),
         "deterministic_repairs": compiled.deterministic_repairs,
         "draft_path": draft_path.display().to_string(),
         "review_path": review_path.display().to_string(),
@@ -1250,6 +1809,19 @@ mod tests {
         }
     }
 
+    fn claim(concept_type: &str, value: &str, scope: &str, branch_id: &str) -> ScientificClaim {
+        ScientificClaim {
+            concept_type: concept_type.into(),
+            value: value.into(),
+            scope: scope.into(),
+            branch_id: branch_id.into(),
+            status: "supported".into(),
+            evidence_refs: vec!["E0001".into()],
+            confidence: "high".into(),
+            reason: "test".into(),
+        }
+    }
+
     #[test]
     fn branch_linkage_requires_source_evidence_that_names_raw_file() {
         let evidence = evidence_with(
@@ -1289,42 +1861,168 @@ mod tests {
             }],
             vec!["runA.raw"],
         );
-        let assertion = AgentAssertion {
-            field: "single_cell_isolation_method".into(),
-            value: "capillary loading".into(),
-            scope: "project".into(),
-            status: "supported".into(),
-            evidence_refs: vec!["E0001".into()],
-            ..Default::default()
-        };
-        let (value, refs) = canonical_assertion_value(&evidence, &assertion).unwrap();
+        let claim = claim("isolation_method", "capillary loading", "project", "");
+        let (value, refs) = canonical_claim_value(&evidence, &claim).unwrap();
         assert_eq!(value, "manual picking");
         assert_eq!(refs, vec!["E0001"]);
     }
 
     #[test]
-    fn project_value_is_not_broadcast_when_branch_assertion_exists() {
+    fn project_value_is_not_broadcast_when_branch_claim_exists() {
         let state = ScientificWorkspaceState {
-            assertions: vec![
-                AgentAssertion {
-                    field: "organism".into(),
-                    value: "Homo sapiens".into(),
-                    scope: "project".into(),
-                    status: "supported".into(),
-                    ..Default::default()
-                },
-                AgentAssertion {
-                    field: "organism".into(),
-                    value: "Xenopus laevis".into(),
-                    scope: "branch".into(),
-                    branch_id: "xeno".into(),
-                    status: "supported".into(),
-                    ..Default::default()
-                },
+            claims: vec![
+                claim("organism", "Homo sapiens", "project", ""),
+                claim("organism", "Xenopus laevis", "branch", "xeno"),
             ],
             ..Default::default()
         };
-        assert!(branch_assertions_exist(&state, "organism"));
+        assert!(branch_claims_exist(&state, "organism"));
+    }
+
+    #[test]
+    fn canonical_state_reducer_deduplicates_repeated_claims() {
+        let evidence = evidence_with(
+            vec![EvidenceItem {
+                id: "E0001".into(),
+                source_kind: "manuscript_semantic_evidence".into(),
+                source_label: "paper.txt".into(),
+                text: "manual hydrodynamic loading of single cells".into(),
+            }],
+            vec!["runA.raw"],
+        );
+        let mut state = ScientificWorkspaceState {
+            claims: vec![
+                claim("isolation_method", "manual loading", "project", ""),
+                claim("isolation_method", "manual loading", "project", ""),
+                claim("isolation_method", "manual loading", "project", ""),
+            ],
+            next_step: "compile".into(),
+            ..Default::default()
+        };
+        normalize_workspace_state(&evidence, &mut state, 1);
+        assert_eq!(state.claims.len(), 1);
+    }
+
+    #[test]
+    fn conflicting_supported_claims_become_hypotheses_and_explicit_conflict() {
+        let evidence = evidence_with(
+            vec![EvidenceItem {
+                id: "E0001".into(),
+                source_kind: "manuscript_semantic_evidence".into(),
+                source_label: "paper.txt".into(),
+                text: "human and mouse organisms are both described".into(),
+            }],
+            vec!["runA.raw"],
+        );
+        let mut claims = vec![
+            claim("organism", "Homo sapiens", "project", ""),
+            claim("organism", "Mus musculus", "project", ""),
+        ];
+        let mut conflicts = Vec::new();
+        reduce_scientific_claims(&evidence, &BTreeSet::new(), &mut claims, &mut conflicts);
+        assert!(claims.iter().all(|claim| claim.status != "supported"));
+        assert_eq!(conflicts.len(), 1);
+    }
+
+    #[test]
+    fn non_exact_raw_query_is_reformulated_instead_of_rejected() {
+        let evidence = evidence_with(Vec::new(), vec!["runA.raw"]);
+        let mut action = AgentEvidenceAction {
+            action: "EXPAND_EVIDENCE_CONTEXT".into(),
+            reason: "search branch pattern".into(),
+            target_concepts: vec!["organism".into()],
+            queries: vec![EvidenceQuery {
+                match_kind: "raw_exact".into(),
+                value: "BS01-BS09 HeLa files".into(),
+                terms: vec!["BS01".into(), "HeLa".into()],
+                ..Default::default()
+            }],
+        };
+        normalize_scientific_agent_action(&evidence, &mut action);
+        assert_eq!(action.action, "EXPAND_EVIDENCE_CONTEXT");
+        assert_eq!(action.queries[0].match_kind, "terms_all");
+    }
+
+    #[test]
+    fn exact_raw_query_is_routed_to_exact_raw_tool() {
+        let evidence = evidence_with(Vec::new(), vec!["runA.raw"]);
+        let mut action = AgentEvidenceAction {
+            action: "EXPAND_EVIDENCE_CONTEXT".into(),
+            reason: "exact lookup".into(),
+            target_concepts: vec!["organism".into()],
+            queries: vec![EvidenceQuery {
+                match_kind: "raw_exact".into(),
+                value: "runA.raw".into(),
+                ..Default::default()
+            }],
+        };
+        normalize_scientific_agent_action(&evidence, &mut action);
+        assert_eq!(action.action, "SEARCH_EXACT_RAW_NAME");
+    }
+
+    #[test]
+    fn deterministic_row_scaffold_restores_structural_fields() {
+        let evidence = evidence_with(Vec::new(), vec!["cellA.raw"]);
+        let headers = vec![
+            "comment[data file]".into(),
+            SC_SAMPLE_TYPE.into(),
+            SC_CELL_IDENTIFIER.into(),
+            SC_CELLS_PER_WELL.into(),
+            "comment[fraction identifier]".into(),
+            "comment[technical replicate]".into(),
+        ];
+        let mut rows = vec![vec![
+            "cellA.raw".into(),
+            "not available".into(),
+            "not available".into(),
+            "not available".into(),
+            "not available".into(),
+            "not available".into(),
+        ]];
+        enforce_deterministic_row_scaffold(
+            &headers,
+            &mut rows,
+            &evidence,
+            "one_cell_per_data_file",
+        );
+        assert_eq!(rows[0][1], "single cell");
+        assert_eq!(rows[0][2], "cellA");
+        assert_eq!(rows[0][3], "1");
+        assert_eq!(rows[0][4], "1");
+        assert_eq!(rows[0][5], "1");
+    }
+
+    #[test]
+    fn branch_heterogeneity_masks_project_baseline() {
+        let evidence = evidence_with(
+            vec![EvidenceItem {
+                id: "E0001".into(),
+                source_kind: "manuscript_semantic_evidence".into(),
+                source_label: "paper.txt".into(),
+                text: "human and Xenopus branches".into(),
+            }],
+            vec!["runA.raw"],
+        );
+        let state = ScientificWorkspaceState {
+            claims: vec![
+                claim("organism", "Homo sapiens", "branch", "human"),
+                claim("organism", "Xenopus laevis", "branch", "xeno"),
+            ],
+            ..Default::default()
+        };
+        let mut proposal = SdrfProposal {
+            organism: "Homo sapiens".into(),
+            ..Default::default()
+        };
+        proposal
+            .evidence_refs
+            .insert("organism".into(), vec!["E0001".into()]);
+        let mut issues = Vec::new();
+        apply_scientific_overlay(&mut proposal, &evidence, &state, &mut issues);
+        assert_eq!(proposal.organism, "not available");
+        assert!(issues
+            .iter()
+            .any(|issue| issue.code == "scientific_agent_branch_scope_masks_project_value"));
     }
 
     #[test]
@@ -1346,10 +2044,10 @@ mod tests {
 
     #[test]
     fn action_budget_is_global_and_bounded() {
-        let actions = vec![EvidenceActionRequest {
+        let actions = vec![AgentEvidenceAction {
             action: "SEARCH_PUBLICATION".into(),
             reason: "test".into(),
-            target_fields: vec!["organism".into()],
+            target_concepts: vec!["organism".into()],
             queries: (0..8)
                 .map(|i| EvidenceQuery {
                     match_kind: "phrase".into(),
@@ -1389,7 +2087,7 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_assertion_without_field_relevant_refs_becomes_hypothesis() {
+    fn unsupported_claim_without_field_relevant_refs_becomes_hypothesis() {
         let evidence = evidence_with(
             vec![EvidenceItem {
                 id: "E0001".into(),
@@ -1400,18 +2098,22 @@ mod tests {
             vec!["runA.raw"],
         );
         let mut state = ScientificWorkspaceState {
-            assertions: vec![AgentAssertion {
-                field: "organism".into(),
-                value: "Homo sapiens".into(),
-                scope: "project".into(),
-                status: "supported".into(),
-                evidence_refs: vec!["E0001".into()],
-                ..Default::default()
-            }],
+            claims: vec![claim("organism", "Homo sapiens", "project", "")],
             next_step: "compile".into(),
             ..Default::default()
         };
         normalize_workspace_state(&evidence, &mut state, 1);
-        assert_eq!(state.assertions[0].status, "hypothesis");
+        assert_eq!(state.claims[0].status, "hypothesis");
+    }
+
+    #[test]
+    fn compiled_fingerprint_is_stable_for_identical_inputs() {
+        let proposal = SdrfProposal::default();
+        let headers = vec!["comment[data file]".to_string()];
+        let rows = vec![vec!["runA.raw".to_string()]];
+        assert_eq!(
+            compiled_workspace_fingerprint(&proposal, &headers, &rows),
+            compiled_workspace_fingerprint(&proposal, &headers, &rows)
+        );
     }
 }
