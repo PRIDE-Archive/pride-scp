@@ -15,6 +15,12 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+mod scientific_agent;
+pub use scientific_agent::{
+    run_scientific_sdrf_agent, SdrfScientificAgentOptions, SdrfScientificAgentSummary,
+    SCIENTIFIC_AGENT_HARNESS_VERSION,
+};
+
 pub const SDRF_SPEC_VERSION: &str = "v1.1.0";
 pub const SINGLE_CELL_TEMPLATE_VERSION: &str = "1.0.0";
 pub const SINGLE_CELL_TEMPLATE_URL: &str =

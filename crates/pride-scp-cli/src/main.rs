@@ -12,8 +12,9 @@ use pride_scp_index::{
     DEFAULT_PROJECT_PAGE_SIZE, DEFAULT_PROTEOMECENTRAL_PROXI_API, DEFAULT_REGISTRY_PAGE_SIZE,
 };
 use pride_scp_sdrf::{
-    annotate_sdrf, audit_sdrf_sources, resolve_sdrf_sources, SdrfAnnotateOptions, SdrfAuditOptions,
-    SdrfResolveOptions, DEFAULT_OLLAMA_URL as DEFAULT_SDRF_OLLAMA_URL,
+    annotate_sdrf, audit_sdrf_sources, resolve_sdrf_sources, run_scientific_sdrf_agent,
+    SdrfAnnotateOptions, SdrfAuditOptions, SdrfResolveOptions, SdrfScientificAgentOptions,
+    DEFAULT_OLLAMA_URL as DEFAULT_SDRF_OLLAMA_URL,
 };
 use std::path::PathBuf;
 use std::time::Instant;
@@ -308,6 +309,50 @@ enum Command {
         /// deterministically when the SDRF draft is serialized.
         #[arg(long, default_value_t = 64)]
         max_files_in_prompt: usize,
+        #[arg(long)]
+        force: bool,
+    },
+    /// Run a persistent scientific-agent harness that reconstructs study design before SDRF rows are compiled.
+    SdrfAgent {
+        #[arg(long = "accession")]
+        accessions: Vec<String>,
+        #[arg(long)]
+        accessions_file: Option<PathBuf>,
+        #[arg(long, default_value = "data/snapshot")]
+        snapshot: PathBuf,
+        #[arg(long, default_value = "work/python/pride_scp_annotations/annotations")]
+        annotations_dir: PathBuf,
+        #[arg(
+            long,
+            default_value = "work/python/pride_candidate_publications_with_content.tsv"
+        )]
+        publication_manifest: PathBuf,
+        #[arg(long = "manuscript-text")]
+        manuscript_text: Vec<PathBuf>,
+        #[arg(long)]
+        resolved_sdrf_dir: Option<PathBuf>,
+        #[arg(long)]
+        explicit_row_mapping_manifest: Option<PathBuf>,
+        #[arg(long, default_value = "data/sdrf_scientific_agent")]
+        output: PathBuf,
+        #[arg(long, default_value = "qwen2.5:3b")]
+        model: String,
+        #[arg(long, default_value = DEFAULT_SDRF_OLLAMA_URL)]
+        ollama_url: String,
+        #[arg(long, default_value_t = 1200)]
+        timeout: u64,
+        #[arg(long, default_value_t = 128)]
+        max_evidence_items: usize,
+        #[arg(long, default_value_t = 60_000)]
+        max_evidence_chars: usize,
+        #[arg(long, default_value_t = 64)]
+        max_files_in_prompt: usize,
+        #[arg(long, default_value_t = 12)]
+        max_agent_turns: usize,
+        #[arg(long, default_value_t = 20)]
+        max_tool_actions: usize,
+        #[arg(long, default_value_t = 3)]
+        max_validator_cycles: usize,
         #[arg(long)]
         force: bool,
     },
@@ -625,6 +670,63 @@ async fn main() -> Result<()> {
                 max_evidence_items,
                 max_evidence_chars,
                 max_files_in_prompt,
+                force,
+                progress,
+            })
+            .await?;
+            println!("{}", serde_json::to_string_pretty(&summary)?);
+        }
+        Command::SdrfAgent {
+            accessions,
+            accessions_file,
+            snapshot,
+            annotations_dir,
+            publication_manifest,
+            manuscript_text,
+            resolved_sdrf_dir,
+            explicit_row_mapping_manifest,
+            output,
+            model,
+            ollama_url,
+            timeout,
+            max_evidence_items,
+            max_evidence_chars,
+            max_files_in_prompt,
+            max_agent_turns,
+            max_tool_actions,
+            max_validator_cycles,
+            force,
+        } => {
+            log::info!(
+                "command=sdrf-agent snapshot={} output={} model={} turns={} actions={} validators={}",
+                snapshot.display(),
+                output.display(),
+                model,
+                max_agent_turns,
+                max_tool_actions,
+                max_validator_cycles
+            );
+            let summary = run_scientific_sdrf_agent(SdrfScientificAgentOptions {
+                snapshot_dir: snapshot,
+                annotations_dir,
+                publication_manifest: publication_manifest
+                    .is_file()
+                    .then_some(publication_manifest),
+                manuscript_text_paths: manuscript_text,
+                output_dir: output,
+                accessions,
+                accessions_file,
+                resolved_sdrf_dir,
+                explicit_row_mapping_manifest,
+                model,
+                ollama_url,
+                timeout_seconds: timeout,
+                max_evidence_items,
+                max_evidence_chars,
+                max_files_in_prompt,
+                max_agent_turns,
+                max_tool_actions,
+                max_validator_cycles,
                 force,
                 progress,
             })
