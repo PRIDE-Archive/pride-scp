@@ -1,6 +1,6 @@
 use super::*;
 
-pub const SCIENTIFIC_AGENT_HARNESS_VERSION: &str = "pride-scp-scientific-agent-v0.3";
+pub const SCIENTIFIC_AGENT_HARNESS_VERSION: &str = "pride-scp-scientific-agent-v0.4";
 #[derive(Debug, Clone)]
 pub struct SdrfScientificAgentOptions {
     pub snapshot_dir: PathBuf,
@@ -121,6 +121,99 @@ struct ScientificClaim {
     reason: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct ScientificClaimUpsert {
+    concept_type: String,
+    value: String,
+    scope: String,
+    branch_id: String,
+    status: String,
+    #[serde(default)]
+    evidence_refs: Vec<String>,
+    confidence: String,
+    reason: String,
+    /// Empty means this is not an explicit supersession. When non-empty it
+    /// must match the currently active value for the stable claim identity.
+    supersedes_value: String,
+}
+
+impl ScientificClaimUpsert {
+    fn as_claim(&self) -> ScientificClaim {
+        ScientificClaim {
+            concept_type: self.concept_type.clone(),
+            value: self.value.clone(),
+            scope: self.scope.clone(),
+            branch_id: self.branch_id.clone(),
+            status: self.status.clone(),
+            evidence_refs: self.evidence_refs.clone(),
+            confidence: self.confidence.clone(),
+            reason: self.reason.clone(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct ScientificClaimRetraction {
+    concept_type: String,
+    scope: String,
+    branch_id: String,
+    /// Empty means retract the current value for this identity. A non-empty
+    /// value protects against retracting a claim that has already changed.
+    expected_value: String,
+    reason: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct WorkspaceConflict {
+    concept_type: String,
+    scope: String,
+    branch_id: String,
+    existing_value: String,
+    proposed_value: String,
+    #[serde(default)]
+    evidence_refs: Vec<String>,
+    reason: String,
+    #[serde(default)]
+    turn: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct WorkspaceConflictResolution {
+    concept_type: String,
+    scope: String,
+    branch_id: String,
+    resolved_value: String,
+    status: String,
+    #[serde(default)]
+    evidence_refs: Vec<String>,
+    confidence: String,
+    reason: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+struct WorkspaceDelta {
+    turn: usize,
+    #[serde(default)]
+    branch_upserts: Vec<AgentBranch>,
+    #[serde(default)]
+    claim_upserts: Vec<ScientificClaimUpsert>,
+    #[serde(default)]
+    claim_retractions: Vec<ScientificClaimRetraction>,
+    #[serde(default)]
+    open_question_additions: Vec<String>,
+    #[serde(default)]
+    open_question_resolutions: Vec<String>,
+    #[serde(default)]
+    conflict_additions: Vec<WorkspaceConflict>,
+    #[serde(default)]
+    conflict_resolutions: Vec<WorkspaceConflictResolution>,
+    #[serde(default)]
+    next_evidence_actions: Vec<AgentEvidenceAction>,
+    next_step: String,
+    notes: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "outcome", rename_all = "snake_case")]
 enum ClaimAdjudication {
@@ -179,7 +272,7 @@ struct ScientificWorkspaceState {
     #[serde(default)]
     open_questions: Vec<String>,
     #[serde(default)]
-    conflicts: Vec<String>,
+    conflicts: Vec<WorkspaceConflict>,
     #[serde(default)]
     next_evidence_actions: Vec<AgentEvidenceAction>,
     next_step: String,
@@ -198,11 +291,24 @@ struct AgentValidationCycle {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct AdjudicationSnapshot {
+    turn: usize,
+    phase: String,
+    evidence_items: usize,
+    #[serde(default)]
+    records: Vec<ClaimAdjudicationRecord>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 struct ScientificAgentTrace {
     harness_version: String,
     accession: String,
     #[serde(default)]
     states: Vec<ScientificWorkspaceState>,
+    #[serde(default)]
+    deltas: Vec<WorkspaceDelta>,
+    #[serde(default)]
+    adjudication_history: Vec<AdjudicationSnapshot>,
     #[serde(default)]
     evidence_action_results: Vec<EvidenceActionResult>,
     #[serde(default)]
@@ -283,40 +389,88 @@ fn scientific_agent_schema() -> Value {
         "required":["match","value","terms","document_hint"],
         "additionalProperties":false
     });
+    let branch = json!({
+        "type":"object",
+        "properties":{
+            "id":{"type":"string","maxLength":50},
+            "label":{"type":"string","maxLength":200},
+            "status":{"type":"string","enum":["supported","hypothesis","rejected"]},
+            "evidence_refs":{"type":"array","items":{"type":"string","pattern":"^E[0-9]{4}$"},"maxItems":16},
+            "linked_raw_files":{"type":"array","items":{"type":"string","maxLength":300},"maxItems":128},
+            "linkage_status":{"type":"string","enum":["supported","partial","unresolved"]},
+            "notes":{"type":"string","maxLength":600}
+        },
+        "required":["id","label","status","evidence_refs","linked_raw_files","linkage_status","notes"],
+        "additionalProperties":false
+    });
+    let claim_upsert = json!({
+        "type":"object",
+        "properties":{
+            "concept_type":{"type":"string","enum":concepts.clone()},
+            "value":{"type":"string","maxLength":500},
+            "scope":{"type":"string","enum":["project","branch","row","unresolved"]},
+            "branch_id":{"type":"string","maxLength":50},
+            "status":{"type":"string","enum":["supported","hypothesis","unresolved","rejected"]},
+            "evidence_refs":{"type":"array","items":{"type":"string","pattern":"^E[0-9]{4}$"},"maxItems":16},
+            "confidence":{"type":"string","enum":["high","medium","low"]},
+            "reason":{"type":"string","maxLength":600},
+            "supersedes_value":{"type":"string","maxLength":500}
+        },
+        "required":["concept_type","value","scope","branch_id","status","evidence_refs","confidence","reason","supersedes_value"],
+        "additionalProperties":false
+    });
+    let claim_retraction = json!({
+        "type":"object",
+        "properties":{
+            "concept_type":{"type":"string","enum":concepts.clone()},
+            "scope":{"type":"string","enum":["project","branch","row","unresolved"]},
+            "branch_id":{"type":"string","maxLength":50},
+            "expected_value":{"type":"string","maxLength":500},
+            "reason":{"type":"string","maxLength":600}
+        },
+        "required":["concept_type","scope","branch_id","expected_value","reason"],
+        "additionalProperties":false
+    });
+    let conflict = json!({
+        "type":"object",
+        "properties":{
+            "concept_type":{"type":"string","enum":concepts.clone()},
+            "scope":{"type":"string","enum":["project","branch","row","unresolved"]},
+            "branch_id":{"type":"string","maxLength":50},
+            "existing_value":{"type":"string","maxLength":500},
+            "proposed_value":{"type":"string","maxLength":500},
+            "evidence_refs":{"type":"array","items":{"type":"string","pattern":"^E[0-9]{4}$"},"maxItems":16},
+            "reason":{"type":"string","maxLength":600}
+        },
+        "required":["concept_type","scope","branch_id","existing_value","proposed_value","evidence_refs","reason"],
+        "additionalProperties":false
+    });
+    let conflict_resolution = json!({
+        "type":"object",
+        "properties":{
+            "concept_type":{"type":"string","enum":concepts.clone()},
+            "scope":{"type":"string","enum":["project","branch","row","unresolved"]},
+            "branch_id":{"type":"string","maxLength":50},
+            "resolved_value":{"type":"string","maxLength":500},
+            "status":{"type":"string","enum":["supported","hypothesis","unresolved"]},
+            "evidence_refs":{"type":"array","items":{"type":"string","pattern":"^E[0-9]{4}$"},"maxItems":16},
+            "confidence":{"type":"string","enum":["high","medium","low"]},
+            "reason":{"type":"string","maxLength":600}
+        },
+        "required":["concept_type","scope","branch_id","resolved_value","status","evidence_refs","confidence","reason"],
+        "additionalProperties":false
+    });
     json!({
         "type":"object",
         "properties":{
-            "harness_version":{"type":"string","maxLength":80},
-            "accession":{"type":"string","maxLength":32},
             "turn":{"type":"integer","minimum":1,"maximum":100},
-            "relation":{"type":"object","properties":{
-                "mode":{"type":"string","enum":["one_cell_per_data_file","multiplexed_cells_per_data_file","mixed","unresolved"]},
-                "scope":{"type":"string","enum":["project","branch","unresolved"]},
-                "evidence_refs":{"type":"array","items":{"type":"string","pattern":"^E[0-9]{4}$"},"maxItems":12},
-                "confidence":{"type":"string","enum":["high","medium","low"]},
-                "reason":{"type":"string","maxLength":500}
-            },"required":["mode","scope","evidence_refs","confidence","reason"],"additionalProperties":false},
-            "branches":{"type":"array","maxItems":24,"items":{"type":"object","properties":{
-                "id":{"type":"string","maxLength":50},
-                "label":{"type":"string","maxLength":200},
-                "status":{"type":"string","enum":["supported","hypothesis","rejected"]},
-                "evidence_refs":{"type":"array","items":{"type":"string","pattern":"^E[0-9]{4}$"},"maxItems":16},
-                "linked_raw_files":{"type":"array","items":{"type":"string","maxLength":300},"maxItems":128},
-                "linkage_status":{"type":"string","enum":["supported","partial","unresolved"]},
-                "notes":{"type":"string","maxLength":600}
-            },"required":["id","label","status","evidence_refs","linked_raw_files","linkage_status","notes"],"additionalProperties":false}},
-            "claims":{"type":"array","maxItems":64,"items":{"type":"object","properties":{
-                "concept_type":{"type":"string","enum":concepts.clone()},
-                "value":{"type":"string","maxLength":500},
-                "scope":{"type":"string","enum":["project","branch","row","unresolved"]},
-                "branch_id":{"type":"string","maxLength":50},
-                "status":{"type":"string","enum":["supported","hypothesis","unresolved","rejected"]},
-                "evidence_refs":{"type":"array","items":{"type":"string","pattern":"^E[0-9]{4}$"},"maxItems":16},
-                "confidence":{"type":"string","enum":["high","medium","low"]},
-                "reason":{"type":"string","maxLength":600}
-            },"required":["concept_type","value","scope","branch_id","status","evidence_refs","confidence","reason"],"additionalProperties":false}},
-            "open_questions":{"type":"array","items":{"type":"string","maxLength":400},"maxItems":32},
-            "conflicts":{"type":"array","items":{"type":"string","maxLength":400},"maxItems":32},
+            "branch_upserts":{"type":"array","maxItems":24,"items":branch},
+            "claim_upserts":{"type":"array","maxItems":48,"items":claim_upsert},
+            "claim_retractions":{"type":"array","maxItems":24,"items":claim_retraction},
+            "open_question_additions":{"type":"array","items":{"type":"string","maxLength":400},"maxItems":32},
+            "open_question_resolutions":{"type":"array","items":{"type":"string","maxLength":400},"maxItems":32},
+            "conflict_additions":{"type":"array","maxItems":24,"items":conflict},
+            "conflict_resolutions":{"type":"array","maxItems":24,"items":conflict_resolution},
             "next_evidence_actions":{"type":"array","maxItems":8,"items":{"type":"object","properties":{
                 "action":{"type":"string","enum":["SEARCH_PUBLICATION","SEARCH_SUPPLEMENT","SEARCH_STRUCTURED_DESIGN","SEARCH_REPOSITORY_METADATA","SEARCH_EXACT_RAW_NAME","EXPAND_EVIDENCE_CONTEXT","LOOKUP_KG_TERM","COMPARE_CONFLICTING_EVIDENCE","ABSTAIN"]},
                 "reason":{"type":"string","maxLength":400},
@@ -326,7 +480,7 @@ fn scientific_agent_schema() -> Value {
             "next_step":{"type":"string","enum":["search","compile","finish","abstain"]},
             "notes":{"type":"string","maxLength":1400}
         },
-        "required":["harness_version","accession","turn","relation","branches","claims","open_questions","conflicts","next_evidence_actions","next_step","notes"],
+        "required":["turn","branch_upserts","claim_upserts","claim_retractions","open_question_additions","open_question_resolutions","conflict_additions","conflict_resolutions","next_evidence_actions","next_step","notes"],
         "additionalProperties":false
     })
 }
@@ -355,10 +509,10 @@ fn workspace_evidence_block(evidence: &DatasetEvidence, max_items: usize) -> Str
 fn scientific_agent_prompt(
     opts: &SdrfScientificAgentOptions,
     evidence: &DatasetEvidence,
-    previous: &ScientificWorkspaceState,
+    workspace: &ScientificWorkspaceState,
     actions: &[EvidenceActionResult],
     validations: &[AgentValidationCycle],
-    harness_feedback: &[String],
+    changed_harness_feedback: &[String],
     turn: usize,
 ) -> String {
     let files = evidence
@@ -368,18 +522,27 @@ fn scientific_agent_prompt(
         .map(|f| format!("- {}", f.file_name))
         .collect::<Vec<_>>()
         .join("\n");
-    let previous_json = serde_json::to_string_pretty(previous).unwrap_or_else(|_| "{}".into());
+    let workspace_json = serde_json::to_string_pretty(workspace).unwrap_or_else(|_| "{}".into());
     let action_json = serde_json::to_string_pretty(actions).unwrap_or_else(|_| "[]".into());
     let validation_json = serde_json::to_string_pretty(validations).unwrap_or_else(|_| "[]".into());
     let feedback_json =
-        serde_json::to_string_pretty(harness_feedback).unwrap_or_else(|_| "[]".into());
+        serde_json::to_string_pretty(changed_harness_feedback).unwrap_or_else(|_| "[]".into());
     format!(
         "You are the scientific annotation agent for PRIDE single-cell proteomics dataset {acc}.\n\n\
-Behave like a careful coding/research agent operating on a persistent scientific workspace. Inspect evidence, maintain branches and typed scientific claims, request tools when evidence is missing, compile only when the current study model has materially changed, inspect validator feedback, revise, and stop when the SDRF is valid or the evidence budget is exhausted.\n\n\
+Behave like a careful coding/research agent operating on a Rust-owned persistent scientific workspace. Inspect evidence, propose only DELTAS to branches and typed scientific claims, request tools when evidence is missing, compile only when the scientific model materially changes, inspect validator feedback, revise, and stop when the SDRF is valid or the evidence budget is exhausted.\n\n\
+PERSISTENT WORKSPACE CONTRACT (v0.4):\n\
+- Rust owns the canonical workspace. Your response is a WorkspaceDelta, never a replacement state.\n\
+- DO NOT copy unchanged branches, claims, questions, or conflicts into the delta. Prior state persists automatically. The structured schema requires every delta key, so use empty arrays for categories with no mutation.\n\
+- Stable claim identity is (concept_type, scope, branch_id).\n\
+- To enrich the same value, upsert the same identity/value; Rust merges evidence, reason, status, and confidence.\n\
+- To change a value intentionally, set claim_upsert.supersedes_value to the exact current value. Rust replaces only on a valid explicit supersession.\n\
+- A changed value without explicit supersession becomes an explicit conflict and the existing active claim is retained.\n\
+- Remove a claim only with claim_retractions. Resolve an explicit claim conflict only with conflict_resolutions or a valid superseding upsert.\n\
+- Search results update the evidence inventory. You do not need to restate prior claims after a search; Rust re-adjudicates retained claims.\n\n\
 IMPORTANT COMPILER CONTRACT:\n\
 - You are NOT rebuilding an SDRF from scratch. Rust starts from a proven deterministic baseline containing relation/cardinality, repository/file structure, row identifiers, fraction/technical replicate defaults, and deterministic metadata scaffolds.\n\
-- Your claims are a semantic overlay. Omitting a field does NOT erase a valid deterministic baseline value.\n\
-- If a field genuinely differs across biological/acquisition branches, represent branch-scoped claims. Rust will then mask an unsafe project-wide baseline value, but will serialize branch values only when file-to-branch linkage is source-grounded.\n\
+- Your claims are a semantic overlay. Omitting a field does NOT erase a valid deterministic baseline value or a prior model claim.\n\
+- If a field genuinely differs across biological/acquisition branches, represent branch-scoped claims. Rust masks an unsafe project-wide baseline value, but serializes branch values only when file-to-branch linkage is source-grounded.\n\
 - Use typed scientific concepts, not arbitrary SDRF columns. Rust owns the final mapping to SDRF fields and controlled vocabulary.\n\n\
 SCIENTIFIC CONCEPTS:\n\
 organism, organism_part, disease, cell_type, cell_line, sample_type, isolation_method, individual, sample_preparation, acquisition_mode, labeling, instrument, cleavage_agent, control_role, biological_condition.\n\n\
@@ -395,16 +558,16 @@ HARD SCIENTIFIC CONTRACT:\n\
 9. Prefer explicit open_questions over guessed values.\n\
 10. Use next_step='search' only with executable actions. Use 'compile' only after a material workspace change. Use 'finish' when no further safe retrieval is needed. Use 'abstain' when evidence cannot safely resolve remaining study design.\n\
 11. Validator feedback is feedback about the compiled draft, not permission to invent metadata. Structural fields such as cell identifier, fraction identifier, and technical replicate are deterministic compiler responsibilities and should NOT become scientific claims.\n\
-12. If HARNESS FEEDBACK says the previous compile was unchanged, do not request compile again without changing claims/branches; search, finish, or abstain instead.\n\n\
+12. Changed harness feedback contains only new/changed compiler adjudications or reducer events since your previous turn. Do not repeat a settled proposal merely to acknowledge feedback.\n\n\
 ACCEPTED DETERMINISTIC RELATION HINT (cardinality only):\n\
 mode={relation}; confidence={relation_confidence}; refs={relation_refs:?}; repository_file_mode={repo_mode}; note={design_note}\n\n\
 RAW FILE COUNT: {nfiles}\nRAW FILE SAMPLE (context/search hints only):\n{files}\n\n\
 EVIDENCE INVENTORY:\n{evidence_block}\n\n\
-PREVIOUS WORKSPACE STATE:\n{previous_json}\n\n\
+CANONICAL RUST-OWNED WORKSPACE (read-only; update only through your delta):\n{workspace_json}\n\n\
 TOOL/ACTION HISTORY:\n{action_json}\n\n\
 VALIDATION HISTORY:\n{validation_json}\n\n\
-HARNESS FEEDBACK:\n{feedback_json}\n\n\
-This is agent turn {turn}. Return the COMPLETE updated workspace state, not a patch. Keep claims deduplicated, concise, and decision-oriented.",
+CHANGED HARNESS FEEDBACK SINCE YOUR PREVIOUS TURN:\n{feedback_json}\n\n\
+This is agent turn {turn}. Return ONLY a WorkspaceDelta. Keep it sparse: populate only real mutations/actions, use empty arrays for no-op categories, and do not restate unchanged canonical state.",
         acc = evidence.accession,
         relation = evidence.study_design.relation_mode_hint,
         relation_confidence = evidence.study_design.relation_confidence,
@@ -414,7 +577,7 @@ This is agent turn {turn}. Return the COMPLETE updated workspace state, not a pa
         nfiles = evidence.raw_files.len(),
         files = files,
         evidence_block = workspace_evidence_block(evidence, 48),
-        previous_json = previous_json,
+        workspace_json = workspace_json,
         action_json = action_json,
         validation_json = validation_json,
         feedback_json = feedback_json,
@@ -425,12 +588,12 @@ This is agent turn {turn}. Return the COMPLETE updated workspace state, not a pa
 async fn call_scientific_agent(
     opts: &SdrfScientificAgentOptions,
     evidence: &DatasetEvidence,
-    previous: &ScientificWorkspaceState,
+    workspace: &ScientificWorkspaceState,
     actions: &[EvidenceActionResult],
     validations: &[AgentValidationCycle],
-    harness_feedback: &[String],
+    changed_harness_feedback: &[String],
     turn: usize,
-) -> Result<ScientificWorkspaceState> {
+) -> Result<WorkspaceDelta> {
     let client = Client::builder()
         .timeout(Duration::from_secs(opts.timeout_seconds))
         .build()?;
@@ -439,10 +602,10 @@ async fn call_scientific_agent(
         "prompt": scientific_agent_prompt(
             opts,
             evidence,
-            previous,
+            workspace,
             actions,
             validations,
-            harness_feedback,
+            changed_harness_feedback,
             turn,
         ),
         "stream": false,
@@ -473,10 +636,10 @@ async fn call_scientific_agent(
     if raw.trim().is_empty() {
         bail!("Ollama returned empty scientific-agent response");
     }
-    let mut state: ScientificWorkspaceState =
-        serde_json::from_str(raw).context("parse structured scientific-agent workspace")?;
-    normalize_workspace_state(evidence, &mut state, turn);
-    Ok(state)
+    let mut delta: WorkspaceDelta =
+        serde_json::from_str(raw).context("parse structured scientific-agent workspace delta")?;
+    delta.turn = turn;
+    Ok(delta)
 }
 
 fn valid_evidence_refs(evidence: &DatasetEvidence, refs: &[String]) -> Vec<String> {
@@ -564,7 +727,7 @@ fn status_rank(value: &str) -> usize {
     }
 }
 
-fn dedup_strings(values: &mut Vec<String>, max_items: usize) {
+fn dedup_strings(values: &mut Vec<String>) {
     let mut seen = BTreeSet::new();
     values.retain(|value| {
         let trimmed = value.trim();
@@ -573,117 +736,173 @@ fn dedup_strings(values: &mut Vec<String>, max_items: usize) {
         }
         seen.insert(trimmed.to_ascii_lowercase())
     });
-    values.truncate(max_items);
+}
+
+fn claim_identity_parts(
+    concept_type: &str,
+    scope: &str,
+    branch_id: &str,
+) -> (String, String, String) {
+    (
+        concept_type.trim().to_ascii_lowercase(),
+        scope.trim().to_ascii_lowercase(),
+        branch_id.trim().to_string(),
+    )
+}
+
+fn claim_identity(claim: &ScientificClaim) -> (String, String, String) {
+    claim_identity_parts(&claim.concept_type, &claim.scope, &claim.branch_id)
+}
+
+fn conflict_identity(conflict: &WorkspaceConflict) -> (String, String, String) {
+    claim_identity_parts(&conflict.concept_type, &conflict.scope, &conflict.branch_id)
+}
+
+fn merge_same_value_claim(existing: &mut ScientificClaim, incoming: ScientificClaim) {
+    existing.evidence_refs.extend(incoming.evidence_refs);
+    existing.evidence_refs.sort();
+    existing.evidence_refs.dedup();
+    if status_rank(&incoming.status) > status_rank(&existing.status) {
+        existing.status = incoming.status;
+    }
+    if confidence_rank(&incoming.confidence) > confidence_rank(&existing.confidence) {
+        existing.confidence = incoming.confidence;
+    }
+    if incoming.reason.len() > existing.reason.len() {
+        existing.reason = incoming.reason;
+    }
+}
+
+fn normalize_claim(
+    evidence: &DatasetEvidence,
+    branch_ids: &BTreeSet<&str>,
+    claim: &mut ScientificClaim,
+) -> bool {
+    let allowed = scientific_concept_types()
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+    claim.concept_type = claim.concept_type.trim().to_ascii_lowercase();
+    claim.value = claim.value.trim().to_string();
+    claim.scope = claim.scope.trim().to_ascii_lowercase();
+    claim.branch_id = claim.branch_id.trim().to_string();
+    claim.evidence_refs = valid_evidence_refs(evidence, &claim.evidence_refs);
+    claim.reason = claim.reason.trim().to_string();
+
+    if !allowed.contains(claim.concept_type.as_str()) || claim.status == "rejected" {
+        return false;
+    }
+    if !matches!(
+        claim.scope.as_str(),
+        "project" | "branch" | "row" | "unresolved"
+    ) {
+        claim.scope = "unresolved".into();
+        claim.status = "unresolved".into();
+        claim.value.clear();
+        claim.branch_id.clear();
+    }
+    if claim.scope == "branch" && !branch_ids.contains(claim.branch_id.as_str()) {
+        claim.scope = "unresolved".into();
+        claim.status = "unresolved".into();
+        claim.value.clear();
+        claim.branch_id.clear();
+    }
+    if matches!(claim.scope.as_str(), "project" | "branch" | "row")
+        && claim.status == "supported"
+        && !claim_refs_are_relevant(evidence, &claim.concept_type, &claim.evidence_refs)
+    {
+        claim.status = "hypothesis".into();
+    }
+    if claim.status == "unresolved" || claim.scope == "unresolved" {
+        claim.value.clear();
+        claim.scope = "unresolved".into();
+    }
+    true
+}
+
+fn push_workspace_conflict(
+    evidence: &DatasetEvidence,
+    conflicts: &mut Vec<WorkspaceConflict>,
+    mut conflict: WorkspaceConflict,
+) {
+    conflict.concept_type = conflict.concept_type.trim().to_ascii_lowercase();
+    conflict.scope = conflict.scope.trim().to_ascii_lowercase();
+    conflict.branch_id = conflict.branch_id.trim().to_string();
+    conflict.existing_value = conflict.existing_value.trim().to_string();
+    conflict.proposed_value = conflict.proposed_value.trim().to_string();
+    conflict.evidence_refs = valid_evidence_refs(evidence, &conflict.evidence_refs);
+    conflict.reason = conflict.reason.trim().to_string();
+    let key = (
+        conflict_identity(&conflict),
+        conflict.existing_value.to_ascii_lowercase(),
+        conflict.proposed_value.to_ascii_lowercase(),
+    );
+    if let Some(existing) = conflicts.iter_mut().find(|existing| {
+        (
+            conflict_identity(existing),
+            existing.existing_value.to_ascii_lowercase(),
+            existing.proposed_value.to_ascii_lowercase(),
+        ) == key
+    }) {
+        existing.evidence_refs.extend(conflict.evidence_refs);
+        existing.evidence_refs.sort();
+        existing.evidence_refs.dedup();
+        if conflict.reason.len() > existing.reason.len() {
+            existing.reason = conflict.reason;
+        }
+        if existing.turn == 0 || (conflict.turn != 0 && conflict.turn < existing.turn) {
+            existing.turn = conflict.turn;
+        }
+        return;
+    }
+    conflicts.push(conflict);
+    conflicts.sort_by(|a, b| {
+        conflict_identity(a)
+            .cmp(&conflict_identity(b))
+            .then_with(|| a.existing_value.cmp(&b.existing_value))
+            .then_with(|| a.proposed_value.cmp(&b.proposed_value))
+    });
 }
 
 fn reduce_scientific_claims(
     evidence: &DatasetEvidence,
     branch_ids: &BTreeSet<&str>,
     claims: &mut Vec<ScientificClaim>,
-    conflicts: &mut Vec<String>,
+    conflicts: &mut Vec<WorkspaceConflict>,
+    turn: usize,
 ) {
-    let allowed = scientific_concept_types()
-        .into_iter()
-        .collect::<BTreeSet<_>>();
-    for claim in claims.iter_mut() {
-        claim.concept_type = claim.concept_type.trim().to_ascii_lowercase();
-        claim.value = claim.value.trim().to_string();
-        claim.branch_id = claim.branch_id.trim().to_string();
-        claim.evidence_refs = valid_evidence_refs(evidence, &claim.evidence_refs);
-        if !allowed.contains(claim.concept_type.as_str()) {
-            claim.status = "rejected".into();
-            claim.value.clear();
+    let mut reduced: BTreeMap<(String, String, String), ScientificClaim> = BTreeMap::new();
+    for mut claim in claims.drain(..) {
+        if !normalize_claim(evidence, branch_ids, &mut claim) {
             continue;
         }
-        if claim.scope == "branch" && !branch_ids.contains(claim.branch_id.as_str()) {
-            claim.scope = "unresolved".into();
-            claim.status = "unresolved".into();
-            claim.value.clear();
-        }
-        if matches!(claim.scope.as_str(), "project" | "branch" | "row")
-            && claim.status == "supported"
-            && !claim_refs_are_relevant(evidence, &claim.concept_type, &claim.evidence_refs)
-        {
-            claim.status = "hypothesis".into();
-        }
-        if claim.status == "unresolved" || claim.scope == "unresolved" {
-            claim.value.clear();
-            claim.scope = "unresolved".into();
-        }
-    }
-    claims.retain(|claim| claim.status != "rejected" && !claim.concept_type.is_empty());
-
-    let mut reduced: BTreeMap<(String, String, String, String), ScientificClaim> = BTreeMap::new();
-    for claim in claims.drain(..) {
-        let key = (
-            claim.concept_type.clone(),
-            claim.scope.clone(),
-            claim.branch_id.clone(),
-            claim.value.to_ascii_lowercase(),
-        );
+        let key = claim_identity(&claim);
         match reduced.get_mut(&key) {
             None => {
                 reduced.insert(key, claim);
             }
+            Some(existing) if existing.value.eq_ignore_ascii_case(&claim.value) => {
+                merge_same_value_claim(existing, claim);
+            }
             Some(existing) => {
-                existing.evidence_refs.extend(claim.evidence_refs);
-                existing.evidence_refs.sort();
-                existing.evidence_refs.dedup();
-                if status_rank(&claim.status) > status_rank(&existing.status) {
-                    existing.status = claim.status;
-                }
-                if confidence_rank(&claim.confidence) > confidence_rank(&existing.confidence) {
-                    existing.confidence = claim.confidence;
-                }
-                if claim.reason.len() > existing.reason.len() {
-                    existing.reason = claim.reason;
-                }
+                push_workspace_conflict(
+                    evidence,
+                    conflicts,
+                    WorkspaceConflict {
+                        concept_type: key.0.clone(),
+                        scope: key.1.clone(),
+                        branch_id: key.2.clone(),
+                        existing_value: existing.value.clone(),
+                        proposed_value: claim.value.clone(),
+                        evidence_refs: claim.evidence_refs.clone(),
+                        reason: "canonical workspace contained multiple active values for one stable claim identity; retained the existing active value and recorded an explicit conflict".into(),
+                        turn,
+                    },
+                );
             }
         }
     }
     *claims = reduced.into_values().collect();
-
-    let mut supported_values: BTreeMap<(String, String, String), BTreeSet<String>> =
-        BTreeMap::new();
-    for claim in claims.iter() {
-        if claim.status != "supported" || claim.value.trim().is_empty() {
-            continue;
-        }
-        supported_values
-            .entry((
-                claim.concept_type.clone(),
-                claim.scope.clone(),
-                claim.branch_id.clone(),
-            ))
-            .or_default()
-            .insert(claim.value.trim().to_ascii_lowercase());
-    }
-    let conflicting_keys = supported_values
-        .iter()
-        .filter(|(_, values)| values.len() > 1)
-        .map(|(key, values)| (key.clone(), values.clone()))
-        .collect::<Vec<_>>();
-    for ((concept, scope, branch), values) in conflicting_keys {
-        conflicts.push(format!(
-            "conflicting supported values for concept={} scope={} branch={}: {:?}",
-            concept, scope, branch, values
-        ));
-        for claim in claims.iter_mut().filter(|claim| {
-            claim.concept_type == concept && claim.scope == scope && claim.branch_id == branch
-        }) {
-            if claim.status == "supported" {
-                claim.status = "hypothesis".into();
-            }
-        }
-    }
-    claims.sort_by(|a, b| {
-        a.concept_type
-            .cmp(&b.concept_type)
-            .then_with(|| a.scope.cmp(&b.scope))
-            .then_with(|| a.branch_id.cmp(&b.branch_id))
-            .then_with(|| a.value.cmp(&b.value))
-    });
-    claims.truncate(48);
+    claims.sort_by(|a, b| claim_identity(a).cmp(&claim_identity(b)));
 }
 
 fn normalize_scientific_agent_action(evidence: &DatasetEvidence, action: &mut AgentEvidenceAction) {
@@ -746,41 +965,14 @@ fn agent_action_to_request(action: &AgentEvidenceAction) -> EvidenceActionReques
     }
 }
 
-fn normalize_workspace_state(
-    evidence: &DatasetEvidence,
-    state: &mut ScientificWorkspaceState,
-    turn: usize,
-) {
-    state.harness_version = SCIENTIFIC_AGENT_HARNESS_VERSION.into();
-    state.accession = evidence.accession.clone();
-    state.turn = turn;
-
-    state.relation.evidence_refs = valid_evidence_refs(evidence, &state.relation.evidence_refs);
-    if !matches!(
-        state.relation.mode.as_str(),
-        "one_cell_per_data_file" | "multiplexed_cells_per_data_file" | "mixed" | "unresolved"
-    ) {
-        state.relation.mode = "unresolved".into();
-        state.relation.scope = "unresolved".into();
-    }
-    if study_design_has_assertive_relation_hint(&evidence.study_design) {
-        state.relation.mode = evidence.study_design.relation_mode_hint.clone();
-        state.relation.scope = "project".into();
-        state.relation.evidence_refs = evidence.study_design.relation_evidence_refs.clone();
-        state.relation.confidence = evidence.study_design.relation_confidence.clone();
-        state.relation.reason = format!(
-            "accepted deterministic acquisition-cardinality scaffold; {}",
-            evidence.study_design.notes
-        );
-    }
-
+fn normalize_workspace_branches(evidence: &DatasetEvidence, branches: &mut Vec<AgentBranch>) {
     let raw_names = evidence
         .raw_files
         .iter()
         .map(|f| f.file_name.to_ascii_lowercase())
         .collect::<BTreeSet<_>>();
     let mut branch_map: BTreeMap<String, AgentBranch> = BTreeMap::new();
-    for mut branch in state.branches.drain(..) {
+    for mut branch in branches.drain(..) {
         branch.id = branch.id.trim().to_string();
         if branch.id.is_empty() {
             continue;
@@ -829,14 +1021,47 @@ fn normalize_workspace_state(
                 if status_rank(&branch.status) > status_rank(&existing.status) {
                     existing.status = branch.status;
                 }
+                if branch.label.len() > existing.label.len() {
+                    existing.label = branch.label;
+                }
                 if branch.notes.len() > existing.notes.len() {
                     existing.notes = branch.notes;
                 }
             }
         }
     }
-    state.branches = branch_map.into_values().take(24).collect();
+    *branches = branch_map.into_values().collect();
+}
 
+fn normalize_workspace_state(
+    evidence: &DatasetEvidence,
+    state: &mut ScientificWorkspaceState,
+    turn: usize,
+) {
+    state.harness_version = SCIENTIFIC_AGENT_HARNESS_VERSION.into();
+    state.accession = evidence.accession.clone();
+    state.turn = turn;
+
+    state.relation.evidence_refs = valid_evidence_refs(evidence, &state.relation.evidence_refs);
+    if !matches!(
+        state.relation.mode.as_str(),
+        "one_cell_per_data_file" | "multiplexed_cells_per_data_file" | "mixed" | "unresolved"
+    ) {
+        state.relation.mode = "unresolved".into();
+        state.relation.scope = "unresolved".into();
+    }
+    if study_design_has_assertive_relation_hint(&evidence.study_design) {
+        state.relation.mode = evidence.study_design.relation_mode_hint.clone();
+        state.relation.scope = "project".into();
+        state.relation.evidence_refs = evidence.study_design.relation_evidence_refs.clone();
+        state.relation.confidence = evidence.study_design.relation_confidence.clone();
+        state.relation.reason = format!(
+            "accepted deterministic acquisition-cardinality scaffold; {}",
+            evidence.study_design.notes
+        );
+    }
+
+    normalize_workspace_branches(evidence, &mut state.branches);
     let branch_ids = state
         .branches
         .iter()
@@ -847,10 +1072,20 @@ fn normalize_workspace_state(
         &branch_ids,
         &mut state.claims,
         &mut state.conflicts,
+        turn,
     );
 
-    dedup_strings(&mut state.open_questions, 32);
-    dedup_strings(&mut state.conflicts, 32);
+    let old_conflicts = std::mem::take(&mut state.conflicts);
+    for mut conflict in old_conflicts {
+        if conflict.turn == 0 {
+            conflict.turn = turn;
+        } else {
+            conflict.turn = conflict.turn.min(turn);
+        }
+        push_workspace_conflict(evidence, &mut state.conflicts, conflict);
+    }
+
+    dedup_strings(&mut state.open_questions);
     for action in &mut state.next_evidence_actions {
         normalize_scientific_agent_action(evidence, action);
     }
@@ -868,6 +1103,209 @@ fn normalize_workspace_state(
     if state.next_step == "search" && state.next_evidence_actions.is_empty() {
         state.next_step = "compile".into();
     }
+}
+
+fn apply_workspace_delta(
+    evidence: &DatasetEvidence,
+    state: &mut ScientificWorkspaceState,
+    delta: &WorkspaceDelta,
+    turn: usize,
+) -> Vec<String> {
+    let mut events = Vec::new();
+
+    // Branches are Rust-owned canonical state. Upserts merge into the existing
+    // branch set; omission never deletes a branch.
+    state.branches.extend(delta.branch_upserts.clone());
+    normalize_workspace_branches(evidence, &mut state.branches);
+    let branch_ids = state
+        .branches
+        .iter()
+        .map(|b| b.id.as_str())
+        .collect::<BTreeSet<_>>();
+
+    // Explicit retractions are the only direct deletion path for active claims.
+    for retraction in &delta.claim_retractions {
+        let identity = claim_identity_parts(
+            &retraction.concept_type,
+            &retraction.scope,
+            &retraction.branch_id,
+        );
+        if let Some(index) = state
+            .claims
+            .iter()
+            .position(|claim| claim_identity(claim) == identity)
+        {
+            let current = state.claims[index].value.clone();
+            let expected = retraction.expected_value.trim();
+            if expected.is_empty() || current.eq_ignore_ascii_case(expected) {
+                state.claims.remove(index);
+                state
+                    .conflicts
+                    .retain(|conflict| conflict_identity(conflict) != identity);
+                events.push(format!(
+                    "turn {turn} reducer explicitly retracted claim identity {:?} value '{}' ({})",
+                    identity,
+                    current,
+                    retraction.reason.trim()
+                ));
+            } else {
+                events.push(format!(
+                    "turn {turn} reducer ignored stale retraction for claim identity {:?}: expected '{}' but active value is '{}'",
+                    identity, expected, current
+                ));
+            }
+        }
+    }
+
+    // An explicit conflict resolution may keep the current value or replace it
+    // with one of the values that participated in the recorded conflict.
+    for resolution in &delta.conflict_resolutions {
+        let identity = claim_identity_parts(
+            &resolution.concept_type,
+            &resolution.scope,
+            &resolution.branch_id,
+        );
+        let candidates = state
+            .conflicts
+            .iter()
+            .filter(|conflict| conflict_identity(conflict) == identity)
+            .flat_map(|conflict| {
+                [
+                    conflict.existing_value.to_ascii_lowercase(),
+                    conflict.proposed_value.to_ascii_lowercase(),
+                ]
+            })
+            .collect::<BTreeSet<_>>();
+        let resolved = resolution.resolved_value.trim();
+        if candidates.is_empty() || !candidates.contains(&resolved.to_ascii_lowercase()) {
+            events.push(format!(
+                "turn {turn} reducer ignored conflict resolution for claim identity {:?}: resolved value '{}' was not part of an active conflict",
+                identity, resolved
+            ));
+            continue;
+        }
+        let mut claim = ScientificClaim {
+            concept_type: identity.0.clone(),
+            value: resolved.to_string(),
+            scope: identity.1.clone(),
+            branch_id: identity.2.clone(),
+            status: resolution.status.clone(),
+            evidence_refs: resolution.evidence_refs.clone(),
+            confidence: resolution.confidence.clone(),
+            reason: resolution.reason.clone(),
+        };
+        if !normalize_claim(evidence, &branch_ids, &mut claim) {
+            continue;
+        }
+        if let Some(index) = state
+            .claims
+            .iter()
+            .position(|existing| claim_identity(existing) == identity)
+        {
+            if state.claims[index].value.eq_ignore_ascii_case(&claim.value) {
+                merge_same_value_claim(&mut state.claims[index], claim);
+            } else {
+                state.claims[index] = claim;
+            }
+        } else {
+            state.claims.push(claim);
+        }
+        state
+            .conflicts
+            .retain(|conflict| conflict_identity(conflict) != identity);
+        events.push(format!(
+            "turn {turn} reducer explicitly resolved conflict for claim identity {:?} to '{}'",
+            identity, resolved
+        ));
+    }
+
+    // Claim upserts mutate one stable identity at a time. Omitted identities are
+    // untouched. A changed value must explicitly name the value it supersedes;
+    // otherwise the proposal becomes a conflict and the active value survives.
+    for upsert in &delta.claim_upserts {
+        let mut incoming = upsert.as_claim();
+        if !normalize_claim(evidence, &branch_ids, &mut incoming) {
+            continue;
+        }
+        let identity = claim_identity(&incoming);
+        if let Some(index) = state
+            .claims
+            .iter()
+            .position(|claim| claim_identity(claim) == identity)
+        {
+            let existing_value = state.claims[index].value.clone();
+            if existing_value.eq_ignore_ascii_case(&incoming.value) {
+                merge_same_value_claim(&mut state.claims[index], incoming);
+                continue;
+            }
+            let supersedes = upsert.supersedes_value.trim();
+            if !supersedes.is_empty() && existing_value.eq_ignore_ascii_case(supersedes) {
+                let new_value = incoming.value.clone();
+                state.claims[index] = incoming;
+                state
+                    .conflicts
+                    .retain(|conflict| conflict_identity(conflict) != identity);
+                events.push(format!(
+                    "turn {turn} reducer explicitly superseded claim identity {:?}: '{}' -> '{}'",
+                    identity, existing_value, new_value
+                ));
+            } else {
+                let reason = if supersedes.is_empty() {
+                    "model proposed a different value without explicit supersession"
+                } else {
+                    "model supersedes_value did not match the active canonical value"
+                };
+                push_workspace_conflict(
+                    evidence,
+                    &mut state.conflicts,
+                    WorkspaceConflict {
+                        concept_type: identity.0.clone(),
+                        scope: identity.1.clone(),
+                        branch_id: identity.2.clone(),
+                        existing_value: existing_value.clone(),
+                        proposed_value: incoming.value.clone(),
+                        evidence_refs: incoming.evidence_refs.clone(),
+                        reason: format!("{reason}; {}", incoming.reason),
+                        turn,
+                    },
+                );
+                events.push(format!(
+                    "turn {turn} reducer retained claim identity {:?} value '{}' and recorded conflicting proposal '{}'",
+                    identity, existing_value, incoming.value
+                ));
+            }
+        } else {
+            state.claims.push(incoming);
+        }
+    }
+
+    for mut conflict in delta.conflict_additions.clone() {
+        conflict.turn = turn;
+        push_workspace_conflict(evidence, &mut state.conflicts, conflict);
+    }
+
+    state
+        .open_questions
+        .extend(delta.open_question_additions.iter().cloned());
+    for resolved in &delta.open_question_resolutions {
+        let needle = resolved.trim().to_ascii_lowercase();
+        state
+            .open_questions
+            .retain(|question| question.trim().to_ascii_lowercase() != needle);
+    }
+
+    state.next_evidence_actions = delta.next_evidence_actions.clone();
+    for action in &mut state.next_evidence_actions {
+        normalize_scientific_agent_action(evidence, action);
+    }
+    state.next_evidence_actions.truncate(8);
+    state.next_step = delta.next_step.clone();
+    if !delta.notes.trim().is_empty() {
+        state.notes = delta.notes.trim().to_string();
+    }
+
+    normalize_workspace_state(evidence, state, turn);
+    events
 }
 
 fn evidence_subset(evidence: &DatasetEvidence, refs: &[String]) -> Vec<EvidenceItem> {
@@ -991,8 +1429,30 @@ fn adjudicate_claim(evidence: &DatasetEvidence, claim: &ScientificClaim) -> Clai
     }
 }
 
+fn adjudicate_workspace_claim(
+    evidence: &DatasetEvidence,
+    state: &ScientificWorkspaceState,
+    claim: &ScientificClaim,
+) -> ClaimAdjudication {
+    let identity = claim_identity(claim);
+    if let Some(conflict) = state
+        .conflicts
+        .iter()
+        .find(|conflict| conflict_identity(conflict) == identity)
+    {
+        return ClaimAdjudication::Conflict {
+            reason: format!(
+                "stable claim identity has an unresolved workspace conflict: active='{}', proposed='{}'; {}",
+                conflict.existing_value, conflict.proposed_value, conflict.reason
+            ),
+        };
+    }
+    adjudicate_claim(evidence, claim)
+}
+
 fn adjudication_record(
     evidence: &DatasetEvidence,
+    state: &ScientificWorkspaceState,
     claim: &ScientificClaim,
 ) -> ClaimAdjudicationRecord {
     ClaimAdjudicationRecord {
@@ -1002,7 +1462,7 @@ fn adjudication_record(
         model_status: claim.status.clone(),
         proposed_value: claim.value.clone(),
         evidence_refs: claim.evidence_refs.clone(),
-        adjudication: adjudicate_claim(evidence, claim),
+        adjudication: adjudicate_workspace_claim(evidence, state, claim),
     }
 }
 
@@ -1011,6 +1471,26 @@ fn canonical_claim_value(
     claim: &ScientificClaim,
 ) -> Option<(String, Vec<String>)> {
     match adjudicate_claim(evidence, claim) {
+        ClaimAdjudication::Canonical {
+            value,
+            evidence_refs,
+        }
+        | ClaimAdjudication::SupportedConcept {
+            value,
+            evidence_refs,
+        } => Some((value, evidence_refs)),
+        ClaimAdjudication::TemplateGap { .. }
+        | ClaimAdjudication::Unresolved { .. }
+        | ClaimAdjudication::Conflict { .. } => None,
+    }
+}
+
+fn canonical_workspace_claim_value(
+    evidence: &DatasetEvidence,
+    state: &ScientificWorkspaceState,
+    claim: &ScientificClaim,
+) -> Option<(String, Vec<String>)> {
+    match adjudicate_workspace_claim(evidence, state, claim) {
         ClaimAdjudication::Canonical {
             value,
             evidence_refs,
@@ -1035,7 +1515,7 @@ fn branch_claims_require_project_mask(
             return false;
         }
         matches!(
-            adjudicate_claim(evidence, claim),
+            adjudicate_workspace_claim(evidence, state, claim),
             ClaimAdjudication::Canonical { .. }
                 | ClaimAdjudication::TemplateGap { .. }
                 | ClaimAdjudication::SupportedConcept { .. }
@@ -1202,7 +1682,7 @@ fn apply_scientific_overlay(
         let Some(field) = concept_to_sdrf_field(&claim.concept_type) else {
             continue;
         };
-        match adjudicate_claim(evidence, claim) {
+        match adjudicate_workspace_claim(evidence, state, claim) {
             ClaimAdjudication::TemplateGap {
                 observed_value,
                 evidence_refs,
@@ -1241,7 +1721,7 @@ fn apply_scientific_overlay(
             }
             ClaimAdjudication::Canonical { .. } | ClaimAdjudication::SupportedConcept { .. } => {}
         }
-        let Some((value, refs)) = canonical_claim_value(evidence, claim) else {
+        let Some((value, refs)) = canonical_workspace_claim_value(evidence, state, claim) else {
             continue;
         };
         let current = proposal_field_value(proposal, field)
@@ -1561,7 +2041,8 @@ fn compile_workspace(
                 let Some(&idx) = header_index.get(header) else {
                     continue;
                 };
-                let Some((value, _)) = canonical_claim_value(evidence, claim) else {
+                let Some((value, _)) = canonical_workspace_claim_value(evidence, state, claim)
+                else {
                     continue;
                 };
                 if idx < row.len() {
@@ -1585,7 +2066,7 @@ fn compile_workspace(
     let adjudications = state
         .claims
         .iter()
-        .map(|claim| adjudication_record(evidence, claim))
+        .map(|claim| adjudication_record(evidence, state, claim))
         .collect::<Vec<_>>();
     let fingerprint = compiled_workspace_fingerprint(&proposal, &headers, &rows);
     Ok(CompiledWorkspace {
@@ -1623,37 +2104,129 @@ fn validation_cycle(cycle: usize, issues: &[ValidationIssue]) -> AgentValidation
     }
 }
 
-fn append_adjudication_feedback(
-    feedback: &mut Vec<String>,
-    compiled: &CompiledWorkspace,
+fn workspace_adjudications(
+    evidence: &DatasetEvidence,
+    state: &ScientificWorkspaceState,
+) -> Vec<ClaimAdjudicationRecord> {
+    state
+        .claims
+        .iter()
+        .map(|claim| adjudication_record(evidence, state, claim))
+        .collect()
+}
+
+fn adjudication_feedback_signature(record: &ClaimAdjudicationRecord) -> String {
+    let outcome = serde_json::to_string(&record.adjudication).unwrap_or_default();
+    format!(
+        "{}|{}|{}",
+        record.proposed_value.trim().to_ascii_lowercase(),
+        record.evidence_refs.join(","),
+        outcome
+    )
+}
+
+fn adjudication_feedback_message(
+    record: &ClaimAdjudicationRecord,
     turn: usize,
+    phase: &str,
+) -> Option<String> {
+    if !matches!(
+        record.concept_type.as_str(),
+        "isolation_method" | "acquisition_mode"
+    ) {
+        return None;
+    }
+    Some(match &record.adjudication {
+        ClaimAdjudication::Canonical {
+            value,
+            evidence_refs,
+        } => format!(
+            "turn {} {} compiler adjudicated {} claim '{}' -> canonical '{}' from refs {:?}",
+            turn, phase, record.concept_type, record.proposed_value, value, evidence_refs
+        ),
+        ClaimAdjudication::TemplateGap {
+            observed_value,
+            evidence_refs,
+            ..
+        } => format!(
+            "turn {} {} compiler adjudicated {} claim '{}' as template gap '{}' from refs {:?}; do not substitute a nearby allowed value",
+            turn,
+            phase,
+            record.concept_type,
+            record.proposed_value,
+            observed_value,
+            evidence_refs
+        ),
+        ClaimAdjudication::Unresolved { reason } | ClaimAdjudication::Conflict { reason } => {
+            format!(
+                "turn {} {} compiler could not publish {} claim '{}' from refs {:?}: {}; search for direct field-specific method evidence or leave unresolved",
+                turn,
+                phase,
+                record.concept_type,
+                record.proposed_value,
+                record.evidence_refs,
+                reason
+            )
+        }
+        ClaimAdjudication::SupportedConcept { .. } => return None,
+    })
+}
+
+fn append_changed_adjudication_feedback(
+    trace_feedback: &mut Vec<String>,
+    pending_feedback: &mut Vec<String>,
+    last_signatures: &mut BTreeMap<(String, String, String), String>,
+    records: &[ClaimAdjudicationRecord],
+    turn: usize,
+    phase: &str,
 ) {
-    for record in &compiled.adjudications {
-        if !matches!(
-            record.concept_type.as_str(),
-            "isolation_method" | "acquisition_mode"
-        ) {
+    let active = records
+        .iter()
+        .map(|record| claim_identity_parts(&record.concept_type, &record.scope, &record.branch_id))
+        .collect::<BTreeSet<_>>();
+    last_signatures.retain(|identity, _| active.contains(identity));
+
+    for record in records {
+        let identity = claim_identity_parts(&record.concept_type, &record.scope, &record.branch_id);
+        let signature = adjudication_feedback_signature(record);
+        if last_signatures
+            .get(&identity)
+            .is_some_and(|previous| previous == &signature)
+        {
             continue;
         }
-        let message = match &record.adjudication {
-            ClaimAdjudication::Canonical { value, evidence_refs } => format!(
-                "turn {} compiler adjudicated {} claim '{}' -> canonical '{}' from refs {:?}",
-                turn, record.concept_type, record.proposed_value, value, evidence_refs
-            ),
-            ClaimAdjudication::TemplateGap { observed_value, evidence_refs, .. } => format!(
-                "turn {} compiler adjudicated {} claim '{}' as template gap '{}' from refs {:?}; do not substitute a nearby allowed value",
-                turn, record.concept_type, record.proposed_value, observed_value, evidence_refs
-            ),
-            ClaimAdjudication::Unresolved { reason } | ClaimAdjudication::Conflict { reason } => format!(
-                "turn {} compiler could not publish {} claim '{}' from refs {:?}: {}; search for direct field-specific method evidence or leave unresolved",
-                turn, record.concept_type, record.proposed_value, record.evidence_refs, reason
-            ),
-            ClaimAdjudication::SupportedConcept { .. } => continue,
-        };
-        if !feedback.iter().any(|existing| existing == &message) {
-            feedback.push(message);
+        last_signatures.insert(identity, signature);
+        if let Some(message) = adjudication_feedback_message(record, turn, phase) {
+            trace_feedback.push(message.clone());
+            pending_feedback.push(message);
         }
     }
+}
+
+fn push_harness_feedback(
+    trace_feedback: &mut Vec<String>,
+    pending_feedback: &mut Vec<String>,
+    message: String,
+) {
+    trace_feedback.push(message.clone());
+    pending_feedback.push(message);
+}
+
+fn record_adjudication_snapshot(
+    trace: &mut ScientificAgentTrace,
+    evidence: &DatasetEvidence,
+    state: &ScientificWorkspaceState,
+    turn: usize,
+    phase: &str,
+) -> Vec<ClaimAdjudicationRecord> {
+    let records = workspace_adjudications(evidence, state);
+    trace.adjudication_history.push(AdjudicationSnapshot {
+        turn,
+        phase: phase.into(),
+        evidence_items: evidence.evidence.len(),
+        records: records.clone(),
+    });
+    records
 }
 
 fn trim_actions_to_budget(
@@ -1769,6 +2342,10 @@ async fn run_one_scientific_agent(
     let max_actions = opts.max_tool_actions.max(1);
     let max_validator_cycles = opts.max_validator_cycles.max(1);
 
+    let mut pending_harness_feedback = Vec::new();
+    let mut last_adjudication_signatures: BTreeMap<(String, String, String), String> =
+        BTreeMap::new();
+
     // Codex-style bootstrap: compile and validate the deterministic baseline
     // before asking the model to reason. The first agent turn therefore sees
     // the actual unresolved scientific tasks instead of inventing a parallel
@@ -1778,19 +2355,33 @@ async fn run_one_scientific_agent(
         workspace_dir.join("adjudications.json"),
         serde_json::to_string_pretty(&baseline.adjudications)?,
     )?;
+    trace.adjudication_history.push(AdjudicationSnapshot {
+        turn: 0,
+        phase: "baseline_compile".into(),
+        evidence_items: evidence.evidence.len(),
+        records: baseline.adjudications.clone(),
+    });
     write_sdrf(&draft_path, &baseline.headers, &baseline.rows)?;
     write_validation_review(&review_path, &baseline.issues)?;
     trace.validator_cycles_completed = 1;
     let baseline_cycle = validation_cycle(1, &baseline.issues);
     let baseline_errors = baseline_cycle.validation_errors;
     trace.validation_history.push(baseline_cycle);
-    trace.harness_feedback.push(format!(
-        "deterministic baseline compiled before agent turn 1 with {} validation error(s); preserve working baseline fields and focus only on unresolved scientific concepts",
-        baseline_errors
-    ));
+    push_harness_feedback(
+        &mut trace.harness_feedback,
+        &mut pending_harness_feedback,
+        format!(
+            "deterministic baseline compiled before agent turn 1 with {} validation error(s); preserve working baseline fields and focus only on unresolved scientific concepts",
+            baseline_errors
+        ),
+    );
     fs::write(
         workspace_dir.join("validation_history.json"),
         serde_json::to_string_pretty(&trace.validation_history)?,
+    )?;
+    fs::write(
+        workspace_dir.join("adjudication_history.json"),
+        serde_json::to_string_pretty(&trace.adjudication_history)?,
     )?;
     let mut last_compile_fingerprint: Option<String> = Some(baseline.fingerprint.clone());
     let mut compiled: Option<CompiledWorkspace> = Some(baseline);
@@ -1812,17 +2403,34 @@ async fn run_one_scientific_agent(
 
     if trace.terminal_status.is_empty() {
         for turn in 1..=max_turns {
-            let next = call_scientific_agent(
+            let delta = call_scientific_agent(
                 opts,
                 &evidence,
                 &state,
                 &trace.evidence_action_results,
                 &trace.validation_history,
-                &trace.harness_feedback,
+                &pending_harness_feedback,
                 turn,
             )
             .await?;
-            state = next;
+            // Feedback is delivered once. New reducer/adjudication feedback
+            // generated below becomes the pending set for the next model turn.
+            pending_harness_feedback.clear();
+
+            fs::write(
+                workspace_dir.join(format!("delta.turn{turn:02}.json")),
+                serde_json::to_string_pretty(&delta)?,
+            )?;
+            trace.deltas.push(delta.clone());
+            let reducer_events = apply_workspace_delta(&evidence, &mut state, &delta, turn);
+            for event in reducer_events {
+                push_harness_feedback(
+                    &mut trace.harness_feedback,
+                    &mut pending_harness_feedback,
+                    event,
+                );
+            }
+
             trace.states.push(state.clone());
             trace.turns_completed = turn;
             fs::write(
@@ -1834,6 +2442,25 @@ async fn run_one_scientific_agent(
                 serde_json::to_string_pretty(&state)?,
             )?;
 
+            // Rust adjudicates every canonical state immediately, even when
+            // the model's next step is another search. A retained claim cannot
+            // disappear before adjudication merely because the model omitted
+            // it from a later delta.
+            let post_delta_adjudications =
+                record_adjudication_snapshot(&mut trace, &evidence, &state, turn, "post_delta");
+            fs::write(
+                workspace_dir.join("adjudications.json"),
+                serde_json::to_string_pretty(&post_delta_adjudications)?,
+            )?;
+            append_changed_adjudication_feedback(
+                &mut trace.harness_feedback,
+                &mut pending_harness_feedback,
+                &mut last_adjudication_signatures,
+                &post_delta_adjudications,
+                turn,
+                "post-delta",
+            );
+
             if state.next_step == "search" {
                 let remaining = max_actions.saturating_sub(trace.tool_actions_completed);
                 if remaining == 0 {
@@ -1842,9 +2469,11 @@ async fn run_one_scientific_agent(
                 }
                 let actions = trim_actions_to_budget(&state.next_evidence_actions, remaining);
                 if actions.is_empty() {
-                    trace.harness_feedback.push(
-                    "search requested but no executable typed action remained after normalization; choose a different search, compile only after a material state change, finish, or abstain".into(),
-                );
+                    push_harness_feedback(
+                        &mut trace.harness_feedback,
+                        &mut pending_harness_feedback,
+                        "search requested but no executable typed action remained after normalization; choose a different search, compile only after a material state change, finish, or abstain".into(),
+                    );
                     continue;
                 }
                 let round_results =
@@ -1856,6 +2485,46 @@ async fn run_one_scientific_agent(
                     workspace_dir.join("action_history.json"),
                     serde_json::to_string_pretty(&trace.evidence_action_results)?,
                 )?;
+
+                // Evidence changes never replace state. Re-normalize only to
+                // enforce evidence admissibility, then re-adjudicate all
+                // retained claims. Feedback is emitted only for changed claim
+                // value/refs/outcome signatures.
+                normalize_workspace_state(&evidence, &mut state, turn);
+                if let Some(last_state) = trace.states.last_mut() {
+                    *last_state = state.clone();
+                }
+                fs::write(
+                    workspace_dir.join(format!("state.turn{turn:02}.json")),
+                    serde_json::to_string_pretty(&state)?,
+                )?;
+                let post_search_adjudications = record_adjudication_snapshot(
+                    &mut trace,
+                    &evidence,
+                    &state,
+                    turn,
+                    "post_search",
+                );
+                fs::write(
+                    workspace_dir.join("adjudications.json"),
+                    serde_json::to_string_pretty(&post_search_adjudications)?,
+                )?;
+                append_changed_adjudication_feedback(
+                    &mut trace.harness_feedback,
+                    &mut pending_harness_feedback,
+                    &mut last_adjudication_signatures,
+                    &post_search_adjudications,
+                    turn,
+                    "post-search",
+                );
+                fs::write(
+                    workspace_dir.join("adjudication_history.json"),
+                    serde_json::to_string_pretty(&trace.adjudication_history)?,
+                )?;
+                fs::write(
+                    workspace_dir.join("state.json"),
+                    serde_json::to_string_pretty(&state)?,
+                )?;
                 continue;
             }
 
@@ -1864,7 +2533,24 @@ async fn run_one_scientific_agent(
                 workspace_dir.join("adjudications.json"),
                 serde_json::to_string_pretty(&compiled_now.adjudications)?,
             )?;
-            append_adjudication_feedback(&mut trace.harness_feedback, &compiled_now, turn);
+            trace.adjudication_history.push(AdjudicationSnapshot {
+                turn,
+                phase: "compile".into(),
+                evidence_items: evidence.evidence.len(),
+                records: compiled_now.adjudications.clone(),
+            });
+            append_changed_adjudication_feedback(
+                &mut trace.harness_feedback,
+                &mut pending_harness_feedback,
+                &mut last_adjudication_signatures,
+                &compiled_now.adjudications,
+                turn,
+                "compile",
+            );
+            fs::write(
+                workspace_dir.join("adjudication_history.json"),
+                serde_json::to_string_pretty(&trace.adjudication_history)?,
+            )?;
             if last_compile_fingerprint
                 .as_deref()
                 .is_some_and(|previous| previous == compiled_now.fingerprint.as_str())
@@ -1878,10 +2564,14 @@ async fn run_one_scientific_agent(
                     trace.terminal_status = "partial".into();
                     break;
                 }
-                trace.harness_feedback.push(format!(
-                "turn {} compile blocked: normalized scientific state produced the same deterministic draft as the previous validated compile; do not compile again without changing evidence-backed claims/branches",
-                turn
-            ));
+                push_harness_feedback(
+                    &mut trace.harness_feedback,
+                    &mut pending_harness_feedback,
+                    format!(
+                        "turn {} compile blocked: normalized scientific state produced the same deterministic draft as the previous validated compile; do not compile again without changing evidence-backed claims/branches",
+                        turn
+                    ),
+                );
                 continue;
             }
             last_compile_fingerprint = Some(compiled_now.fingerprint.clone());
@@ -1916,30 +2606,10 @@ async fn run_one_scientific_agent(
         }
     }
 
-    if compiled.is_none() {
-        let compiled_now = compile_workspace(&evidence, &state, &explicit_mappings)?;
-        fs::write(
-            workspace_dir.join("adjudications.json"),
-            serde_json::to_string_pretty(&compiled_now.adjudications)?,
-        )?;
-        append_adjudication_feedback(
-            &mut trace.harness_feedback,
-            &compiled_now,
-            trace.turns_completed,
-        );
-        write_sdrf(&draft_path, &compiled_now.headers, &compiled_now.rows)?;
-        write_validation_review(&review_path, &compiled_now.issues)?;
-        trace.validator_cycles_completed += 1;
-        trace.validation_history.push(validation_cycle(
-            trace.validator_cycles_completed,
-            &compiled_now.issues,
-        ));
-        fs::write(
-            workspace_dir.join("validation_history.json"),
-            serde_json::to_string_pretty(&trace.validation_history)?,
-        )?;
-        compiled = Some(compiled_now);
-    }
+    // `compiled` always contains at least the deterministic baseline. Final
+    // audit adjudications below are recomputed from canonical state so a
+    // retained claim remains visible even if the final turn was a search and
+    // no additional validator cycle was requested.
     if trace.terminal_status.is_empty() {
         trace.terminal_status = if trace.turns_completed >= max_turns {
             "turn_budget_exhausted".into()
@@ -1954,6 +2624,15 @@ async fn run_one_scientific_agent(
         .filter(|issue| issue.level == "error")
         .count();
     let locally_valid = validation_errors == 0;
+    let final_adjudications = workspace_adjudications(&evidence, &state);
+    fs::write(
+        workspace_dir.join("adjudications.json"),
+        serde_json::to_string_pretty(&final_adjudications)?,
+    )?;
+    fs::write(
+        workspace_dir.join("adjudication_history.json"),
+        serde_json::to_string_pretty(&trace.adjudication_history)?,
+    )?;
 
     fs::write(
         workspace_dir.join("trace.json"),
@@ -1977,7 +2656,7 @@ async fn run_one_scientific_agent(
         "validation_errors": validation_errors,
         "branches": state.branches.clone(),
         "claims": state.claims.clone(),
-        "claim_adjudications": compiled.adjudications.clone(),
+        "claim_adjudications": final_adjudications,
         "open_questions": state.open_questions.clone(),
         "conflicts": state.conflicts.clone(),
         "harness_feedback": trace.harness_feedback.clone(),
@@ -2354,12 +3033,12 @@ mod tests {
     }
 
     #[test]
-    fn conflicting_supported_claims_become_hypotheses_and_explicit_conflict() {
+    fn conflicting_values_reduce_to_one_active_claim_and_explicit_conflict() {
         let evidence = evidence_with(
             vec![EvidenceItem {
                 id: "E0001".into(),
                 source_kind: "manuscript_semantic_evidence".into(),
-                source_label: "paper.txt".into(),
+                source_label: "organism".into(),
                 text: "human and mouse organisms are both described".into(),
             }],
             vec!["runA.raw"],
@@ -2369,9 +3048,358 @@ mod tests {
             claim("organism", "Mus musculus", "project", ""),
         ];
         let mut conflicts = Vec::new();
-        reduce_scientific_claims(&evidence, &BTreeSet::new(), &mut claims, &mut conflicts);
-        assert!(claims.iter().all(|claim| claim.status != "supported"));
+        reduce_scientific_claims(&evidence, &BTreeSet::new(), &mut claims, &mut conflicts, 1);
+        assert_eq!(claims.len(), 1);
         assert_eq!(conflicts.len(), 1);
+        let state = ScientificWorkspaceState {
+            claims: claims.clone(),
+            conflicts,
+            ..Default::default()
+        };
+        assert!(matches!(
+            adjudicate_workspace_claim(&evidence, &state, &state.claims[0]),
+            ClaimAdjudication::Conflict { .. }
+        ));
+    }
+
+    #[test]
+    fn workspace_delta_omission_preserves_hydrodynamic_claim_and_allows_rust_adjudication() {
+        let evidence = evidence_with(
+            vec![
+                EvidenceItem {
+                    id: "E0021".into(),
+                    source_kind: "manuscript_semantic_evidence".into(),
+                    source_label: "single cell isolation method".into(),
+                    text: "individual single cells were introduced into the capillary by hydrodynamic injection".into(),
+                },
+                EvidenceItem {
+                    id: "E0029".into(),
+                    source_kind: "manuscript_semantic_evidence".into(),
+                    source_label: "single cell isolation method".into(),
+                    text: "hydrodynamic loading was followed by on-capillary lysis".into(),
+                },
+            ],
+            vec!["runA.raw"],
+        );
+        let mut persistent = claim_with_status(
+            "isolation_method",
+            "Hydrodynamic/ESI injection + On-capillary lysis",
+            "project",
+            "",
+            "hypothesis",
+        );
+        persistent.evidence_refs = vec!["E0021".into(), "E0029".into()];
+        let mut state = ScientificWorkspaceState {
+            claims: vec![persistent],
+            next_step: "compile".into(),
+            ..Default::default()
+        };
+        normalize_workspace_state(&evidence, &mut state, 1);
+
+        // The next model turn deliberately says nothing about isolation.
+        let delta = WorkspaceDelta {
+            turn: 2,
+            next_step: "finish".into(),
+            notes: "no isolation update".into(),
+            ..Default::default()
+        };
+        apply_workspace_delta(&evidence, &mut state, &delta, 2);
+
+        assert_eq!(state.claims.len(), 1);
+        assert_eq!(
+            state.claims[0].value,
+            "Hydrodynamic/ESI injection + On-capillary lysis"
+        );
+        assert_eq!(state.claims[0].evidence_refs, vec!["E0021", "E0029"]);
+        match adjudicate_workspace_claim(&evidence, &state, &state.claims[0]) {
+            ClaimAdjudication::Canonical { value, .. } => assert_eq!(value, "manual picking"),
+            other => panic!("expected preserved isolation claim to be adjudicated, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn same_value_delta_merges_and_deduplicates_evidence() {
+        let evidence = evidence_with(
+            vec![
+                EvidenceItem {
+                    id: "E0001".into(),
+                    source_kind: "manuscript_semantic_evidence".into(),
+                    source_label: "single cell isolation method".into(),
+                    text: "single cells were loaded hydrodynamically".into(),
+                },
+                EvidenceItem {
+                    id: "E0002".into(),
+                    source_kind: "manuscript_semantic_evidence".into(),
+                    source_label: "single cell isolation method".into(),
+                    text: "hydrodynamic capillary loading of individual cells".into(),
+                },
+            ],
+            vec!["runA.raw"],
+        );
+        let mut state = ScientificWorkspaceState {
+            claims: vec![claim_with_status(
+                "isolation_method",
+                "hydrodynamic loading",
+                "project",
+                "",
+                "hypothesis",
+            )],
+            next_step: "compile".into(),
+            ..Default::default()
+        };
+        let delta = WorkspaceDelta {
+            turn: 2,
+            claim_upserts: vec![ScientificClaimUpsert {
+                concept_type: "isolation_method".into(),
+                value: "hydrodynamic loading".into(),
+                scope: "project".into(),
+                branch_id: String::new(),
+                status: "hypothesis".into(),
+                evidence_refs: vec!["E0001".into(), "E0002".into(), "E0002".into()],
+                confidence: "high".into(),
+                reason: "additional direct method evidence".into(),
+                supersedes_value: String::new(),
+            }],
+            next_step: "compile".into(),
+            ..Default::default()
+        };
+        apply_workspace_delta(&evidence, &mut state, &delta, 2);
+        assert_eq!(state.claims.len(), 1);
+        assert_eq!(state.claims[0].evidence_refs, vec!["E0001", "E0002"]);
+    }
+
+    #[test]
+    fn changed_value_without_supersession_records_conflict_and_retains_active_claim() {
+        let evidence = evidence_with(
+            vec![EvidenceItem {
+                id: "E0001".into(),
+                source_kind: "manuscript_semantic_evidence".into(),
+                source_label: "organism".into(),
+                text: "Homo sapiens cells were analyzed".into(),
+            }],
+            vec!["runA.raw"],
+        );
+        let mut state = ScientificWorkspaceState {
+            claims: vec![claim("organism", "Homo sapiens", "project", "")],
+            next_step: "compile".into(),
+            ..Default::default()
+        };
+        let delta = WorkspaceDelta {
+            turn: 2,
+            claim_upserts: vec![ScientificClaimUpsert {
+                concept_type: "organism".into(),
+                value: "Mus musculus".into(),
+                scope: "project".into(),
+                branch_id: String::new(),
+                status: "supported".into(),
+                evidence_refs: vec!["E0001".into()],
+                confidence: "high".into(),
+                reason: "alternative interpretation".into(),
+                supersedes_value: String::new(),
+            }],
+            next_step: "compile".into(),
+            ..Default::default()
+        };
+        apply_workspace_delta(&evidence, &mut state, &delta, 2);
+        assert_eq!(state.claims.len(), 1);
+        assert_eq!(state.claims[0].value, "Homo sapiens");
+        assert_eq!(state.conflicts.len(), 1);
+        assert!(matches!(
+            adjudicate_workspace_claim(&evidence, &state, &state.claims[0]),
+            ClaimAdjudication::Conflict { .. }
+        ));
+    }
+
+    #[test]
+    fn explicit_supersession_replaces_value_and_clears_identity_conflict() {
+        let evidence = evidence_with(
+            vec![EvidenceItem {
+                id: "E0001".into(),
+                source_kind: "manuscript_semantic_evidence".into(),
+                source_label: "organism".into(),
+                text: "Mus musculus cells were analyzed".into(),
+            }],
+            vec!["runA.raw"],
+        );
+        let mut state = ScientificWorkspaceState {
+            claims: vec![claim("organism", "Homo sapiens", "project", "")],
+            conflicts: vec![WorkspaceConflict {
+                concept_type: "organism".into(),
+                scope: "project".into(),
+                branch_id: String::new(),
+                existing_value: "Homo sapiens".into(),
+                proposed_value: "Mus musculus".into(),
+                evidence_refs: vec!["E0001".into()],
+                reason: "test conflict".into(),
+                turn: 1,
+            }],
+            next_step: "compile".into(),
+            ..Default::default()
+        };
+        let delta = WorkspaceDelta {
+            turn: 2,
+            claim_upserts: vec![ScientificClaimUpsert {
+                concept_type: "organism".into(),
+                value: "Mus musculus".into(),
+                scope: "project".into(),
+                branch_id: String::new(),
+                status: "supported".into(),
+                evidence_refs: vec!["E0001".into()],
+                confidence: "high".into(),
+                reason: "explicitly supersede after reviewing direct evidence".into(),
+                supersedes_value: "Homo sapiens".into(),
+            }],
+            next_step: "compile".into(),
+            ..Default::default()
+        };
+        apply_workspace_delta(&evidence, &mut state, &delta, 2);
+        assert_eq!(state.claims.len(), 1);
+        assert_eq!(state.claims[0].value, "Mus musculus");
+        assert!(state.conflicts.is_empty());
+    }
+
+    #[test]
+    fn explicit_retraction_is_required_to_remove_persistent_claim() {
+        let evidence = evidence_with(
+            vec![EvidenceItem {
+                id: "E0001".into(),
+                source_kind: "manuscript_semantic_evidence".into(),
+                source_label: "organism".into(),
+                text: "Homo sapiens cells were analyzed".into(),
+            }],
+            vec!["runA.raw"],
+        );
+        let mut state = ScientificWorkspaceState {
+            claims: vec![claim("organism", "Homo sapiens", "project", "")],
+            next_step: "compile".into(),
+            ..Default::default()
+        };
+        let no_change = WorkspaceDelta {
+            turn: 2,
+            next_step: "finish".into(),
+            ..Default::default()
+        };
+        apply_workspace_delta(&evidence, &mut state, &no_change, 2);
+        assert_eq!(state.claims.len(), 1);
+
+        let retract = WorkspaceDelta {
+            turn: 3,
+            claim_retractions: vec![ScientificClaimRetraction {
+                concept_type: "organism".into(),
+                scope: "project".into(),
+                branch_id: String::new(),
+                expected_value: "Homo sapiens".into(),
+                reason: "direct evidence invalidated the proposal".into(),
+            }],
+            next_step: "finish".into(),
+            ..Default::default()
+        };
+        apply_workspace_delta(&evidence, &mut state, &retract, 3);
+        assert!(state.claims.is_empty());
+    }
+
+    #[test]
+    fn branch_omission_in_delta_does_not_delete_canonical_branch() {
+        let evidence = evidence_with(
+            vec![EvidenceItem {
+                id: "E0001".into(),
+                source_kind: "manuscript_semantic_evidence".into(),
+                source_label: "paper.txt".into(),
+                text: "HeLa experimental branch".into(),
+            }],
+            vec!["runA.raw"],
+        );
+        let mut state = ScientificWorkspaceState {
+            branches: vec![AgentBranch {
+                id: "hela".into(),
+                label: "HeLa".into(),
+                status: "supported".into(),
+                evidence_refs: vec!["E0001".into()],
+                linked_raw_files: Vec::new(),
+                linkage_status: "unresolved".into(),
+                notes: "conceptual branch only".into(),
+            }],
+            next_step: "compile".into(),
+            ..Default::default()
+        };
+        let delta = WorkspaceDelta {
+            turn: 2,
+            next_step: "finish".into(),
+            ..Default::default()
+        };
+        apply_workspace_delta(&evidence, &mut state, &delta, 2);
+        assert_eq!(state.branches.len(), 1);
+        assert_eq!(state.branches[0].id, "hela");
+        assert!(state.branches[0].linked_raw_files.is_empty());
+        assert_eq!(state.branches[0].linkage_status, "unresolved");
+    }
+
+    #[test]
+    fn unchanged_adjudication_feedback_is_emitted_only_once() {
+        let record = ClaimAdjudicationRecord {
+            concept_type: "isolation_method".into(),
+            scope: "project".into(),
+            branch_id: String::new(),
+            model_status: "hypothesis".into(),
+            proposed_value: "hydrodynamic loading".into(),
+            evidence_refs: vec!["E0001".into()],
+            adjudication: ClaimAdjudication::Canonical {
+                value: "manual picking".into(),
+                evidence_refs: vec!["E0001".into()],
+            },
+        };
+        let mut trace_feedback = Vec::new();
+        let mut pending = Vec::new();
+        let mut signatures = BTreeMap::new();
+        append_changed_adjudication_feedback(
+            &mut trace_feedback,
+            &mut pending,
+            &mut signatures,
+            &[record.clone()],
+            1,
+            "post-delta",
+        );
+        append_changed_adjudication_feedback(
+            &mut trace_feedback,
+            &mut pending,
+            &mut signatures,
+            &[record],
+            2,
+            "post-search",
+        );
+        assert_eq!(trace_feedback.len(), 1);
+        assert_eq!(pending.len(), 1);
+    }
+
+    #[test]
+    fn v04_schema_is_delta_only_not_full_workspace_replacement() {
+        let schema = scientific_agent_schema();
+        let properties = schema["properties"].as_object().unwrap();
+        assert!(properties.contains_key("claim_upserts"));
+        assert!(properties.contains_key("claim_retractions"));
+        assert!(properties.contains_key("branch_upserts"));
+        assert!(!properties.contains_key("claims"));
+        assert!(!properties.contains_key("branches"));
+        assert!(!properties.contains_key("relation"));
+    }
+
+    #[test]
+    fn workspace_delta_parser_rejects_full_state_fields_even_if_model_emits_them() {
+        let value = json!({
+            "turn": 1,
+            "branch_upserts": [],
+            "claim_upserts": [],
+            "claim_retractions": [],
+            "open_question_additions": [],
+            "open_question_resolutions": [],
+            "conflict_additions": [],
+            "conflict_resolutions": [],
+            "next_evidence_actions": [],
+            "next_step": "finish",
+            "notes": "",
+            "claims": []
+        });
+        assert!(serde_json::from_value::<WorkspaceDelta>(value).is_err());
     }
 
     #[test]
