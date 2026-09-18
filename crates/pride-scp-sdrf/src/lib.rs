@@ -20,9 +20,9 @@ pub const SINGLE_CELL_TEMPLATE_VERSION: &str = "1.0.0";
 pub const SINGLE_CELL_TEMPLATE_URL: &str =
     "https://github.com/bigbio/sdrf-templates/blob/main/single-cell/1.0.0/single-cell.yaml";
 pub const SDRF_SPEC_URL: &str = "https://sdrf.quantms.org/specification.html";
-pub const GENERATOR_VERSION: &str = "pride-scp-sdrf-v0.5.4";
+pub const GENERATOR_VERSION: &str = "pride-scp-sdrf-v0.5.5";
 pub const DESIGN_AGENT_VERSION: &str = "pride-scp-design-agent-v0.4";
-pub const VALIDATOR_REPAIR_AGENT_VERSION: &str = "pride-scp-validator-repair-v0.2";
+pub const VALIDATOR_REPAIR_AGENT_VERSION: &str = "pride-scp-validator-repair-v0.3";
 const DESIGN_AGENT_MAX_ROUNDS: usize = 3;
 const VALIDATOR_REPAIR_MAX_ROUNDS: usize = 1;
 const VALIDATOR_REPAIR_MAX_TASKS: usize = 4;
@@ -380,6 +380,8 @@ struct EvidenceActionResult {
     action: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     normalized_from_action: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    target_fields: Vec<String>,
     query: EvidenceQuery,
     outcome: String,
     #[serde(default)]
@@ -3671,6 +3673,7 @@ fn execute_evidence_actions(
                 round,
                 action: request.action.clone(),
                 normalized_from_action: String::new(),
+                target_fields: request.target_fields.clone(),
                 query: EvidenceQuery::default(),
                 outcome: "abstain".into(),
                 matched_evidence_refs: Vec::new(),
@@ -3700,6 +3703,7 @@ fn execute_evidence_actions(
                     round,
                     action: effective_action,
                     normalized_from_action,
+                    target_fields: request.target_fields.clone(),
                     query,
                     outcome: "duplicate_skipped".into(),
                     matched_evidence_refs: Vec::new(),
@@ -3717,6 +3721,7 @@ fn execute_evidence_actions(
                     round,
                     action: effective_action,
                     normalized_from_action,
+                    target_fields: request.target_fields.clone(),
                     query,
                     outcome: "invalid_query".into(),
                     matched_evidence_refs: Vec::new(),
@@ -3782,6 +3787,7 @@ fn execute_evidence_actions(
                 round,
                 action: effective_action,
                 normalized_from_action,
+                target_fields: request.target_fields.clone(),
                 query,
                 outcome,
                 matched_evidence_refs: refs,
@@ -4166,7 +4172,7 @@ fn validator_repair_schema() -> Value {
             "next_evidence_actions":{"type":"array","maxItems":4,"items":{"type":"object","properties":{
                 "action":{"type":"string","enum":["SEARCH_PUBLICATION","SEARCH_SUPPLEMENT","SEARCH_STRUCTURED_DESIGN","SEARCH_REPOSITORY_METADATA","SEARCH_EXACT_RAW_NAME","EXPAND_EVIDENCE_CONTEXT","LOOKUP_KG_TERM","COMPARE_CONFLICTING_EVIDENCE","ABSTAIN"]},
                 "reason":{"type":"string","maxLength":300},
-                "target_fields":{"type":"array","items":{"type":"string","enum":repair_fields.clone()},"maxItems":4},
+                "target_fields":{"type":"array","items":{"type":"string","enum":repair_fields.clone()},"minItems":1,"maxItems":1},
                 "queries":{"type":"array","items":evidence_query,"maxItems":4}
             },"required":["action","reason","target_fields","queries"],"additionalProperties":false}},
             "terminal_status":{"type":"string","enum":["continue","resolved","partial","abstained"]},
@@ -4185,9 +4191,10 @@ fn evidence_action_history_block(results: &[EvidenceActionResult], empty_message
         .iter()
         .map(|result| {
             format!(
-                "- round={} action={} query={} outcome={} refs={:?}: {}",
+                "- round={} action={} targets={:?} query={} outcome={} refs={:?}: {}",
                 result.round,
                 result.action,
+                result.target_fields,
                 evidence_query_display(&result.query),
                 result.outcome,
                 result.matched_evidence_refs,
@@ -4239,7 +4246,7 @@ HARD SCIENTIFIC CONSTRAINTS:\n\
 6. set_project_value requires scope='project', one or more E#### refs, and direct field-relevant support. The value is an evidence-grounded intent, not authority over SDRF vocabulary.\n\
 7. row_mapping_required must not contain a project-wide annotation value. keep_unresolved must not contain a concrete value. template_gap must not substitute a nearby allowed annotation term.\n\
 8. A previous design-agent project/group/row scope remains a safety constraint. Do not override an explicit group/row design claim with a project-wide repair.\n\
-9. Request at most {max_tasks} actions and at most {max_queries} queries per action. Prefer targeted terms/identifiers/DOIs and do not repeat exhausted design-agent searches.\n\
+9. Emit at most ONE evidence action per nonterminal repair task. Each action MUST target exactly one task field and may contain at most {max_queries} queries. Every nonterminal task gets one evidence-search opportunity before any task receives extra query specificity. Prefer targeted terms/identifiers/DOIs and do not repeat exhausted design-agent searches.\n\
 10. Success is binary per task: source-backed canonicalizable repair, deterministically corroborated template gap, explicit row-mapping requirement, or honest unresolved/abstain. Do not optimize for validator-green output.\n\n\
 CLUSTERED VALIDATION TASKS:\n{task_json}\n\n\
 CURRENT PROPOSAL (context; only task fields may change):\n{proposal_json}\n\n\
@@ -4249,7 +4256,6 @@ PRIOR DESIGN-AGENT ACTION HISTORY (do not repeat exhausted searches):\n{design_h
 VALIDATOR-REPAIR ACTION HISTORY:\n{repair_history}\n\n\
 Return the structured ValidatorRepairAssessment. Set repair_agent_version exactly to {repair_version}.",
         accession = evidence.accession,
-        max_tasks = VALIDATOR_REPAIR_MAX_TASKS,
         max_queries = VALIDATOR_REPAIR_MAX_QUERIES_PER_TASK,
         evidence_block = design_evidence_block(evidence, 42),
         repair_version = VALIDATOR_REPAIR_AGENT_VERSION,
@@ -4309,6 +4315,7 @@ fn normalize_validator_repair_assessment(
         action
             .target_fields
             .retain(|field| task_fields.contains(field.as_str()));
+        action.target_fields.truncate(1);
         action
             .queries
             .truncate(VALIDATOR_REPAIR_MAX_QUERIES_PER_TASK);
@@ -4596,6 +4603,215 @@ fn synthesized_validator_repair_actions(
         }
     }
     actions
+}
+
+fn task_aware_validator_repair_actions(
+    evidence: &DatasetEvidence,
+    design_assessment: Option<&DatasetDesignAssessment>,
+    tasks: &[ValidatorRepairTask],
+    assessment: &ValidatorRepairAssessment,
+) -> Vec<EvidenceActionRequest> {
+    let fallback =
+        synthesized_validator_repair_actions(evidence, design_assessment, tasks, assessment);
+    let mut used_model_actions = BTreeSet::new();
+    let mut out = Vec::new();
+
+    for task in tasks {
+        let safe = assessment
+            .decisions
+            .iter()
+            .find(|decision| decision.field == task.field)
+            .map_or(false, |decision| {
+                validator_repair_decision_is_safe_terminal(evidence, design_assessment, decision)
+            });
+        if safe {
+            continue;
+        }
+
+        let mut chosen = None;
+        for (idx, action) in assessment.next_evidence_actions.iter().enumerate() {
+            if used_model_actions.contains(&idx)
+                || action.action == "ABSTAIN"
+                || action.queries.is_empty()
+                || !action
+                    .target_fields
+                    .iter()
+                    .any(|field| field == &task.field)
+            {
+                continue;
+            }
+            let mut action = action.clone();
+            action.target_fields = vec![task.field.clone()];
+            action
+                .queries
+                .truncate(VALIDATOR_REPAIR_MAX_QUERIES_PER_TASK);
+            chosen = Some((idx, action));
+            break;
+        }
+
+        if let Some((idx, action)) = chosen {
+            used_model_actions.insert(idx);
+            out.push(action);
+        } else if let Some(action) = fallback.iter().find(|action| {
+            action
+                .target_fields
+                .iter()
+                .any(|field| field == &task.field)
+        }) {
+            out.push(action.clone());
+        }
+
+        if out.len() >= VALIDATOR_REPAIR_MAX_TASKS {
+            break;
+        }
+    }
+
+    out
+}
+
+fn augment_validator_repair_task_evidence_refs(
+    evidence: &DatasetEvidence,
+    initial: &ValidatorRepairAssessment,
+    action_results: &[EvidenceActionResult],
+    final_assessment: &mut ValidatorRepairAssessment,
+) {
+    let valid_refs = evidence
+        .evidence
+        .iter()
+        .map(|item| item.id.as_str())
+        .collect::<BTreeSet<_>>();
+
+    for decision in &mut final_assessment.decisions {
+        let field = decision.field.clone();
+        let mut refs = decision
+            .evidence_refs
+            .iter()
+            .cloned()
+            .collect::<BTreeSet<_>>();
+
+        if let Some(initial_decision) = initial
+            .decisions
+            .iter()
+            .find(|candidate| candidate.field == field)
+        {
+            refs.extend(initial_decision.evidence_refs.iter().cloned());
+        }
+
+        for result in action_results {
+            if result.target_fields.iter().any(|target| target == &field) {
+                refs.extend(result.matched_evidence_refs.iter().cloned());
+            }
+        }
+
+        decision.evidence_refs = refs
+            .into_iter()
+            .filter(|reference| valid_refs.contains(reference.as_str()))
+            .filter(|reference| {
+                evidence
+                    .evidence
+                    .iter()
+                    .find(|item| item.id == reference.as_str())
+                    .map_or(false, |item| evidence_relevant_to_field(&field, item))
+            })
+            .collect();
+    }
+}
+
+fn promote_canonicalizable_validator_repair_decisions(
+    evidence: &DatasetEvidence,
+    design_assessment: Option<&DatasetDesignAssessment>,
+    assessment: &mut ValidatorRepairAssessment,
+) -> Vec<String> {
+    let mut promoted = Vec::new();
+    for decision in &mut assessment.decisions {
+        if !matches!(
+            decision.field.as_str(),
+            "single_cell_isolation_method" | "proteomics_data_acquisition_method"
+        ) || !matches!(
+            decision.resolution.as_str(),
+            "set_project_value" | "template_gap" | "no_change"
+        ) || decision.scope != "project"
+            || decision.evidence_refs.is_empty()
+            || design_field_project_arbitration(design_assessment, &decision.field)
+                == ScopeArbitration::Block
+            || !decision_refs_are_field_relevant(evidence, &decision.field, &decision.evidence_refs)
+            || evidence
+                .metadata_scaffold
+                .template_gaps
+                .iter()
+                .any(|gap| gap.field == decision.field)
+        {
+            continue;
+        }
+
+        let Some((canonical_value, canonical_refs)) =
+            canonical_validator_repair_project_value(evidence, decision)
+        else {
+            continue;
+        };
+
+        let previous_resolution = decision.resolution.clone();
+        decision.resolution = "set_project_value".into();
+        decision.value = canonical_value.clone();
+        decision.evidence_refs = canonical_refs;
+        decision.reason = format!(
+            "{} Deterministic task-evidence canonicalization promoted the repair from '{}' to supported project value '{}'.",
+            decision.reason, previous_resolution, canonical_value
+        );
+        promoted.push(decision.field.clone());
+    }
+    promoted
+}
+
+fn deterministic_validator_repair_terminal_status(
+    tasks: &[ValidatorRepairTask],
+    issues: &[ValidationIssue],
+    assessment: &ValidatorRepairAssessment,
+    rounds_completed: usize,
+    applied_fields: &[String],
+) -> String {
+    if tasks.is_empty() {
+        return "resolved".into();
+    }
+
+    let remaining_codes = issues
+        .iter()
+        .filter(|issue| issue.level == "error")
+        .map(|issue| issue.code.as_str())
+        .collect::<BTreeSet<_>>();
+    let remaining_tasks = tasks
+        .iter()
+        .filter(|task| {
+            task.error_codes
+                .iter()
+                .any(|code| remaining_codes.contains(code.as_str()))
+        })
+        .count();
+
+    if remaining_tasks == 0 {
+        return "resolved".into();
+    }
+    if assessment.terminal_status == "abstained" {
+        return "abstained".into();
+    }
+
+    let confirmed_template_gap_fields = issues
+        .iter()
+        .filter(|issue| issue.code == "validator_repair_template_gap_confirmed")
+        .map(|issue| issue.column.as_str())
+        .collect::<BTreeSet<_>>();
+    let has_closed_blocker = assessment.decisions.iter().any(|decision| {
+        decision.resolution == "row_mapping_required"
+            || (decision.resolution == "template_gap"
+                && confirmed_template_gap_fields.contains(decision.field.as_str()))
+    });
+    if remaining_tasks < tasks.len() || !applied_fields.is_empty() || has_closed_blocker {
+        return "partial".into();
+    }
+    if rounds_completed > 0 {
+        return "evidence_exhausted".into();
+    }
+    "partial".into()
 }
 
 fn seed_attempted_actions_from_history(results: &[EvidenceActionResult]) -> BTreeSet<String> {
@@ -8753,14 +8969,12 @@ async fn annotate_one(opts: &SdrfAnnotateOptions, accession: &str) -> Result<Res
                 &initial_repair,
             );
         if needs_retrieval {
-            if initial_repair.next_evidence_actions.is_empty() {
-                initial_repair.next_evidence_actions = synthesized_validator_repair_actions(
-                    &evidence,
-                    design_assessment,
-                    &repair_tasks,
-                    &initial_repair,
-                );
-            }
+            initial_repair.next_evidence_actions = task_aware_validator_repair_actions(
+                &evidence,
+                design_assessment,
+                &repair_tasks,
+                &initial_repair,
+            );
             if !initial_repair.next_evidence_actions.is_empty() {
                 initial_repair.terminal_status = "continue".into();
                 let mut attempted_actions =
@@ -8804,6 +9018,23 @@ async fn annotate_one(opts: &SdrfAnnotateOptions, accession: &str) -> Result<Res
         if final_repair.terminal_status == "continue" {
             final_repair.terminal_status = "partial".into();
             final_repair.next_evidence_actions.clear();
+        }
+
+        augment_validator_repair_task_evidence_refs(
+            &evidence,
+            &initial_repair,
+            &action_results,
+            &mut final_repair,
+        );
+        let canonicalization_promotions = promote_canonicalizable_validator_repair_decisions(
+            &evidence,
+            design_assessment,
+            &mut final_repair,
+        );
+        for field in &canonicalization_promotions {
+            deterministic_validator_repairs.push(format!(
+                "validator_repair_task_evidence_canonicalized:{field}"
+            ));
         }
 
         let mut repair_issues = apply_validator_repair_template_gaps(&mut evidence, &final_repair);
@@ -8868,6 +9099,15 @@ async fn annotate_one(opts: &SdrfAnnotateOptions, accession: &str) -> Result<Res
             issues.extend(repair_issues.clone());
             fs::write(&evidence_path, serde_json::to_string_pretty(&evidence)?)?;
         }
+
+        final_repair.terminal_status = deterministic_validator_repair_terminal_status(
+            &repair_tasks,
+            &issues,
+            &final_repair,
+            rounds_completed,
+            &applied_fields,
+        );
+        final_repair.next_evidence_actions.clear();
 
         let trace = ValidatorRepairTrace {
             repair_agent_version: VALIDATOR_REPAIR_AGENT_VERSION.into(),
@@ -9650,8 +9890,8 @@ mod tests {
             .iter()
             .position(|h| h == "comment[sdrf annotation tool]")
             .unwrap();
-        assert_eq!(rows[0][annotation_idx], "pride-scp-sdrf v0.5.4");
-        assert_eq!(sdrf_annotation_tool_value(), "pride-scp-sdrf v0.5.4");
+        assert_eq!(rows[0][annotation_idx], "pride-scp-sdrf v0.5.5");
+        assert_eq!(sdrf_annotation_tool_value(), "pride-scp-sdrf v0.5.5");
         let issues = validate_draft(&headers, &rows, &evidence);
         assert!(issues.iter().all(|x| x.level != "error"), "{issues:?}");
     }
@@ -13189,5 +13429,362 @@ mod tests {
         normalize_validator_repair_assessment(&evidence, &tasks, "decide", &mut assessment);
         assert!(assessment.next_evidence_actions.is_empty());
         assert_eq!(assessment.terminal_status, "partial");
+    }
+
+    #[test]
+    fn validator_repair_task_aware_actions_cover_each_nonterminal_field() {
+        let evidence = DatasetEvidence {
+            accession: "PXD000001".into(),
+            project_json_path: String::new(),
+            files_json_path: String::new(),
+            existing_sdrf_path: String::new(),
+            raw_files: vec![],
+            study_design: StudyDesignScaffold::default(),
+            metadata_scaffold: DeterministicMetadataScaffold::default(),
+            evidence: vec![],
+            manuscript_sources: vec![],
+            annotation_sources: vec![],
+        };
+        let tasks = vec![
+            ValidatorRepairTask {
+                field: "single_cell_isolation_method".into(),
+                error_codes: vec!["single_cell_isolation_unresolved".into()],
+                error_count: 10,
+                representative_rows: vec![1],
+                representative_messages: vec!["missing isolation".into()],
+            },
+            ValidatorRepairTask {
+                field: "proteomics_data_acquisition_method".into(),
+                error_codes: vec!["data_file_name_acquisition_contradiction".into()],
+                error_count: 4,
+                representative_rows: vec![2],
+                representative_messages: vec!["acquisition conflict".into()],
+            },
+            ValidatorRepairTask {
+                field: "organism".into(),
+                error_codes: vec![
+                    "multiorganism_project_collapsed_to_single_candidate_organism".into(),
+                ],
+                error_count: 1,
+                representative_rows: vec![0],
+                representative_messages: vec!["multiple organisms".into()],
+            },
+        ];
+        let assessment = ValidatorRepairAssessment {
+            next_evidence_actions: vec![EvidenceActionRequest {
+                action: "SEARCH_REPOSITORY_METADATA".into(),
+                reason: "organism mapping".into(),
+                target_fields: vec!["organism".into()],
+                queries: vec![EvidenceQuery {
+                    match_kind: "terms_any".into(),
+                    value: String::new(),
+                    terms: vec!["organism".into()],
+                    document_hint: String::new(),
+                }],
+            }],
+            terminal_status: "continue".into(),
+            ..ValidatorRepairAssessment::default()
+        };
+        let actions = task_aware_validator_repair_actions(&evidence, None, &tasks, &assessment);
+        let targets = actions
+            .iter()
+            .flat_map(|action| action.target_fields.iter().cloned())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(actions.len(), 3);
+        assert!(targets.contains("single_cell_isolation_method"));
+        assert!(targets.contains("proteomics_data_acquisition_method"));
+        assert!(targets.contains("organism"));
+        assert!(actions.iter().all(|action| action.target_fields.len() == 1));
+    }
+
+    #[test]
+    fn validator_repair_task_evidence_pool_merges_initial_and_retrieved_refs() {
+        let evidence = DatasetEvidence {
+            accession: "PXD000001".into(),
+            project_json_path: String::new(),
+            files_json_path: String::new(),
+            existing_sdrf_path: String::new(),
+            raw_files: vec![],
+            study_design: StudyDesignScaffold::default(),
+            metadata_scaffold: DeterministicMetadataScaffold::default(),
+            evidence: vec![
+                EvidenceItem {
+                    id: "E0001".into(),
+                    source_kind: "publication".into(),
+                    source_label: "methods:isolation".into(),
+                    text: "Single cells were loaded manually.".into(),
+                },
+                EvidenceItem {
+                    id: "E0002".into(),
+                    source_kind: "publication".into(),
+                    source_label: "methods:isolation".into(),
+                    text: "Hydrodynamic pressure was used to load each single cell.".into(),
+                },
+            ],
+            manuscript_sources: vec![],
+            annotation_sources: vec![],
+        };
+        let initial = ValidatorRepairAssessment {
+            decisions: vec![ValidatorRepairDecision {
+                field: "single_cell_isolation_method".into(),
+                resolution: "template_gap".into(),
+                scope: "project".into(),
+                evidence_refs: vec!["E0001".into()],
+                ..ValidatorRepairDecision::default()
+            }],
+            ..ValidatorRepairAssessment::default()
+        };
+        let actions = vec![EvidenceActionResult {
+            round: 1,
+            action: "SEARCH_PUBLICATION".into(),
+            target_fields: vec!["single_cell_isolation_method".into()],
+            query: EvidenceQuery::default(),
+            outcome: "matched".into(),
+            matched_evidence_refs: vec!["E0002".into()],
+            ..EvidenceActionResult::default()
+        }];
+        let mut final_assessment = ValidatorRepairAssessment {
+            decisions: vec![ValidatorRepairDecision {
+                field: "single_cell_isolation_method".into(),
+                resolution: "template_gap".into(),
+                scope: "project".into(),
+                ..ValidatorRepairDecision::default()
+            }],
+            ..ValidatorRepairAssessment::default()
+        };
+        augment_validator_repair_task_evidence_refs(
+            &evidence,
+            &initial,
+            &actions,
+            &mut final_assessment,
+        );
+        assert_eq!(
+            final_assessment.decisions[0].evidence_refs,
+            vec!["E0001".to_string(), "E0002".to_string()]
+        );
+    }
+
+    #[test]
+    fn validator_repair_canonicalization_precedes_model_template_gap() {
+        let evidence = DatasetEvidence {
+            accession: "PXD000001".into(),
+            project_json_path: String::new(),
+            files_json_path: String::new(),
+            existing_sdrf_path: String::new(),
+            raw_files: vec![],
+            study_design: StudyDesignScaffold::default(),
+            metadata_scaffold: DeterministicMetadataScaffold::default(),
+            evidence: vec![EvidenceItem {
+                id: "E0001".into(),
+                source_kind: "publication".into(),
+                source_label: "methods:isolation".into(),
+                text: "Single cells were loaded into the capillary manually using hydrodynamic pressure before injection.".into(),
+            }],
+            manuscript_sources: vec![],
+            annotation_sources: vec![],
+        };
+        let mut assessment = ValidatorRepairAssessment {
+            decisions: vec![ValidatorRepairDecision {
+                field: "single_cell_isolation_method".into(),
+                resolution: "template_gap".into(),
+                scope: "project".into(),
+                value: String::new(),
+                evidence_refs: vec!["E0001".into()],
+                confidence: "high".into(),
+                reason: "model called the method a template gap".into(),
+            }],
+            ..ValidatorRepairAssessment::default()
+        };
+        let promoted =
+            promote_canonicalizable_validator_repair_decisions(&evidence, None, &mut assessment);
+        assert_eq!(promoted, vec!["single_cell_isolation_method".to_string()]);
+        assert_eq!(assessment.decisions[0].resolution, "set_project_value");
+        assert_eq!(assessment.decisions[0].value, "manual picking");
+    }
+
+    #[test]
+    fn validator_repair_canonicalization_does_not_override_existing_template_gap() {
+        let mut scaffold = DeterministicMetadataScaffold::default();
+        scaffold.template_gaps.push(TemplateCompatibilityGap {
+            field: "single_cell_isolation_method".into(),
+            observed_value: "capillary microsampling".into(),
+            evidence_refs: vec!["E0001".into()],
+            reason: "unsupported method".into(),
+        });
+        let evidence = DatasetEvidence {
+            accession: "PXD000001".into(),
+            project_json_path: String::new(),
+            files_json_path: String::new(),
+            existing_sdrf_path: String::new(),
+            raw_files: vec![],
+            study_design: StudyDesignScaffold::default(),
+            metadata_scaffold: scaffold,
+            evidence: vec![EvidenceItem {
+                id: "E0001".into(),
+                source_kind: "publication".into(),
+                source_label: "methods:isolation".into(),
+                text: "Cells were collected by capillary microsampling.".into(),
+            }],
+            manuscript_sources: vec![],
+            annotation_sources: vec![],
+        };
+        let mut assessment = ValidatorRepairAssessment {
+            decisions: vec![ValidatorRepairDecision {
+                field: "single_cell_isolation_method".into(),
+                resolution: "template_gap".into(),
+                scope: "project".into(),
+                evidence_refs: vec!["E0001".into()],
+                ..ValidatorRepairDecision::default()
+            }],
+            ..ValidatorRepairAssessment::default()
+        };
+        assert!(promote_canonicalizable_validator_repair_decisions(
+            &evidence,
+            None,
+            &mut assessment,
+        )
+        .is_empty());
+        assert_eq!(assessment.decisions[0].resolution, "template_gap");
+    }
+
+    #[test]
+    fn validator_repair_terminal_status_resolved_requires_error_clearance() {
+        let tasks = vec![ValidatorRepairTask {
+            field: "single_cell_isolation_method".into(),
+            error_codes: vec!["single_cell_isolation_unresolved".into()],
+            error_count: 4,
+            ..ValidatorRepairTask::default()
+        }];
+        let assessment = ValidatorRepairAssessment {
+            terminal_status: "resolved".into(),
+            ..ValidatorRepairAssessment::default()
+        };
+        assert_eq!(
+            deterministic_validator_repair_terminal_status(
+                &tasks,
+                &[],
+                &assessment,
+                1,
+                &["single_cell_isolation_method".into()],
+            ),
+            "resolved"
+        );
+    }
+
+    #[test]
+    fn validator_repair_terminal_status_partial_for_row_mapping_blocker() {
+        let tasks = vec![ValidatorRepairTask {
+            field: "organism".into(),
+            error_codes: vec![
+                "multiorganism_project_collapsed_to_single_candidate_organism".into(),
+            ],
+            error_count: 1,
+            ..ValidatorRepairTask::default()
+        }];
+        let issues = vec![ValidationIssue {
+            level: "error".into(),
+            code: "multiorganism_project_collapsed_to_single_candidate_organism".into(),
+            row: 0,
+            column: "characteristics[organism]".into(),
+            message: "mapping unresolved".into(),
+        }];
+        let assessment = ValidatorRepairAssessment {
+            decisions: vec![ValidatorRepairDecision {
+                field: "organism".into(),
+                resolution: "row_mapping_required".into(),
+                scope: "row".into(),
+                ..ValidatorRepairDecision::default()
+            }],
+            terminal_status: "resolved".into(),
+            ..ValidatorRepairAssessment::default()
+        };
+        assert_eq!(
+            deterministic_validator_repair_terminal_status(&tasks, &issues, &assessment, 1, &[],),
+            "partial"
+        );
+    }
+
+    #[test]
+    fn validator_repair_terminal_status_evidence_exhausted_when_nothing_closes() {
+        let tasks = vec![ValidatorRepairTask {
+            field: "single_cell_isolation_method".into(),
+            error_codes: vec!["single_cell_isolation_unresolved".into()],
+            error_count: 4,
+            ..ValidatorRepairTask::default()
+        }];
+        let issues = vec![ValidationIssue {
+            level: "error".into(),
+            code: "single_cell_isolation_unresolved".into(),
+            row: 1,
+            column: SC_ISOLATION_METHOD.into(),
+            message: "still unresolved".into(),
+        }];
+        let assessment = ValidatorRepairAssessment {
+            decisions: vec![ValidatorRepairDecision {
+                field: "single_cell_isolation_method".into(),
+                resolution: "keep_unresolved".into(),
+                scope: "unresolved".into(),
+                ..ValidatorRepairDecision::default()
+            }],
+            terminal_status: "resolved".into(),
+            ..ValidatorRepairAssessment::default()
+        };
+        assert_eq!(
+            deterministic_validator_repair_terminal_status(&tasks, &issues, &assessment, 1, &[],),
+            "evidence_exhausted"
+        );
+    }
+
+    #[test]
+    fn validator_repair_schema_limits_actions_to_one_target_field() {
+        let schema = validator_repair_schema();
+        let max_items = schema["properties"]["next_evidence_actions"]["items"]["properties"]
+            ["target_fields"]["maxItems"]
+            .as_u64();
+        let min_items = schema["properties"]["next_evidence_actions"]["items"]["properties"]
+            ["target_fields"]["minItems"]
+            .as_u64();
+        assert_eq!(max_items, Some(1));
+        assert_eq!(min_items, Some(1));
+    }
+
+    #[test]
+    fn validator_repair_unconfirmed_template_gap_is_evidence_exhausted_not_partial() {
+        let tasks = vec![ValidatorRepairTask {
+            field: "single_cell_isolation_method".into(),
+            error_codes: vec!["single_cell_isolation_unresolved".into()],
+            error_count: 4,
+            ..ValidatorRepairTask::default()
+        }];
+        let issues = vec![
+            ValidationIssue {
+                level: "error".into(),
+                code: "single_cell_isolation_unresolved".into(),
+                row: 1,
+                column: SC_ISOLATION_METHOD.into(),
+                message: "still unresolved".into(),
+            },
+            ValidationIssue {
+                level: "warning".into(),
+                code: "validator_repair_template_gap_unconfirmed".into(),
+                row: 0,
+                column: "single_cell_isolation_method".into(),
+                message: "not corroborated".into(),
+            },
+        ];
+        let assessment = ValidatorRepairAssessment {
+            decisions: vec![ValidatorRepairDecision {
+                field: "single_cell_isolation_method".into(),
+                resolution: "template_gap".into(),
+                scope: "project".into(),
+                ..ValidatorRepairDecision::default()
+            }],
+            terminal_status: "resolved".into(),
+            ..ValidatorRepairAssessment::default()
+        };
+        assert_eq!(
+            deterministic_validator_repair_terminal_status(&tasks, &issues, &assessment, 1, &[],),
+            "evidence_exhausted"
+        );
     }
 }
