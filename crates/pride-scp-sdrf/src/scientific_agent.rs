@@ -1,6 +1,8 @@
 use super::*;
 
-pub const SCIENTIFIC_AGENT_HARNESS_VERSION: &str = "pride-scp-scientific-agent-v0.4";
+pub const SCIENTIFIC_AGENT_HARNESS_VERSION: &str = "pride-scp-scientific-workspace-agent-v1.0";
+const SCIENTIFIC_AGENT_TASK_EVIDENCE_LIMIT: usize = 20;
+const SCIENTIFIC_AGENT_CONTEXT_READ_RADIUS: usize = 6000;
 #[derive(Debug, Clone)]
 pub struct SdrfScientificAgentOptions {
     pub snapshot_dir: PathBuf,
@@ -194,6 +196,8 @@ struct WorkspaceConflictResolution {
 #[serde(deny_unknown_fields)]
 struct WorkspaceDelta {
     turn: usize,
+    task_id: String,
+    task_status: String,
     #[serde(default)]
     branch_upserts: Vec<AgentBranch>,
     #[serde(default)]
@@ -257,6 +261,30 @@ struct AgentEvidenceAction {
     target_concepts: Vec<String>,
     #[serde(default)]
     queries: Vec<EvidenceQuery>,
+    #[serde(default)]
+    evidence_refs: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct ScientificTask {
+    id: String,
+    concept_type: String,
+    sdrf_field: String,
+    status: String,
+    #[serde(default)]
+    error_codes: Vec<String>,
+    error_count: usize,
+    #[serde(default)]
+    representative_rows: Vec<usize>,
+    #[serde(default)]
+    representative_messages: Vec<String>,
+    objective: String,
+    #[serde(default)]
+    evidence_candidates: Vec<String>,
+    #[serde(default)]
+    evidence_reads: Vec<String>,
+    attempts: usize,
+    notes: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -273,6 +301,9 @@ struct ScientificWorkspaceState {
     open_questions: Vec<String>,
     #[serde(default)]
     conflicts: Vec<WorkspaceConflict>,
+    #[serde(default)]
+    tasks: Vec<ScientificTask>,
+    active_task_id: String,
     #[serde(default)]
     next_evidence_actions: Vec<AgentEvidenceAction>,
     next_step: String,
@@ -464,6 +495,8 @@ fn scientific_agent_schema() -> Value {
         "type":"object",
         "properties":{
             "turn":{"type":"integer","minimum":1,"maximum":100},
+            "task_id":{"type":"string","maxLength":80},
+            "task_status":{"type":"string","enum":["continue","resolved","human_review"]},
             "branch_upserts":{"type":"array","maxItems":24,"items":branch},
             "claim_upserts":{"type":"array","maxItems":48,"items":claim_upsert},
             "claim_retractions":{"type":"array","maxItems":24,"items":claim_retraction},
@@ -472,38 +505,396 @@ fn scientific_agent_schema() -> Value {
             "conflict_additions":{"type":"array","maxItems":24,"items":conflict},
             "conflict_resolutions":{"type":"array","maxItems":24,"items":conflict_resolution},
             "next_evidence_actions":{"type":"array","maxItems":8,"items":{"type":"object","properties":{
-                "action":{"type":"string","enum":["SEARCH_PUBLICATION","SEARCH_SUPPLEMENT","SEARCH_STRUCTURED_DESIGN","SEARCH_REPOSITORY_METADATA","SEARCH_EXACT_RAW_NAME","EXPAND_EVIDENCE_CONTEXT","LOOKUP_KG_TERM","COMPARE_CONFLICTING_EVIDENCE","ABSTAIN"]},
+                "action":{"type":"string","enum":["READ_EVIDENCE_CONTEXT","SEARCH_PUBLICATION","SEARCH_SUPPLEMENT","SEARCH_STRUCTURED_DESIGN","SEARCH_REPOSITORY_METADATA","SEARCH_EXACT_RAW_NAME","EXPAND_EVIDENCE_CONTEXT","LOOKUP_KG_TERM","COMPARE_CONFLICTING_EVIDENCE","ABSTAIN"]},
                 "reason":{"type":"string","maxLength":400},
                 "target_concepts":{"type":"array","items":{"type":"string","enum":concepts.clone()},"maxItems":8},
-                "queries":{"type":"array","items":query,"maxItems":8}
-            },"required":["action","reason","target_concepts","queries"],"additionalProperties":false}},
+                "queries":{"type":"array","items":query,"maxItems":8},
+                "evidence_refs":{"type":"array","items":{"type":"string","pattern":"^E[0-9]{4}$"},"maxItems":8}
+            },"required":["action","reason","target_concepts","queries","evidence_refs"],"additionalProperties":false}},
             "next_step":{"type":"string","enum":["search","compile","finish","abstain"]},
             "notes":{"type":"string","maxLength":1400}
         },
-        "required":["turn","branch_upserts","claim_upserts","claim_retractions","open_question_additions","open_question_resolutions","conflict_additions","conflict_resolutions","next_evidence_actions","next_step","notes"],
+        "required":["turn","task_id","task_status","branch_upserts","claim_upserts","claim_retractions","open_question_additions","open_question_resolutions","conflict_additions","conflict_resolutions","next_evidence_actions","next_step","notes"],
         "additionalProperties":false
     })
 }
 
-fn workspace_evidence_block(evidence: &DatasetEvidence, max_items: usize) -> String {
-    evidence
+fn concept_for_repair_field(field: &str) -> Option<&'static str> {
+    match field {
+        "single_cell_isolation_method" => Some("isolation_method"),
+        "proteomics_data_acquisition_method" => Some("acquisition_mode"),
+        "organism" => Some("organism"),
+        "individual" => Some("individual"),
+        _ => None,
+    }
+}
+
+fn task_relevance_score(field: &str, item: &EvidenceItem) -> usize {
+    let mut score = if evidence_relevant_to_field(field, item) {
+        10
+    } else {
+        0
+    };
+    let hay = format!("{} {}", item.source_label, item.text).to_ascii_lowercase();
+    let direct_terms: &[&str] = match field {
+        "study_structure" => &[
+            "single-cell",
+            "single cell",
+            "organism",
+            "cell line",
+            "hela",
+            "xenopus",
+            "mouse",
+            "human",
+            "control",
+            "treatment",
+            "condition",
+            "replicate",
+            "data-independent",
+            "data-dependent",
+            "dia",
+            "dda",
+            "isolation",
+            "microwell",
+            "microfluid",
+            "aspirat",
+            "hydrodynamic",
+        ],
+        "single_cell_isolation_method" => &[
+            "hydrodynamic",
+            "on-capillary",
+            "on capillary",
+            "capillary lysis",
+            "esi injection",
+            "single-cell injection",
+            "single cell injection",
+            "microinjection",
+            "micropipette",
+            "microaspirat",
+            "aspirat",
+            "manual pick",
+            "manual isolat",
+            "microfluid",
+            "microwell",
+            "nanowell",
+            "cellenone",
+            "facs",
+            "flow cytometry",
+            "laser capture",
+            "evdisco",
+        ],
+        "proteomics_data_acquisition_method" => &[
+            "data-independent",
+            "data independent",
+            "dia-pasef",
+            "diapasef",
+            "data-dependent",
+            "data dependent",
+            "dda",
+            "dia",
+        ],
+        "organism" => &[
+            "homo sapiens",
+            "mus musculus",
+            "xenopus",
+            "danio rerio",
+            "species",
+            "organism",
+        ],
+        "individual" => &["donor", "patient", "subject", "individual", "animal id"],
+        _ => &[],
+    };
+    for term in direct_terms {
+        if hay.contains(term) {
+            score += 8;
+        }
+    }
+    let source_kind = item.source_kind.to_ascii_lowercase();
+    if source_kind.contains("publication") || source_kind.contains("manuscript") {
+        score += 3;
+    }
+    if source_kind.contains("supplement") || source_kind.contains("annotation") {
+        score += 2;
+    }
+    score
+}
+
+fn task_evidence_candidates(evidence: &DatasetEvidence, field: &str, limit: usize) -> Vec<String> {
+    let mut ranked = evidence
         .evidence
         .iter()
-        .take(max_items)
-        .map(|item| {
-            let text = item.text.replace('\n', " ");
-            let text = if text.chars().count() > 1000 {
-                text.chars().take(1000).collect::<String>() + "..."
-            } else {
-                text
-            };
+        .filter_map(|item| {
+            let score = task_relevance_score(field, item);
+            (score > 0).then_some((score, item.id.clone()))
+        })
+        .collect::<Vec<_>>();
+    ranked.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+    ranked.dedup_by(|a, b| a.1 == b.1);
+    ranked.into_iter().take(limit).map(|(_, id)| id).collect()
+}
+
+fn build_scientific_tasks(
+    evidence: &DatasetEvidence,
+    issues: &[ValidationIssue],
+) -> Vec<ScientificTask> {
+    let mut tasks = Vec::new();
+    if !issues.is_empty() {
+        tasks.push(ScientificTask {
+            id: "task:study_structure".into(),
+            concept_type: "study_structure".into(),
+            sdrf_field: "study_structure".into(),
+            status: "open".into(),
+            error_codes: vec!["scientific_study_structure_review".into()],
+            error_count: 1,
+            representative_rows: Vec::new(),
+            representative_messages: Vec::new(),
+            objective: "Establish a source-grounded study model before field repair: biological/experimental branches, acquisition cardinality, field scope, and only source-supported RAW linkage. Preserve unresolved linkage rather than infer biological identity from filenames.".into(),
+            evidence_candidates: task_evidence_candidates(
+                evidence,
+                "study_structure",
+                SCIENTIFIC_AGENT_TASK_EVIDENCE_LIMIT,
+            ),
+            evidence_reads: Vec::new(),
+            attempts: 0,
+            notes: String::new(),
+        });
+    }
+    tasks.extend(
+        cluster_validator_repair_tasks(issues)
+            .into_iter()
+            .filter_map(|task| {
+                let concept_type = concept_for_repair_field(&task.field)?.to_string();
+                let objective = format!(
+                    "Resolve {} from trusted source evidence without guessing; {} current validator error(s)",
+                    task.field, task.error_count
+                );
+                Some(ScientificTask {
+                    id: format!("task:{}", task.field),
+                    concept_type,
+                    sdrf_field: task.field.clone(),
+                    status: "open".into(),
+                    error_codes: task.error_codes,
+                    error_count: task.error_count,
+                    representative_rows: task.representative_rows,
+                    representative_messages: task.representative_messages,
+                    objective,
+                    evidence_candidates: task_evidence_candidates(
+                        evidence,
+                        &task.field,
+                        SCIENTIFIC_AGENT_TASK_EVIDENCE_LIMIT,
+                    ),
+                    evidence_reads: Vec::new(),
+                    attempts: 0,
+                    notes: String::new(),
+                })
+            }),
+    );
+    tasks
+}
+
+fn task_is_terminal(task: &ScientificTask) -> bool {
+    matches!(task.status.as_str(), "resolved" | "human_review")
+}
+
+fn ensure_active_task(state: &mut ScientificWorkspaceState) {
+    let active_still_valid = state.tasks.iter().any(|task| {
+        task.id == state.active_task_id && !task_is_terminal(task) && task.error_count > 0
+    });
+    if active_still_valid {
+        return;
+    }
+    state.active_task_id = state
+        .tasks
+        .iter()
+        .find(|task| !task_is_terminal(task) && task.error_count > 0)
+        .map(|task| task.id.clone())
+        .unwrap_or_default();
+    for task in &mut state.tasks {
+        if task.id == state.active_task_id && task.status == "open" {
+            task.status = "investigating".into();
+        }
+    }
+}
+
+fn refresh_scientific_tasks(
+    evidence: &DatasetEvidence,
+    state: &mut ScientificWorkspaceState,
+    issues: &[ValidationIssue],
+) {
+    if state.tasks.is_empty() {
+        state.tasks = build_scientific_tasks(evidence, issues);
+        ensure_active_task(state);
+        return;
+    }
+
+    let current = cluster_validator_repair_tasks(issues)
+        .into_iter()
+        .map(|task| (task.field.clone(), task))
+        .collect::<BTreeMap<_, _>>();
+    for task in &mut state.tasks {
+        if task.sdrf_field == "study_structure" {
+            task.evidence_candidates = task_evidence_candidates(
+                evidence,
+                "study_structure",
+                SCIENTIFIC_AGENT_TASK_EVIDENCE_LIMIT,
+            );
+            continue;
+        }
+        if let Some(now) = current.get(&task.sdrf_field) {
+            task.error_codes = now.error_codes.clone();
+            task.error_count = now.error_count;
+            task.representative_rows = now.representative_rows.clone();
+            task.representative_messages = now.representative_messages.clone();
+            let mut candidates = task_evidence_candidates(
+                evidence,
+                &task.sdrf_field,
+                SCIENTIFIC_AGENT_TASK_EVIDENCE_LIMIT,
+            );
+            let mut seen = candidates.iter().cloned().collect::<BTreeSet<_>>();
+            for read in &task.evidence_reads {
+                if seen.insert(read.clone()) {
+                    candidates.push(read.clone());
+                }
+            }
+            task.evidence_candidates = candidates;
+            if task.status == "resolved" {
+                task.status = "open".into();
+            }
+        } else {
+            task.error_count = 0;
+            task.status = "resolved".into();
+        }
+    }
+
+    for new_task in build_scientific_tasks(evidence, issues) {
+        if !state.tasks.iter().any(|task| task.id == new_task.id) {
+            state.tasks.push(new_task);
+        }
+    }
+    state.tasks.sort_by(|a, b| {
+        b.error_count
+            .cmp(&a.error_count)
+            .then_with(|| a.id.cmp(&b.id))
+    });
+    ensure_active_task(state);
+}
+
+fn active_task<'a>(state: &'a ScientificWorkspaceState) -> Option<&'a ScientificTask> {
+    state
+        .tasks
+        .iter()
+        .find(|task| task.id == state.active_task_id)
+}
+
+fn mark_active_task_human_review(state: &mut ScientificWorkspaceState, note: &str) {
+    if let Some(task) = state
+        .tasks
+        .iter_mut()
+        .find(|task| task.id == state.active_task_id)
+    {
+        task.status = "human_review".into();
+        if !note.trim().is_empty() {
+            task.notes = note.trim().to_string();
+        }
+    }
+    state.active_task_id.clear();
+    ensure_active_task(state);
+}
+
+fn task_board_block(state: &ScientificWorkspaceState) -> String {
+    if state.tasks.is_empty() {
+        return "no unresolved scientific tasks were derived from validation".into();
+    }
+    state
+        .tasks
+        .iter()
+        .map(|task| {
             format!(
-                "{} [{}:{}] {}",
-                item.id, item.source_kind, item.source_label, text
+                "- {} status={} concept={} errors={} codes={:?} candidates={} reads={} attempts={} objective={}",
+                task.id,
+                task.status,
+                task.concept_type,
+                task.error_count,
+                task.error_codes,
+                task.evidence_candidates.len(),
+                task.evidence_reads.len(),
+                task.attempts,
+                task.objective
             )
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+fn task_evidence_block(evidence: &DatasetEvidence, task: Option<&ScientificTask>) -> String {
+    let Some(task) = task else {
+        return "none".into();
+    };
+    let read_refs = task.evidence_reads.iter().cloned().collect::<BTreeSet<_>>();
+    let mut refs = task.evidence_reads.clone();
+    let mut seen = refs.iter().cloned().collect::<BTreeSet<_>>();
+    for candidate in &task.evidence_candidates {
+        if seen.insert(candidate.clone()) {
+            refs.push(candidate.clone());
+        }
+    }
+    refs.into_iter()
+        .filter_map(|id| {
+            let item = evidence.evidence.iter().find(|item| item.id == id)?;
+            let read = read_refs.contains(&id) || item.source_kind == "agent_read_context";
+            let max_chars = if read { 5000 } else { 1400 };
+            let text = item.text.replace('\0', " ");
+            let text = if text.chars().count() > max_chars {
+                text.chars().take(max_chars).collect::<String>() + "..."
+            } else {
+                text
+            };
+            Some(format!(
+                "{} [{}:{}] {}{}",
+                item.id,
+                item.source_kind,
+                item.source_label,
+                if read { "[READ] " } else { "[CANDIDATE] " },
+                text
+            ))
+        })
+        .take(SCIENTIFIC_AGENT_TASK_EVIDENCE_LIMIT)
+        .collect::<Vec<_>>()
+        .join("\n\n")
+}
+
+fn write_workspace_notebook(
+    workspace_dir: &Path,
+    evidence: &DatasetEvidence,
+    state: &ScientificWorkspaceState,
+    adjudications: &[ClaimAdjudicationRecord],
+    validations: &[AgentValidationCycle],
+) -> Result<()> {
+    let active = active_task(state);
+    let active_json = serde_json::to_string_pretty(&active).unwrap_or_else(|_| "null".into());
+    let claims_json = serde_json::to_string_pretty(&state.claims).unwrap_or_else(|_| "[]".into());
+    let adjudications_json =
+        serde_json::to_string_pretty(adjudications).unwrap_or_else(|_| "[]".into());
+    let validation_json = validations
+        .last()
+        .map(|cycle| serde_json::to_string_pretty(cycle).unwrap_or_else(|_| "{}".into()))
+        .unwrap_or_else(|| "none".into());
+    let notebook = format!(
+        "# PRIDE-SCP scientific workspace: {}\n\n## Task board\n{}\n\n## Active task\n{}\n\n## Focused evidence\n{}\n\n## Canonical claims\n{}\n\n## Rust adjudications\n{}\n\n## Latest validation\n{}\n",
+        state.accession,
+        task_board_block(state),
+        active_json,
+        task_evidence_block(evidence, active),
+        claims_json,
+        adjudications_json,
+        validation_json,
+    );
+    fs::write(workspace_dir.join("NOTEBOOK.md"), notebook)?;
+    fs::write(
+        workspace_dir.join("TASKS.json"),
+        serde_json::to_string_pretty(&state.tasks)?,
+    )?;
+    Ok(())
 }
 
 fn scientific_agent_prompt(
@@ -518,57 +909,77 @@ fn scientific_agent_prompt(
     let files = evidence
         .raw_files
         .iter()
-        .take(opts.max_files_in_prompt)
+        .take(opts.max_files_in_prompt.min(32))
         .map(|f| format!("- {}", f.file_name))
         .collect::<Vec<_>>()
         .join("\n");
-    let workspace_json = serde_json::to_string_pretty(workspace).unwrap_or_else(|_| "{}".into());
-    let action_json = serde_json::to_string_pretty(actions).unwrap_or_else(|_| "[]".into());
-    let validation_json = serde_json::to_string_pretty(validations).unwrap_or_else(|_| "[]".into());
+    let active = active_task(workspace);
+    let active_json = serde_json::to_string_pretty(&active).unwrap_or_else(|_| "null".into());
+    let compact_workspace = json!({
+        "relation": &workspace.relation,
+        "branches": &workspace.branches,
+        "claims": &workspace.claims,
+        "open_questions": &workspace.open_questions,
+        "conflicts": &workspace.conflicts,
+    });
+    let workspace_json =
+        serde_json::to_string_pretty(&compact_workspace).unwrap_or_else(|_| "{}".into());
+    let recent_actions = actions.iter().rev().take(12).cloned().collect::<Vec<_>>();
+    let action_json = serde_json::to_string_pretty(&recent_actions).unwrap_or_else(|_| "[]".into());
+    let recent_validations = validations
+        .iter()
+        .rev()
+        .take(2)
+        .cloned()
+        .collect::<Vec<_>>();
+    let validation_json =
+        serde_json::to_string_pretty(&recent_validations).unwrap_or_else(|_| "[]".into());
     let feedback_json =
         serde_json::to_string_pretty(changed_harness_feedback).unwrap_or_else(|_| "[]".into());
     format!(
-        "You are the scientific annotation agent for PRIDE single-cell proteomics dataset {acc}.\n\n\
-Behave like a careful coding/research agent operating on a Rust-owned persistent scientific workspace. Inspect evidence, propose only DELTAS to branches and typed scientific claims, request tools when evidence is missing, compile only when the scientific model materially changes, inspect validator feedback, revise, and stop when the SDRF is valid or the evidence budget is exhausted.\n\n\
-PERSISTENT WORKSPACE CONTRACT (v0.4):\n\
-- Rust owns the canonical workspace. Your response is a WorkspaceDelta, never a replacement state.\n\
-- DO NOT copy unchanged branches, claims, questions, or conflicts into the delta. Prior state persists automatically. The structured schema requires every delta key, so use empty arrays for categories with no mutation.\n\
+        "You are the scientific workspace agent for PRIDE single-cell proteomics dataset {acc}.\n\n\
+Your environment behaves like a coding/research workspace: Rust owns persistent files/state, derives a deterministic scientific task board from the current SDRF validation failures, preserves prior edits, gives you focused evidence candidates, and executes bounded source-reading/search tools. Work ONE active task deeply before moving to another task. Do not try to rewrite the whole dataset each turn.\n\n\
+WORKSPACE-AGENT CONTRACT (v1.0):\n\
+- The ACTIVE TASK below is the only scientific objective for this turn. Set task_id exactly to its id. Set task_status=continue while you still need context/search; resolved when you have enough evidence to compile/test; human_review when the task cannot be resolved safely from available evidence. For validator-backed field tasks, Rust—not the model—marks the task truly resolved only after validation clears its error. Use next_step=compile when task_status is resolved or human_review.\n\
+- Rust owns canonical state. Return a sparse WorkspaceDelta; omitted prior branches/claims persist.\n\
+- For task:study_structure, establish the source-grounded branch/scope/linkage model before field-level repair. It is valid to resolve this task with unresolved RAW linkage when the paper supports conceptual branches but not exact file mapping. For read/search actions, target the affected scientific concepts (for example organism, cell_line, isolation_method, acquisition_mode); study_structure itself is not a claim concept.\n\
+- First inspect the focused evidence candidates. If a candidate is promising but the excerpt is insufficient, use READ_EVIDENCE_CONTEXT with evidence_refs=[E####] before inventing new keyword searches. This reads a much larger window from the registered trusted source.\n\
+- Use publication/supplement/metadata searches only when the focused candidates and already-read context do not answer the task. Search results become new trusted E#### items; read them if more context is needed.\n\
+- After source context supports a scientific interpretation, upsert the typed claim and cite the strongest E#### refs. Rust independently adjudicates controlled vocabulary, template gaps, conflicts, and publication safety.\n\
+- Compile only after a material evidence-backed workspace edit. Validator errors are task feedback, not permission to guess.\n\
+- Use abstain only when the task cannot be resolved safely after the relevant evidence candidates/context and reasonable targeted search are exhausted. Rust will route that task to human review instead of endlessly searching.\n\n\
+PERSISTENT CLAIM CONTRACT:\n\
 - Stable claim identity is (concept_type, scope, branch_id).\n\
-- To enrich the same value, upsert the same identity/value; Rust merges evidence, reason, status, and confidence.\n\
-- To change a value intentionally, set claim_upsert.supersedes_value to the exact current value. Rust replaces only on a valid explicit supersession.\n\
-- A changed value without explicit supersession becomes an explicit conflict and the existing active claim is retained.\n\
-- Remove a claim only with claim_retractions. Resolve an explicit claim conflict only with conflict_resolutions or a valid superseding upsert.\n\
-- Search results update the evidence inventory. You do not need to restate prior claims after a search; Rust re-adjudicates retained claims.\n\n\
-IMPORTANT COMPILER CONTRACT:\n\
-- You are NOT rebuilding an SDRF from scratch. Rust starts from a proven deterministic baseline containing relation/cardinality, repository/file structure, row identifiers, fraction/technical replicate defaults, and deterministic metadata scaffolds.\n\
-- Your claims are a semantic overlay. Omitting a field does NOT erase a valid deterministic baseline value or a prior model claim.\n\
-- If a field genuinely differs across biological/acquisition branches, represent branch-scoped claims. Rust masks an unsafe project-wide baseline value, but serializes branch values only when file-to-branch linkage is source-grounded.\n\
-- Use typed scientific concepts, not arbitrary SDRF columns. Rust owns the final mapping to SDRF fields and controlled vocabulary.\n\n\
-SCIENTIFIC CONCEPTS:\n\
-organism, organism_part, disease, cell_type, cell_line, sample_type, isolation_method, individual, sample_preparation, acquisition_mode, labeling, instrument, cleavage_agent, control_role, biological_condition.\n\n\
-HARD SCIENTIFIC CONTRACT:\n\
+- Same identity/value merges evidence. To replace a value, supersedes_value must exactly name the active value. Otherwise Rust records a conflict and retains the old value.\n\
+- Remove claims only with claim_retractions. Resolve conflicts only explicitly.\n\n\
+HARD SCIENTIFIC SAFETY CONTRACT:\n\
 1. Never use GT labels or hidden benchmark truth.\n\
-2. Filename words are search hints and contradiction detectors, NOT biological identity. A branch may list linked_raw_files only when cited E#### source evidence explicitly names or otherwise source-links those exact RAW basenames.\n\
-3. Keep project, branch, row, and unresolved scopes distinct. A project claim means the same scientific value holds across every relevant branch.\n\
-4. Biological heterogeneity is separate from acquisition cardinality.\n\
-5. Do not collapse multiple organisms or acquisition regimes into one project claim. Represent separate branches and leave file linkage unresolved when evidence is insufficient.\n\
-6. For isolation and acquisition, describe the scientific intent faithfully and cite the strongest direct method evidence. Rust—not you—decides whether the refs canonicalize to one supported value, prove a template gap, conflict, or remain unresolved. Distinguish the act that isolates/selects a single cell from downstream lysis, digestion, droplet handling, or injection of an already isolated lysate; those downstream steps are not isolation evidence by themselves.\n\
-7. Model status is advisory. For isolation_method and acquisition_mode you MAY return status='hypothesis' when the scientific interpretation is source-grounded but the exact controlled term is uncertain; Rust independently adjudicates the cited evidence and may canonicalize it. Other hypothesis concepts remain non-publishable.\n\
-8. Do not use sample_preparation as a dumping ground for every method detail. Emit one concise claim only when the concept is genuinely needed for SDRF annotation; procedural detail belongs in notes unless it changes a typed scientific concept.\n\
-9. Prefer explicit open_questions over guessed values.\n\
-10. Use next_step='search' only with executable actions. Use 'compile' only after a material workspace change. Use 'finish' when no further safe retrieval is needed. Use 'abstain' when evidence cannot safely resolve remaining study design.\n\
-11. Validator feedback is feedback about the compiled draft, not permission to invent metadata. Structural fields such as cell identifier, fraction identifier, and technical replicate are deterministic compiler responsibilities and should NOT become scientific claims.\n\
-12. Changed harness feedback contains only new/changed compiler adjudications or reducer events since your previous turn. Do not repeat a settled proposal merely to acknowledge feedback.\n\n\
+2. Filename words are search hints/contradiction detectors, never biological identity. linked_raw_files require trusted source evidence explicitly linking those exact RAW basenames.\n\
+3. Keep project, branch, row, and unresolved scopes distinct. A project claim means one invariant value across all relevant branches.\n\
+4. Do not collapse multiple organisms, cell populations, isolation regimes, or acquisition regimes into one project claim.\n\
+5. For isolation_method, identify the operation that actually selects/isolates the individual cell. Downstream lysis, digestion, droplet handling, LC/ESI injection of already isolated material, or generic sample loading is not isolation by itself. If source text explicitly describes hydrodynamic/capillary manipulation of an individual intact cell as the selection/loading act, preserve that exact scientific interpretation and let Rust adjudicate it.\n\
+6. For acquisition_mode, cite direct source evidence. Mixed DDA/DIA stays branch-scoped or unresolved unless trusted linkage proves one regime.\n\
+7. Model status/confidence are advisory. Rust owns canonicalization, template-gap precedence, evidence admissibility, branch masking, trusted linkage, and SDRF serialization.\n\
+8. Structural fields (cell identifier, fraction identifier, technical replicate) are compiler-owned and must not become scientific claims.\n\n\
+TOOL CONTRACT:\n\
+- READ_EVIDENCE_CONTEXT: set queries=[] and evidence_refs to one or more existing E#### candidates. Use this to read surrounding trusted source context.\n\
+- SEARCH_* / LOOKUP_KG_TERM / COMPARE_CONFLICTING_EVIDENCE: set evidence_refs=[] and provide typed queries.\n\
+- Do not repeat an exhausted identical read/search.\n\n\
+TASK BOARD:\n{task_board}\n\n\
+ACTIVE TASK:\n{active_json}\n\n\
+FOCUSED EVIDENCE FOR ACTIVE TASK:\n{task_evidence}\n\n\
 ACCEPTED DETERMINISTIC RELATION HINT (cardinality only):\n\
 mode={relation}; confidence={relation_confidence}; refs={relation_refs:?}; repository_file_mode={repo_mode}; note={design_note}\n\n\
-RAW FILE COUNT: {nfiles}\nRAW FILE SAMPLE (context/search hints only):\n{files}\n\n\
-EVIDENCE INVENTORY:\n{evidence_block}\n\n\
-CANONICAL RUST-OWNED WORKSPACE (read-only; update only through your delta):\n{workspace_json}\n\n\
-TOOL/ACTION HISTORY:\n{action_json}\n\n\
-VALIDATION HISTORY:\n{validation_json}\n\n\
-CHANGED HARNESS FEEDBACK SINCE YOUR PREVIOUS TURN:\n{feedback_json}\n\n\
-This is agent turn {turn}. Return ONLY a WorkspaceDelta. Keep it sparse: populate only real mutations/actions, use empty arrays for no-op categories, and do not restate unchanged canonical state.",
+RAW FILE COUNT: {nfiles}\nRAW FILE SAMPLE (search hints only):\n{files}\n\n\
+CANONICAL WORKSPACE (read-only; mutate through WorkspaceDelta):\n{workspace_json}\n\n\
+RECENT TOOL/ACTION HISTORY:\n{action_json}\n\n\
+RECENT VALIDATION HISTORY:\n{validation_json}\n\n\
+CHANGED RUST FEEDBACK SINCE THE PREVIOUS TURN:\n{feedback_json}\n\n\
+This is turn {turn}. Return ONLY WorkspaceDelta. task_id must equal the ACTIVE TASK id. Use empty arrays for mutation/action categories you are not using. Do not restate unchanged state.",
         acc = evidence.accession,
+        task_board = task_board_block(workspace),
+        active_json = active_json,
+        task_evidence = task_evidence_block(evidence, active),
         relation = evidence.study_design.relation_mode_hint,
         relation_confidence = evidence.study_design.relation_confidence,
         relation_refs = evidence.study_design.relation_evidence_refs,
@@ -576,7 +987,6 @@ This is agent turn {turn}. Return ONLY a WorkspaceDelta. Keep it sparse: populat
         design_note = evidence.study_design.notes,
         nfiles = evidence.raw_files.len(),
         files = files,
-        evidence_block = workspace_evidence_block(evidence, 48),
         workspace_json = workspace_json,
         action_json = action_json,
         validation_json = validation_json,
@@ -917,6 +1327,14 @@ fn normalize_scientific_agent_action(evidence: &DatasetEvidence, action: &mut Ag
         .collect();
     action.target_concepts.sort();
     action.target_concepts.dedup();
+    action.evidence_refs = valid_evidence_refs(evidence, &action.evidence_refs);
+
+    if action.action == "READ_EVIDENCE_CONTEXT" {
+        action.queries.clear();
+        action.evidence_refs.truncate(8);
+        return;
+    }
+    action.evidence_refs.clear();
 
     for query in &mut action.queries {
         normalize_evidence_query(query);
@@ -963,6 +1381,307 @@ fn agent_action_to_request(action: &AgentEvidenceAction) -> EvidenceActionReques
             .collect(),
         queries: action.queries.clone(),
     }
+}
+
+fn registered_source_paths(evidence: &DatasetEvidence) -> BTreeSet<String> {
+    let mut paths = evidence
+        .manuscript_sources
+        .iter()
+        .chain(evidence.annotation_sources.iter())
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    if !evidence.project_json_path.trim().is_empty() {
+        paths.insert(evidence.project_json_path.clone());
+    }
+    if !evidence.files_json_path.trim().is_empty() {
+        paths.insert(evidence.files_json_path.clone());
+    }
+    paths
+}
+
+fn registered_source_candidates(evidence: &DatasetEvidence, item: &EvidenceItem) -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    let direct = PathBuf::from(item.source_label.trim());
+    if direct.is_file() {
+        paths.push(direct);
+    }
+    let kind = item.source_kind.to_ascii_lowercase();
+    if kind.contains("manuscript") && !kind.contains("semantic") {
+        paths.extend(
+            evidence
+                .manuscript_sources
+                .iter()
+                .map(|path| PathBuf::from(path.as_str())),
+        );
+        paths.extend(
+            evidence
+                .annotation_sources
+                .iter()
+                .map(|path| PathBuf::from(path.as_str())),
+        );
+    } else if kind.contains("annotation") || kind.contains("semantic") {
+        paths.extend(
+            evidence
+                .annotation_sources
+                .iter()
+                .map(|path| PathBuf::from(path.as_str())),
+        );
+        paths.extend(
+            evidence
+                .manuscript_sources
+                .iter()
+                .map(|path| PathBuf::from(path.as_str())),
+        );
+    } else {
+        paths.extend(
+            evidence
+                .manuscript_sources
+                .iter()
+                .map(|path| PathBuf::from(path.as_str())),
+        );
+        paths.extend(
+            evidence
+                .annotation_sources
+                .iter()
+                .map(|path| PathBuf::from(path.as_str())),
+        );
+    }
+    if !evidence.project_json_path.trim().is_empty() {
+        paths.push(PathBuf::from(&evidence.project_json_path));
+    }
+    if !evidence.files_json_path.trim().is_empty() {
+        paths.push(PathBuf::from(&evidence.files_json_path));
+    }
+    let registered = registered_source_paths(evidence);
+    paths.retain(|path| path.is_file() && registered.contains(&path.display().to_string()));
+    paths.sort_by_key(|path| {
+        let display = path.display().to_string();
+        if display == item.source_label {
+            0usize
+        } else {
+            1usize
+        }
+    });
+    paths.dedup();
+    paths
+}
+
+fn context_anchor(source: &str, excerpt: &str) -> Option<usize> {
+    let lower = source.to_ascii_lowercase();
+    let exact = excerpt.trim().to_ascii_lowercase();
+    if !exact.is_empty() {
+        if let Some(pos) = lower.find(&exact) {
+            return Some(pos);
+        }
+    }
+    let mut terms = excerpt
+        .split(|c: char| !c.is_ascii_alphanumeric() && c != '-')
+        .map(str::trim)
+        .filter(|term| term.len() >= 7)
+        .map(|term| term.to_ascii_lowercase())
+        .collect::<Vec<_>>();
+    terms.sort_by_key(|term| std::cmp::Reverse(term.len()));
+    terms.dedup();
+    terms
+        .into_iter()
+        .take(24)
+        .find_map(|term| lower.find(&term))
+}
+
+fn registered_context_for_item(
+    evidence: &DatasetEvidence,
+    item: &EvidenceItem,
+) -> Option<(PathBuf, String, usize)> {
+    for path in registered_source_candidates(evidence, item) {
+        let Ok(source) = fs::read_to_string(&path) else {
+            continue;
+        };
+        if let Some(anchor) = context_anchor(&source, &item.text) {
+            return Some((path, source, anchor));
+        }
+    }
+    None
+}
+
+fn source_context_window(source: &str, anchor: usize, radius: usize) -> String {
+    let mut start = anchor.saturating_sub(radius);
+    let mut end = (anchor + radius).min(source.len());
+    while start > 0 && !source.is_char_boundary(start) {
+        start -= 1;
+    }
+    while end < source.len() && !source.is_char_boundary(end) {
+        end += 1;
+    }
+    source[start..end].replace('\0', " ")
+}
+
+fn read_evidence_context(
+    evidence: &mut DatasetEvidence,
+    evidence_ref: &str,
+    target_fields: &[String],
+    reason: &str,
+    turn: usize,
+    attempted: &mut BTreeSet<String>,
+) -> EvidenceActionResult {
+    let query = EvidenceQuery {
+        match_kind: "identifier".into(),
+        value: evidence_ref.into(),
+        terms: Vec::new(),
+        document_hint: String::new(),
+    };
+    let key = format!(
+        "READ_EVIDENCE_CONTEXT:{}",
+        evidence_ref.to_ascii_uppercase()
+    );
+    if !attempted.insert(key) {
+        return EvidenceActionResult {
+            round: turn,
+            action: "READ_EVIDENCE_CONTEXT".into(),
+            target_fields: target_fields.to_vec(),
+            query,
+            outcome: "duplicate_skipped".into(),
+            summary: format!(
+                "evidence context {} was already read; use the existing expanded E#### context or choose a different source; reason={}",
+                evidence_ref, reason
+            ),
+            ..EvidenceActionResult::default()
+        };
+    }
+    let Some(item) = evidence
+        .evidence
+        .iter()
+        .find(|item| item.id.eq_ignore_ascii_case(evidence_ref))
+        .cloned()
+    else {
+        return EvidenceActionResult {
+            round: turn,
+            action: "READ_EVIDENCE_CONTEXT".into(),
+            target_fields: target_fields.to_vec(),
+            query,
+            outcome: "invalid_query".into(),
+            summary: format!(
+                "evidence ref {} is not in the trusted inventory",
+                evidence_ref
+            ),
+            ..EvidenceActionResult::default()
+        };
+    };
+    let Some((path, source, anchor)) = registered_context_for_item(evidence, &item) else {
+        return EvidenceActionResult {
+            round: turn,
+            action: "READ_EVIDENCE_CONTEXT".into(),
+            target_fields: target_fields.to_vec(),
+            query,
+            outcome: "context_unavailable".into(),
+            matched_evidence_refs: vec![item.id.clone()],
+            summary: format!(
+                "{} could not be anchored in any registered trusted source document; the inline trusted excerpt remains available; source_label={}; reason={}",
+                item.id, item.source_label, reason
+            ),
+            ..EvidenceActionResult::default()
+        };
+    };
+    let context = source_context_window(&source, anchor, SCIENTIFIC_AGENT_CONTEXT_READ_RADIUS);
+    let context_label = path.display().to_string();
+    if let Some(existing) = evidence.evidence.iter().find(|existing| {
+        existing.source_kind == "agent_read_context"
+            && existing.source_label == context_label
+            && existing.text == context
+    }) {
+        return EvidenceActionResult {
+            round: turn,
+            action: "READ_EVIDENCE_CONTEXT".into(),
+            target_fields: target_fields.to_vec(),
+            query,
+            outcome: "matched".into(),
+            matched_evidence_refs: vec![existing.id.clone()],
+            summary: format!(
+                "expanded trusted source context for {} was already materialized as {}; source={}; reason={}",
+                item.id, existing.id, path.display(), reason
+            ),
+            ..EvidenceActionResult::default()
+        };
+    }
+    let expanded_id = next_agent_evidence_id(evidence);
+    evidence.evidence.push(EvidenceItem {
+        id: expanded_id.clone(),
+        source_kind: "agent_read_context".into(),
+        source_label: context_label,
+        text: context,
+    });
+    EvidenceActionResult {
+        round: turn,
+        action: "READ_EVIDENCE_CONTEXT".into(),
+        target_fields: target_fields.to_vec(),
+        query,
+        outcome: "matched".into(),
+        matched_evidence_refs: vec![expanded_id.clone()],
+        summary: format!(
+            "expanded {} into {} with a bounded surrounding context window from registered trusted source {}; reason={}",
+            item.id, expanded_id, path.display(), reason
+        ),
+        ..EvidenceActionResult::default()
+    }
+}
+
+fn execute_scientific_agent_actions(
+    evidence: &mut DatasetEvidence,
+    actions: &[AgentEvidenceAction],
+    turn: usize,
+    attempted: &mut BTreeSet<String>,
+) -> Vec<EvidenceActionResult> {
+    let mut out = Vec::new();
+    for action in actions {
+        let target_fields = action
+            .target_concepts
+            .iter()
+            .map(|concept| {
+                concept_to_sdrf_field(concept)
+                    .unwrap_or(concept)
+                    .to_string()
+            })
+            .collect::<Vec<_>>();
+        if action.action == "READ_EVIDENCE_CONTEXT" {
+            for evidence_ref in &action.evidence_refs {
+                out.push(read_evidence_context(
+                    evidence,
+                    evidence_ref,
+                    &target_fields,
+                    &action.reason,
+                    turn,
+                    attempted,
+                ));
+            }
+            continue;
+        }
+        let request = agent_action_to_request(action);
+        out.extend(execute_evidence_actions(
+            evidence,
+            &[request],
+            turn,
+            attempted,
+        ));
+    }
+    out
+}
+
+fn record_task_reads(
+    state: &mut ScientificWorkspaceState,
+    task_id: &str,
+    results: &[EvidenceActionResult],
+) {
+    let Some(task) = state.tasks.iter_mut().find(|task| task.id == task_id) else {
+        return;
+    };
+    for result in results
+        .iter()
+        .filter(|result| result.action == "READ_EVIDENCE_CONTEXT")
+    {
+        task.evidence_reads
+            .extend(result.matched_evidence_refs.iter().cloned());
+    }
+    task.evidence_reads.sort();
+    task.evidence_reads.dedup();
 }
 
 fn normalize_workspace_branches(evidence: &DatasetEvidence, branches: &mut Vec<AgentBranch>) {
@@ -1086,6 +1805,11 @@ fn normalize_workspace_state(
     }
 
     dedup_strings(&mut state.open_questions);
+    for task in &mut state.tasks {
+        task.evidence_candidates = valid_evidence_refs(evidence, &task.evidence_candidates);
+        task.evidence_reads = valid_evidence_refs(evidence, &task.evidence_reads);
+    }
+    ensure_active_task(state);
     for action in &mut state.next_evidence_actions {
         normalize_scientific_agent_action(evidence, action);
     }
@@ -1112,6 +1836,41 @@ fn apply_workspace_delta(
     turn: usize,
 ) -> Vec<String> {
     let mut events = Vec::new();
+
+    if !state.active_task_id.is_empty() && delta.task_id != state.active_task_id {
+        events.push(format!(
+            "turn {turn} reducer rejected delta for task '{}' because active task is '{}'; inspect and work the active task only",
+            delta.task_id, state.active_task_id
+        ));
+        state.next_evidence_actions.clear();
+        state.next_step = "compile".into();
+        return events;
+    }
+    if let Some(task) = state
+        .tasks
+        .iter_mut()
+        .find(|task| task.id == state.active_task_id)
+    {
+        task.attempts += 1;
+        if task.status == "open" {
+            task.status = "investigating".into();
+        }
+        if !delta.notes.trim().is_empty() {
+            task.notes = delta.notes.trim().to_string();
+        }
+        match delta.task_status.as_str() {
+            "resolved" if task.sdrf_field == "study_structure" => {
+                task.status = "resolved".into();
+            }
+            // Field tasks are only resolved by Rust after compile/validation
+            // proves that their validator failures disappeared. Model
+            // `resolved` means "ready to compile/test", not permission to hide
+            // an outstanding error.
+            "resolved" => task.status = "investigating".into(),
+            "human_review" => task.status = "human_review".into(),
+            _ => task.status = "investigating".into(),
+        }
+    }
 
     // Branches are Rust-owned canonical state. Upserts merge into the existing
     // branch set; omission never deletes a branch.
@@ -1305,6 +2064,10 @@ fn apply_workspace_delta(
     }
 
     normalize_workspace_state(evidence, state, turn);
+    if matches!(delta.task_status.as_str(), "resolved" | "human_review") {
+        state.next_evidence_actions.clear();
+        state.next_step = "compile".into();
+    }
     events
 }
 
@@ -2232,23 +2995,35 @@ fn record_adjudication_snapshot(
 fn trim_actions_to_budget(
     actions: &[AgentEvidenceAction],
     remaining: usize,
-) -> Vec<EvidenceActionRequest> {
+) -> Vec<AgentEvidenceAction> {
     let mut left = remaining;
     let mut out = Vec::new();
     for action in actions {
         if left == 0 {
             break;
         }
-        let mut request = agent_action_to_request(action);
-        if request.action == "ABSTAIN" {
-            out.push(request);
+        let mut action = action.clone();
+        if action.action == "ABSTAIN" {
+            action.queries.clear();
+            action.evidence_refs.clear();
+            out.push(action);
             left = left.saturating_sub(1);
             continue;
         }
-        request.queries.truncate(left.min(8));
-        if !request.queries.is_empty() {
-            left = left.saturating_sub(request.queries.len());
-            out.push(request);
+        if action.action == "READ_EVIDENCE_CONTEXT" {
+            action.evidence_refs.truncate(left.min(8));
+            action.queries.clear();
+            if !action.evidence_refs.is_empty() {
+                left = left.saturating_sub(action.evidence_refs.len());
+                out.push(action);
+            }
+            continue;
+        }
+        action.queries.truncate(left.min(8));
+        action.evidence_refs.clear();
+        if !action.queries.is_empty() {
+            left = left.saturating_sub(action.queries.len());
+            out.push(action);
         }
     }
     out
@@ -2367,6 +3142,23 @@ async fn run_one_scientific_agent(
     let baseline_cycle = validation_cycle(1, &baseline.issues);
     let baseline_errors = baseline_cycle.validation_errors;
     trace.validation_history.push(baseline_cycle);
+    refresh_scientific_tasks(&evidence, &mut state, &baseline.issues);
+    trace.states[0] = state.clone();
+    fs::write(
+        workspace_dir.join("state.turn00.json"),
+        serde_json::to_string_pretty(&state)?,
+    )?;
+    fs::write(
+        workspace_dir.join("state.json"),
+        serde_json::to_string_pretty(&state)?,
+    )?;
+    write_workspace_notebook(
+        &workspace_dir,
+        &evidence,
+        &state,
+        &baseline.adjudications,
+        &trace.validation_history,
+    )?;
     push_harness_feedback(
         &mut trace.harness_feedback,
         &mut pending_harness_feedback,
@@ -2403,6 +3195,11 @@ async fn run_one_scientific_agent(
 
     if trace.terminal_status.is_empty() {
         for turn in 1..=max_turns {
+            ensure_active_task(&mut state);
+            if state.active_task_id.is_empty() {
+                trace.terminal_status = "partial_no_active_scientific_task".into();
+                break;
+            }
             let delta = call_scientific_agent(
                 opts,
                 &evidence,
@@ -2464,22 +3261,38 @@ async fn run_one_scientific_agent(
             if state.next_step == "search" {
                 let remaining = max_actions.saturating_sub(trace.tool_actions_completed);
                 if remaining == 0 {
-                    trace.terminal_status = "evidence_exhausted".into();
-                    break;
+                    mark_active_task_human_review(
+                        &mut state,
+                        "evidence/tool budget exhausted before the active scientific task could be resolved",
+                    );
+                    if state.active_task_id.is_empty() {
+                        trace.terminal_status = "evidence_exhausted".into();
+                        break;
+                    }
+                    push_harness_feedback(
+                        &mut trace.harness_feedback,
+                        &mut pending_harness_feedback,
+                        "tool budget exhausted for the previous task; Rust routed it to human review and advanced the task board".into(),
+                    );
+                    continue;
                 }
                 let actions = trim_actions_to_budget(&state.next_evidence_actions, remaining);
                 if actions.is_empty() {
                     push_harness_feedback(
                         &mut trace.harness_feedback,
                         &mut pending_harness_feedback,
-                        "search requested but no executable typed action remained after normalization; choose a different search, compile only after a material state change, finish, or abstain".into(),
+                        "search requested but no executable read/search action remained after normalization; inspect focused candidates, request READ_EVIDENCE_CONTEXT/search, compile after a material edit, or abstain to human review".into(),
                     );
                     continue;
                 }
                 let round_results =
-                    execute_evidence_actions(&mut evidence, &actions, turn, &mut attempted);
+                    execute_scientific_agent_actions(&mut evidence, &actions, turn, &mut attempted);
                 trace.tool_actions_completed += round_results.len();
+                record_task_reads(&mut state, &delta.task_id, &round_results);
                 trace.evidence_action_results.extend(round_results);
+                if let Some(current) = compiled.as_ref() {
+                    refresh_scientific_tasks(&evidence, &mut state, &current.issues);
+                }
                 fs::write(&evidence_path, serde_json::to_string_pretty(&evidence)?)?;
                 fs::write(
                     workspace_dir.join("action_history.json"),
@@ -2525,6 +3338,13 @@ async fn run_one_scientific_agent(
                     workspace_dir.join("state.json"),
                     serde_json::to_string_pretty(&state)?,
                 )?;
+                write_workspace_notebook(
+                    &workspace_dir,
+                    &evidence,
+                    &state,
+                    &post_search_adjudications,
+                    &trace.validation_history,
+                )?;
                 continue;
             }
 
@@ -2551,27 +3371,53 @@ async fn run_one_scientific_agent(
                 workspace_dir.join("adjudication_history.json"),
                 serde_json::to_string_pretty(&trace.adjudication_history)?,
             )?;
+            refresh_scientific_tasks(&evidence, &mut state, &compiled_now.issues);
             if last_compile_fingerprint
                 .as_deref()
                 .is_some_and(|previous| previous == compiled_now.fingerprint.as_str())
             {
+                let adjudications = compiled_now.adjudications.clone();
                 compiled = Some(compiled_now);
-                if state.next_step == "abstain" {
-                    trace.terminal_status = "abstained".into();
-                    break;
-                }
-                if state.next_step == "finish" {
-                    trace.terminal_status = "partial".into();
-                    break;
+                if matches!(state.next_step.as_str(), "abstain" | "finish") {
+                    let note = if state.next_step == "abstain" {
+                        "agent explicitly abstained after inspecting the active task"
+                    } else {
+                        "agent requested finish while the active task still had validation errors"
+                    };
+                    mark_active_task_human_review(&mut state, note);
+                    write_workspace_notebook(
+                        &workspace_dir,
+                        &evidence,
+                        &state,
+                        &adjudications,
+                        &trace.validation_history,
+                    )?;
+                    if state.active_task_id.is_empty() {
+                        trace.terminal_status = "human_review".into();
+                        break;
+                    }
+                    push_harness_feedback(
+                        &mut trace.harness_feedback,
+                        &mut pending_harness_feedback,
+                        "previous task routed to human review; continue with the next Rust-selected scientific task".into(),
+                    );
+                    continue;
                 }
                 push_harness_feedback(
                     &mut trace.harness_feedback,
                     &mut pending_harness_feedback,
                     format!(
-                        "turn {} compile blocked: normalized scientific state produced the same deterministic draft as the previous validated compile; do not compile again without changing evidence-backed claims/branches",
+                        "turn {} compile blocked: normalized scientific state produced the same deterministic draft as the previous validated compile; read/search additional task evidence or change the evidence-backed scientific model before compiling again",
                         turn
                     ),
                 );
+                write_workspace_notebook(
+                    &workspace_dir,
+                    &evidence,
+                    &state,
+                    &adjudications,
+                    &trace.validation_history,
+                )?;
                 continue;
             }
             last_compile_fingerprint = Some(compiled_now.fingerprint.clone());
@@ -2585,18 +3431,41 @@ async fn run_one_scientific_agent(
                 workspace_dir.join("validation_history.json"),
                 serde_json::to_string_pretty(&trace.validation_history)?,
             )?;
+            refresh_scientific_tasks(&evidence, &mut state, &compiled_now.issues);
+            let adjudications = compiled_now.adjudications.clone();
             compiled = Some(compiled_now);
+            write_workspace_notebook(
+                &workspace_dir,
+                &evidence,
+                &state,
+                &adjudications,
+                &trace.validation_history,
+            )?;
 
             if errors == 0 {
                 trace.terminal_status = "resolved".into();
                 break;
             }
-            if state.next_step == "abstain" {
-                trace.terminal_status = "abstained".into();
-                break;
+            if matches!(state.next_step.as_str(), "abstain" | "finish") {
+                let note = if state.next_step == "abstain" {
+                    "agent explicitly abstained after the latest validated compile"
+                } else {
+                    "agent requested finish while the active task still had validation errors"
+                };
+                mark_active_task_human_review(&mut state, note);
+                if state.active_task_id.is_empty() {
+                    trace.terminal_status = "human_review".into();
+                    break;
+                }
+                push_harness_feedback(
+                    &mut trace.harness_feedback,
+                    &mut pending_harness_feedback,
+                    "previous task routed to human review; continue with the next Rust-selected scientific task".into(),
+                );
+                continue;
             }
-            if state.next_step == "finish" {
-                trace.terminal_status = "partial".into();
+            if state.active_task_id.is_empty() {
+                trace.terminal_status = "partial_no_active_scientific_task".into();
                 break;
             }
             if trace.validator_cycles_completed >= max_validator_cycles {
@@ -2617,6 +3486,13 @@ async fn run_one_scientific_agent(
             "partial".into()
         };
     }
+    if let Some(last_state) = trace.states.last_mut() {
+        *last_state = state.clone();
+    }
+    fs::write(
+        workspace_dir.join("state.json"),
+        serde_json::to_string_pretty(&state)?,
+    )?;
     let compiled = compiled.unwrap();
     let validation_errors = compiled
         .issues
@@ -2632,6 +3508,13 @@ async fn run_one_scientific_agent(
     fs::write(
         workspace_dir.join("adjudication_history.json"),
         serde_json::to_string_pretty(&trace.adjudication_history)?,
+    )?;
+    write_workspace_notebook(
+        &workspace_dir,
+        &evidence,
+        &state,
+        &final_adjudications,
+        &trace.validation_history,
     )?;
 
     fs::write(
@@ -2659,6 +3542,8 @@ async fn run_one_scientific_agent(
         "claim_adjudications": final_adjudications,
         "open_questions": state.open_questions.clone(),
         "conflicts": state.conflicts.clone(),
+        "tasks": state.tasks.clone(),
+        "active_task_id": state.active_task_id.clone(),
         "harness_feedback": trace.harness_feedback.clone(),
         "deterministic_repairs": compiled.deterministic_repairs,
         "draft_path": draft_path.display().to_string(),
@@ -3372,12 +4257,227 @@ mod tests {
     }
 
     #[test]
-    fn v04_schema_is_delta_only_not_full_workspace_replacement() {
+    fn task_board_surfaces_direct_hydrodynamic_evidence_ahead_of_noise() {
+        let mut items = (1..=30)
+            .map(|i| EvidenceItem {
+                id: format!("E{i:04}"),
+                source_kind: "repository_metadata".into(),
+                source_label: format!("noise-{i}"),
+                text: "generic project metadata with no method description".into(),
+            })
+            .collect::<Vec<_>>();
+        items.push(EvidenceItem {
+            id: "E0031".into(),
+            source_kind: "manuscript_semantic_evidence".into(),
+            source_label: "stage04_semantic".into(),
+            text: "individual single cells were introduced by hydrodynamic injection and processed by on-capillary lysis".into(),
+        });
+        let evidence = evidence_with(items, vec!["runA.raw"]);
+        let issues = vec![ValidationIssue {
+            level: "error".into(),
+            code: "single_cell_isolation_unresolved".into(),
+            row: 1,
+            column: SC_ISOLATION_METHOD.into(),
+            message: "missing isolation method".into(),
+        }];
+        let tasks = build_scientific_tasks(&evidence, &issues);
+        assert_eq!(tasks.len(), 2);
+        assert_eq!(tasks[0].id, "task:study_structure");
+        assert_eq!(tasks[1].concept_type, "isolation_method");
+        assert_eq!(
+            tasks[1].evidence_candidates.first().map(String::as_str),
+            Some("E0031")
+        );
+    }
+
+    #[test]
+    fn read_evidence_context_materializes_larger_window_from_registered_source() {
+        let dir = std::env::temp_dir().join(format!(
+            "pride-scp-workspace-agent-read-context-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let source_path = dir.join("semantic.json");
+        let phrase = "individual single cells were introduced by hydrodynamic injection";
+        let source = format!(
+            "{} {} {}",
+            "prefix ".repeat(1200),
+            phrase,
+            "suffix ".repeat(1200)
+        );
+        fs::write(&source_path, &source).unwrap();
+
+        let mut evidence = evidence_with(
+            vec![EvidenceItem {
+                id: "E0021".into(),
+                source_kind: "manuscript_semantic_evidence".into(),
+                source_label: "stage04_semantic".into(),
+                text: phrase.into(),
+            }],
+            vec!["runA.raw"],
+        );
+        evidence.annotation_sources = vec![source_path.display().to_string()];
+        let mut attempted = BTreeSet::new();
+        let result = read_evidence_context(
+            &mut evidence,
+            "E0021",
+            &["single_cell_isolation_method".into()],
+            "inspect direct isolation evidence",
+            1,
+            &mut attempted,
+        );
+        assert_eq!(result.outcome, "matched");
+        assert_eq!(result.matched_evidence_refs.len(), 1);
+        let expanded = evidence
+            .evidence
+            .iter()
+            .find(|item| item.id == result.matched_evidence_refs[0])
+            .unwrap();
+        assert_eq!(expanded.source_kind, "agent_read_context");
+        assert_eq!(expanded.source_label, source_path.display().to_string());
+        assert!(expanded.text.contains(phrase));
+        assert!(expanded.text.len() > phrase.len());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn read_evidence_context_does_not_open_unregistered_arbitrary_path() {
+        let dir = std::env::temp_dir().join(format!(
+            "pride-scp-workspace-agent-unregistered-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let unregistered = dir.join("secret.txt");
+        fs::write(&unregistered, "hydrodynamic injection of single cells").unwrap();
+        let mut evidence = evidence_with(
+            vec![EvidenceItem {
+                id: "E0001".into(),
+                source_kind: "manuscript_semantic_evidence".into(),
+                source_label: unregistered.display().to_string(),
+                text: "hydrodynamic injection".into(),
+            }],
+            vec!["runA.raw"],
+        );
+        let mut attempted = BTreeSet::new();
+        let result = read_evidence_context(
+            &mut evidence,
+            "E0001",
+            &["single_cell_isolation_method".into()],
+            "test trust boundary",
+            1,
+            &mut attempted,
+        );
+        assert_eq!(result.outcome, "context_unavailable");
+        assert_eq!(evidence.evidence.len(), 1);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn human_review_task_rotation_advances_to_next_open_task() {
+        let mut state = ScientificWorkspaceState {
+            tasks: vec![
+                ScientificTask {
+                    id: "task:single_cell_isolation_method".into(),
+                    concept_type: "isolation_method".into(),
+                    sdrf_field: "single_cell_isolation_method".into(),
+                    status: "investigating".into(),
+                    error_count: 15,
+                    ..Default::default()
+                },
+                ScientificTask {
+                    id: "task:organism".into(),
+                    concept_type: "organism".into(),
+                    sdrf_field: "organism".into(),
+                    status: "open".into(),
+                    error_count: 4,
+                    ..Default::default()
+                },
+            ],
+            active_task_id: "task:single_cell_isolation_method".into(),
+            ..Default::default()
+        };
+        mark_active_task_human_review(&mut state, "evidence exhausted");
+        assert_eq!(state.tasks[0].status, "human_review");
+        assert_eq!(state.active_task_id, "task:organism");
+        assert_eq!(state.tasks[1].status, "investigating");
+    }
+
+    #[test]
+    fn study_structure_task_is_first_and_explicit_resolution_advances_to_field_task() {
+        let evidence = evidence_with(
+            vec![EvidenceItem {
+                id: "E0001".into(),
+                source_kind: "manuscript_semantic_evidence".into(),
+                source_label: "stage04_semantic".into(),
+                text:
+                    "HeLa cells and Xenopus oocytes were described as distinct experimental systems"
+                        .into(),
+            }],
+            vec!["runA.raw"],
+        );
+        let issues = vec![ValidationIssue {
+            level: "error".into(),
+            code: "single_cell_isolation_unresolved".into(),
+            row: 1,
+            column: SC_ISOLATION_METHOD.into(),
+            message: "missing isolation method".into(),
+        }];
+        let mut state = ScientificWorkspaceState {
+            tasks: build_scientific_tasks(&evidence, &issues),
+            ..Default::default()
+        };
+        ensure_active_task(&mut state);
+        assert_eq!(state.active_task_id, "task:study_structure");
+
+        let delta = WorkspaceDelta {
+            turn: 1,
+            task_id: "task:study_structure".into(),
+            task_status: "resolved".into(),
+            branch_upserts: vec![AgentBranch {
+                id: "hela".into(),
+                label: "HeLa experimental system".into(),
+                status: "supported".into(),
+                evidence_refs: vec!["E0001".into()],
+                linked_raw_files: Vec::new(),
+                linkage_status: "unresolved".into(),
+                notes: "conceptual branch; no source-grounded RAW mapping".into(),
+            }],
+            next_step: "compile".into(),
+            ..Default::default()
+        };
+        apply_workspace_delta(&evidence, &mut state, &delta, 1);
+        refresh_scientific_tasks(&evidence, &mut state, &issues);
+        assert_eq!(
+            state
+                .tasks
+                .iter()
+                .find(|task| task.id == "task:study_structure")
+                .map(|task| task.status.as_str()),
+            Some("resolved")
+        );
+        assert_eq!(state.active_task_id, "task:single_cell_isolation_method");
+        assert_eq!(state.branches.len(), 1);
+        assert!(state.branches[0].linked_raw_files.is_empty());
+    }
+
+    #[test]
+    fn v10_schema_is_task_scoped_delta_not_full_workspace_replacement() {
         let schema = scientific_agent_schema();
         let properties = schema["properties"].as_object().unwrap();
+        assert!(properties.contains_key("task_id"));
+        assert!(properties.contains_key("task_status"));
         assert!(properties.contains_key("claim_upserts"));
         assert!(properties.contains_key("claim_retractions"));
         assert!(properties.contains_key("branch_upserts"));
+        let action_enum = properties["next_evidence_actions"]["items"]["properties"]["action"]
+            ["enum"]
+            .as_array()
+            .unwrap();
+        assert!(action_enum
+            .iter()
+            .any(|value| value.as_str() == Some("READ_EVIDENCE_CONTEXT")));
         assert!(!properties.contains_key("claims"));
         assert!(!properties.contains_key("branches"));
         assert!(!properties.contains_key("relation"));
@@ -3387,6 +4487,8 @@ mod tests {
     fn workspace_delta_parser_rejects_full_state_fields_even_if_model_emits_them() {
         let value = json!({
             "turn": 1,
+            "task_id": "task:single_cell_isolation_method",
+            "task_status": "continue",
             "branch_upserts": [],
             "claim_upserts": [],
             "claim_retractions": [],
@@ -3415,6 +4517,7 @@ mod tests {
                 terms: vec!["BS01".into(), "HeLa".into()],
                 ..Default::default()
             }],
+            evidence_refs: Vec::new(),
         };
         normalize_scientific_agent_action(&evidence, &mut action);
         assert_eq!(action.action, "EXPAND_EVIDENCE_CONTEXT");
@@ -3433,6 +4536,7 @@ mod tests {
                 value: "runA.raw".into(),
                 ..Default::default()
             }],
+            evidence_refs: Vec::new(),
         };
         normalize_scientific_agent_action(&evidence, &mut action);
         assert_eq!(action.action, "SEARCH_EXACT_RAW_NAME");
@@ -3533,6 +4637,7 @@ mod tests {
                     ..Default::default()
                 })
                 .collect(),
+            evidence_refs: Vec::new(),
         }];
         let trimmed = trim_actions_to_budget(&actions, 3);
         assert_eq!(trimmed.len(), 1);
