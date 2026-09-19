@@ -1,6 +1,6 @@
 use super::*;
 
-pub const SCIENTIFIC_AGENT_HARNESS_VERSION: &str = "pride-scp-scientific-workspace-agent-v1.0";
+pub const SCIENTIFIC_AGENT_HARNESS_VERSION: &str = "pride-scp-scientific-workspace-agent-v1.1";
 const SCIENTIFIC_AGENT_TASK_EVIDENCE_LIMIT: usize = 20;
 const SCIENTIFIC_AGENT_CONTEXT_READ_RADIUS: usize = 6000;
 #[derive(Debug, Clone)]
@@ -113,6 +113,7 @@ struct AgentBranch {
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 struct ScientificClaim {
     concept_type: String,
+    #[serde(rename = "observed_value", alias = "value")]
     value: String,
     scope: String,
     branch_id: String,
@@ -248,6 +249,7 @@ struct ClaimAdjudicationRecord {
     scope: String,
     branch_id: String,
     model_status: String,
+    #[serde(rename = "observed_value", alias = "proposed_value")]
     proposed_value: String,
     evidence_refs: Vec<String>,
     adjudication: ClaimAdjudication,
@@ -263,6 +265,104 @@ struct AgentEvidenceAction {
     queries: Vec<EvidenceQuery>,
     #[serde(default)]
     evidence_refs: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct ScientificObservationUpsert {
+    concept_type: String,
+    observed_value: String,
+    scope: String,
+    branch_id: String,
+    status: String,
+    #[serde(default)]
+    evidence_refs: Vec<String>,
+    confidence: String,
+    reason: String,
+    /// Empty means the observation is not explicitly replacing a prior
+    /// observation for the same stable identity. This compares observations,
+    /// never Rust-owned canonical SDRF vocabulary values.
+    supersedes_observed_value: String,
+}
+
+impl ScientificObservationUpsert {
+    fn as_claim_upsert(&self) -> ScientificClaimUpsert {
+        ScientificClaimUpsert {
+            concept_type: self.concept_type.clone(),
+            value: self.observed_value.clone(),
+            scope: self.scope.clone(),
+            branch_id: self.branch_id.clone(),
+            status: self.status.clone(),
+            evidence_refs: self.evidence_refs.clone(),
+            confidence: self.confidence.clone(),
+            reason: self.reason.clone(),
+            supersedes_value: self.supersedes_observed_value.clone(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct ScientificObservationRetraction {
+    concept_type: String,
+    scope: String,
+    branch_id: String,
+    expected_observed_value: String,
+    reason: String,
+}
+
+impl ScientificObservationRetraction {
+    fn as_claim_retraction(&self) -> ScientificClaimRetraction {
+        ScientificClaimRetraction {
+            concept_type: self.concept_type.clone(),
+            scope: self.scope.clone(),
+            branch_id: self.branch_id.clone(),
+            expected_value: self.expected_observed_value.clone(),
+            reason: self.reason.clone(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "command", rename_all = "snake_case", deny_unknown_fields)]
+enum AgentCommand {
+    ReadEvidence {
+        task_id: String,
+        evidence_refs: Vec<String>,
+        reason: String,
+    },
+    SearchEvidence {
+        task_id: String,
+        actions: Vec<AgentEvidenceAction>,
+        reason: String,
+    },
+    EditWorkspace {
+        task_id: String,
+        #[serde(default)]
+        branch_upserts: Vec<AgentBranch>,
+        #[serde(default)]
+        observation_upserts: Vec<ScientificObservationUpsert>,
+        #[serde(default)]
+        observation_retractions: Vec<ScientificObservationRetraction>,
+        #[serde(default)]
+        open_question_additions: Vec<String>,
+        #[serde(default)]
+        open_question_resolutions: Vec<String>,
+        notes: String,
+    },
+    Escalate {
+        task_id: String,
+        reason: String,
+    },
+}
+
+impl AgentCommand {
+    fn task_id(&self) -> &str {
+        match self {
+            AgentCommand::ReadEvidence { task_id, .. }
+            | AgentCommand::SearchEvidence { task_id, .. }
+            | AgentCommand::EditWorkspace { task_id, .. }
+            | AgentCommand::Escalate { task_id, .. } => task_id,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -336,6 +436,8 @@ struct ScientificAgentTrace {
     accession: String,
     #[serde(default)]
     states: Vec<ScientificWorkspaceState>,
+    #[serde(default)]
+    commands: Vec<AgentCommand>,
     #[serde(default)]
     deltas: Vec<WorkspaceDelta>,
     #[serde(default)]
@@ -423,99 +525,107 @@ fn scientific_agent_schema() -> Value {
     let branch = json!({
         "type":"object",
         "properties":{
-            "id":{"type":"string","maxLength":50},
-            "label":{"type":"string","maxLength":200},
+            "id":{"type":"string","maxLength":80},
+            "label":{"type":"string","maxLength":240},
             "status":{"type":"string","enum":["supported","hypothesis","rejected"]},
             "evidence_refs":{"type":"array","items":{"type":"string","pattern":"^E[0-9]{4}$"},"maxItems":16},
             "linked_raw_files":{"type":"array","items":{"type":"string","maxLength":300},"maxItems":128},
             "linkage_status":{"type":"string","enum":["supported","partial","unresolved"]},
-            "notes":{"type":"string","maxLength":600}
+            "notes":{"type":"string","maxLength":700}
         },
         "required":["id","label","status","evidence_refs","linked_raw_files","linkage_status","notes"],
         "additionalProperties":false
     });
-    let claim_upsert = json!({
+    let observation = json!({
         "type":"object",
         "properties":{
             "concept_type":{"type":"string","enum":concepts.clone()},
-            "value":{"type":"string","maxLength":500},
+            "observed_value":{"type":"string","maxLength":800},
             "scope":{"type":"string","enum":["project","branch","row","unresolved"]},
-            "branch_id":{"type":"string","maxLength":50},
+            "branch_id":{"type":"string","maxLength":80},
             "status":{"type":"string","enum":["supported","hypothesis","unresolved","rejected"]},
             "evidence_refs":{"type":"array","items":{"type":"string","pattern":"^E[0-9]{4}$"},"maxItems":16},
             "confidence":{"type":"string","enum":["high","medium","low"]},
-            "reason":{"type":"string","maxLength":600},
-            "supersedes_value":{"type":"string","maxLength":500}
+            "reason":{"type":"string","maxLength":800},
+            "supersedes_observed_value":{"type":"string","maxLength":800}
         },
-        "required":["concept_type","value","scope","branch_id","status","evidence_refs","confidence","reason","supersedes_value"],
+        "required":["concept_type","observed_value","scope","branch_id","status","evidence_refs","confidence","reason","supersedes_observed_value"],
         "additionalProperties":false
     });
-    let claim_retraction = json!({
+    let observation_retraction = json!({
         "type":"object",
         "properties":{
             "concept_type":{"type":"string","enum":concepts.clone()},
             "scope":{"type":"string","enum":["project","branch","row","unresolved"]},
-            "branch_id":{"type":"string","maxLength":50},
-            "expected_value":{"type":"string","maxLength":500},
+            "branch_id":{"type":"string","maxLength":80},
+            "expected_observed_value":{"type":"string","maxLength":800},
             "reason":{"type":"string","maxLength":600}
         },
-        "required":["concept_type","scope","branch_id","expected_value","reason"],
+        "required":["concept_type","scope","branch_id","expected_observed_value","reason"],
         "additionalProperties":false
     });
-    let conflict = json!({
+    let search_action = json!({
         "type":"object",
         "properties":{
-            "concept_type":{"type":"string","enum":concepts.clone()},
-            "scope":{"type":"string","enum":["project","branch","row","unresolved"]},
-            "branch_id":{"type":"string","maxLength":50},
-            "existing_value":{"type":"string","maxLength":500},
-            "proposed_value":{"type":"string","maxLength":500},
-            "evidence_refs":{"type":"array","items":{"type":"string","pattern":"^E[0-9]{4}$"},"maxItems":16},
-            "reason":{"type":"string","maxLength":600}
+            "action":{"type":"string","enum":["SEARCH_PUBLICATION","SEARCH_SUPPLEMENT","SEARCH_STRUCTURED_DESIGN","SEARCH_REPOSITORY_METADATA","SEARCH_EXACT_RAW_NAME","EXPAND_EVIDENCE_CONTEXT","LOOKUP_KG_TERM","COMPARE_CONFLICTING_EVIDENCE"]},
+            "reason":{"type":"string","maxLength":500},
+            "target_concepts":{"type":"array","items":{"type":"string","enum":concepts.clone()},"maxItems":8},
+            "queries":{"type":"array","items":query,"minItems":1,"maxItems":8},
+            "evidence_refs":{"type":"array","maxItems":0}
         },
-        "required":["concept_type","scope","branch_id","existing_value","proposed_value","evidence_refs","reason"],
-        "additionalProperties":false
-    });
-    let conflict_resolution = json!({
-        "type":"object",
-        "properties":{
-            "concept_type":{"type":"string","enum":concepts.clone()},
-            "scope":{"type":"string","enum":["project","branch","row","unresolved"]},
-            "branch_id":{"type":"string","maxLength":50},
-            "resolved_value":{"type":"string","maxLength":500},
-            "status":{"type":"string","enum":["supported","hypothesis","unresolved"]},
-            "evidence_refs":{"type":"array","items":{"type":"string","pattern":"^E[0-9]{4}$"},"maxItems":16},
-            "confidence":{"type":"string","enum":["high","medium","low"]},
-            "reason":{"type":"string","maxLength":600}
-        },
-        "required":["concept_type","scope","branch_id","resolved_value","status","evidence_refs","confidence","reason"],
+        "required":["action","reason","target_concepts","queries","evidence_refs"],
         "additionalProperties":false
     });
     json!({
-        "type":"object",
-        "properties":{
-            "turn":{"type":"integer","minimum":1,"maximum":100},
-            "task_id":{"type":"string","maxLength":80},
-            "task_status":{"type":"string","enum":["continue","resolved","human_review"]},
-            "branch_upserts":{"type":"array","maxItems":24,"items":branch},
-            "claim_upserts":{"type":"array","maxItems":48,"items":claim_upsert},
-            "claim_retractions":{"type":"array","maxItems":24,"items":claim_retraction},
-            "open_question_additions":{"type":"array","items":{"type":"string","maxLength":400},"maxItems":32},
-            "open_question_resolutions":{"type":"array","items":{"type":"string","maxLength":400},"maxItems":32},
-            "conflict_additions":{"type":"array","maxItems":24,"items":conflict},
-            "conflict_resolutions":{"type":"array","maxItems":24,"items":conflict_resolution},
-            "next_evidence_actions":{"type":"array","maxItems":8,"items":{"type":"object","properties":{
-                "action":{"type":"string","enum":["READ_EVIDENCE_CONTEXT","SEARCH_PUBLICATION","SEARCH_SUPPLEMENT","SEARCH_STRUCTURED_DESIGN","SEARCH_REPOSITORY_METADATA","SEARCH_EXACT_RAW_NAME","EXPAND_EVIDENCE_CONTEXT","LOOKUP_KG_TERM","COMPARE_CONFLICTING_EVIDENCE","ABSTAIN"]},
-                "reason":{"type":"string","maxLength":400},
-                "target_concepts":{"type":"array","items":{"type":"string","enum":concepts.clone()},"maxItems":8},
-                "queries":{"type":"array","items":query,"maxItems":8},
-                "evidence_refs":{"type":"array","items":{"type":"string","pattern":"^E[0-9]{4}$"},"maxItems":8}
-            },"required":["action","reason","target_concepts","queries","evidence_refs"],"additionalProperties":false}},
-            "next_step":{"type":"string","enum":["search","compile","finish","abstain"]},
-            "notes":{"type":"string","maxLength":1400}
-        },
-        "required":["turn","task_id","task_status","branch_upserts","claim_upserts","claim_retractions","open_question_additions","open_question_resolutions","conflict_additions","conflict_resolutions","next_evidence_actions","next_step","notes"],
-        "additionalProperties":false
+        "oneOf":[
+            {
+                "type":"object",
+                "properties":{
+                    "command":{"type":"string","enum":["read_evidence"]},
+                    "task_id":{"type":"string","maxLength":100},
+                    "evidence_refs":{"type":"array","items":{"type":"string","pattern":"^E[0-9]{4}$"},"minItems":1,"maxItems":4},
+                    "reason":{"type":"string","maxLength":600}
+                },
+                "required":["command","task_id","evidence_refs","reason"],
+                "additionalProperties":false
+            },
+            {
+                "type":"object",
+                "properties":{
+                    "command":{"type":"string","enum":["search_evidence"]},
+                    "task_id":{"type":"string","maxLength":100},
+                    "actions":{"type":"array","items":search_action,"minItems":1,"maxItems":4},
+                    "reason":{"type":"string","maxLength":600}
+                },
+                "required":["command","task_id","actions","reason"],
+                "additionalProperties":false
+            },
+            {
+                "type":"object",
+                "properties":{
+                    "command":{"type":"string","enum":["edit_workspace"]},
+                    "task_id":{"type":"string","maxLength":100},
+                    "branch_upserts":{"type":"array","items":branch,"maxItems":24},
+                    "observation_upserts":{"type":"array","items":observation,"maxItems":48},
+                    "observation_retractions":{"type":"array","items":observation_retraction,"maxItems":24},
+                    "open_question_additions":{"type":"array","items":{"type":"string","maxLength":500},"maxItems":24},
+                    "open_question_resolutions":{"type":"array","items":{"type":"string","maxLength":500},"maxItems":24},
+                    "notes":{"type":"string","maxLength":1600}
+                },
+                "required":["command","task_id","branch_upserts","observation_upserts","observation_retractions","open_question_additions","open_question_resolutions","notes"],
+                "additionalProperties":false
+            },
+            {
+                "type":"object",
+                "properties":{
+                    "command":{"type":"string","enum":["escalate"]},
+                    "task_id":{"type":"string","maxLength":100},
+                    "reason":{"type":"string","maxLength":1000}
+                },
+                "required":["command","task_id","reason"],
+                "additionalProperties":false
+            }
+        ]
     })
 }
 
@@ -880,7 +990,7 @@ fn write_workspace_notebook(
         .map(|cycle| serde_json::to_string_pretty(cycle).unwrap_or_else(|_| "{}".into()))
         .unwrap_or_else(|| "none".into());
     let notebook = format!(
-        "# PRIDE-SCP scientific workspace: {}\n\n## Task board\n{}\n\n## Active task\n{}\n\n## Focused evidence\n{}\n\n## Canonical claims\n{}\n\n## Rust adjudications\n{}\n\n## Latest validation\n{}\n",
+        "# PRIDE-SCP scientific workspace: {}\n\n## Task board\n{}\n\n## Active task\n{}\n\n## Focused evidence\n{}\n\n## Scientific observations (source-faithful; not canonical SDRF values)\n{}\n\n## Rust adjudications\n{}\n\n## Latest validation\n{}\n",
         state.accession,
         task_board_block(state),
         active_json,
@@ -918,9 +1028,9 @@ fn scientific_agent_prompt(
     let compact_workspace = json!({
         "relation": &workspace.relation,
         "branches": &workspace.branches,
-        "claims": &workspace.claims,
+        "scientific_observations": &workspace.claims,
         "open_questions": &workspace.open_questions,
-        "conflicts": &workspace.conflicts,
+        "observation_conflicts": &workspace.conflicts,
     });
     let workspace_json =
         serde_json::to_string_pretty(&compact_workspace).unwrap_or_else(|_| "{}".into());
@@ -938,44 +1048,46 @@ fn scientific_agent_prompt(
         serde_json::to_string_pretty(changed_harness_feedback).unwrap_or_else(|_| "[]".into());
     format!(
         "You are the scientific workspace agent for PRIDE single-cell proteomics dataset {acc}.\n\n\
-Your environment behaves like a coding/research workspace: Rust owns persistent files/state, derives a deterministic scientific task board from the current SDRF validation failures, preserves prior edits, gives you focused evidence candidates, and executes bounded source-reading/search tools. Work ONE active task deeply before moving to another task. Do not try to rewrite the whole dataset each turn.\n\n\
-WORKSPACE-AGENT CONTRACT (v1.0):\n\
-- The ACTIVE TASK below is the only scientific objective for this turn. Set task_id exactly to its id. Set task_status=continue while you still need context/search; resolved when you have enough evidence to compile/test; human_review when the task cannot be resolved safely from available evidence. For validator-backed field tasks, Rust—not the model—marks the task truly resolved only after validation clears its error. Use next_step=compile when task_status is resolved or human_review.\n\
-- Rust owns canonical state. Return a sparse WorkspaceDelta; omitted prior branches/claims persist.\n\
-- For task:study_structure, establish the source-grounded branch/scope/linkage model before field-level repair. It is valid to resolve this task with unresolved RAW linkage when the paper supports conceptual branches but not exact file mapping. For read/search actions, target the affected scientific concepts (for example organism, cell_line, isolation_method, acquisition_mode); study_structure itself is not a claim concept.\n\
-- First inspect the focused evidence candidates. If a candidate is promising but the excerpt is insufficient, use READ_EVIDENCE_CONTEXT with evidence_refs=[E####] before inventing new keyword searches. This reads a much larger window from the registered trusted source.\n\
-- Use publication/supplement/metadata searches only when the focused candidates and already-read context do not answer the task. Search results become new trusted E#### items; read them if more context is needed.\n\
-- After source context supports a scientific interpretation, upsert the typed claim and cite the strongest E#### refs. Rust independently adjudicates controlled vocabulary, template gaps, conflicts, and publication safety.\n\
-- Compile only after a material evidence-backed workspace edit. Validator errors are task feedback, not permission to guess.\n\
-- Use abstain only when the task cannot be resolved safely after the relevant evidence candidates/context and reasonable targeted search are exhausted. Rust will route that task to human review instead of endlessly searching.\n\n\
-PERSISTENT CLAIM CONTRACT:\n\
-- Stable claim identity is (concept_type, scope, branch_id).\n\
-- Same identity/value merges evidence. To replace a value, supersedes_value must exactly name the active value. Otherwise Rust records a conflict and retains the old value.\n\
-- Remove claims only with claim_retractions. Resolve conflicts only explicitly.\n\n\
-HARD SCIENTIFIC SAFETY CONTRACT:\n\
+Your environment behaves like a coding/research workspace. Rust owns persistent state, provenance, controlled-vocabulary canonicalization, task status, compilation, validation, trusted RAW linkage, and all safety gates. You inspect source evidence, build a study model, and record source-faithful scientific observations. Work ONE active task deeply before moving to another task.\n\n\
+SCIENTIFIC WORKSPACE AGENT CONTRACT (v1.1):\n\
+- Return exactly ONE executable top-level command for this turn: read_evidence, search_evidence, edit_workspace, or escalate. Do not narrate a future tool action inside notes; if you need to read E####, the command itself must be read_evidence.\n\
+- task_id must exactly equal the ACTIVE TASK id. Rust derives task status and chooses when compilation/validation is useful. You do NOT request compile/finish or mark validator-backed tasks resolved.\n\
+- read_evidence: use when an existing promising E#### excerpt is insufficient. Rust reads a larger bounded window from only registered trusted sources and returns it on the next turn.\n\
+- search_evidence: use only when focused candidates plus already-read context do not answer the task. Use targeted publication/supplement/structured-design/repository/KG/conflict searches.\n\
+- edit_workspace: use only when current evidence supports a material study-model or scientific-observation edit. Omitted state persists.\n\
+- escalate: use only after relevant focused evidence/context and reasonable targeted search are exhausted or the judgment requires human review.\n\n\
+SCIENTIFIC OBSERVATION -> RUST CANONICALIZATION CONTRACT:\n\
+- observation_upserts record what the source says the experiment actually did. observed_value is an evidence-faithful scientific description, NOT an SDRF controlled-vocabulary answer.\n\
+- For isolation_method, describe the physical cell-selection/isolation operation (for example, 'an individual intact cell was manually loaded into the separation capillary using hydrodynamic pressure'). Do not invent pseudo-vocabulary such as hydrodynamic_loading. Do not choose 'manual picking' merely because you think the validator wants it unless that exact phrase is what the source says. Rust independently maps the cited observation/evidence to a canonical SDRF value, template_gap, unresolved, or conflict.\n\
+- For acquisition_mode, describe the source-supported acquisition regime; Rust owns the canonical serialization.\n\
+- Stable observation identity is (concept_type, scope, branch_id). Same evidence-compatible meaning merges. If you intentionally replace a genuinely different prior observation, set supersedes_observed_value exactly to the old observed_value.\n\
+- A branch existing does NOT automatically make every observation branch-scoped. Use project scope only when the trusted source supports one invariant value across all relevant study material and no heterogeneous branch evidence contradicts it. Use branch scope when the method/biology actually differs by branch. Rust masks unsafe project broadcasts whenever heterogeneous branch evidence exists.\n\n\
+STUDY-STRUCTURE CONTRACT:\n\
+- task:study_structure comes first. Establish source-grounded biological/experimental branches, acquisition cardinality, and scope before field repair. Conceptual branches may be supported while linked_raw_files remains empty/unresolved.\n\
+- linked_raw_files require trusted source evidence explicitly linking exact RAW basenames. Filename words are search hints/contradiction detectors, never biological identity.\n\
+- Never collapse multiple organisms, cell populations, isolation regimes, or acquisition regimes into one project observation.\n\n\
+HARD SAFETY CONTRACT:\n\
 1. Never use GT labels or hidden benchmark truth.\n\
-2. Filename words are search hints/contradiction detectors, never biological identity. linked_raw_files require trusted source evidence explicitly linking those exact RAW basenames.\n\
-3. Keep project, branch, row, and unresolved scopes distinct. A project claim means one invariant value across all relevant branches.\n\
-4. Do not collapse multiple organisms, cell populations, isolation regimes, or acquisition regimes into one project claim.\n\
-5. For isolation_method, identify the operation that actually selects/isolates the individual cell. Downstream lysis, digestion, droplet handling, LC/ESI injection of already isolated material, or generic sample loading is not isolation by itself. If source text explicitly describes hydrodynamic/capillary manipulation of an individual intact cell as the selection/loading act, preserve that exact scientific interpretation and let Rust adjudicate it.\n\
-6. For acquisition_mode, cite direct source evidence. Mixed DDA/DIA stays branch-scoped or unresolved unless trusted linkage proves one regime.\n\
-7. Model status/confidence are advisory. Rust owns canonicalization, template-gap precedence, evidence admissibility, branch masking, trusted linkage, and SDRF serialization.\n\
-8. Structural fields (cell identifier, fraction identifier, technical replicate) are compiler-owned and must not become scientific claims.\n\n\
-TOOL CONTRACT:\n\
-- READ_EVIDENCE_CONTEXT: set queries=[] and evidence_refs to one or more existing E#### candidates. Use this to read surrounding trusted source context.\n\
-- SEARCH_* / LOOKUP_KG_TERM / COMPARE_CONFLICTING_EVIDENCE: set evidence_refs=[] and provide typed queries.\n\
-- Do not repeat an exhausted identical read/search.\n\n\
+2. Preserve project/branch/row/unresolved scope distinctions.\n\
+3. Structural fields (cell identifier, fraction identifier, technical replicate) are compiler-owned and never scientific observations.\n\
+4. For isolation_method, downstream lysis, digestion, generic LC/ESI injection, or processing of already isolated material is not cell isolation by itself.\n\
+5. Model confidence/status are advisory. Rust owns evidence admissibility, template-gap precedence, canonical vocabulary, branch masking, trusted linkage, SDRF serialization, and validation.\n\n\
+COMMAND CHOICE:\n\
+- If you need more context around an existing E#### candidate -> read_evidence.\n\
+- If the candidate set lacks the needed evidence -> search_evidence.\n\
+- If evidence is sufficient to change the study model/observations -> edit_workspace.\n\
+- If evidence is exhausted/ambiguous beyond safe automation -> escalate.\n\n\
 TASK BOARD:\n{task_board}\n\n\
 ACTIVE TASK:\n{active_json}\n\n\
 FOCUSED EVIDENCE FOR ACTIVE TASK:\n{task_evidence}\n\n\
 ACCEPTED DETERMINISTIC RELATION HINT (cardinality only):\n\
 mode={relation}; confidence={relation_confidence}; refs={relation_refs:?}; repository_file_mode={repo_mode}; note={design_note}\n\n\
 RAW FILE COUNT: {nfiles}\nRAW FILE SAMPLE (search hints only):\n{files}\n\n\
-CANONICAL WORKSPACE (read-only; mutate through WorkspaceDelta):\n{workspace_json}\n\n\
-RECENT TOOL/ACTION HISTORY:\n{action_json}\n\n\
+PERSISTENT WORKSPACE (read-only; mutate only via edit_workspace):\n{workspace_json}\n\n\
+RECENT EXECUTED TOOL/ACTION HISTORY:\n{action_json}\n\n\
 RECENT VALIDATION HISTORY:\n{validation_json}\n\n\
 CHANGED RUST FEEDBACK SINCE THE PREVIOUS TURN:\n{feedback_json}\n\n\
-This is turn {turn}. Return ONLY WorkspaceDelta. task_id must equal the ACTIVE TASK id. Use empty arrays for mutation/action categories you are not using. Do not restate unchanged state.",
+This is turn {turn}. Return ONLY one AgentCommand object matching the JSON schema. Do not restate unchanged workspace state.",
         acc = evidence.accession,
         task_board = task_board_block(workspace),
         active_json = active_json,
@@ -1003,7 +1115,7 @@ async fn call_scientific_agent(
     validations: &[AgentValidationCycle],
     changed_harness_feedback: &[String],
     turn: usize,
-) -> Result<WorkspaceDelta> {
+) -> Result<AgentCommand> {
     let client = Client::builder()
         .timeout(Duration::from_secs(opts.timeout_seconds))
         .build()?;
@@ -1030,7 +1142,7 @@ async fn call_scientific_agent(
         .await
         .with_context(|| {
             format!(
-                "Ollama scientific-agent request for {} turn {}",
+                "Ollama scientific-workspace-agent request for {} turn {}",
                 evidence.accession, turn
             )
         })?;
@@ -1038,18 +1150,15 @@ async fn call_scientific_agent(
     let body: Value = response
         .json()
         .await
-        .context("decode Ollama scientific-agent response")?;
+        .context("decode Ollama scientific-workspace-agent response")?;
     if !status.is_success() {
-        bail!("Ollama scientific-agent HTTP {status}: {body}");
+        bail!("Ollama scientific-workspace-agent HTTP {status}: {body}");
     }
     let raw = body.get("response").and_then(Value::as_str).unwrap_or("");
     if raw.trim().is_empty() {
-        bail!("Ollama returned empty scientific-agent response");
+        bail!("Ollama returned empty scientific-workspace-agent response");
     }
-    let mut delta: WorkspaceDelta =
-        serde_json::from_str(raw).context("parse structured scientific-agent workspace delta")?;
-    delta.turn = turn;
-    Ok(delta)
+    serde_json::from_str(raw).context("parse structured scientific-workspace-agent command")
 }
 
 fn valid_evidence_refs(evidence: &DatasetEvidence, refs: &[String]) -> Vec<String> {
@@ -1293,6 +1402,23 @@ fn reduce_scientific_claims(
             Some(existing) if existing.value.eq_ignore_ascii_case(&claim.value) => {
                 merge_same_value_claim(existing, claim);
             }
+            Some(existing)
+                if adjudication_equivalence_key(evidence, existing).is_some()
+                    && adjudication_equivalence_key(evidence, existing)
+                        == adjudication_equivalence_key(evidence, &claim) =>
+            {
+                // Different source-faithful phrasings that independently lead
+                // Rust to the same canonical/template-gap outcome are not a
+                // scientific conflict. Preserve the richer observation while
+                // merging provenance.
+                let incoming_value = claim.value.clone();
+                let incoming_is_richer = incoming_value.len() > existing.value.len();
+                merge_same_value_claim(existing, claim);
+                if incoming_is_richer {
+                    existing.value = incoming_value;
+                }
+                conflicts.retain(|conflict| conflict_identity(conflict) != key);
+            }
             Some(existing) => {
                 push_workspace_conflict(
                     evidence,
@@ -1304,7 +1430,7 @@ fn reduce_scientific_claims(
                         existing_value: existing.value.clone(),
                         proposed_value: claim.value.clone(),
                         evidence_refs: claim.evidence_refs.clone(),
-                        reason: "canonical workspace contained multiple active values for one stable claim identity; retained the existing active value and recorded an explicit conflict".into(),
+                        reason: "canonical workspace contained multiple scientifically non-equivalent observations for one stable identity; retained the existing observation and recorded an explicit conflict".into(),
                         turn,
                     },
                 );
@@ -1997,6 +2123,25 @@ fn apply_workspace_delta(
                 merge_same_value_claim(&mut state.claims[index], incoming);
                 continue;
             }
+            let equivalent = adjudication_equivalence_key(evidence, &state.claims[index]).is_some()
+                && adjudication_equivalence_key(evidence, &state.claims[index])
+                    == adjudication_equivalence_key(evidence, &incoming);
+            if equivalent {
+                let incoming_value = incoming.value.clone();
+                let incoming_is_richer = incoming_value.len() > state.claims[index].value.len();
+                merge_same_value_claim(&mut state.claims[index], incoming);
+                if incoming_is_richer {
+                    state.claims[index].value = incoming_value.clone();
+                }
+                state
+                    .conflicts
+                    .retain(|conflict| conflict_identity(conflict) != identity);
+                events.push(format!(
+                    "turn {turn} reducer merged evidence-compatible observation variant for identity {:?}: '{}' ~= '{}' under the same Rust adjudication",
+                    identity, existing_value, incoming_value
+                ));
+                continue;
+            }
             let supersedes = upsert.supersedes_value.trim();
             if !supersedes.is_empty() && existing_value.eq_ignore_ascii_case(supersedes) {
                 let new_value = incoming.value.clone();
@@ -2010,9 +2155,9 @@ fn apply_workspace_delta(
                 ));
             } else {
                 let reason = if supersedes.is_empty() {
-                    "model proposed a different value without explicit supersession"
+                    "model proposed a scientifically non-equivalent observation without explicit supersession"
                 } else {
-                    "model supersedes_value did not match the active canonical value"
+                    "model supersedes_observed_value did not match the active observation"
                 };
                 push_workspace_conflict(
                     evidence,
@@ -2107,7 +2252,9 @@ fn adjudicate_claim(evidence: &DatasetEvidence, claim: &ScientificClaim) -> Clai
     if claim.scope == "unresolved" || claim.status == "unresolved" || claim.value.trim().is_empty()
     {
         return ClaimAdjudication::Unresolved {
-            reason: "claim is explicitly unresolved or has no proposed scientific value".into(),
+            reason:
+                "observation is explicitly unresolved or has no source-faithful scientific value"
+                    .into(),
         };
     }
 
@@ -2115,7 +2262,7 @@ fn adjudicate_claim(evidence: &DatasetEvidence, claim: &ScientificClaim) -> Clai
         field_relevant_claim_refs(evidence, &claim.concept_type, &claim.evidence_refs);
     if relevant_refs.is_empty() {
         return ClaimAdjudication::Unresolved {
-            reason: "claim has no field-relevant trusted evidence refs".into(),
+            reason: "observation has no field-relevant trusted evidence refs".into(),
         };
     }
     let subset = evidence_subset(evidence, &relevant_refs);
@@ -2189,6 +2336,25 @@ fn adjudicate_claim(evidence: &DatasetEvidence, claim: &ScientificClaim) -> Clai
                 }
             }
         }
+    }
+}
+
+fn adjudication_equivalence_key(
+    evidence: &DatasetEvidence,
+    claim: &ScientificClaim,
+) -> Option<String> {
+    match adjudicate_claim(evidence, claim) {
+        ClaimAdjudication::Canonical { value, .. } => {
+            Some(format!("canonical:{}", value.trim().to_ascii_lowercase()))
+        }
+        ClaimAdjudication::TemplateGap { observed_value, .. } => Some(format!(
+            "template_gap:{}",
+            observed_value.trim().to_ascii_lowercase()
+        )),
+        ClaimAdjudication::SupportedConcept { value, .. } => {
+            Some(format!("supported:{}", value.trim().to_ascii_lowercase()))
+        }
+        ClaimAdjudication::Unresolved { .. } | ClaimAdjudication::Conflict { .. } => None,
     }
 }
 
@@ -2301,7 +2467,21 @@ fn branch_claims_are_heterogeneous(
                 && !claim.value.trim().is_empty()
                 && claim_refs_are_relevant(evidence, &claim.concept_type, &claim.evidence_refs)
         })
-        .map(|claim| claim.value.trim().to_ascii_lowercase())
+        .filter_map(
+            |claim| match adjudicate_workspace_claim(evidence, state, claim) {
+                ClaimAdjudication::Canonical { value, .. } => {
+                    Some(format!("canonical:{}", value.trim().to_ascii_lowercase()))
+                }
+                ClaimAdjudication::TemplateGap { observed_value, .. } => Some(format!(
+                    "template_gap:{}",
+                    observed_value.trim().to_ascii_lowercase()
+                )),
+                ClaimAdjudication::SupportedConcept { value, .. } => {
+                    Some(format!("supported:{}", value.trim().to_ascii_lowercase()))
+                }
+                ClaimAdjudication::Unresolved { .. } | ClaimAdjudication::Conflict { .. } => None,
+            },
+        )
         .collect::<BTreeSet<_>>();
     values.len() > 1
 }
@@ -2871,11 +3051,38 @@ fn workspace_adjudications(
     evidence: &DatasetEvidence,
     state: &ScientificWorkspaceState,
 ) -> Vec<ClaimAdjudicationRecord> {
-    state
+    let mut records = state
         .claims
         .iter()
         .map(|claim| adjudication_record(evidence, state, claim))
-        .collect()
+        .collect::<Vec<_>>();
+
+    // Template-gap safety is compiler-owned, not contingent on the model
+    // successfully restating an observation. Keep a fail-closed evidence-level
+    // adjudication visible when trusted inventory proves an unsupported
+    // isolation method but no active observation currently exposes that gap.
+    let has_isolation_template_gap = records.iter().any(|record| {
+        record.concept_type == "isolation_method"
+            && matches!(&record.adjudication, ClaimAdjudication::TemplateGap { .. })
+    });
+    if !has_isolation_template_gap {
+        if let Some(gap) = infer_isolation_template_gap(&evidence.evidence) {
+            records.push(ClaimAdjudicationRecord {
+                concept_type: "isolation_method".into(),
+                scope: "unresolved".into(),
+                branch_id: "rust:evidence_template_gap".into(),
+                model_status: "rust_evidence_bootstrap".into(),
+                proposed_value: gap.observed_value.clone(),
+                evidence_refs: gap.evidence_refs.clone(),
+                adjudication: ClaimAdjudication::TemplateGap {
+                    observed_value: gap.observed_value,
+                    evidence_refs: gap.evidence_refs,
+                    reason: gap.reason,
+                },
+            });
+        }
+    }
+    records
 }
 
 fn adjudication_feedback_signature(record: &ClaimAdjudicationRecord) -> String {
@@ -2904,7 +3111,7 @@ fn adjudication_feedback_message(
             value,
             evidence_refs,
         } => format!(
-            "turn {} {} compiler adjudicated {} claim '{}' -> canonical '{}' from refs {:?}",
+            "turn {} {} compiler adjudicated {} observation '{}' -> canonical '{}' from refs {:?}",
             turn, phase, record.concept_type, record.proposed_value, value, evidence_refs
         ),
         ClaimAdjudication::TemplateGap {
@@ -2912,7 +3119,7 @@ fn adjudication_feedback_message(
             evidence_refs,
             ..
         } => format!(
-            "turn {} {} compiler adjudicated {} claim '{}' as template gap '{}' from refs {:?}; do not substitute a nearby allowed value",
+            "turn {} {} compiler adjudicated {} observation '{}' as template gap '{}' from refs {:?}; do not substitute a nearby allowed value",
             turn,
             phase,
             record.concept_type,
@@ -2922,7 +3129,7 @@ fn adjudication_feedback_message(
         ),
         ClaimAdjudication::Unresolved { reason } | ClaimAdjudication::Conflict { reason } => {
             format!(
-                "turn {} {} compiler could not publish {} claim '{}' from refs {:?}: {}; search for direct field-specific method evidence or leave unresolved",
+                "turn {} {} compiler could not publish {} observation '{}' from refs {:?}: {}; search for direct field-specific method evidence or leave unresolved",
                 turn,
                 phase,
                 record.concept_type,
@@ -2990,6 +3197,116 @@ fn record_adjudication_snapshot(
         records: records.clone(),
     });
     records
+}
+
+fn command_matches_active_task(state: &ScientificWorkspaceState, command: &AgentCommand) -> bool {
+    !state.active_task_id.is_empty() && command.task_id() == state.active_task_id
+}
+
+fn record_non_edit_task_attempt(state: &mut ScientificWorkspaceState, task_id: &str, note: &str) {
+    if let Some(task) = state.tasks.iter_mut().find(|task| task.id == task_id) {
+        task.attempts += 1;
+        if task.status == "open" {
+            task.status = "investigating".into();
+        }
+        if !note.trim().is_empty() {
+            task.notes = note.trim().to_string();
+        }
+    }
+}
+
+fn task_target_concepts(state: &ScientificWorkspaceState, task_id: &str) -> Vec<String> {
+    state
+        .tasks
+        .iter()
+        .find(|task| task.id == task_id)
+        .and_then(|task| {
+            scientific_concept_types()
+                .contains(&task.concept_type.as_str())
+                .then_some(vec![task.concept_type.clone()])
+        })
+        .unwrap_or_default()
+}
+
+fn apply_edit_workspace_command(
+    evidence: &DatasetEvidence,
+    state: &mut ScientificWorkspaceState,
+    task_id: &str,
+    branch_upserts: &[AgentBranch],
+    observation_upserts: &[ScientificObservationUpsert],
+    observation_retractions: &[ScientificObservationRetraction],
+    open_question_additions: &[String],
+    open_question_resolutions: &[String],
+    notes: &str,
+    turn: usize,
+) -> (Vec<String>, bool) {
+    let publishable_edit = !branch_upserts.is_empty()
+        || !observation_upserts.is_empty()
+        || !observation_retractions.is_empty();
+    let delta = WorkspaceDelta {
+        turn,
+        task_id: task_id.to_string(),
+        task_status: "continue".into(),
+        branch_upserts: branch_upserts.to_vec(),
+        claim_upserts: observation_upserts
+            .iter()
+            .map(ScientificObservationUpsert::as_claim_upsert)
+            .collect(),
+        claim_retractions: observation_retractions
+            .iter()
+            .map(ScientificObservationRetraction::as_claim_retraction)
+            .collect(),
+        open_question_additions: open_question_additions.to_vec(),
+        open_question_resolutions: open_question_resolutions.to_vec(),
+        conflict_additions: Vec::new(),
+        conflict_resolutions: Vec::new(),
+        next_evidence_actions: Vec::new(),
+        next_step: "compile".into(),
+        notes: notes.to_string(),
+    };
+    let mut events = apply_workspace_delta(evidence, state, &delta, turn);
+
+    if task_id == "task:study_structure" && publishable_edit {
+        if let Some(task) = state.tasks.iter_mut().find(|task| task.id == task_id) {
+            task.status = "resolved".into();
+            if !notes.trim().is_empty() {
+                task.notes = notes.trim().to_string();
+            }
+        }
+        state.active_task_id.clear();
+        ensure_active_task(state);
+        events.push(format!(
+            "turn {turn} Rust marked task:study_structure resolved after a material source-grounded workspace edit and advanced the task board"
+        ));
+    }
+    state.next_evidence_actions.clear();
+    state.next_step = "compile".into();
+    (events, publishable_edit)
+}
+
+fn search_actions_for_command(
+    evidence: &DatasetEvidence,
+    actions: &[AgentEvidenceAction],
+) -> Vec<AgentEvidenceAction> {
+    let allowed = [
+        "SEARCH_PUBLICATION",
+        "SEARCH_SUPPLEMENT",
+        "SEARCH_STRUCTURED_DESIGN",
+        "SEARCH_REPOSITORY_METADATA",
+        "SEARCH_EXACT_RAW_NAME",
+        "EXPAND_EVIDENCE_CONTEXT",
+        "LOOKUP_KG_TERM",
+        "COMPARE_CONFLICTING_EVIDENCE",
+    ]
+    .into_iter()
+    .collect::<BTreeSet<_>>();
+    let mut out = actions.to_vec();
+    for action in &mut out {
+        normalize_scientific_agent_action(evidence, action);
+    }
+    out.retain(|action| allowed.contains(action.action.as_str()) && !action.queries.is_empty());
+    out.truncate(4);
+    out
 }
 
 fn trim_actions_to_budget(
@@ -3074,6 +3391,7 @@ async fn run_one_scientific_agent(
     }
     fs::write(&evidence_path, serde_json::to_string_pretty(&evidence)?)?;
     fs::write(workspace_dir.join("action_history.json"), "[]\n")?;
+    fs::write(workspace_dir.join("command_history.json"), "[]\n")?;
     fs::write(workspace_dir.join("validation_history.json"), "[]\n")?;
 
     let mut state = ScientificWorkspaceState {
@@ -3200,7 +3518,8 @@ async fn run_one_scientific_agent(
                 trace.terminal_status = "partial_no_active_scientific_task".into();
                 break;
             }
-            let delta = call_scientific_agent(
+
+            let command = call_scientific_agent(
                 opts,
                 &evidence,
                 &state,
@@ -3210,181 +3529,251 @@ async fn run_one_scientific_agent(
                 turn,
             )
             .await?;
-            // Feedback is delivered once. New reducer/adjudication feedback
-            // generated below becomes the pending set for the next model turn.
             pending_harness_feedback.clear();
 
             fs::write(
-                workspace_dir.join(format!("delta.turn{turn:02}.json")),
-                serde_json::to_string_pretty(&delta)?,
+                workspace_dir.join(format!("command.turn{turn:02}.json")),
+                serde_json::to_string_pretty(&command)?,
             )?;
-            trace.deltas.push(delta.clone());
-            let reducer_events = apply_workspace_delta(&evidence, &mut state, &delta, turn);
-            for event in reducer_events {
+            trace.commands.push(command.clone());
+            fs::write(
+                workspace_dir.join("command_history.json"),
+                serde_json::to_string_pretty(&trace.commands)?,
+            )?;
+            trace.turns_completed = turn;
+            state.turn = turn;
+
+            if !command_matches_active_task(&state, &command) {
                 push_harness_feedback(
                     &mut trace.harness_feedback,
                     &mut pending_harness_feedback,
-                    event,
+                    format!(
+                        "turn {turn} command rejected because task_id='{}' does not match active task '{}'; issue exactly one command for the active task",
+                        command.task_id(), state.active_task_id
+                    ),
                 );
-            }
-
-            trace.states.push(state.clone());
-            trace.turns_completed = turn;
-            fs::write(
-                workspace_dir.join(format!("state.turn{turn:02}.json")),
-                serde_json::to_string_pretty(&state)?,
-            )?;
-            fs::write(
-                workspace_dir.join("state.json"),
-                serde_json::to_string_pretty(&state)?,
-            )?;
-
-            // Rust adjudicates every canonical state immediately, even when
-            // the model's next step is another search. A retained claim cannot
-            // disappear before adjudication merely because the model omitted
-            // it from a later delta.
-            let post_delta_adjudications =
-                record_adjudication_snapshot(&mut trace, &evidence, &state, turn, "post_delta");
-            fs::write(
-                workspace_dir.join("adjudications.json"),
-                serde_json::to_string_pretty(&post_delta_adjudications)?,
-            )?;
-            append_changed_adjudication_feedback(
-                &mut trace.harness_feedback,
-                &mut pending_harness_feedback,
-                &mut last_adjudication_signatures,
-                &post_delta_adjudications,
-                turn,
-                "post-delta",
-            );
-
-            if state.next_step == "search" {
-                let remaining = max_actions.saturating_sub(trace.tool_actions_completed);
-                if remaining == 0 {
-                    mark_active_task_human_review(
-                        &mut state,
-                        "evidence/tool budget exhausted before the active scientific task could be resolved",
-                    );
-                    if state.active_task_id.is_empty() {
-                        trace.terminal_status = "evidence_exhausted".into();
-                        break;
-                    }
-                    push_harness_feedback(
-                        &mut trace.harness_feedback,
-                        &mut pending_harness_feedback,
-                        "tool budget exhausted for the previous task; Rust routed it to human review and advanced the task board".into(),
-                    );
-                    continue;
-                }
-                let actions = trim_actions_to_budget(&state.next_evidence_actions, remaining);
-                if actions.is_empty() {
-                    push_harness_feedback(
-                        &mut trace.harness_feedback,
-                        &mut pending_harness_feedback,
-                        "search requested but no executable read/search action remained after normalization; inspect focused candidates, request READ_EVIDENCE_CONTEXT/search, compile after a material edit, or abstain to human review".into(),
-                    );
-                    continue;
-                }
-                let round_results =
-                    execute_scientific_agent_actions(&mut evidence, &actions, turn, &mut attempted);
-                trace.tool_actions_completed += round_results.len();
-                record_task_reads(&mut state, &delta.task_id, &round_results);
-                trace.evidence_action_results.extend(round_results);
-                if let Some(current) = compiled.as_ref() {
-                    refresh_scientific_tasks(&evidence, &mut state, &current.issues);
-                }
-                fs::write(&evidence_path, serde_json::to_string_pretty(&evidence)?)?;
-                fs::write(
-                    workspace_dir.join("action_history.json"),
-                    serde_json::to_string_pretty(&trace.evidence_action_results)?,
-                )?;
-
-                // Evidence changes never replace state. Re-normalize only to
-                // enforce evidence admissibility, then re-adjudicate all
-                // retained claims. Feedback is emitted only for changed claim
-                // value/refs/outcome signatures.
-                normalize_workspace_state(&evidence, &mut state, turn);
-                if let Some(last_state) = trace.states.last_mut() {
-                    *last_state = state.clone();
-                }
-                fs::write(
-                    workspace_dir.join(format!("state.turn{turn:02}.json")),
-                    serde_json::to_string_pretty(&state)?,
-                )?;
-                let post_search_adjudications = record_adjudication_snapshot(
-                    &mut trace,
-                    &evidence,
-                    &state,
-                    turn,
-                    "post_search",
-                );
-                fs::write(
-                    workspace_dir.join("adjudications.json"),
-                    serde_json::to_string_pretty(&post_search_adjudications)?,
-                )?;
-                append_changed_adjudication_feedback(
-                    &mut trace.harness_feedback,
-                    &mut pending_harness_feedback,
-                    &mut last_adjudication_signatures,
-                    &post_search_adjudications,
-                    turn,
-                    "post-search",
-                );
-                fs::write(
-                    workspace_dir.join("adjudication_history.json"),
-                    serde_json::to_string_pretty(&trace.adjudication_history)?,
-                )?;
-                fs::write(
-                    workspace_dir.join("state.json"),
-                    serde_json::to_string_pretty(&state)?,
-                )?;
-                write_workspace_notebook(
-                    &workspace_dir,
-                    &evidence,
-                    &state,
-                    &post_search_adjudications,
-                    &trace.validation_history,
-                )?;
+                trace.states.push(state.clone());
                 continue;
             }
 
-            let compiled_now = compile_workspace(&evidence, &state, &explicit_mappings)?;
-            fs::write(
-                workspace_dir.join("adjudications.json"),
-                serde_json::to_string_pretty(&compiled_now.adjudications)?,
-            )?;
-            trace.adjudication_history.push(AdjudicationSnapshot {
-                turn,
-                phase: "compile".into(),
-                evidence_items: evidence.evidence.len(),
-                records: compiled_now.adjudications.clone(),
-            });
-            append_changed_adjudication_feedback(
-                &mut trace.harness_feedback,
-                &mut pending_harness_feedback,
-                &mut last_adjudication_signatures,
-                &compiled_now.adjudications,
-                turn,
-                "compile",
-            );
-            fs::write(
-                workspace_dir.join("adjudication_history.json"),
-                serde_json::to_string_pretty(&trace.adjudication_history)?,
-            )?;
-            refresh_scientific_tasks(&evidence, &mut state, &compiled_now.issues);
-            if last_compile_fingerprint
-                .as_deref()
-                .is_some_and(|previous| previous == compiled_now.fingerprint.as_str())
-            {
-                let adjudications = compiled_now.adjudications.clone();
-                compiled = Some(compiled_now);
-                if matches!(state.next_step.as_str(), "abstain" | "finish") {
-                    let note = if state.next_step == "abstain" {
-                        "agent explicitly abstained after inspecting the active task"
-                    } else {
-                        "agent requested finish while the active task still had validation errors"
+            match &command {
+                AgentCommand::ReadEvidence {
+                    task_id,
+                    evidence_refs,
+                    reason,
+                } => {
+                    record_non_edit_task_attempt(&mut state, task_id, reason);
+                    let remaining = max_actions.saturating_sub(trace.tool_actions_completed);
+                    if remaining == 0 {
+                        mark_active_task_human_review(
+                            &mut state,
+                            "evidence/tool budget exhausted before requested source context could be read",
+                        );
+                        trace.states.push(state.clone());
+                        if state.active_task_id.is_empty() {
+                            trace.terminal_status = "evidence_exhausted".into();
+                            break;
+                        }
+                        push_harness_feedback(
+                            &mut trace.harness_feedback,
+                            &mut pending_harness_feedback,
+                            "tool budget exhausted; Rust routed the previous task to human review and advanced the task board".into(),
+                        );
+                        continue;
+                    }
+                    let mut refs = valid_evidence_refs(&evidence, evidence_refs);
+                    refs.truncate(remaining.min(4));
+                    if refs.is_empty() {
+                        push_harness_feedback(
+                            &mut trace.harness_feedback,
+                            &mut pending_harness_feedback,
+                            format!(
+                                "turn {turn} read_evidence had no valid trusted E#### refs after normalization; choose an E#### from the focused evidence list"
+                            ),
+                        );
+                        trace.states.push(state.clone());
+                        continue;
+                    }
+                    let read_action = AgentEvidenceAction {
+                        action: "READ_EVIDENCE_CONTEXT".into(),
+                        reason: reason.clone(),
+                        target_concepts: task_target_concepts(&state, task_id),
+                        queries: Vec::new(),
+                        evidence_refs: refs,
                     };
-                    mark_active_task_human_review(&mut state, note);
+                    let round_results = execute_scientific_agent_actions(
+                        &mut evidence,
+                        &[read_action],
+                        turn,
+                        &mut attempted,
+                    );
+                    trace.tool_actions_completed += round_results.len();
+                    record_task_reads(&mut state, task_id, &round_results);
+                    trace.evidence_action_results.extend(round_results);
+                    if let Some(current) = compiled.as_ref() {
+                        refresh_scientific_tasks(&evidence, &mut state, &current.issues);
+                    }
+                    normalize_workspace_state(&evidence, &mut state, turn);
+                    fs::write(&evidence_path, serde_json::to_string_pretty(&evidence)?)?;
+                    fs::write(
+                        workspace_dir.join("action_history.json"),
+                        serde_json::to_string_pretty(&trace.evidence_action_results)?,
+                    )?;
+                    let adjudications = record_adjudication_snapshot(
+                        &mut trace,
+                        &evidence,
+                        &state,
+                        turn,
+                        "post_read",
+                    );
+                    append_changed_adjudication_feedback(
+                        &mut trace.harness_feedback,
+                        &mut pending_harness_feedback,
+                        &mut last_adjudication_signatures,
+                        &adjudications,
+                        turn,
+                        "post-read",
+                    );
+                    fs::write(
+                        workspace_dir.join("adjudications.json"),
+                        serde_json::to_string_pretty(&adjudications)?,
+                    )?;
+                    fs::write(
+                        workspace_dir.join("adjudication_history.json"),
+                        serde_json::to_string_pretty(&trace.adjudication_history)?,
+                    )?;
+                    trace.states.push(state.clone());
+                    fs::write(
+                        workspace_dir.join(format!("state.turn{turn:02}.json")),
+                        serde_json::to_string_pretty(&state)?,
+                    )?;
+                    fs::write(
+                        workspace_dir.join("state.json"),
+                        serde_json::to_string_pretty(&state)?,
+                    )?;
+                    write_workspace_notebook(
+                        &workspace_dir,
+                        &evidence,
+                        &state,
+                        &adjudications,
+                        &trace.validation_history,
+                    )?;
+                    continue;
+                }
+                AgentCommand::SearchEvidence {
+                    task_id,
+                    actions,
+                    reason,
+                } => {
+                    record_non_edit_task_attempt(&mut state, task_id, reason);
+                    let remaining = max_actions.saturating_sub(trace.tool_actions_completed);
+                    if remaining == 0 {
+                        mark_active_task_human_review(
+                            &mut state,
+                            "evidence/tool budget exhausted before requested targeted search could run",
+                        );
+                        trace.states.push(state.clone());
+                        if state.active_task_id.is_empty() {
+                            trace.terminal_status = "evidence_exhausted".into();
+                            break;
+                        }
+                        push_harness_feedback(
+                            &mut trace.harness_feedback,
+                            &mut pending_harness_feedback,
+                            "tool budget exhausted; Rust routed the previous task to human review and advanced the task board".into(),
+                        );
+                        continue;
+                    }
+                    let normalized = search_actions_for_command(&evidence, actions);
+                    let executable = trim_actions_to_budget(&normalized, remaining);
+                    if executable.is_empty() {
+                        push_harness_feedback(
+                            &mut trace.harness_feedback,
+                            &mut pending_harness_feedback,
+                            format!(
+                                "turn {turn} search_evidence contained no executable normalized search query; use read_evidence for existing E#### refs or provide a typed SEARCH_* query"
+                            ),
+                        );
+                        trace.states.push(state.clone());
+                        continue;
+                    }
+                    let round_results = execute_scientific_agent_actions(
+                        &mut evidence,
+                        &executable,
+                        turn,
+                        &mut attempted,
+                    );
+                    trace.tool_actions_completed += round_results.len();
+                    trace.evidence_action_results.extend(round_results);
+                    if let Some(current) = compiled.as_ref() {
+                        refresh_scientific_tasks(&evidence, &mut state, &current.issues);
+                    }
+                    normalize_workspace_state(&evidence, &mut state, turn);
+                    fs::write(&evidence_path, serde_json::to_string_pretty(&evidence)?)?;
+                    fs::write(
+                        workspace_dir.join("action_history.json"),
+                        serde_json::to_string_pretty(&trace.evidence_action_results)?,
+                    )?;
+                    let adjudications = record_adjudication_snapshot(
+                        &mut trace,
+                        &evidence,
+                        &state,
+                        turn,
+                        "post_search",
+                    );
+                    append_changed_adjudication_feedback(
+                        &mut trace.harness_feedback,
+                        &mut pending_harness_feedback,
+                        &mut last_adjudication_signatures,
+                        &adjudications,
+                        turn,
+                        "post-search",
+                    );
+                    fs::write(
+                        workspace_dir.join("adjudications.json"),
+                        serde_json::to_string_pretty(&adjudications)?,
+                    )?;
+                    fs::write(
+                        workspace_dir.join("adjudication_history.json"),
+                        serde_json::to_string_pretty(&trace.adjudication_history)?,
+                    )?;
+                    trace.states.push(state.clone());
+                    fs::write(
+                        workspace_dir.join(format!("state.turn{turn:02}.json")),
+                        serde_json::to_string_pretty(&state)?,
+                    )?;
+                    fs::write(
+                        workspace_dir.join("state.json"),
+                        serde_json::to_string_pretty(&state)?,
+                    )?;
+                    write_workspace_notebook(
+                        &workspace_dir,
+                        &evidence,
+                        &state,
+                        &adjudications,
+                        &trace.validation_history,
+                    )?;
+                    continue;
+                }
+                AgentCommand::Escalate { task_id, reason } => {
+                    record_non_edit_task_attempt(&mut state, task_id, reason);
+                    mark_active_task_human_review(&mut state, reason);
+                    let adjudications = record_adjudication_snapshot(
+                        &mut trace,
+                        &evidence,
+                        &state,
+                        turn,
+                        "post_escalation",
+                    );
+                    trace.states.push(state.clone());
+                    fs::write(
+                        workspace_dir.join(format!("state.turn{turn:02}.json")),
+                        serde_json::to_string_pretty(&state)?,
+                    )?;
+                    fs::write(
+                        workspace_dir.join("state.json"),
+                        serde_json::to_string_pretty(&state)?,
+                    )?;
                     write_workspace_notebook(
                         &workspace_dir,
                         &evidence,
@@ -3399,78 +3788,192 @@ async fn run_one_scientific_agent(
                     push_harness_feedback(
                         &mut trace.harness_feedback,
                         &mut pending_harness_feedback,
-                        "previous task routed to human review; continue with the next Rust-selected scientific task".into(),
+                        "previous task escalated to human review; Rust advanced to the next scientific task".into(),
                     );
                     continue;
                 }
-                push_harness_feedback(
-                    &mut trace.harness_feedback,
-                    &mut pending_harness_feedback,
-                    format!(
-                        "turn {} compile blocked: normalized scientific state produced the same deterministic draft as the previous validated compile; read/search additional task evidence or change the evidence-backed scientific model before compiling again",
-                        turn
-                    ),
-                );
-                write_workspace_notebook(
-                    &workspace_dir,
-                    &evidence,
-                    &state,
-                    &adjudications,
-                    &trace.validation_history,
-                )?;
-                continue;
-            }
-            last_compile_fingerprint = Some(compiled_now.fingerprint.clone());
-            write_sdrf(&draft_path, &compiled_now.headers, &compiled_now.rows)?;
-            write_validation_review(&review_path, &compiled_now.issues)?;
-            trace.validator_cycles_completed += 1;
-            let cycle = validation_cycle(trace.validator_cycles_completed, &compiled_now.issues);
-            let errors = cycle.validation_errors;
-            trace.validation_history.push(cycle);
-            fs::write(
-                workspace_dir.join("validation_history.json"),
-                serde_json::to_string_pretty(&trace.validation_history)?,
-            )?;
-            refresh_scientific_tasks(&evidence, &mut state, &compiled_now.issues);
-            let adjudications = compiled_now.adjudications.clone();
-            compiled = Some(compiled_now);
-            write_workspace_notebook(
-                &workspace_dir,
-                &evidence,
-                &state,
-                &adjudications,
-                &trace.validation_history,
-            )?;
+                AgentCommand::EditWorkspace {
+                    task_id,
+                    branch_upserts,
+                    observation_upserts,
+                    observation_retractions,
+                    open_question_additions,
+                    open_question_resolutions,
+                    notes,
+                } => {
+                    let (reducer_events, publishable_edit) = apply_edit_workspace_command(
+                        &evidence,
+                        &mut state,
+                        task_id,
+                        branch_upserts,
+                        observation_upserts,
+                        observation_retractions,
+                        open_question_additions,
+                        open_question_resolutions,
+                        notes,
+                        turn,
+                    );
+                    for event in reducer_events {
+                        push_harness_feedback(
+                            &mut trace.harness_feedback,
+                            &mut pending_harness_feedback,
+                            event,
+                        );
+                    }
 
-            if errors == 0 {
-                trace.terminal_status = "resolved".into();
-                break;
-            }
-            if matches!(state.next_step.as_str(), "abstain" | "finish") {
-                let note = if state.next_step == "abstain" {
-                    "agent explicitly abstained after the latest validated compile"
-                } else {
-                    "agent requested finish while the active task still had validation errors"
-                };
-                mark_active_task_human_review(&mut state, note);
-                if state.active_task_id.is_empty() {
-                    trace.terminal_status = "human_review".into();
-                    break;
+                    let post_edit_adjudications = record_adjudication_snapshot(
+                        &mut trace,
+                        &evidence,
+                        &state,
+                        turn,
+                        "post_edit",
+                    );
+                    append_changed_adjudication_feedback(
+                        &mut trace.harness_feedback,
+                        &mut pending_harness_feedback,
+                        &mut last_adjudication_signatures,
+                        &post_edit_adjudications,
+                        turn,
+                        "post-edit",
+                    );
+                    fs::write(
+                        workspace_dir.join("adjudications.json"),
+                        serde_json::to_string_pretty(&post_edit_adjudications)?,
+                    )?;
+                    fs::write(
+                        workspace_dir.join("adjudication_history.json"),
+                        serde_json::to_string_pretty(&trace.adjudication_history)?,
+                    )?;
+                    trace.states.push(state.clone());
+                    fs::write(
+                        workspace_dir.join(format!("state.turn{turn:02}.json")),
+                        serde_json::to_string_pretty(&state)?,
+                    )?;
+                    fs::write(
+                        workspace_dir.join("state.json"),
+                        serde_json::to_string_pretty(&state)?,
+                    )?;
+
+                    if !publishable_edit {
+                        push_harness_feedback(
+                            &mut trace.harness_feedback,
+                            &mut pending_harness_feedback,
+                            format!(
+                                "turn {turn} edit_workspace changed no branch or scientific observation; Rust skipped compilation/validation"
+                            ),
+                        );
+                        write_workspace_notebook(
+                            &workspace_dir,
+                            &evidence,
+                            &state,
+                            &post_edit_adjudications,
+                            &trace.validation_history,
+                        )?;
+                        continue;
+                    }
+
+                    let compiled_now = compile_workspace(&evidence, &state, &explicit_mappings)?;
+                    fs::write(
+                        workspace_dir.join("adjudications.json"),
+                        serde_json::to_string_pretty(&compiled_now.adjudications)?,
+                    )?;
+                    trace.adjudication_history.push(AdjudicationSnapshot {
+                        turn,
+                        phase: "compile_after_edit".into(),
+                        evidence_items: evidence.evidence.len(),
+                        records: compiled_now.adjudications.clone(),
+                    });
+                    append_changed_adjudication_feedback(
+                        &mut trace.harness_feedback,
+                        &mut pending_harness_feedback,
+                        &mut last_adjudication_signatures,
+                        &compiled_now.adjudications,
+                        turn,
+                        "compile-after-edit",
+                    );
+                    fs::write(
+                        workspace_dir.join("adjudication_history.json"),
+                        serde_json::to_string_pretty(&trace.adjudication_history)?,
+                    )?;
+                    refresh_scientific_tasks(&evidence, &mut state, &compiled_now.issues);
+
+                    if last_compile_fingerprint
+                        .as_deref()
+                        .is_some_and(|previous| previous == compiled_now.fingerprint.as_str())
+                    {
+                        let adjudications = compiled_now.adjudications.clone();
+                        compiled = Some(compiled_now);
+                        push_harness_feedback(
+                            &mut trace.harness_feedback,
+                            &mut pending_harness_feedback,
+                            format!(
+                                "turn {turn} edit produced the same deterministic SDRF fingerprint as the previous validated compile; Rust skipped a validator cycle. Read/search more evidence, refine the scientific observation/scope, or escalate."
+                            ),
+                        );
+                        fs::write(
+                            workspace_dir.join("state.json"),
+                            serde_json::to_string_pretty(&state)?,
+                        )?;
+                        write_workspace_notebook(
+                            &workspace_dir,
+                            &evidence,
+                            &state,
+                            &adjudications,
+                            &trace.validation_history,
+                        )?;
+                        continue;
+                    }
+
+                    if trace.validator_cycles_completed >= max_validator_cycles {
+                        push_harness_feedback(
+                            &mut trace.harness_feedback,
+                            &mut pending_harness_feedback,
+                            "validator-cycle budget exhausted before the new edited draft could be validated".into(),
+                        );
+                        trace.terminal_status = "validation_exhausted".into();
+                        break;
+                    }
+
+                    last_compile_fingerprint = Some(compiled_now.fingerprint.clone());
+                    write_sdrf(&draft_path, &compiled_now.headers, &compiled_now.rows)?;
+                    write_validation_review(&review_path, &compiled_now.issues)?;
+                    trace.validator_cycles_completed += 1;
+                    let cycle =
+                        validation_cycle(trace.validator_cycles_completed, &compiled_now.issues);
+                    let errors = cycle.validation_errors;
+                    trace.validation_history.push(cycle);
+                    fs::write(
+                        workspace_dir.join("validation_history.json"),
+                        serde_json::to_string_pretty(&trace.validation_history)?,
+                    )?;
+                    refresh_scientific_tasks(&evidence, &mut state, &compiled_now.issues);
+                    let adjudications = compiled_now.adjudications.clone();
+                    compiled = Some(compiled_now);
+                    fs::write(
+                        workspace_dir.join("state.json"),
+                        serde_json::to_string_pretty(&state)?,
+                    )?;
+                    write_workspace_notebook(
+                        &workspace_dir,
+                        &evidence,
+                        &state,
+                        &adjudications,
+                        &trace.validation_history,
+                    )?;
+
+                    if errors == 0 {
+                        trace.terminal_status = "resolved".into();
+                        break;
+                    }
+                    if state.active_task_id.is_empty() {
+                        trace.terminal_status = "partial_no_active_scientific_task".into();
+                        break;
+                    }
+                    if trace.validator_cycles_completed >= max_validator_cycles {
+                        trace.terminal_status = "validation_exhausted".into();
+                        break;
+                    }
                 }
-                push_harness_feedback(
-                    &mut trace.harness_feedback,
-                    &mut pending_harness_feedback,
-                    "previous task routed to human review; continue with the next Rust-selected scientific task".into(),
-                );
-                continue;
-            }
-            if state.active_task_id.is_empty() {
-                trace.terminal_status = "partial_no_active_scientific_task".into();
-                break;
-            }
-            if trace.validator_cycles_completed >= max_validator_cycles {
-                trace.terminal_status = "validation_exhausted".into();
-                break;
             }
         }
     }
@@ -3538,6 +4041,10 @@ async fn run_one_scientific_agent(
         "locally_valid": locally_valid,
         "validation_errors": validation_errors,
         "branches": state.branches.clone(),
+        "scientific_observations": state.claims.clone(),
+        "observation_adjudications": final_adjudications.clone(),
+        // Backward-compatible aliases for existing audit tooling. v1.1 model
+        // commands and prompts use observation terminology exclusively.
         "claims": state.claims.clone(),
         "claim_adjudications": final_adjudications,
         "open_questions": state.open_questions.clone(),
@@ -3820,6 +4327,78 @@ mod tests {
             other => panic!("expected template gap, got {other:?}"),
         }
         assert!(canonical_claim_value(&evidence, &claim).is_none());
+    }
+
+    #[test]
+    fn evidence_equivalent_observation_phrasings_merge_without_workspace_conflict() {
+        let evidence = evidence_with(
+            vec![EvidenceItem {
+                id: "E0001".into(),
+                source_kind: "manuscript_semantic_evidence".into(),
+                source_label: "single cell isolation method".into(),
+                text: "an individual intact cell was manually loaded into the separation capillary using hydrodynamic pressure".into(),
+            }],
+            vec!["runA.raw"],
+        );
+        let mut state = ScientificWorkspaceState {
+            claims: vec![claim("isolation_method", "manual picking", "project", "")],
+            ..Default::default()
+        };
+        let observation = ScientificObservationUpsert {
+            concept_type: "isolation_method".into(),
+            observed_value: "an individual intact cell was manually loaded into the separation capillary using hydrodynamic pressure".into(),
+            scope: "project".into(),
+            branch_id: String::new(),
+            status: "supported".into(),
+            evidence_refs: vec!["E0001".into()],
+            confidence: "high".into(),
+            reason: "source-faithful description of the physical isolation/loading operation".into(),
+            supersedes_observed_value: String::new(),
+        };
+        let (_events, publishable) = apply_edit_workspace_command(
+            &evidence,
+            &mut state,
+            "",
+            &[],
+            &[observation],
+            &[],
+            &[],
+            &[],
+            "refine observation wording without changing Rust canonical outcome",
+            1,
+        );
+        assert!(publishable);
+        assert!(state.conflicts.is_empty());
+        assert!(state.claims[0].value.contains("hydrodynamic pressure"));
+        assert!(matches!(
+            adjudicate_workspace_claim(&evidence, &state, &state.claims[0]),
+            ClaimAdjudication::Canonical { ref value, .. } if value == "manual picking"
+        ));
+    }
+
+    #[test]
+    fn compiler_owned_template_gap_remains_visible_without_model_observation() {
+        let evidence = evidence_with(
+            vec![EvidenceItem {
+                id: "E0001".into(),
+                source_kind: "pride_project".into(),
+                source_label: "project:sampleProcessingProtocol".into(),
+                text: "The picked single-cell was immediately transferred into the microwell on the chip before extraction and digestion.".into(),
+            }],
+            vec!["runA.raw"],
+        );
+        let state = ScientificWorkspaceState::default();
+        let records = workspace_adjudications(&evidence, &state);
+        let record = records
+            .iter()
+            .find(|record| record.concept_type == "isolation_method")
+            .expect("Rust evidence bootstrap should expose the template gap");
+        assert_eq!(record.model_status, "rust_evidence_bootstrap");
+        assert!(matches!(
+            record.adjudication,
+            ClaimAdjudication::TemplateGap { ref observed_value, .. }
+                if observed_value == "microwell-chip single-cell transfer"
+        ));
     }
 
     #[test]
@@ -4405,7 +4984,7 @@ mod tests {
     }
 
     #[test]
-    fn study_structure_task_is_first_and_explicit_resolution_advances_to_field_task() {
+    fn study_structure_task_is_first_and_rust_resolves_after_material_edit() {
         let evidence = evidence_with(
             vec![EvidenceItem {
                 id: "E0001".into(),
@@ -4431,11 +5010,11 @@ mod tests {
         ensure_active_task(&mut state);
         assert_eq!(state.active_task_id, "task:study_structure");
 
-        let delta = WorkspaceDelta {
-            turn: 1,
-            task_id: "task:study_structure".into(),
-            task_status: "resolved".into(),
-            branch_upserts: vec![AgentBranch {
+        let (_events, publishable) = apply_edit_workspace_command(
+            &evidence,
+            &mut state,
+            "task:study_structure",
+            &[AgentBranch {
                 id: "hela".into(),
                 label: "HeLa experimental system".into(),
                 status: "supported".into(),
@@ -4444,10 +5023,14 @@ mod tests {
                 linkage_status: "unresolved".into(),
                 notes: "conceptual branch; no source-grounded RAW mapping".into(),
             }],
-            next_step: "compile".into(),
-            ..Default::default()
-        };
-        apply_workspace_delta(&evidence, &mut state, &delta, 1);
+            &[],
+            &[],
+            &[],
+            &[],
+            "source-grounded structure established",
+            1,
+        );
+        assert!(publishable);
         refresh_scientific_tasks(&evidence, &mut state, &issues);
         assert_eq!(
             state
@@ -4463,45 +5046,60 @@ mod tests {
     }
 
     #[test]
-    fn v10_schema_is_task_scoped_delta_not_full_workspace_replacement() {
+    fn v11_schema_is_explicit_single_command_protocol() {
         let schema = scientific_agent_schema();
-        let properties = schema["properties"].as_object().unwrap();
-        assert!(properties.contains_key("task_id"));
-        assert!(properties.contains_key("task_status"));
-        assert!(properties.contains_key("claim_upserts"));
-        assert!(properties.contains_key("claim_retractions"));
-        assert!(properties.contains_key("branch_upserts"));
-        let action_enum = properties["next_evidence_actions"]["items"]["properties"]["action"]
-            ["enum"]
-            .as_array()
-            .unwrap();
-        assert!(action_enum
+        let variants = schema["oneOf"].as_array().unwrap();
+        let commands = variants
             .iter()
-            .any(|value| value.as_str() == Some("READ_EVIDENCE_CONTEXT")));
-        assert!(!properties.contains_key("claims"));
-        assert!(!properties.contains_key("branches"));
-        assert!(!properties.contains_key("relation"));
+            .filter_map(|variant| variant["properties"]["command"]["enum"][0].as_str())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            commands,
+            [
+                "read_evidence",
+                "search_evidence",
+                "edit_workspace",
+                "escalate"
+            ]
+            .into_iter()
+            .collect::<BTreeSet<_>>()
+        );
+        let edit = variants
+            .iter()
+            .find(|variant| {
+                variant["properties"]["command"]["enum"][0].as_str() == Some("edit_workspace")
+            })
+            .unwrap();
+        let properties = edit["properties"].as_object().unwrap();
+        assert!(properties.contains_key("observation_upserts"));
+        assert!(properties.contains_key("observation_retractions"));
+        assert!(properties.contains_key("branch_upserts"));
+        assert!(!properties.contains_key("next_step"));
+        assert!(!properties.contains_key("task_status"));
+        assert!(!properties.contains_key("next_evidence_actions"));
     }
 
     #[test]
-    fn workspace_delta_parser_rejects_full_state_fields_even_if_model_emits_them() {
-        let value = json!({
-            "turn": 1,
+    fn agent_command_parser_rejects_mixed_intents_and_full_workspace_fields() {
+        let mixed = json!({
+            "command": "read_evidence",
             "task_id": "task:single_cell_isolation_method",
-            "task_status": "continue",
-            "branch_upserts": [],
-            "claim_upserts": [],
-            "claim_retractions": [],
-            "open_question_additions": [],
-            "open_question_resolutions": [],
-            "conflict_additions": [],
-            "conflict_resolutions": [],
-            "next_evidence_actions": [],
-            "next_step": "finish",
-            "notes": "",
-            "claims": []
+            "evidence_refs": ["E0001"],
+            "reason": "need context",
+            "observation_upserts": []
         });
-        assert!(serde_json::from_value::<WorkspaceDelta>(value).is_err());
+        assert!(serde_json::from_value::<AgentCommand>(mixed).is_err());
+
+        let valid = json!({
+            "command": "read_evidence",
+            "task_id": "task:single_cell_isolation_method",
+            "evidence_refs": ["E0001"],
+            "reason": "need context"
+        });
+        assert!(matches!(
+            serde_json::from_value::<AgentCommand>(valid).unwrap(),
+            AgentCommand::ReadEvidence { .. }
+        ));
     }
 
     #[test]

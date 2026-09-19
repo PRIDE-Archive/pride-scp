@@ -2372,6 +2372,9 @@ fn infer_isolation_template_gap(evidence: &[EvidenceItem]) -> Option<TemplateCom
                 "microwell-chip",
                 "transferring to the microwells",
                 "transfer to the microwell",
+                "transfer into the microwell",
+                "transferred to the microwell",
+                "transferred into the microwell",
                 "single cells into microwells",
             ] as &[&str],
         ),
@@ -5545,6 +5548,13 @@ fn evidence_relevant_to_field(field: &str, item: &EvidenceItem) -> bool {
             "acoustic droplet",
             "tweezer",
             "individually transferred",
+            "picked single-cell",
+            "picked single cell",
+            "transfer to the microwell",
+            "transfer into the microwell",
+            "transferred to the microwell",
+            "transferred into the microwell",
+            "transferring to the microwells",
             "individual fibers were transferred",
             "mechanically dissociated",
             "mechanically isolated",
@@ -11553,6 +11563,49 @@ mod tests {
             .template_gaps
             .iter()
             .any(|gap| gap.observed_value == "capillary microsampling"));
+    }
+
+    #[test]
+    fn explicit_microwell_single_cell_transfer_variant_creates_template_gap() {
+        let item = EvidenceItem {
+            id: "E0001".into(),
+            source_kind: "pride_project".into(),
+            source_label: "project:sampleProcessingProtocol".into(),
+            text: "The picked single-cell was immediately transferred into the microwell on the chip before extraction and digestion.".into(),
+        };
+        let design = StudyDesignScaffold {
+            relation_mode_hint: "one_cell_per_data_file".into(),
+            relation_confidence: "high".into(),
+            repository_file_mode: "raw_files_present".into(),
+            ..Default::default()
+        };
+        let scaffold = infer_deterministic_metadata_scaffold(&[item], &design);
+        assert!(scaffold
+            .template_gaps
+            .iter()
+            .any(|gap| gap.observed_value == "microwell-chip single-cell transfer"));
+        assert!(!scaffold.values.contains_key("single_cell_isolation_method"));
+    }
+
+    #[test]
+    fn microwell_fabrication_without_single_cell_transfer_does_not_create_template_gap() {
+        let item = EvidenceItem {
+            id: "E0001".into(),
+            source_kind: "pride_project".into(),
+            source_label: "project:projectDescription".into(),
+            text: "A microwell-chip was fabricated and used for downstream extraction and protein digestion.".into(),
+        };
+        let design = StudyDesignScaffold {
+            relation_mode_hint: "one_cell_per_data_file".into(),
+            relation_confidence: "high".into(),
+            repository_file_mode: "raw_files_present".into(),
+            ..Default::default()
+        };
+        let scaffold = infer_deterministic_metadata_scaffold(&[item], &design);
+        assert!(scaffold
+            .template_gaps
+            .iter()
+            .all(|gap| gap.observed_value != "microwell-chip single-cell transfer"));
     }
 
     #[test]
