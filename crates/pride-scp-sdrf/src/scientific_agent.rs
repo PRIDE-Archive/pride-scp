@@ -1,6 +1,6 @@
 use super::*;
 
-pub const SCIENTIFIC_AGENT_HARNESS_VERSION: &str = "pride-scp-scientific-workspace-agent-v1.1";
+pub const SCIENTIFIC_AGENT_HARNESS_VERSION: &str = "pride-scp-scientific-workspace-agent-v1.2";
 const SCIENTIFIC_AGENT_TASK_EVIDENCE_LIMIT: usize = 20;
 const SCIENTIFIC_AGENT_CONTEXT_READ_RADIUS: usize = 6000;
 #[derive(Debug, Clone)]
@@ -383,6 +383,10 @@ struct ScientificTask {
     evidence_candidates: Vec<String>,
     #[serde(default)]
     evidence_reads: Vec<String>,
+    #[serde(default)]
+    decision_required: bool,
+    #[serde(default)]
+    search_blocked: bool,
     attempts: usize,
     notes: String,
 }
@@ -509,7 +513,7 @@ fn concept_to_sdrf_field(concept: &str) -> Option<&'static str> {
     }
 }
 
-fn scientific_agent_schema() -> Value {
+fn scientific_agent_schema(allow_read_evidence: bool, allow_search_evidence: bool) -> Value {
     let concepts = scientific_concept_types();
     let query = json!({
         "type":"object",
@@ -576,57 +580,63 @@ fn scientific_agent_schema() -> Value {
         "required":["action","reason","target_concepts","queries","evidence_refs"],
         "additionalProperties":false
     });
-    json!({
-        "oneOf":[
-            {
-                "type":"object",
-                "properties":{
-                    "command":{"type":"string","enum":["read_evidence"]},
-                    "task_id":{"type":"string","maxLength":100},
-                    "evidence_refs":{"type":"array","items":{"type":"string","pattern":"^E[0-9]{4}$"},"minItems":1,"maxItems":4},
-                    "reason":{"type":"string","maxLength":600}
-                },
-                "required":["command","task_id","evidence_refs","reason"],
-                "additionalProperties":false
-            },
-            {
-                "type":"object",
-                "properties":{
-                    "command":{"type":"string","enum":["search_evidence"]},
-                    "task_id":{"type":"string","maxLength":100},
-                    "actions":{"type":"array","items":search_action,"minItems":1,"maxItems":4},
-                    "reason":{"type":"string","maxLength":600}
-                },
-                "required":["command","task_id","actions","reason"],
-                "additionalProperties":false
-            },
-            {
-                "type":"object",
-                "properties":{
-                    "command":{"type":"string","enum":["edit_workspace"]},
-                    "task_id":{"type":"string","maxLength":100},
-                    "branch_upserts":{"type":"array","items":branch,"maxItems":24},
-                    "observation_upserts":{"type":"array","items":observation,"maxItems":48},
-                    "observation_retractions":{"type":"array","items":observation_retraction,"maxItems":24},
-                    "open_question_additions":{"type":"array","items":{"type":"string","maxLength":500},"maxItems":24},
-                    "open_question_resolutions":{"type":"array","items":{"type":"string","maxLength":500},"maxItems":24},
-                    "notes":{"type":"string","maxLength":1600}
-                },
-                "required":["command","task_id","branch_upserts","observation_upserts","observation_retractions","open_question_additions","open_question_resolutions","notes"],
-                "additionalProperties":false
-            },
-            {
-                "type":"object",
-                "properties":{
-                    "command":{"type":"string","enum":["escalate"]},
-                    "task_id":{"type":"string","maxLength":100},
-                    "reason":{"type":"string","maxLength":1000}
-                },
-                "required":["command","task_id","reason"],
-                "additionalProperties":false
-            }
-        ]
-    })
+    let read_command = json!({
+        "type":"object",
+        "properties":{
+            "command":{"type":"string","enum":["read_evidence"]},
+            "task_id":{"type":"string","maxLength":100},
+            "evidence_refs":{"type":"array","items":{"type":"string","pattern":"^E[0-9]{4}$"},"minItems":1,"maxItems":4},
+            "reason":{"type":"string","maxLength":600}
+        },
+        "required":["command","task_id","evidence_refs","reason"],
+        "additionalProperties":false
+    });
+    let search_command = json!({
+        "type":"object",
+        "properties":{
+            "command":{"type":"string","enum":["search_evidence"]},
+            "task_id":{"type":"string","maxLength":100},
+            "actions":{"type":"array","items":search_action,"minItems":1,"maxItems":4},
+            "reason":{"type":"string","maxLength":600}
+        },
+        "required":["command","task_id","actions","reason"],
+        "additionalProperties":false
+    });
+    let edit_command = json!({
+        "type":"object",
+        "properties":{
+            "command":{"type":"string","enum":["edit_workspace"]},
+            "task_id":{"type":"string","maxLength":100},
+            "branch_upserts":{"type":"array","items":branch,"maxItems":24},
+            "observation_upserts":{"type":"array","items":observation,"maxItems":48},
+            "observation_retractions":{"type":"array","items":observation_retraction,"maxItems":24},
+            "open_question_additions":{"type":"array","items":{"type":"string","maxLength":500},"maxItems":24},
+            "open_question_resolutions":{"type":"array","items":{"type":"string","maxLength":500},"maxItems":24},
+            "notes":{"type":"string","maxLength":1600}
+        },
+        "required":["command","task_id","branch_upserts","observation_upserts","observation_retractions","open_question_additions","open_question_resolutions","notes"],
+        "additionalProperties":false
+    });
+    let escalate_command = json!({
+        "type":"object",
+        "properties":{
+            "command":{"type":"string","enum":["escalate"]},
+            "task_id":{"type":"string","maxLength":100},
+            "reason":{"type":"string","maxLength":1000}
+        },
+        "required":["command","task_id","reason"],
+        "additionalProperties":false
+    });
+    let mut commands = Vec::new();
+    if allow_read_evidence {
+        commands.push(read_command);
+    }
+    if allow_search_evidence {
+        commands.push(search_command);
+    }
+    commands.push(edit_command);
+    commands.push(escalate_command);
+    json!({"oneOf": commands})
 }
 
 fn concept_for_repair_field(field: &str) -> Option<&'static str> {
@@ -765,6 +775,8 @@ fn build_scientific_tasks(
                 SCIENTIFIC_AGENT_TASK_EVIDENCE_LIMIT,
             ),
             evidence_reads: Vec::new(),
+            decision_required: false,
+            search_blocked: false,
             attempts: 0,
             notes: String::new(),
         });
@@ -794,6 +806,8 @@ fn build_scientific_tasks(
                         SCIENTIFIC_AGENT_TASK_EVIDENCE_LIMIT,
                     ),
                     evidence_reads: Vec::new(),
+                    decision_required: false,
+                    search_blocked: false,
                     attempts: 0,
                     notes: String::new(),
                 })
@@ -920,7 +934,7 @@ fn task_board_block(state: &ScientificWorkspaceState) -> String {
         .iter()
         .map(|task| {
             format!(
-                "- {} status={} concept={} errors={} codes={:?} candidates={} reads={} attempts={} objective={}",
+                "- {} status={} concept={} errors={} codes={:?} candidates={} reads={} decision_required={} search_blocked={} attempts={} objective={}",
                 task.id,
                 task.status,
                 task.concept_type,
@@ -928,6 +942,8 @@ fn task_board_block(state: &ScientificWorkspaceState) -> String {
                 task.error_codes,
                 task.evidence_candidates.len(),
                 task.evidence_reads.len(),
+                task.decision_required,
+                task.search_blocked,
                 task.attempts,
                 task.objective
             )
@@ -1046,11 +1062,25 @@ fn scientific_agent_prompt(
         serde_json::to_string_pretty(&recent_validations).unwrap_or_else(|_| "[]".into());
     let feedback_json =
         serde_json::to_string_pretty(changed_harness_feedback).unwrap_or_else(|_| "[]".into());
+    let read_policy = match active {
+        Some(task) if task.decision_required && task.search_blocked => {
+            "DECISION ONLY: prior evidence gathering produced no new source material. Both read_evidence and search_evidence are disabled. Commit a supported edit_workspace or escalate."
+        }
+        Some(task) if task.decision_required => {
+            "READ LOCK ACTIVE: Rust has already returned source context for this task. read_evidence is disabled for this turn. Use edit_workspace if the evidence supports a material finding, search_evidence if a genuinely different source/query is still needed, or escalate if the evidence is insufficient/ambiguous."
+        }
+        _ => {
+            "GATHER AVAILABLE: You may read promising unread E#### refs or issue a targeted search. After Rust returns context, the next turn enters a decision step before another read is allowed."
+        }
+    };
     format!(
         "You are the scientific workspace agent for PRIDE single-cell proteomics dataset {acc}.\n\n\
 Your environment behaves like a coding/research workspace. Rust owns persistent state, provenance, controlled-vocabulary canonicalization, task status, compilation, validation, trusted RAW linkage, and all safety gates. You inspect source evidence, build a study model, and record source-faithful scientific observations. Work ONE active task deeply before moving to another task.\n\n\
-SCIENTIFIC WORKSPACE AGENT CONTRACT (v1.1):\n\
+SCIENTIFIC WORKSPACE AGENT CONTRACT (v1.2):\n\
 - Return exactly ONE executable top-level command for this turn: read_evidence, search_evidence, edit_workspace, or escalate. Do not narrate a future tool action inside notes; if you need to read E####, the command itself must be read_evidence.\n\
+- Never request the same evidence ref twice. Rust records requested refs as read even when multiple refs resolve to the same materialized source window.\n\
+- After a successful read, Rust enters a decision step: do not keep reading by inertia. Commit a supported study/observation edit, search a genuinely different source/query, or escalate.\n\
+CURRENT COMMAND POLICY: {read_policy}\n\
 - task_id must exactly equal the ACTIVE TASK id. Rust derives task status and chooses when compilation/validation is useful. You do NOT request compile/finish or mark validator-backed tasks resolved.\n\
 - read_evidence: use when an existing promising E#### excerpt is insufficient. Rust reads a larger bounded window from only registered trusted sources and returns it on the next turn.\n\
 - search_evidence: use only when focused candidates plus already-read context do not answer the task. Use targeted publication/supplement/structured-design/repository/KG/conflict searches.\n\
@@ -1103,6 +1133,7 @@ This is turn {turn}. Return ONLY one AgentCommand object matching the JSON schem
         action_json = action_json,
         validation_json = validation_json,
         feedback_json = feedback_json,
+        read_policy = read_policy,
         turn = turn,
     )
 }
@@ -1132,7 +1163,10 @@ async fn call_scientific_agent(
         ),
         "stream": false,
         "think": false,
-        "format": scientific_agent_schema(),
+        "format": scientific_agent_schema(
+            active_task(workspace).is_some_and(|task| !task.decision_required),
+            active_task(workspace).is_some_and(|task| !task.search_blocked),
+        ),
         "options": {"temperature": 0.0}
     });
     let response = client
@@ -1794,20 +1828,65 @@ fn execute_scientific_agent_actions(
 fn record_task_reads(
     state: &mut ScientificWorkspaceState,
     task_id: &str,
+    requested_refs: &[String],
     results: &[EvidenceActionResult],
 ) {
     let Some(task) = state.tasks.iter_mut().find(|task| task.id == task_id) else {
         return;
     };
+    task.evidence_reads.extend(requested_refs.iter().cloned());
     for result in results
         .iter()
         .filter(|result| result.action == "READ_EVIDENCE_CONTEXT")
     {
+        let requested = result.query.value.trim();
+        if requested.starts_with('E') {
+            task.evidence_reads.push(requested.to_string());
+        }
         task.evidence_reads
             .extend(result.matched_evidence_refs.iter().cloned());
     }
     task.evidence_reads.sort();
     task.evidence_reads.dedup();
+    task.decision_required = true;
+    task.search_blocked = false;
+}
+
+fn unread_evidence_refs_for_task(
+    evidence: &DatasetEvidence,
+    state: &ScientificWorkspaceState,
+    task_id: &str,
+    refs: &[String],
+) -> Vec<String> {
+    let already_read = state
+        .tasks
+        .iter()
+        .find(|task| task.id == task_id)
+        .map(|task| task.evidence_reads.iter().cloned().collect::<BTreeSet<_>>())
+        .unwrap_or_default();
+    valid_evidence_refs(evidence, refs)
+        .into_iter()
+        .filter(|evidence_ref| !already_read.contains(evidence_ref))
+        .collect()
+}
+
+fn evidence_action_count(results: &[EvidenceActionResult]) -> usize {
+    results
+        .iter()
+        .filter(|result| result.outcome != "duplicate_skipped")
+        .count()
+}
+
+fn set_task_decision_required(state: &mut ScientificWorkspaceState, task_id: &str, value: bool) {
+    if let Some(task) = state.tasks.iter_mut().find(|task| task.id == task_id) {
+        task.decision_required = value;
+    }
+}
+
+fn set_task_search_blocked(state: &mut ScientificWorkspaceState, task_id: &str, value: bool) {
+    if let Some(task) = state.tasks.iter_mut().find(|task| task.id == task_id) {
+        task.search_blocked = value;
+    }
 }
 
 fn normalize_workspace_branches(evidence: &DatasetEvidence, branches: &mut Vec<AgentBranch>) {
@@ -3581,14 +3660,28 @@ async fn run_one_scientific_agent(
                         );
                         continue;
                     }
-                    let mut refs = valid_evidence_refs(&evidence, evidence_refs);
-                    refs.truncate(remaining.min(4));
-                    if refs.is_empty() {
+                    if active_task(&state).is_some_and(|task| task.decision_required) {
                         push_harness_feedback(
                             &mut trace.harness_feedback,
                             &mut pending_harness_feedback,
                             format!(
-                                "turn {turn} read_evidence had no valid trusted E#### refs after normalization; choose an E#### from the focused evidence list"
+                                "turn {turn} read_evidence was rejected because the task is in a decision step after a prior read. Use edit_workspace, search_evidence with a genuinely different query/source, or escalate."
+                            ),
+                        );
+                        trace.states.push(state.clone());
+                        continue;
+                    }
+                    let valid_requested = valid_evidence_refs(&evidence, evidence_refs);
+                    let mut refs =
+                        unread_evidence_refs_for_task(&evidence, &state, task_id, &valid_requested);
+                    refs.truncate(remaining.min(4));
+                    if refs.is_empty() {
+                        set_task_decision_required(&mut state, task_id, true);
+                        push_harness_feedback(
+                            &mut trace.harness_feedback,
+                            &mut pending_harness_feedback,
+                            format!(
+                                "turn {turn} read_evidence contained only invalid or already-read E#### refs. Rust has locked further reads for this task until you edit_workspace, run a genuinely new search_evidence query, or escalate."
                             ),
                         );
                         trace.states.push(state.clone());
@@ -3599,7 +3692,7 @@ async fn run_one_scientific_agent(
                         reason: reason.clone(),
                         target_concepts: task_target_concepts(&state, task_id),
                         queries: Vec::new(),
-                        evidence_refs: refs,
+                        evidence_refs: refs.clone(),
                     };
                     let round_results = execute_scientific_agent_actions(
                         &mut evidence,
@@ -3607,8 +3700,8 @@ async fn run_one_scientific_agent(
                         turn,
                         &mut attempted,
                     );
-                    trace.tool_actions_completed += round_results.len();
-                    record_task_reads(&mut state, task_id, &round_results);
+                    trace.tool_actions_completed += evidence_action_count(&round_results);
+                    record_task_reads(&mut state, task_id, &refs, &round_results);
                     trace.evidence_action_results.extend(round_results);
                     if let Some(current) = compiled.as_ref() {
                         refresh_scientific_tasks(&evidence, &mut state, &current.issues);
@@ -3687,11 +3780,13 @@ async fn run_one_scientific_agent(
                     let normalized = search_actions_for_command(&evidence, actions);
                     let executable = trim_actions_to_budget(&normalized, remaining);
                     if executable.is_empty() {
+                        set_task_decision_required(&mut state, task_id, true);
+                        set_task_search_blocked(&mut state, task_id, true);
                         push_harness_feedback(
                             &mut trace.harness_feedback,
                             &mut pending_harness_feedback,
                             format!(
-                                "turn {turn} search_evidence contained no executable normalized search query; use read_evidence for existing E#### refs or provide a typed SEARCH_* query"
+                                "turn {turn} search_evidence contained no executable normalized search query. Rust has closed further evidence gathering for this task; use edit_workspace with current evidence or escalate."
                             ),
                         );
                         trace.states.push(state.clone());
@@ -3703,7 +3798,13 @@ async fn run_one_scientific_agent(
                         turn,
                         &mut attempted,
                     );
-                    trace.tool_actions_completed += round_results.len();
+                    let executed_actions = evidence_action_count(&round_results);
+                    let produced_new_evidence = round_results.iter().any(|result| {
+                        result.outcome == "matched" && !result.matched_evidence_refs.is_empty()
+                    });
+                    trace.tool_actions_completed += executed_actions;
+                    set_task_decision_required(&mut state, task_id, !produced_new_evidence);
+                    set_task_search_blocked(&mut state, task_id, !produced_new_evidence);
                     trace.evidence_action_results.extend(round_results);
                     if let Some(current) = compiled.as_ref() {
                         refresh_scientific_tasks(&evidence, &mut state, &current.issues);
@@ -3801,6 +3902,8 @@ async fn run_one_scientific_agent(
                     open_question_resolutions,
                     notes,
                 } => {
+                    set_task_decision_required(&mut state, task_id, false);
+                    set_task_search_blocked(&mut state, task_id, false);
                     let (reducer_events, publishable_edit) = apply_edit_workspace_command(
                         &evidence,
                         &mut state,
@@ -4043,7 +4146,7 @@ async fn run_one_scientific_agent(
         "branches": state.branches.clone(),
         "scientific_observations": state.claims.clone(),
         "observation_adjudications": final_adjudications.clone(),
-        // Backward-compatible aliases for existing audit tooling. v1.1 model
+        // Backward-compatible aliases for existing audit tooling. v1.2 model
         // commands and prompts use observation terminology exclusively.
         "claims": state.claims.clone(),
         "claim_adjudications": final_adjudications,
@@ -5046,8 +5149,8 @@ mod tests {
     }
 
     #[test]
-    fn v11_schema_is_explicit_single_command_protocol() {
-        let schema = scientific_agent_schema();
+    fn v12_schema_is_explicit_single_command_protocol() {
+        let schema = scientific_agent_schema(true, true);
         let variants = schema["oneOf"].as_array().unwrap();
         let commands = variants
             .iter()
@@ -5077,6 +5180,125 @@ mod tests {
         assert!(!properties.contains_key("next_step"));
         assert!(!properties.contains_key("task_status"));
         assert!(!properties.contains_key("next_evidence_actions"));
+    }
+
+    #[test]
+    fn v12_decision_step_schema_disables_repeated_reads() {
+        let schema = scientific_agent_schema(false, true);
+        let commands = schema["oneOf"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|variant| variant["properties"]["command"]["enum"][0].as_str())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            commands,
+            ["search_evidence", "edit_workspace", "escalate"]
+                .into_iter()
+                .collect::<BTreeSet<_>>()
+        );
+        assert!(!commands.contains("read_evidence"));
+    }
+
+    #[test]
+    fn v12_stalled_search_schema_forces_edit_or_escalate() {
+        let schema = scientific_agent_schema(false, false);
+        let commands = schema["oneOf"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|variant| variant["properties"]["command"]["enum"][0].as_str())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            commands,
+            ["edit_workspace", "escalate"]
+                .into_iter()
+                .collect::<BTreeSet<_>>()
+        );
+    }
+
+    #[test]
+    fn v12_read_receipt_records_requested_ref_and_enters_decision_step() {
+        let mut state = ScientificWorkspaceState {
+            tasks: vec![ScientificTask {
+                id: "task:study_structure".into(),
+                status: "investigating".into(),
+                error_count: 1,
+                ..Default::default()
+            }],
+            active_task_id: "task:study_structure".into(),
+            ..Default::default()
+        };
+        let requested = vec!["E0021".to_string()];
+        let result = EvidenceActionResult {
+            action: "READ_EVIDENCE_CONTEXT".into(),
+            outcome: "matched".into(),
+            query: EvidenceQuery {
+                match_kind: "identifier".into(),
+                value: "E0021".into(),
+                ..Default::default()
+            },
+            matched_evidence_refs: vec!["E0040".into()],
+            ..Default::default()
+        };
+        record_task_reads(&mut state, "task:study_structure", &requested, &[result]);
+        let task = &state.tasks[0];
+        assert_eq!(task.evidence_reads, vec!["E0021", "E0040"]);
+        assert!(task.decision_required);
+    }
+
+    #[test]
+    fn v12_unread_filter_blocks_already_consumed_context_refs() {
+        let evidence = evidence_with(
+            vec![
+                EvidenceItem {
+                    id: "E0001".into(),
+                    source_kind: "pride_project".into(),
+                    source_label: "project:projectDescription".into(),
+                    text: "first".into(),
+                },
+                EvidenceItem {
+                    id: "E0002".into(),
+                    source_kind: "pride_project".into(),
+                    source_label: "project:sampleProcessingProtocol".into(),
+                    text: "second".into(),
+                },
+            ],
+            Vec::new(),
+        );
+        let state = ScientificWorkspaceState {
+            tasks: vec![ScientificTask {
+                id: "task:study_structure".into(),
+                evidence_reads: vec!["E0001".into()],
+                ..Default::default()
+            }],
+            active_task_id: "task:study_structure".into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            unread_evidence_refs_for_task(
+                &evidence,
+                &state,
+                "task:study_structure",
+                &["E0001".into(), "E0002".into()],
+            ),
+            vec!["E0002"]
+        );
+    }
+
+    #[test]
+    fn v12_duplicate_skipped_results_do_not_consume_tool_budget() {
+        let results = vec![
+            EvidenceActionResult {
+                outcome: "matched".into(),
+                ..Default::default()
+            },
+            EvidenceActionResult {
+                outcome: "duplicate_skipped".into(),
+                ..Default::default()
+            },
+        ];
+        assert_eq!(evidence_action_count(&results), 1);
     }
 
     #[test]
