@@ -398,6 +398,180 @@ struct StudyGraphAcceptance {
     model_calls: usize,
 }
 
+pub const SCIENTIFIC_AGENT_FACTOR_GRAPH_STAGE1_MODE: &str = "study_factor_graph_v2_stage1";
+pub const SCIENTIFIC_AGENT_FACTOR_GRAPH_STAGE1_VERSION: &str =
+    "pride-scp-scientific-workspace-agent-v2-factor-stage1";
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+struct FactorMaterialProposal {
+    local_id: String,
+    label: String,
+    organism: String,
+    biological_material: String,
+    experimental_role: String,
+    #[serde(default)]
+    evidence_refs: Vec<String>,
+    notes: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+struct FactorRegimeProposal {
+    local_id: String,
+    label: String,
+    experimental_role: String,
+    isolation_or_loading_method: String,
+    input_or_cell_count_regime: String,
+    #[serde(default)]
+    evidence_refs: Vec<String>,
+    notes: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+struct FactorAcquisitionProposal {
+    local_id: String,
+    label: String,
+    acquisition_method_or_platform: String,
+    #[serde(default)]
+    evidence_refs: Vec<String>,
+    notes: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+struct FactorRelationProposal {
+    source_id: String,
+    relation_type: String,
+    target_id: String,
+    #[serde(default)]
+    evidence_refs: Vec<String>,
+    notes: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+struct FactorRawLinkProposal {
+    node_id: String,
+    raw_file: String,
+    #[serde(default)]
+    evidence_refs: Vec<String>,
+    notes: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+struct StudyFactorGraphProposal {
+    decision: String,
+    #[serde(default)]
+    materials: Vec<FactorMaterialProposal>,
+    #[serde(default)]
+    regimes: Vec<FactorRegimeProposal>,
+    #[serde(default)]
+    acquisitions: Vec<FactorAcquisitionProposal>,
+    #[serde(default)]
+    relations: Vec<FactorRelationProposal>,
+    #[serde(default)]
+    raw_links: Vec<FactorRawLinkProposal>,
+    #[serde(default)]
+    open_questions: Vec<String>,
+    reason: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct AcceptedFactorMaterial {
+    id: String,
+    label: String,
+    organism: String,
+    biological_material: String,
+    experimental_role: String,
+    #[serde(default)]
+    evidence_refs: Vec<String>,
+    notes: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct AcceptedFactorRegime {
+    id: String,
+    label: String,
+    experimental_role: String,
+    isolation_or_loading_method: String,
+    input_or_cell_count_regime: String,
+    #[serde(default)]
+    evidence_refs: Vec<String>,
+    notes: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct AcceptedFactorAcquisition {
+    id: String,
+    label: String,
+    acquisition_method_or_platform: String,
+    #[serde(default)]
+    evidence_refs: Vec<String>,
+    notes: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct AcceptedFactorRelation {
+    source_id: String,
+    relation_type: String,
+    target_id: String,
+    #[serde(default)]
+    evidence_refs: Vec<String>,
+    notes: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct AcceptedFactorRawLink {
+    node_id: String,
+    raw_file: String,
+    #[serde(default)]
+    evidence_refs: Vec<String>,
+    notes: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct FactorGraphRejectedItem {
+    item_type: String,
+    local_id: String,
+    label: String,
+    reason: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct FactorGraphRemovedRawLink {
+    node_id: String,
+    raw_file: String,
+    reason: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct StudyFactorGraphAcceptance {
+    harness_version: String,
+    accession: String,
+    status: String,
+    #[serde(default)]
+    materials: Vec<AcceptedFactorMaterial>,
+    #[serde(default)]
+    regimes: Vec<AcceptedFactorRegime>,
+    #[serde(default)]
+    acquisitions: Vec<AcceptedFactorAcquisition>,
+    #[serde(default)]
+    relations: Vec<AcceptedFactorRelation>,
+    #[serde(default)]
+    raw_links: Vec<AcceptedFactorRawLink>,
+    #[serde(default)]
+    open_questions: Vec<String>,
+    #[serde(default)]
+    rejected_items: Vec<FactorGraphRejectedItem>,
+    #[serde(default)]
+    removed_raw_links: Vec<FactorGraphRemovedRawLink>,
+    reason: String,
+    model_calls: usize,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "command", rename_all = "snake_case", deny_unknown_fields)]
 enum AgentCommand {
@@ -1890,6 +2064,784 @@ async fn run_study_graph_stage1(
     let rendered = serde_json::to_string_pretty(&summary)?;
     fs::write(
         opts.output_dir.join("study_graph_stage1_summary.json"),
+        &rendered,
+    )?;
+    fs::write(
+        opts.output_dir.join("scientific_agent_summary.json"),
+        rendered,
+    )?;
+    Ok(summary)
+}
+
+fn factor_graph_stage1_schema() -> Value {
+    let evidence_refs = || {
+        json!({
+            "type":"array",
+            "items":{"type":"string","pattern":"^E[0-9]{4}$"},
+            "minItems":1,
+            "maxItems":16
+        })
+    };
+    let material = json!({
+        "type":"object",
+        "properties":{
+            "local_id":{"type":"string","pattern":"^M[0-9]{1,3}$"},
+            "label":{"type":"string","minLength":1,"maxLength":240},
+            "organism":{"type":"string","maxLength":300},
+            "biological_material":{"type":"string","minLength":1,"maxLength":700},
+            "experimental_role":{"type":"string","maxLength":500},
+            "evidence_refs":evidence_refs(),
+            "notes":{"type":"string","maxLength":1000}
+        },
+        "required":["local_id","label","organism","biological_material","experimental_role","evidence_refs","notes"],
+        "additionalProperties":false
+    });
+    let regime = json!({
+        "type":"object",
+        "properties":{
+            "local_id":{"type":"string","pattern":"^R[0-9]{1,3}$"},
+            "label":{"type":"string","minLength":1,"maxLength":240},
+            "experimental_role":{"type":"string","minLength":1,"maxLength":500},
+            "isolation_or_loading_method":{"type":"string","maxLength":800},
+            "input_or_cell_count_regime":{"type":"string","maxLength":500},
+            "evidence_refs":evidence_refs(),
+            "notes":{"type":"string","maxLength":1000}
+        },
+        "required":["local_id","label","experimental_role","isolation_or_loading_method","input_or_cell_count_regime","evidence_refs","notes"],
+        "additionalProperties":false
+    });
+    let acquisition = json!({
+        "type":"object",
+        "properties":{
+            "local_id":{"type":"string","pattern":"^A[0-9]{1,3}$"},
+            "label":{"type":"string","minLength":1,"maxLength":240},
+            "acquisition_method_or_platform":{"type":"string","minLength":1,"maxLength":800},
+            "evidence_refs":evidence_refs(),
+            "notes":{"type":"string","maxLength":1000}
+        },
+        "required":["local_id","label","acquisition_method_or_platform","evidence_refs","notes"],
+        "additionalProperties":false
+    });
+    let relation = json!({
+        "type":"object",
+        "properties":{
+            "source_id":{"type":"string","pattern":"^[MRA][0-9]{1,3}$"},
+            "relation_type":{"type":"string","enum":["material_to_regime","regime_to_acquisition","material_to_acquisition"]},
+            "target_id":{"type":"string","pattern":"^[MRA][0-9]{1,3}$"},
+            "evidence_refs":evidence_refs(),
+            "notes":{"type":"string","maxLength":800}
+        },
+        "required":["source_id","relation_type","target_id","evidence_refs","notes"],
+        "additionalProperties":false
+    });
+    let raw_link = json!({
+        "type":"object",
+        "properties":{
+            "node_id":{"type":"string","pattern":"^[MRA][0-9]{1,3}$"},
+            "raw_file":{"type":"string","minLength":1,"maxLength":300},
+            "evidence_refs":evidence_refs(),
+            "notes":{"type":"string","maxLength":800}
+        },
+        "required":["node_id","raw_file","evidence_refs","notes"],
+        "additionalProperties":false
+    });
+    json!({
+        "type":"object",
+        "properties":{
+            "decision":{"type":"string","enum":["propose_graph","human_review"]},
+            "materials":{"type":"array","items":material,"maxItems":24},
+            "regimes":{"type":"array","items":regime,"maxItems":24},
+            "acquisitions":{"type":"array","items":acquisition,"maxItems":16},
+            "relations":{"type":"array","items":relation,"maxItems":64},
+            "raw_links":{"type":"array","items":raw_link,"maxItems":128},
+            "open_questions":{"type":"array","items":{"type":"string","maxLength":700},"maxItems":24},
+            "reason":{"type":"string","maxLength":1800}
+        },
+        "required":["decision","materials","regimes","acquisitions","relations","raw_links","open_questions","reason"],
+        "additionalProperties":false
+    })
+}
+
+fn factor_graph_stage1_prompt(
+    opts: &SdrfScientificAgentOptions,
+    evidence: &DatasetEvidence,
+) -> String {
+    let evidence_block = study_graph_stage1_evidence_block(
+        evidence,
+        opts.max_evidence_items.min(40),
+        opts.max_evidence_chars.min(60000),
+    );
+    format!(
+        "You are constructing the prerequisite evidence-backed scientific FACTOR GRAPH for PRIDE single-cell proteomics dataset {acc}.\n\n\
+This is a ONE-SHOT, BOUNDED STRUCTURAL SYNTHESIS. There is no conversational repair loop. Return either a source-grounded factor graph or human_review.\n\n\
+WHY A FACTOR GRAPH:\n\
+- Do NOT force organism/material, experimental regime, isolation/loading method, experimental role, and acquisition into one monolithic branch.\n\
+- Preserve orthogonal distinctions as separate nodes even when they share the same material or acquisition workflow.\n\n\
+MATERIAL NODES (M#):\n\
+- Represent distinct biological/material entities directly supported by trusted evidence: organism, cell line/type, tissue, commercial reference digest, etc.\n\
+- Distinct explicit organisms or materially different source materials must not be silently collapsed merely because they share a workflow.\n\n\
+EXPERIMENTAL REGIME NODES (R#):\n\
+- Represent distinct experimental roles, isolation/loading/sampling operations, or input/cell-count regimes.\n\
+- If trusted evidence distinguishes single-cell manual/hydrodynamic loading from low-number spray-voltage injection, they MUST be separate regime nodes even if both use HeLa and the same CE-MS/MS acquisition.\n\
+- A named source-defined isolation technology such as evDISCO/tDISCO or capillary microsampling is a valid regime description.\n\n\
+ACQUISITION NODES (A#):\n\
+- Represent distinct mass-spectrometry acquisition/platform workflows when source-supported.\n\n\
+RELATIONS:\n\
+- Use only material_to_regime, regime_to_acquisition, or material_to_acquisition.\n\
+- A relation requires source-grounded E#### evidence. Do not create a relation just because two nodes coexist in the project.\n\n\
+RAW LINKAGE:\n\
+- Exact RAW linkage is OPTIONAL and separate from the scientific factor graph.\n\
+- Add raw_links only when trusted cited source text explicitly names that RAW basename in connection with the target node.\n\
+- Filename words alone are never evidence for organism, cell type, regime, condition, or role.\n\
+- Lack of exact RAW linkage is NOT a reason to merge nodes and is NOT a reason for human_review.\n\n\
+SAFETY AND SCOPE:\n\
+- Every node and relation requires at least one supporting E#### ref.\n\
+- Do not choose SDRF controlled-vocabulary values and do not repair SDRF fields in this phase.\n\
+- Use human_review only when the conceptual factor graph itself cannot be established safely.\n\n\
+DETERMINISTIC CARDINALITY HINT (not biological identity):\n\
+relation_mode={relation}; confidence={confidence}; refs={refs:?}; repository_file_mode={repo_mode}; note={note}\n\n\
+TRUSTED STUDY-STRUCTURE EVIDENCE:\n{evidence_block}\n\n\
+Return ONLY the StudyFactorGraphProposal JSON object matching the schema.",
+        acc = evidence.accession,
+        relation = evidence.study_design.relation_mode_hint,
+        confidence = evidence.study_design.relation_confidence,
+        refs = evidence.study_design.relation_evidence_refs,
+        repo_mode = evidence.study_design.repository_file_mode,
+        note = evidence.study_design.notes,
+        evidence_block = evidence_block,
+    )
+}
+
+async fn call_factor_graph_stage1(
+    opts: &SdrfScientificAgentOptions,
+    evidence: &DatasetEvidence,
+) -> Result<StudyFactorGraphProposal> {
+    let client = Client::builder()
+        .timeout(Duration::from_secs(opts.timeout_seconds))
+        .build()?;
+    let payload = json!({
+        "model": opts.model,
+        "prompt": factor_graph_stage1_prompt(opts, evidence),
+        "stream": false,
+        "think": false,
+        "format": factor_graph_stage1_schema(),
+        "options": {"temperature": 0.0}
+    });
+    let response = client
+        .post(&opts.ollama_url)
+        .json(&payload)
+        .send()
+        .await
+        .with_context(|| {
+            format!(
+                "Ollama factor-graph v2-stage1 request for {}",
+                evidence.accession
+            )
+        })?;
+    let status = response.status();
+    let body: Value = response
+        .json()
+        .await
+        .context("decode Ollama factor-graph v2-stage1 response")?;
+    if !status.is_success() {
+        bail!("Ollama factor-graph v2-stage1 HTTP {status}: {body}");
+    }
+    let raw = body.get("response").and_then(Value::as_str).unwrap_or("");
+    if raw.trim().is_empty() {
+        bail!("Ollama returned empty factor-graph v2-stage1 response");
+    }
+    serde_json::from_str(raw).context("parse structured factor-graph v2-stage1 proposal")
+}
+
+fn normalize_factor_local_id(value: &str) -> String {
+    normalize_study_graph_text(value).to_ascii_uppercase()
+}
+
+fn factor_local_id_has_prefix(value: &str, prefix: char) -> bool {
+    let value = normalize_factor_local_id(value);
+    let mut chars = value.chars();
+    chars.next() == Some(prefix)
+        && chars.clone().count() >= 1
+        && chars.count() <= 3
+        && value.chars().skip(1).all(|ch| ch.is_ascii_digit())
+}
+
+fn relation_type_matches_local_ids(relation_type: &str, source: &str, target: &str) -> bool {
+    match relation_type {
+        "material_to_regime" => {
+            factor_local_id_has_prefix(source, 'M') && factor_local_id_has_prefix(target, 'R')
+        }
+        "regime_to_acquisition" => {
+            factor_local_id_has_prefix(source, 'R') && factor_local_id_has_prefix(target, 'A')
+        }
+        "material_to_acquisition" => {
+            factor_local_id_has_prefix(source, 'M') && factor_local_id_has_prefix(target, 'A')
+        }
+        _ => false,
+    }
+}
+
+fn accept_factor_graph_stage1(
+    evidence: &DatasetEvidence,
+    proposal: &StudyFactorGraphProposal,
+) -> StudyFactorGraphAcceptance {
+    if proposal.decision == "human_review" {
+        return StudyFactorGraphAcceptance {
+            harness_version: SCIENTIFIC_AGENT_FACTOR_GRAPH_STAGE1_VERSION.into(),
+            accession: evidence.accession.clone(),
+            status: "human_review".into(),
+            open_questions: proposal.open_questions.clone(),
+            reason: normalize_study_graph_text(&proposal.reason),
+            model_calls: 1,
+            ..Default::default()
+        };
+    }
+    if proposal.decision != "propose_graph" {
+        return StudyFactorGraphAcceptance {
+            harness_version: SCIENTIFIC_AGENT_FACTOR_GRAPH_STAGE1_VERSION.into(),
+            accession: evidence.accession.clone(),
+            status: "human_review".into(),
+            reason: format!("unsupported factor-graph decision '{}'", proposal.decision),
+            model_calls: 1,
+            ..Default::default()
+        };
+    }
+
+    let mut rejected_items = Vec::new();
+    let mut local_to_canonical = BTreeMap::<String, String>::new();
+    let mut seen_local = BTreeSet::<String>::new();
+
+    let mut material_rows = Vec::<(String, String, FactorMaterialProposal, Vec<String>)>::new();
+    let mut seen_materials = BTreeSet::<String>::new();
+    for mut node in proposal.materials.clone() {
+        node.local_id = normalize_factor_local_id(&node.local_id);
+        node.label = normalize_study_graph_text(&node.label);
+        node.organism = normalize_study_graph_text(&node.organism);
+        node.biological_material = normalize_study_graph_text(&node.biological_material);
+        node.experimental_role = normalize_study_graph_text(&node.experimental_role);
+        node.notes = normalize_study_graph_text(&node.notes);
+        let refs = valid_evidence_refs(evidence, &node.evidence_refs);
+        if !factor_local_id_has_prefix(&node.local_id, 'M')
+            || node.label.is_empty()
+            || node.biological_material.is_empty()
+            || refs.is_empty()
+        {
+            rejected_items.push(FactorGraphRejectedItem {
+                item_type: "material".into(),
+                local_id: node.local_id.clone(),
+                label: node.label.clone(),
+                reason: "material rejected: M# local_id, label, biological_material and trusted evidence are required".into(),
+            });
+            continue;
+        }
+        if !seen_local.insert(node.local_id.clone()) {
+            rejected_items.push(FactorGraphRejectedItem {
+                item_type: "material".into(),
+                local_id: node.local_id.clone(),
+                label: node.label.clone(),
+                reason: "material rejected: duplicate local_id".into(),
+            });
+            continue;
+        }
+        let key = format!(
+            "{}|{}|{}|{}",
+            node.label.to_ascii_lowercase(),
+            node.organism.to_ascii_lowercase(),
+            node.biological_material.to_ascii_lowercase(),
+            node.experimental_role.to_ascii_lowercase(),
+        );
+        if !seen_materials.insert(key.clone()) {
+            rejected_items.push(FactorGraphRejectedItem {
+                item_type: "material".into(),
+                local_id: node.local_id.clone(),
+                label: node.label.clone(),
+                reason: "material rejected: semantic duplicate".into(),
+            });
+            continue;
+        }
+        material_rows.push((key, node.local_id.clone(), node, refs));
+    }
+    material_rows.sort_by(|a, b| a.0.cmp(&b.0));
+    let mut materials = Vec::new();
+    for (i, (_, local_id, node, refs)) in material_rows.into_iter().enumerate() {
+        let id = format!("M{:03}", i + 1);
+        local_to_canonical.insert(local_id, id.clone());
+        materials.push(AcceptedFactorMaterial {
+            id,
+            label: node.label,
+            organism: node.organism,
+            biological_material: node.biological_material,
+            experimental_role: node.experimental_role,
+            evidence_refs: refs,
+            notes: node.notes,
+        });
+    }
+
+    let mut regime_rows = Vec::<(String, String, FactorRegimeProposal, Vec<String>)>::new();
+    let mut seen_regimes = BTreeSet::<String>::new();
+    for mut node in proposal.regimes.clone() {
+        node.local_id = normalize_factor_local_id(&node.local_id);
+        node.label = normalize_study_graph_text(&node.label);
+        node.experimental_role = normalize_study_graph_text(&node.experimental_role);
+        node.isolation_or_loading_method =
+            normalize_study_graph_text(&node.isolation_or_loading_method);
+        node.input_or_cell_count_regime =
+            normalize_study_graph_text(&node.input_or_cell_count_regime);
+        node.notes = normalize_study_graph_text(&node.notes);
+        let refs = valid_evidence_refs(evidence, &node.evidence_refs);
+        if !factor_local_id_has_prefix(&node.local_id, 'R')
+            || node.label.is_empty()
+            || node.experimental_role.is_empty()
+            || refs.is_empty()
+        {
+            rejected_items.push(FactorGraphRejectedItem {
+                item_type: "regime".into(),
+                local_id: node.local_id.clone(),
+                label: node.label.clone(),
+                reason: "regime rejected: R# local_id, label, experimental_role and trusted evidence are required".into(),
+            });
+            continue;
+        }
+        if !seen_local.insert(node.local_id.clone()) {
+            rejected_items.push(FactorGraphRejectedItem {
+                item_type: "regime".into(),
+                local_id: node.local_id.clone(),
+                label: node.label.clone(),
+                reason: "regime rejected: duplicate local_id".into(),
+            });
+            continue;
+        }
+        let key = format!(
+            "{}|{}|{}|{}",
+            node.label.to_ascii_lowercase(),
+            node.experimental_role.to_ascii_lowercase(),
+            node.isolation_or_loading_method.to_ascii_lowercase(),
+            node.input_or_cell_count_regime.to_ascii_lowercase(),
+        );
+        if !seen_regimes.insert(key.clone()) {
+            rejected_items.push(FactorGraphRejectedItem {
+                item_type: "regime".into(),
+                local_id: node.local_id.clone(),
+                label: node.label.clone(),
+                reason: "regime rejected: semantic duplicate".into(),
+            });
+            continue;
+        }
+        regime_rows.push((key, node.local_id.clone(), node, refs));
+    }
+    regime_rows.sort_by(|a, b| a.0.cmp(&b.0));
+    let mut regimes = Vec::new();
+    for (i, (_, local_id, node, refs)) in regime_rows.into_iter().enumerate() {
+        let id = format!("R{:03}", i + 1);
+        local_to_canonical.insert(local_id, id.clone());
+        regimes.push(AcceptedFactorRegime {
+            id,
+            label: node.label,
+            experimental_role: node.experimental_role,
+            isolation_or_loading_method: node.isolation_or_loading_method,
+            input_or_cell_count_regime: node.input_or_cell_count_regime,
+            evidence_refs: refs,
+            notes: node.notes,
+        });
+    }
+
+    let mut acquisition_rows =
+        Vec::<(String, String, FactorAcquisitionProposal, Vec<String>)>::new();
+    let mut seen_acquisitions = BTreeSet::<String>::new();
+    for mut node in proposal.acquisitions.clone() {
+        node.local_id = normalize_factor_local_id(&node.local_id);
+        node.label = normalize_study_graph_text(&node.label);
+        node.acquisition_method_or_platform =
+            normalize_study_graph_text(&node.acquisition_method_or_platform);
+        node.notes = normalize_study_graph_text(&node.notes);
+        let refs = valid_evidence_refs(evidence, &node.evidence_refs);
+        if !factor_local_id_has_prefix(&node.local_id, 'A')
+            || node.label.is_empty()
+            || node.acquisition_method_or_platform.is_empty()
+            || refs.is_empty()
+        {
+            rejected_items.push(FactorGraphRejectedItem {
+                item_type: "acquisition".into(),
+                local_id: node.local_id.clone(),
+                label: node.label.clone(),
+                reason: "acquisition rejected: A# local_id, label, acquisition_method_or_platform and trusted evidence are required".into(),
+            });
+            continue;
+        }
+        if !seen_local.insert(node.local_id.clone()) {
+            rejected_items.push(FactorGraphRejectedItem {
+                item_type: "acquisition".into(),
+                local_id: node.local_id.clone(),
+                label: node.label.clone(),
+                reason: "acquisition rejected: duplicate local_id".into(),
+            });
+            continue;
+        }
+        let key = format!(
+            "{}|{}",
+            node.label.to_ascii_lowercase(),
+            node.acquisition_method_or_platform.to_ascii_lowercase(),
+        );
+        if !seen_acquisitions.insert(key.clone()) {
+            rejected_items.push(FactorGraphRejectedItem {
+                item_type: "acquisition".into(),
+                local_id: node.local_id.clone(),
+                label: node.label.clone(),
+                reason: "acquisition rejected: semantic duplicate".into(),
+            });
+            continue;
+        }
+        acquisition_rows.push((key, node.local_id.clone(), node, refs));
+    }
+    acquisition_rows.sort_by(|a, b| a.0.cmp(&b.0));
+    let mut acquisitions = Vec::new();
+    for (i, (_, local_id, node, refs)) in acquisition_rows.into_iter().enumerate() {
+        let id = format!("A{:03}", i + 1);
+        local_to_canonical.insert(local_id, id.clone());
+        acquisitions.push(AcceptedFactorAcquisition {
+            id,
+            label: node.label,
+            acquisition_method_or_platform: node.acquisition_method_or_platform,
+            evidence_refs: refs,
+            notes: node.notes,
+        });
+    }
+
+    let mut relations = Vec::new();
+    let mut seen_relations = BTreeSet::new();
+    for relation in &proposal.relations {
+        let source_local = normalize_factor_local_id(&relation.source_id);
+        let target_local = normalize_factor_local_id(&relation.target_id);
+        let refs = valid_evidence_refs(evidence, &relation.evidence_refs);
+        let relation_type =
+            normalize_study_graph_text(&relation.relation_type).to_ascii_lowercase();
+        if refs.is_empty()
+            || !relation_type_matches_local_ids(&relation_type, &source_local, &target_local)
+        {
+            rejected_items.push(FactorGraphRejectedItem {
+                item_type: "relation".into(),
+                local_id: format!("{}->{}", source_local, target_local),
+                label: relation_type.clone(),
+                reason: "relation rejected: supported relation type, compatible node types and trusted evidence are required".into(),
+            });
+            continue;
+        }
+        let (Some(source_id), Some(target_id)) = (
+            local_to_canonical.get(&source_local),
+            local_to_canonical.get(&target_local),
+        ) else {
+            rejected_items.push(FactorGraphRejectedItem {
+                item_type: "relation".into(),
+                local_id: format!("{}->{}", source_local, target_local),
+                label: relation_type.clone(),
+                reason: "relation rejected: source or target node was not accepted by Rust".into(),
+            });
+            continue;
+        };
+        let key = format!("{}|{}|{}", source_id, relation_type, target_id);
+        if !seen_relations.insert(key) {
+            continue;
+        }
+        relations.push(AcceptedFactorRelation {
+            source_id: source_id.clone(),
+            relation_type,
+            target_id: target_id.clone(),
+            evidence_refs: refs,
+            notes: normalize_study_graph_text(&relation.notes),
+        });
+    }
+    relations.sort_by(|a, b| {
+        (&a.source_id, &a.relation_type, &a.target_id).cmp(&(
+            &b.source_id,
+            &b.relation_type,
+            &b.target_id,
+        ))
+    });
+
+    let raw_names = evidence
+        .raw_files
+        .iter()
+        .map(|raw| raw.file_name.to_ascii_lowercase())
+        .collect::<BTreeSet<_>>();
+    let mut raw_links = Vec::new();
+    let mut removed_raw_links = Vec::new();
+    for raw_link in &proposal.raw_links {
+        let local_id = normalize_factor_local_id(&raw_link.node_id);
+        let Some(node_id) = local_to_canonical.get(&local_id) else {
+            removed_raw_links.push(FactorGraphRemovedRawLink {
+                node_id: local_id,
+                raw_file: raw_link.raw_file.trim().to_string(),
+                reason: "RAW link removed: target factor node was not accepted by Rust".into(),
+            });
+            continue;
+        };
+        let refs = valid_evidence_refs(evidence, &raw_link.evidence_refs);
+        let trimmed = raw_link.raw_file.trim();
+        let Some(canonical) = evidence
+            .raw_files
+            .iter()
+            .find(|candidate| candidate.file_name.eq_ignore_ascii_case(trimmed))
+            .map(|candidate| candidate.file_name.clone())
+        else {
+            removed_raw_links.push(FactorGraphRemovedRawLink {
+                node_id: node_id.clone(),
+                raw_file: trimmed.to_string(),
+                reason: "RAW link removed: basename is not present in the repository inventory"
+                    .into(),
+            });
+            continue;
+        };
+        if refs.is_empty()
+            || !raw_names.contains(&canonical.to_ascii_lowercase())
+            || !branch_file_is_source_grounded(evidence, &refs, &canonical)
+        {
+            removed_raw_links.push(FactorGraphRemovedRawLink {
+                node_id: node_id.clone(),
+                raw_file: canonical,
+                reason: "RAW link removed: exact basename linkage was not explicitly supported by cited trusted evidence; filename semantics were not used".into(),
+            });
+            continue;
+        }
+        raw_links.push(AcceptedFactorRawLink {
+            node_id: node_id.clone(),
+            raw_file: canonical,
+            evidence_refs: refs,
+            notes: normalize_study_graph_text(&raw_link.notes),
+        });
+    }
+    raw_links.sort_by(|a, b| (&a.node_id, &a.raw_file).cmp(&(&b.node_id, &b.raw_file)));
+    raw_links.dedup_by(|a, b| a.node_id == b.node_id && a.raw_file == b.raw_file);
+
+    let status = if materials.is_empty() || regimes.is_empty() {
+        "human_review"
+    } else {
+        "accepted"
+    };
+    let reason = if status == "accepted" {
+        format!(
+            "Rust accepted an evidence-backed factor graph with {} material node(s), {} experimental-regime node(s), {} acquisition node(s), {} relation(s), and {} exact RAW link(s)",
+            materials.len(), regimes.len(), acquisitions.len(), relations.len(), raw_links.len()
+        )
+    } else {
+        "Rust could not accept the minimum safe factor graph: at least one material node and one experimental-regime node are required".into()
+    };
+
+    StudyFactorGraphAcceptance {
+        harness_version: SCIENTIFIC_AGENT_FACTOR_GRAPH_STAGE1_VERSION.into(),
+        accession: evidence.accession.clone(),
+        status: status.into(),
+        materials,
+        regimes,
+        acquisitions,
+        relations,
+        raw_links,
+        open_questions: proposal.open_questions.clone(),
+        rejected_items,
+        removed_raw_links,
+        reason,
+        model_calls: 1,
+    }
+}
+
+fn write_factor_graph_stage1_review(
+    path: &Path,
+    acceptance: &StudyFactorGraphAcceptance,
+) -> Result<()> {
+    let mut out = String::new();
+    out.push_str(&format!(
+        "# PRIDE-SCP Factor Graph v2 Stage 1: {}\n\n",
+        acceptance.accession
+    ));
+    out.push_str(&format!(
+        "Status: **{}**\n\n{}\n\n",
+        acceptance.status, acceptance.reason
+    ));
+    out.push_str("## Materials\n\n");
+    for node in &acceptance.materials {
+        out.push_str(&format!(
+            "- **{} — {}**\n  - organism: {}\n  - biological material: {}\n  - experimental role: {}\n  - evidence: {:?}\n  - notes: {}\n",
+            node.id, node.label, node.organism, node.biological_material, node.experimental_role, node.evidence_refs, node.notes
+        ));
+    }
+    out.push_str("\n## Experimental regimes\n\n");
+    for node in &acceptance.regimes {
+        out.push_str(&format!(
+            "- **{} — {}**\n  - role: {}\n  - isolation/loading: {}\n  - input/cell-count regime: {}\n  - evidence: {:?}\n  - notes: {}\n",
+            node.id, node.label, node.experimental_role, node.isolation_or_loading_method, node.input_or_cell_count_regime, node.evidence_refs, node.notes
+        ));
+    }
+    out.push_str("\n## Acquisitions\n\n");
+    for node in &acceptance.acquisitions {
+        out.push_str(&format!(
+            "- **{} — {}**\n  - method/platform: {}\n  - evidence: {:?}\n  - notes: {}\n",
+            node.id,
+            node.label,
+            node.acquisition_method_or_platform,
+            node.evidence_refs,
+            node.notes
+        ));
+    }
+    out.push_str("\n## Relations\n\n");
+    for relation in &acceptance.relations {
+        out.push_str(&format!(
+            "- {} --{}--> {} | evidence={:?} | {}\n",
+            relation.source_id,
+            relation.relation_type,
+            relation.target_id,
+            relation.evidence_refs,
+            relation.notes
+        ));
+    }
+    out.push_str("\n## Exact RAW links\n\n");
+    if acceptance.raw_links.is_empty() {
+        out.push_str(
+            "None. Exact RAW linkage remains unresolved and is not inferred from filenames.\n",
+        );
+    } else {
+        for link in &acceptance.raw_links {
+            out.push_str(&format!(
+                "- {} -> {} | evidence={:?}\n",
+                link.node_id, link.raw_file, link.evidence_refs
+            ));
+        }
+    }
+    out.push_str("\n## Open questions\n\n");
+    for question in &acceptance.open_questions {
+        out.push_str(&format!("- {}\n", question));
+    }
+    fs::write(path, out)?;
+    Ok(())
+}
+
+async fn run_one_factor_graph_stage1(
+    opts: &SdrfScientificAgentOptions,
+    accession: &str,
+) -> Result<ScientificAgentResultRow> {
+    let annotate_opts = opts.annotate_options();
+    let evidence = build_evidence(&annotate_opts, accession)?;
+    let root = opts.output_dir.join("study_factor_graphs").join(accession);
+    fs::create_dir_all(&root)?;
+    let evidence_path = root.join("evidence.json");
+    let proposal_path = root.join("proposal.json");
+    let accepted_path = root.join("accepted_graph.json");
+    let review_path = root.join("REVIEW.md");
+    fs::write(&evidence_path, serde_json::to_string_pretty(&evidence)?)?;
+
+    let proposal = call_factor_graph_stage1(opts, &evidence).await?;
+    fs::write(&proposal_path, serde_json::to_string_pretty(&proposal)?)?;
+    let acceptance = accept_factor_graph_stage1(&evidence, &proposal);
+    fs::write(&accepted_path, serde_json::to_string_pretty(&acceptance)?)?;
+    write_factor_graph_stage1_review(&review_path, &acceptance)?;
+
+    Ok(ScientificAgentResultRow {
+        accession: accession.into(),
+        status: "success".into(),
+        terminal_status: if acceptance.status == "accepted" {
+            "factor_graph_accepted".into()
+        } else {
+            "factor_graph_human_review".into()
+        },
+        turns: 1,
+        tool_actions: 0,
+        validator_cycles: 0,
+        branches: acceptance.materials.len()
+            + acceptance.regimes.len()
+            + acceptance.acquisitions.len(),
+        open_questions: acceptance.open_questions.len(),
+        relation_mode: evidence.study_design.relation_mode_hint.clone(),
+        locally_valid: false,
+        validation_errors: 0,
+        draft_path: accepted_path.display().to_string(),
+        review_path: review_path.display().to_string(),
+        workspace_path: root.display().to_string(),
+        error: String::new(),
+    })
+}
+
+async fn run_factor_graph_stage1(
+    opts: SdrfScientificAgentOptions,
+) -> Result<SdrfScientificAgentSummary> {
+    let accessions = collect_accessions_values(&opts.accessions, opts.accessions_file.as_deref())?;
+    if accessions.len() > 1 && !opts.manuscript_text_paths.is_empty() {
+        bail!("--manuscript-text is accession-specific and may only be used for one accession");
+    }
+    fs::create_dir_all(&opts.output_dir)?;
+    let results_path = opts
+        .output_dir
+        .join("study_factor_graph_stage1_results.tsv");
+    let mut rows = Vec::new();
+    for (i, accession) in accessions.iter().enumerate() {
+        if opts.progress {
+            eprintln!(
+                "[{}/{}] {} FactorGraph v2-stage1",
+                i + 1,
+                accessions.len(),
+                accession
+            );
+        }
+        match run_one_factor_graph_stage1(&opts, accession).await {
+            Ok(row) => {
+                if opts.progress {
+                    eprintln!(
+                        "  -> terminal={} model_calls={} accepted_nodes={} open_questions={}",
+                        row.terminal_status, row.turns, row.branches, row.open_questions
+                    );
+                }
+                rows.push(row);
+            }
+            Err(err) => {
+                eprintln!("  -> FactorGraph v2-stage1 error: {err:#}");
+                rows.push(ScientificAgentResultRow {
+                    accession: accession.clone(),
+                    status: "error".into(),
+                    terminal_status: "error".into(),
+                    turns: 0,
+                    tool_actions: 0,
+                    validator_cycles: 0,
+                    branches: 0,
+                    open_questions: 0,
+                    relation_mode: String::new(),
+                    locally_valid: false,
+                    validation_errors: 0,
+                    draft_path: String::new(),
+                    review_path: String::new(),
+                    workspace_path: String::new(),
+                    error: format!("{err:#}"),
+                });
+            }
+        }
+    }
+    let mut writer = WriterBuilder::new()
+        .delimiter(b'\t')
+        .from_path(&results_path)?;
+    for row in &rows {
+        writer.serialize(row)?;
+    }
+    writer.flush()?;
+    let successful = rows.iter().filter(|row| row.status == "success").count();
+    let summary = SdrfScientificAgentSummary {
+        harness_version: SCIENTIFIC_AGENT_FACTOR_GRAPH_STAGE1_VERSION.into(),
+        generator_version: GENERATOR_VERSION.into(),
+        accessions_requested: accessions.len(),
+        successful,
+        errors: rows.len().saturating_sub(successful),
+        locally_valid_drafts: 0,
+        incomplete_drafts: 0,
+        total_validation_errors: 0,
+        total_agent_turns: rows.iter().map(|row| row.turns).sum(),
+        total_tool_actions: 0,
+        total_validator_cycles: 0,
+        results_tsv: results_path.display().to_string(),
+        workspace_root: opts
+            .output_dir
+            .join("study_factor_graphs")
+            .display()
+            .to_string(),
+    };
+    let rendered = serde_json::to_string_pretty(&summary)?;
+    fs::write(
+        opts.output_dir
+            .join("study_factor_graph_stage1_summary.json"),
         &rendered,
     )?;
     fs::write(
@@ -4855,13 +5807,17 @@ pub async fn run_scientific_sdrf_agent(
     opts: SdrfScientificAgentOptions,
 ) -> Result<SdrfScientificAgentSummary> {
     let requested_mode = std::env::var("PRIDE_SCP_SCIENTIFIC_AGENT_MODE").unwrap_or_default();
+    if requested_mode == SCIENTIFIC_AGENT_FACTOR_GRAPH_STAGE1_MODE {
+        return run_factor_graph_stage1(opts).await;
+    }
     if requested_mode == SCIENTIFIC_AGENT_STUDY_GRAPH_STAGE1_MODE {
         return run_study_graph_stage1(opts).await;
     }
     if !requested_mode.trim().is_empty() {
         bail!(
-            "unsupported PRIDE_SCP_SCIENTIFIC_AGENT_MODE='{}'; expected '{}' or unset for the v1.3 workspace agent",
+            "unsupported PRIDE_SCP_SCIENTIFIC_AGENT_MODE='{}'; expected '{}' or '{}' or unset for the v1.3 workspace agent",
             requested_mode,
+            SCIENTIFIC_AGENT_FACTOR_GRAPH_STAGE1_MODE,
             SCIENTIFIC_AGENT_STUDY_GRAPH_STAGE1_MODE
         );
     }
@@ -6482,5 +7438,302 @@ mod tests {
         assert_eq!(accepted.status, "human_review");
         assert!(accepted.branches.is_empty());
         assert_eq!(accepted.model_calls, 1);
+    }
+
+    #[test]
+    fn v2_factor_stage1_schema_separates_material_regime_and_acquisition_axes() {
+        let schema = factor_graph_stage1_schema();
+        let text = serde_json::to_string(&schema).unwrap();
+        assert!(text.contains("materials"));
+        assert!(text.contains("regimes"));
+        assert!(text.contains("acquisitions"));
+        assert!(text.contains("material_to_regime"));
+        assert!(!text.contains("linked_raw_files"));
+        assert!(!text.contains("edit_scientific_observation"));
+    }
+
+    #[test]
+    fn v2_factor_stage1_preserves_two_regimes_for_one_material() {
+        let evidence = evidence_with(
+            vec![EvidenceItem {
+                id: "E0001".into(),
+                source_kind: "pride_project".into(),
+                source_label: "project:projectDescription".into(),
+                text: "HeLa single cells were manually loaded by hydrodynamic pressure, while low-number cells were introduced by spray voltage; both used CE-MS/MS.".into(),
+            }],
+            vec!["single.raw", "spray.raw"],
+        );
+        let proposal = StudyFactorGraphProposal {
+            decision: "propose_graph".into(),
+            materials: vec![FactorMaterialProposal {
+                local_id: "M1".into(),
+                label: "HeLa".into(),
+                organism: "Homo sapiens".into(),
+                biological_material: "HeLa cells".into(),
+                experimental_role: "single-cell and low-input material".into(),
+                evidence_refs: vec!["E0001".into()],
+                notes: String::new(),
+            }],
+            regimes: vec![
+                FactorRegimeProposal {
+                    local_id: "R1".into(),
+                    label: "single-cell hydrodynamic loading".into(),
+                    experimental_role: "single-cell proteomics".into(),
+                    isolation_or_loading_method: "manual loading by hydrodynamic pressure".into(),
+                    input_or_cell_count_regime: "single cell".into(),
+                    evidence_refs: vec!["E0001".into()],
+                    notes: String::new(),
+                },
+                FactorRegimeProposal {
+                    local_id: "R2".into(),
+                    label: "spray-voltage low-input".into(),
+                    experimental_role: "low-number cell method comparison".into(),
+                    isolation_or_loading_method: "spray voltage injection".into(),
+                    input_or_cell_count_regime: "low-number cells".into(),
+                    evidence_refs: vec!["E0001".into()],
+                    notes: String::new(),
+                },
+            ],
+            acquisitions: vec![FactorAcquisitionProposal {
+                local_id: "A1".into(),
+                label: "CE-MS/MS".into(),
+                acquisition_method_or_platform: "CE-MS/MS top-down proteomics".into(),
+                evidence_refs: vec!["E0001".into()],
+                notes: String::new(),
+            }],
+            relations: vec![
+                FactorRelationProposal {
+                    source_id: "M1".into(),
+                    relation_type: "material_to_regime".into(),
+                    target_id: "R1".into(),
+                    evidence_refs: vec!["E0001".into()],
+                    notes: String::new(),
+                },
+                FactorRelationProposal {
+                    source_id: "M1".into(),
+                    relation_type: "material_to_regime".into(),
+                    target_id: "R2".into(),
+                    evidence_refs: vec!["E0001".into()],
+                    notes: String::new(),
+                },
+                FactorRelationProposal {
+                    source_id: "R1".into(),
+                    relation_type: "regime_to_acquisition".into(),
+                    target_id: "A1".into(),
+                    evidence_refs: vec!["E0001".into()],
+                    notes: String::new(),
+                },
+                FactorRelationProposal {
+                    source_id: "R2".into(),
+                    relation_type: "regime_to_acquisition".into(),
+                    target_id: "A1".into(),
+                    evidence_refs: vec!["E0001".into()],
+                    notes: String::new(),
+                },
+            ],
+            raw_links: Vec::new(),
+            open_questions: Vec::new(),
+            reason: "separate source-supported regimes".into(),
+        };
+        let accepted = accept_factor_graph_stage1(&evidence, &proposal);
+        assert_eq!(accepted.status, "accepted");
+        assert_eq!(accepted.materials.len(), 1);
+        assert_eq!(accepted.regimes.len(), 2);
+        assert_eq!(accepted.acquisitions.len(), 1);
+        assert_eq!(accepted.relations.len(), 4);
+        assert_eq!(accepted.materials[0].id, "M001");
+        assert!(accepted
+            .regimes
+            .iter()
+            .any(|node| node.isolation_or_loading_method.contains("hydrodynamic")));
+        assert!(accepted
+            .regimes
+            .iter()
+            .any(|node| node.isolation_or_loading_method.contains("spray voltage")));
+    }
+
+    #[test]
+    fn v2_factor_stage1_preserves_distinct_explicit_organisms_as_material_nodes() {
+        let evidence = evidence_with(
+            vec![EvidenceItem {
+                id: "E0001".into(),
+                source_kind: "pride_project".into(),
+                source_label: "project:projectDescription".into(),
+                text: "Human HeLa and mouse HT22 cells were studied with a microwell single-cell workflow.".into(),
+            }],
+            vec!["run.raw"],
+        );
+        let proposal = StudyFactorGraphProposal {
+            decision: "propose_graph".into(),
+            materials: vec![
+                FactorMaterialProposal {
+                    local_id: "M1".into(),
+                    label: "HeLa".into(),
+                    organism: "Homo sapiens".into(),
+                    biological_material: "HeLa cells".into(),
+                    experimental_role: "single-cell material".into(),
+                    evidence_refs: vec!["E0001".into()],
+                    notes: String::new(),
+                },
+                FactorMaterialProposal {
+                    local_id: "M2".into(),
+                    label: "HT22".into(),
+                    organism: "Mus musculus".into(),
+                    biological_material: "HT22 cells".into(),
+                    experimental_role: "single-cell material".into(),
+                    evidence_refs: vec!["E0001".into()],
+                    notes: String::new(),
+                },
+            ],
+            regimes: vec![FactorRegimeProposal {
+                local_id: "R1".into(),
+                label: "microwell single-cell processing".into(),
+                experimental_role: "single-cell multi-omics".into(),
+                isolation_or_loading_method: "picked single-cell transferred into microwell".into(),
+                input_or_cell_count_regime: "single cell".into(),
+                evidence_refs: vec!["E0001".into()],
+                notes: String::new(),
+            }],
+            acquisitions: Vec::new(),
+            relations: Vec::new(),
+            raw_links: Vec::new(),
+            open_questions: Vec::new(),
+            reason: String::new(),
+        };
+        let accepted = accept_factor_graph_stage1(&evidence, &proposal);
+        assert_eq!(accepted.status, "accepted");
+        assert_eq!(accepted.materials.len(), 2);
+        assert!(accepted
+            .materials
+            .iter()
+            .any(|node| node.organism == "Homo sapiens"));
+        assert!(accepted
+            .materials
+            .iter()
+            .any(|node| node.organism == "Mus musculus"));
+    }
+
+    #[test]
+    fn v2_factor_stage1_relations_use_rust_assigned_ids() {
+        let evidence = evidence_with(
+            vec![EvidenceItem {
+                id: "E0001".into(),
+                source_kind: "pride_project".into(),
+                source_label: "project:projectDescription".into(),
+                text: "Xenopus cells were sampled by aspiration.".into(),
+            }],
+            vec!["run.raw"],
+        );
+        let proposal = StudyFactorGraphProposal {
+            decision: "propose_graph".into(),
+            materials: vec![FactorMaterialProposal {
+                local_id: "M7".into(),
+                label: "Xenopus".into(),
+                organism: "Xenopus laevis".into(),
+                biological_material: "embryo cell".into(),
+                experimental_role: "single-cell sample".into(),
+                evidence_refs: vec!["E0001".into()],
+                notes: String::new(),
+            }],
+            regimes: vec![FactorRegimeProposal {
+                local_id: "R9".into(),
+                label: "aspiration".into(),
+                experimental_role: "single-cell sampling".into(),
+                isolation_or_loading_method: "capillary aspiration".into(),
+                input_or_cell_count_regime: "single cell".into(),
+                evidence_refs: vec!["E0001".into()],
+                notes: String::new(),
+            }],
+            acquisitions: Vec::new(),
+            relations: vec![FactorRelationProposal {
+                source_id: "M7".into(),
+                relation_type: "material_to_regime".into(),
+                target_id: "R9".into(),
+                evidence_refs: vec!["E0001".into()],
+                notes: String::new(),
+            }],
+            raw_links: Vec::new(),
+            open_questions: Vec::new(),
+            reason: String::new(),
+        };
+        let accepted = accept_factor_graph_stage1(&evidence, &proposal);
+        assert_eq!(accepted.relations.len(), 1);
+        assert_eq!(accepted.relations[0].source_id, "M001");
+        assert_eq!(accepted.relations[0].target_id, "R001");
+    }
+
+    #[test]
+    fn v2_factor_stage1_strips_unsupported_raw_links() {
+        let evidence = evidence_with(
+            vec![EvidenceItem {
+                id: "E0001".into(),
+                source_kind: "pride_project".into(),
+                source_label: "project:projectDescription".into(),
+                text: "The project includes Xenopus cells.".into(),
+            }],
+            vec!["xenopus_D11.raw"],
+        );
+        let proposal = StudyFactorGraphProposal {
+            decision: "propose_graph".into(),
+            materials: vec![FactorMaterialProposal {
+                local_id: "M1".into(),
+                label: "Xenopus".into(),
+                organism: "Xenopus laevis".into(),
+                biological_material: "embryo cell".into(),
+                experimental_role: "single-cell sample".into(),
+                evidence_refs: vec!["E0001".into()],
+                notes: String::new(),
+            }],
+            regimes: vec![FactorRegimeProposal {
+                local_id: "R1".into(),
+                label: "single-cell".into(),
+                experimental_role: "single-cell sampling".into(),
+                isolation_or_loading_method: String::new(),
+                input_or_cell_count_regime: "single cell".into(),
+                evidence_refs: vec!["E0001".into()],
+                notes: String::new(),
+            }],
+            acquisitions: Vec::new(),
+            relations: Vec::new(),
+            raw_links: vec![FactorRawLinkProposal {
+                node_id: "M1".into(),
+                raw_file: "xenopus_D11.raw".into(),
+                evidence_refs: vec!["E0001".into()],
+                notes: String::new(),
+            }],
+            open_questions: Vec::new(),
+            reason: String::new(),
+        };
+        let accepted = accept_factor_graph_stage1(&evidence, &proposal);
+        assert!(accepted.raw_links.is_empty());
+        assert_eq!(accepted.removed_raw_links.len(), 1);
+    }
+
+    #[test]
+    fn v2_factor_stage1_human_review_is_terminal_before_phase_b() {
+        let evidence = evidence_with(
+            vec![EvidenceItem {
+                id: "E0001".into(),
+                source_kind: "pride_project".into(),
+                source_label: "project:projectDescription".into(),
+                text: "ambiguous study".into(),
+            }],
+            vec!["run.raw"],
+        );
+        let proposal = StudyFactorGraphProposal {
+            decision: "human_review".into(),
+            materials: Vec::new(),
+            regimes: Vec::new(),
+            acquisitions: Vec::new(),
+            relations: Vec::new(),
+            raw_links: Vec::new(),
+            open_questions: vec!["structure unresolved".into()],
+            reason: "insufficient evidence".into(),
+        };
+        let accepted = accept_factor_graph_stage1(&evidence, &proposal);
+        assert_eq!(accepted.status, "human_review");
+        assert_eq!(accepted.model_calls, 1);
+        assert!(accepted.materials.is_empty());
+        assert!(accepted.regimes.is_empty());
     }
 }
