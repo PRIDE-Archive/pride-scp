@@ -1,6 +1,6 @@
 use super::*;
 
-pub const SCIENTIFIC_AGENT_HARNESS_VERSION: &str = "pride-scp-scientific-workspace-agent-v1.2";
+pub const SCIENTIFIC_AGENT_HARNESS_VERSION: &str = "pride-scp-scientific-workspace-agent-v1.3";
 const SCIENTIFIC_AGENT_TASK_EVIDENCE_LIMIT: usize = 20;
 const SCIENTIFIC_AGENT_CONTEXT_READ_RADIUS: usize = 6000;
 #[derive(Debug, Clone)]
@@ -334,11 +334,17 @@ enum AgentCommand {
         actions: Vec<AgentEvidenceAction>,
         reason: String,
     },
-    EditWorkspace {
+    EditStudyStructure {
         task_id: String,
-        #[serde(default)]
         branch_upserts: Vec<AgentBranch>,
         #[serde(default)]
+        open_question_additions: Vec<String>,
+        #[serde(default)]
+        open_question_resolutions: Vec<String>,
+        notes: String,
+    },
+    EditScientificObservation {
+        task_id: String,
         observation_upserts: Vec<ScientificObservationUpsert>,
         #[serde(default)]
         observation_retractions: Vec<ScientificObservationRetraction>,
@@ -354,13 +360,62 @@ enum AgentCommand {
     },
 }
 
+#[derive(Debug, Clone)]
+struct WorkspaceEditPayload {
+    task_id: String,
+    branch_upserts: Vec<AgentBranch>,
+    observation_upserts: Vec<ScientificObservationUpsert>,
+    observation_retractions: Vec<ScientificObservationRetraction>,
+    open_question_additions: Vec<String>,
+    open_question_resolutions: Vec<String>,
+    notes: String,
+}
+
 impl AgentCommand {
     fn task_id(&self) -> &str {
         match self {
             AgentCommand::ReadEvidence { task_id, .. }
             | AgentCommand::SearchEvidence { task_id, .. }
-            | AgentCommand::EditWorkspace { task_id, .. }
+            | AgentCommand::EditStudyStructure { task_id, .. }
+            | AgentCommand::EditScientificObservation { task_id, .. }
             | AgentCommand::Escalate { task_id, .. } => task_id,
+        }
+    }
+
+    fn workspace_edit_payload(&self) -> Option<WorkspaceEditPayload> {
+        match self {
+            AgentCommand::EditStudyStructure {
+                task_id,
+                branch_upserts,
+                open_question_additions,
+                open_question_resolutions,
+                notes,
+            } => Some(WorkspaceEditPayload {
+                task_id: task_id.clone(),
+                branch_upserts: branch_upserts.clone(),
+                observation_upserts: Vec::new(),
+                observation_retractions: Vec::new(),
+                open_question_additions: open_question_additions.clone(),
+                open_question_resolutions: open_question_resolutions.clone(),
+                notes: notes.clone(),
+            }),
+            AgentCommand::EditScientificObservation {
+                task_id,
+                observation_upserts,
+                observation_retractions,
+                open_question_additions,
+                open_question_resolutions,
+                notes,
+            } => Some(WorkspaceEditPayload {
+                task_id: task_id.clone(),
+                branch_upserts: Vec::new(),
+                observation_upserts: observation_upserts.clone(),
+                observation_retractions: observation_retractions.clone(),
+                open_question_additions: open_question_additions.clone(),
+                open_question_resolutions: open_question_resolutions.clone(),
+                notes: notes.clone(),
+            }),
+            _ => None,
         }
     }
 }
@@ -513,7 +568,11 @@ fn concept_to_sdrf_field(concept: &str) -> Option<&'static str> {
     }
 }
 
-fn scientific_agent_schema(allow_read_evidence: bool, allow_search_evidence: bool) -> Value {
+fn scientific_agent_schema(
+    allow_read_evidence: bool,
+    allow_search_evidence: bool,
+    study_structure_task: bool,
+) -> Value {
     let concepts = scientific_concept_types();
     let query = json!({
         "type":"object",
@@ -528,13 +587,14 @@ fn scientific_agent_schema(allow_read_evidence: bool, allow_search_evidence: boo
     });
     let branch = json!({
         "type":"object",
+        "description":"A source-supported conceptual study branch. Exact RAW linkage is optional: when the branch is scientifically supported but exact RAW basenames are not source-linked, use linked_raw_files=[] and linkage_status='unresolved'.",
         "properties":{
             "id":{"type":"string","maxLength":80},
             "label":{"type":"string","maxLength":240},
             "status":{"type":"string","enum":["supported","hypothesis","rejected"]},
-            "evidence_refs":{"type":"array","items":{"type":"string","pattern":"^E[0-9]{4}$"},"maxItems":16},
-            "linked_raw_files":{"type":"array","items":{"type":"string","maxLength":300},"maxItems":128},
-            "linkage_status":{"type":"string","enum":["supported","partial","unresolved"]},
+            "evidence_refs":{"type":"array","items":{"type":"string","pattern":"^E[0-9]{4}$"},"minItems":1,"maxItems":16},
+            "linked_raw_files":{"type":"array","items":{"type":"string","maxLength":300},"maxItems":128,"description":"Only exact RAW basenames explicitly linked by trusted source evidence. Use [] when linkage is unresolved."},
+            "linkage_status":{"type":"string","enum":["supported","partial","unresolved"],"description":"Use unresolved when the conceptual branch is supported but exact RAW linkage is absent."},
             "notes":{"type":"string","maxLength":700}
         },
         "required":["id","label","status","evidence_refs","linked_raw_files","linkage_status","notes"],
@@ -542,13 +602,14 @@ fn scientific_agent_schema(allow_read_evidence: bool, allow_search_evidence: boo
     });
     let observation = json!({
         "type":"object",
+        "description":"A source-faithful scientific observation. Record what the trusted source explicitly says or names; Rust, not the model, owns SDRF canonicalization.",
         "properties":{
             "concept_type":{"type":"string","enum":concepts.clone()},
             "observed_value":{"type":"string","maxLength":800},
             "scope":{"type":"string","enum":["project","branch","row","unresolved"]},
             "branch_id":{"type":"string","maxLength":80},
             "status":{"type":"string","enum":["supported","hypothesis","unresolved","rejected"]},
-            "evidence_refs":{"type":"array","items":{"type":"string","pattern":"^E[0-9]{4}$"},"maxItems":16},
+            "evidence_refs":{"type":"array","items":{"type":"string","pattern":"^E[0-9]{4}$"},"minItems":1,"maxItems":16},
             "confidence":{"type":"string","enum":["high","medium","low"]},
             "reason":{"type":"string","maxLength":800},
             "supersedes_observed_value":{"type":"string","maxLength":800}
@@ -570,6 +631,7 @@ fn scientific_agent_schema(allow_read_evidence: bool, allow_search_evidence: boo
     });
     let search_action = json!({
         "type":"object",
+        "description":"Search only registered/trusted publication, supplement, structured-design, repository metadata, exact RAW-name, knowledge-graph, or conflict-evidence sources. This is not arbitrary web browsing.",
         "properties":{
             "action":{"type":"string","enum":["SEARCH_PUBLICATION","SEARCH_SUPPLEMENT","SEARCH_STRUCTURED_DESIGN","SEARCH_REPOSITORY_METADATA","SEARCH_EXACT_RAW_NAME","EXPAND_EVIDENCE_CONTEXT","LOOKUP_KG_TERM","COMPARE_CONFLICTING_EVIDENCE"]},
             "reason":{"type":"string","maxLength":500},
@@ -602,19 +664,33 @@ fn scientific_agent_schema(allow_read_evidence: bool, allow_search_evidence: boo
         "required":["command","task_id","actions","reason"],
         "additionalProperties":false
     });
-    let edit_command = json!({
+    let study_structure_edit_command = json!({
         "type":"object",
+        "description":"Commit source-supported conceptual study branches for task:study_structure. This command CAN create branches even when exact RAW linkage is unresolved.",
         "properties":{
-            "command":{"type":"string","enum":["edit_workspace"]},
+            "command":{"type":"string","enum":["edit_study_structure"]},
+            "task_id":{"type":"string","enum":["task:study_structure"]},
+            "branch_upserts":{"type":"array","items":branch,"minItems":1,"maxItems":24},
+            "open_question_additions":{"type":"array","items":{"type":"string","maxLength":500},"maxItems":24},
+            "open_question_resolutions":{"type":"array","items":{"type":"string","maxLength":500},"maxItems":24},
+            "notes":{"type":"string","maxLength":1600}
+        },
+        "required":["command","task_id","branch_upserts","open_question_additions","open_question_resolutions","notes"],
+        "additionalProperties":false
+    });
+    let observation_edit_command = json!({
+        "type":"object",
+        "description":"Commit at least one source-faithful scientific observation for the active validator-backed field task. Do not choose SDRF vocabulary; Rust canonicalizes after this edit.",
+        "properties":{
+            "command":{"type":"string","enum":["edit_scientific_observation"]},
             "task_id":{"type":"string","maxLength":100},
-            "branch_upserts":{"type":"array","items":branch,"maxItems":24},
-            "observation_upserts":{"type":"array","items":observation,"maxItems":48},
+            "observation_upserts":{"type":"array","items":observation,"minItems":1,"maxItems":48},
             "observation_retractions":{"type":"array","items":observation_retraction,"maxItems":24},
             "open_question_additions":{"type":"array","items":{"type":"string","maxLength":500},"maxItems":24},
             "open_question_resolutions":{"type":"array","items":{"type":"string","maxLength":500},"maxItems":24},
             "notes":{"type":"string","maxLength":1600}
         },
-        "required":["command","task_id","branch_upserts","observation_upserts","observation_retractions","open_question_additions","open_question_resolutions","notes"],
+        "required":["command","task_id","observation_upserts","observation_retractions","open_question_additions","open_question_resolutions","notes"],
         "additionalProperties":false
     });
     let escalate_command = json!({
@@ -634,7 +710,11 @@ fn scientific_agent_schema(allow_read_evidence: bool, allow_search_evidence: boo
     if allow_search_evidence {
         commands.push(search_command);
     }
-    commands.push(edit_command);
+    if study_structure_task {
+        commands.push(study_structure_edit_command);
+    } else {
+        commands.push(observation_edit_command);
+    }
     commands.push(escalate_command);
     json!({"oneOf": commands})
 }
@@ -1062,38 +1142,49 @@ fn scientific_agent_prompt(
         serde_json::to_string_pretty(&recent_validations).unwrap_or_else(|_| "[]".into());
     let feedback_json =
         serde_json::to_string_pretty(changed_harness_feedback).unwrap_or_else(|_| "[]".into());
+    let study_structure_active = active.is_some_and(|task| task.id == "task:study_structure");
+    let edit_command = if study_structure_active {
+        "edit_study_structure"
+    } else {
+        "edit_scientific_observation"
+    };
+    let edit_contract = if study_structure_active {
+        "edit_study_structure: commit one or more source-supported conceptual branches. This command CAN create branches. Exact RAW linkage is not required: when the branch is supported but the sources do not explicitly map exact RAW basenames, use linked_raw_files=[] and linkage_status='unresolved'."
+    } else {
+        "edit_scientific_observation: commit one or more source-faithful scientific observations for the active field task. A source explicitly naming or defining an isolation method/platform is sufficient as an observation even when deeper mechanical detail is absent; Rust decides canonical SDRF mapping/template-gap/unresolved."
+    };
     let read_policy = match active {
-        Some(task) if task.decision_required && task.search_blocked => {
-            "DECISION ONLY: prior evidence gathering produced no new source material. Both read_evidence and search_evidence are disabled. Commit a supported edit_workspace or escalate."
-        }
-        Some(task) if task.decision_required => {
-            "READ LOCK ACTIVE: Rust has already returned source context for this task. read_evidence is disabled for this turn. Use edit_workspace if the evidence supports a material finding, search_evidence if a genuinely different source/query is still needed, or escalate if the evidence is insufficient/ambiguous."
-        }
+        Some(task) if task.decision_required && task.search_blocked => format!(
+            "DECISION ONLY: prior evidence gathering produced no new source material. Both read_evidence and search_evidence are disabled. Commit a supported {edit_command} or escalate."
+        ),
+        Some(task) if task.decision_required => format!(
+            "READ LOCK ACTIVE: Rust has already returned source context for this task. read_evidence is disabled for this turn. Use {edit_command} if the evidence supports a material finding, search_evidence if a genuinely different trusted source/query is still needed, or escalate only if the evidence is insufficient/ambiguous after reasonable trusted search."
+        ),
         _ => {
-            "GATHER AVAILABLE: You may read promising unread E#### refs or issue a targeted search. After Rust returns context, the next turn enters a decision step before another read is allowed."
+            "GATHER AVAILABLE: You may read promising unread E#### refs or issue a targeted trusted search. After Rust returns context, the next turn enters a decision step before another read is allowed.".to_string()
         }
     };
     format!(
         "You are the scientific workspace agent for PRIDE single-cell proteomics dataset {acc}.\n\n\
 Your environment behaves like a coding/research workspace. Rust owns persistent state, provenance, controlled-vocabulary canonicalization, task status, compilation, validation, trusted RAW linkage, and all safety gates. You inspect source evidence, build a study model, and record source-faithful scientific observations. Work ONE active task deeply before moving to another task.\n\n\
-SCIENTIFIC WORKSPACE AGENT CONTRACT (v1.2):\n\
-- Return exactly ONE executable top-level command for this turn: read_evidence, search_evidence, edit_workspace, or escalate. Do not narrate a future tool action inside notes; if you need to read E####, the command itself must be read_evidence.\n\
+SCIENTIFIC WORKSPACE AGENT CONTRACT (v1.3):\n\
+- Return exactly ONE executable top-level command for this turn: read_evidence, search_evidence, {edit_command}, or escalate. Do not narrate a future tool action inside notes; if you need to read E####, the command itself must be read_evidence.\n\
 - Never request the same evidence ref twice. Rust records requested refs as read even when multiple refs resolve to the same materialized source window.\n\
 - After a successful read, Rust enters a decision step: do not keep reading by inertia. Commit a supported study/observation edit, search a genuinely different source/query, or escalate.\n\
 CURRENT COMMAND POLICY: {read_policy}\n\
 - task_id must exactly equal the ACTIVE TASK id. Rust derives task status and chooses when compilation/validation is useful. You do NOT request compile/finish or mark validator-backed tasks resolved.\n\
 - read_evidence: use when an existing promising E#### excerpt is insufficient. Rust reads a larger bounded window from only registered trusted sources and returns it on the next turn.\n\
-- search_evidence: use only when focused candidates plus already-read context do not answer the task. Use targeted publication/supplement/structured-design/repository/KG/conflict searches.\n\
-- edit_workspace: use only when current evidence supports a material study-model or scientific-observation edit. Omitted state persists.\n\
-- escalate: use only after relevant focused evidence/context and reasonable targeted search are exhausted or the judgment requires human review.\n\n\
+- search_evidence: use only when focused candidates plus already-read context do not answer the task. It searches registered/trusted publication, supplement, structured-design, repository metadata, exact-RAW-name, KG, or conflict-evidence sources only; it is NOT arbitrary web browsing.\n\
+- {edit_contract}\n\
+- escalate: use only after relevant focused evidence/context and reasonable trusted search are exhausted or the judgment truly requires human review. Do not escalate merely because exact RAW linkage is unresolved or because Rust still needs to canonicalize an observation.\n\n\
 SCIENTIFIC OBSERVATION -> RUST CANONICALIZATION CONTRACT:\n\
 - observation_upserts record what the source says the experiment actually did. observed_value is an evidence-faithful scientific description, NOT an SDRF controlled-vocabulary answer.\n\
-- For isolation_method, describe the physical cell-selection/isolation operation (for example, 'an individual intact cell was manually loaded into the separation capillary using hydrodynamic pressure'). Do not invent pseudo-vocabulary such as hydrodynamic_loading. Do not choose 'manual picking' merely because you think the validator wants it unless that exact phrase is what the source says. Rust independently maps the cited observation/evidence to a canonical SDRF value, template_gap, unresolved, or conflict.\n\
+- For isolation_method, record the most specific source-faithful method description available. An explicit source-defined method/platform name such as 'evDISCO (ex vivo-digital microfluidic isolation of single cells for -Omics)' is sufficient as an observation even if the excerpt does not spell out every mechanical substep. When the source provides the physical operation, preserve it (for example, 'an individual intact cell was manually loaded into the separation capillary using hydrodynamic pressure'). Do not invent pseudo-vocabulary such as hydrodynamic_loading. Do not choose 'manual picking' merely because you think the validator wants it unless that exact phrase is what the source says. Rust independently maps the cited observation/evidence to a canonical SDRF value, template_gap, unresolved, or conflict.\n\
 - For acquisition_mode, describe the source-supported acquisition regime; Rust owns the canonical serialization.\n\
 - Stable observation identity is (concept_type, scope, branch_id). Same evidence-compatible meaning merges. If you intentionally replace a genuinely different prior observation, set supersedes_observed_value exactly to the old observed_value.\n\
 - A branch existing does NOT automatically make every observation branch-scoped. Use project scope only when the trusted source supports one invariant value across all relevant study material and no heterogeneous branch evidence contradicts it. Use branch scope when the method/biology actually differs by branch. Rust masks unsafe project broadcasts whenever heterogeneous branch evidence exists.\n\n\
 STUDY-STRUCTURE CONTRACT:\n\
-- task:study_structure comes first. Establish source-grounded biological/experimental branches, acquisition cardinality, and scope before field repair. Conceptual branches may be supported while linked_raw_files remains empty/unresolved.\n\
+- task:study_structure comes first. Establish source-grounded biological/experimental branches, acquisition cardinality, and scope before field repair. Use edit_study_structure to create the supported conceptual branches. Conceptual branches may be supported while linked_raw_files remains empty and linkage_status is unresolved; unresolved RAW linkage is NOT a reason to avoid creating the branch.\n\
 - linked_raw_files require trusted source evidence explicitly linking exact RAW basenames. Filename words are search hints/contradiction detectors, never biological identity.\n\
 - Never collapse multiple organisms, cell populations, isolation regimes, or acquisition regimes into one project observation.\n\n\
 HARD SAFETY CONTRACT:\n\
@@ -1105,7 +1196,7 @@ HARD SAFETY CONTRACT:\n\
 COMMAND CHOICE:\n\
 - If you need more context around an existing E#### candidate -> read_evidence.\n\
 - If the candidate set lacks the needed evidence -> search_evidence.\n\
-- If evidence is sufficient to change the study model/observations -> edit_workspace.\n\
+- If evidence is sufficient to change the active task state -> {edit_command}.\n\
 - If evidence is exhausted/ambiguous beyond safe automation -> escalate.\n\n\
 TASK BOARD:\n{task_board}\n\n\
 ACTIVE TASK:\n{active_json}\n\n\
@@ -1113,12 +1204,14 @@ FOCUSED EVIDENCE FOR ACTIVE TASK:\n{task_evidence}\n\n\
 ACCEPTED DETERMINISTIC RELATION HINT (cardinality only):\n\
 mode={relation}; confidence={relation_confidence}; refs={relation_refs:?}; repository_file_mode={repo_mode}; note={design_note}\n\n\
 RAW FILE COUNT: {nfiles}\nRAW FILE SAMPLE (search hints only):\n{files}\n\n\
-PERSISTENT WORKSPACE (read-only; mutate only via edit_workspace):\n{workspace_json}\n\n\
+PERSISTENT WORKSPACE (read-only; mutate only via the task-specific typed edit command):\n{workspace_json}\n\n\
 RECENT EXECUTED TOOL/ACTION HISTORY:\n{action_json}\n\n\
 RECENT VALIDATION HISTORY:\n{validation_json}\n\n\
 CHANGED RUST FEEDBACK SINCE THE PREVIOUS TURN:\n{feedback_json}\n\n\
 This is turn {turn}. Return ONLY one AgentCommand object matching the JSON schema. Do not restate unchanged workspace state.",
         acc = evidence.accession,
+        edit_command = edit_command,
+        edit_contract = edit_contract,
         task_board = task_board_block(workspace),
         active_json = active_json,
         task_evidence = task_evidence_block(evidence, active),
@@ -1166,6 +1259,7 @@ async fn call_scientific_agent(
         "format": scientific_agent_schema(
             active_task(workspace).is_some_and(|task| !task.decision_required),
             active_task(workspace).is_some_and(|task| !task.search_blocked),
+            active_task(workspace).is_some_and(|task| task.id == "task:study_structure"),
         ),
         "options": {"temperature": 0.0}
     });
@@ -3279,7 +3373,16 @@ fn record_adjudication_snapshot(
 }
 
 fn command_matches_active_task(state: &ScientificWorkspaceState, command: &AgentCommand) -> bool {
-    !state.active_task_id.is_empty() && command.task_id() == state.active_task_id
+    if state.active_task_id.is_empty() || command.task_id() != state.active_task_id {
+        return false;
+    }
+    match command {
+        AgentCommand::EditStudyStructure { .. } => state.active_task_id == "task:study_structure",
+        AgentCommand::EditScientificObservation { .. } => {
+            state.active_task_id != "task:study_structure"
+        }
+        _ => true,
+    }
 }
 
 fn record_non_edit_task_attempt(state: &mut ScientificWorkspaceState, task_id: &str, note: &str) {
@@ -3665,7 +3768,7 @@ async fn run_one_scientific_agent(
                             &mut trace.harness_feedback,
                             &mut pending_harness_feedback,
                             format!(
-                                "turn {turn} read_evidence was rejected because the task is in a decision step after a prior read. Use edit_workspace, search_evidence with a genuinely different query/source, or escalate."
+                                "turn {turn} read_evidence was rejected because the task is in a decision step after a prior read. Use the task-specific typed edit command, search_evidence with a genuinely different trusted query/source, or escalate."
                             ),
                         );
                         trace.states.push(state.clone());
@@ -3681,7 +3784,7 @@ async fn run_one_scientific_agent(
                             &mut trace.harness_feedback,
                             &mut pending_harness_feedback,
                             format!(
-                                "turn {turn} read_evidence contained only invalid or already-read E#### refs. Rust has locked further reads for this task until you edit_workspace, run a genuinely new search_evidence query, or escalate."
+                                "turn {turn} read_evidence contained only invalid or already-read E#### refs. Rust has locked further reads for this task until you use the task-specific typed edit command, run a genuinely new trusted search_evidence query, or escalate."
                             ),
                         );
                         trace.states.push(state.clone());
@@ -3786,7 +3889,7 @@ async fn run_one_scientific_agent(
                             &mut trace.harness_feedback,
                             &mut pending_harness_feedback,
                             format!(
-                                "turn {turn} search_evidence contained no executable normalized search query. Rust has closed further evidence gathering for this task; use edit_workspace with current evidence or escalate."
+                                "turn {turn} search_evidence contained no executable normalized search query. Rust has closed further evidence gathering for this task; use the task-specific typed edit command with current evidence or escalate."
                             ),
                         );
                         trace.states.push(state.clone());
@@ -3893,27 +3996,23 @@ async fn run_one_scientific_agent(
                     );
                     continue;
                 }
-                AgentCommand::EditWorkspace {
-                    task_id,
-                    branch_upserts,
-                    observation_upserts,
-                    observation_retractions,
-                    open_question_additions,
-                    open_question_resolutions,
-                    notes,
-                } => {
-                    set_task_decision_required(&mut state, task_id, false);
-                    set_task_search_blocked(&mut state, task_id, false);
+                AgentCommand::EditStudyStructure { .. }
+                | AgentCommand::EditScientificObservation { .. } => {
+                    let edit = command
+                        .workspace_edit_payload()
+                        .expect("typed edit command must expose a workspace edit payload");
+                    set_task_decision_required(&mut state, &edit.task_id, false);
+                    set_task_search_blocked(&mut state, &edit.task_id, false);
                     let (reducer_events, publishable_edit) = apply_edit_workspace_command(
                         &evidence,
                         &mut state,
-                        task_id,
-                        branch_upserts,
-                        observation_upserts,
-                        observation_retractions,
-                        open_question_additions,
-                        open_question_resolutions,
-                        notes,
+                        &edit.task_id,
+                        &edit.branch_upserts,
+                        &edit.observation_upserts,
+                        &edit.observation_retractions,
+                        &edit.open_question_additions,
+                        &edit.open_question_resolutions,
+                        &edit.notes,
                         turn,
                     );
                     for event in reducer_events {
@@ -3962,7 +4061,7 @@ async fn run_one_scientific_agent(
                             &mut trace.harness_feedback,
                             &mut pending_harness_feedback,
                             format!(
-                                "turn {turn} edit_workspace changed no branch or scientific observation; Rust skipped compilation/validation"
+                                "turn {turn} typed edit changed no branch or scientific observation; Rust skipped compilation/validation"
                             ),
                         );
                         write_workspace_notebook(
@@ -4146,7 +4245,7 @@ async fn run_one_scientific_agent(
         "branches": state.branches.clone(),
         "scientific_observations": state.claims.clone(),
         "observation_adjudications": final_adjudications.clone(),
-        // Backward-compatible aliases for existing audit tooling. v1.2 model
+        // Backward-compatible aliases for existing audit tooling. v1.3 model
         // commands and prompts use observation terminology exclusively.
         "claims": state.claims.clone(),
         "claim_adjudications": final_adjudications,
@@ -5149,8 +5248,8 @@ mod tests {
     }
 
     #[test]
-    fn v12_schema_is_explicit_single_command_protocol() {
-        let schema = scientific_agent_schema(true, true);
+    fn v13_study_structure_schema_exposes_only_typed_structure_edit() {
+        let schema = scientific_agent_schema(true, true, true);
         let variants = schema["oneOf"].as_array().unwrap();
         let commands = variants
             .iter()
@@ -5161,64 +5260,172 @@ mod tests {
             [
                 "read_evidence",
                 "search_evidence",
-                "edit_workspace",
-                "escalate"
+                "edit_study_structure",
+                "escalate",
             ]
             .into_iter()
             .collect::<BTreeSet<_>>()
         );
+        assert!(!commands.contains("edit_workspace"));
+        assert!(!commands.contains("edit_scientific_observation"));
         let edit = variants
             .iter()
             .find(|variant| {
-                variant["properties"]["command"]["enum"][0].as_str() == Some("edit_workspace")
+                variant["properties"]["command"]["enum"][0].as_str() == Some("edit_study_structure")
+            })
+            .unwrap();
+        let properties = edit["properties"].as_object().unwrap();
+        assert!(properties.contains_key("branch_upserts"));
+        assert!(!properties.contains_key("observation_upserts"));
+        assert_eq!(
+            edit["properties"]["branch_upserts"]["minItems"].as_u64(),
+            Some(1)
+        );
+        assert_eq!(
+            edit["properties"]["task_id"]["enum"][0],
+            "task:study_structure"
+        );
+    }
+
+    #[test]
+    fn v13_field_schema_exposes_only_typed_observation_edit() {
+        let schema = scientific_agent_schema(true, true, false);
+        let variants = schema["oneOf"].as_array().unwrap();
+        let commands = variants
+            .iter()
+            .filter_map(|variant| variant["properties"]["command"]["enum"][0].as_str())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            commands,
+            [
+                "read_evidence",
+                "search_evidence",
+                "edit_scientific_observation",
+                "escalate",
+            ]
+            .into_iter()
+            .collect::<BTreeSet<_>>()
+        );
+        assert!(!commands.contains("edit_workspace"));
+        assert!(!commands.contains("edit_study_structure"));
+        let edit = variants
+            .iter()
+            .find(|variant| {
+                variant["properties"]["command"]["enum"][0].as_str()
+                    == Some("edit_scientific_observation")
             })
             .unwrap();
         let properties = edit["properties"].as_object().unwrap();
         assert!(properties.contains_key("observation_upserts"));
         assert!(properties.contains_key("observation_retractions"));
-        assert!(properties.contains_key("branch_upserts"));
-        assert!(!properties.contains_key("next_step"));
-        assert!(!properties.contains_key("task_status"));
-        assert!(!properties.contains_key("next_evidence_actions"));
+        assert!(!properties.contains_key("branch_upserts"));
+        assert_eq!(
+            edit["properties"]["observation_upserts"]["minItems"].as_u64(),
+            Some(1)
+        );
     }
 
     #[test]
-    fn v12_decision_step_schema_disables_repeated_reads() {
-        let schema = scientific_agent_schema(false, true);
-        let commands = schema["oneOf"]
+    fn v13_decision_step_schema_disables_repeated_reads_but_keeps_typed_edit() {
+        let study_schema = scientific_agent_schema(false, true, true);
+        let study_commands = study_schema["oneOf"]
             .as_array()
             .unwrap()
             .iter()
             .filter_map(|variant| variant["properties"]["command"]["enum"][0].as_str())
             .collect::<BTreeSet<_>>();
         assert_eq!(
-            commands,
-            ["search_evidence", "edit_workspace", "escalate"]
+            study_commands,
+            ["search_evidence", "edit_study_structure", "escalate"]
                 .into_iter()
                 .collect::<BTreeSet<_>>()
         );
-        assert!(!commands.contains("read_evidence"));
-    }
+        assert!(!study_commands.contains("read_evidence"));
 
-    #[test]
-    fn v12_stalled_search_schema_forces_edit_or_escalate() {
-        let schema = scientific_agent_schema(false, false);
-        let commands = schema["oneOf"]
+        let field_schema = scientific_agent_schema(false, true, false);
+        let field_commands = field_schema["oneOf"]
             .as_array()
             .unwrap()
             .iter()
             .filter_map(|variant| variant["properties"]["command"]["enum"][0].as_str())
             .collect::<BTreeSet<_>>();
         assert_eq!(
-            commands,
-            ["edit_workspace", "escalate"]
+            field_commands,
+            ["search_evidence", "edit_scientific_observation", "escalate"]
                 .into_iter()
                 .collect::<BTreeSet<_>>()
         );
     }
 
     #[test]
-    fn v12_read_receipt_records_requested_ref_and_enters_decision_step() {
+    fn v13_stalled_search_schema_forces_task_specific_edit_or_escalate() {
+        let study_schema = scientific_agent_schema(false, false, true);
+        let study_commands = study_schema["oneOf"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|variant| variant["properties"]["command"]["enum"][0].as_str())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            study_commands,
+            ["edit_study_structure", "escalate"]
+                .into_iter()
+                .collect::<BTreeSet<_>>()
+        );
+
+        let field_schema = scientific_agent_schema(false, false, false);
+        let field_commands = field_schema["oneOf"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|variant| variant["properties"]["command"]["enum"][0].as_str())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            field_commands,
+            ["edit_scientific_observation", "escalate"]
+                .into_iter()
+                .collect::<BTreeSet<_>>()
+        );
+    }
+
+    #[test]
+    fn v13_runtime_rejects_edit_type_for_wrong_task() {
+        let study_state = ScientificWorkspaceState {
+            active_task_id: "task:study_structure".into(),
+            ..Default::default()
+        };
+        let wrong_study_edit = AgentCommand::EditScientificObservation {
+            task_id: "task:study_structure".into(),
+            observation_upserts: vec![ScientificObservationUpsert::default()],
+            observation_retractions: Vec::new(),
+            open_question_additions: Vec::new(),
+            open_question_resolutions: Vec::new(),
+            notes: String::new(),
+        };
+        assert!(!command_matches_active_task(
+            &study_state,
+            &wrong_study_edit
+        ));
+
+        let field_state = ScientificWorkspaceState {
+            active_task_id: "task:single_cell_isolation_method".into(),
+            ..Default::default()
+        };
+        let wrong_field_edit = AgentCommand::EditStudyStructure {
+            task_id: "task:single_cell_isolation_method".into(),
+            branch_upserts: vec![AgentBranch::default()],
+            open_question_additions: Vec::new(),
+            open_question_resolutions: Vec::new(),
+            notes: String::new(),
+        };
+        assert!(!command_matches_active_task(
+            &field_state,
+            &wrong_field_edit
+        ));
+    }
+
+    #[test]
+    fn v13_read_receipt_records_requested_ref_and_enters_decision_step() {
         let mut state = ScientificWorkspaceState {
             tasks: vec![ScientificTask {
                 id: "task:study_structure".into(),
@@ -5248,7 +5455,7 @@ mod tests {
     }
 
     #[test]
-    fn v12_unread_filter_blocks_already_consumed_context_refs() {
+    fn v13_unread_filter_blocks_already_consumed_context_refs() {
         let evidence = evidence_with(
             vec![
                 EvidenceItem {
@@ -5287,7 +5494,7 @@ mod tests {
     }
 
     #[test]
-    fn v12_duplicate_skipped_results_do_not_consume_tool_budget() {
+    fn v13_duplicate_skipped_results_do_not_consume_tool_budget() {
         let results = vec![
             EvidenceActionResult {
                 outcome: "matched".into(),
@@ -5321,6 +5528,63 @@ mod tests {
         assert!(matches!(
             serde_json::from_value::<AgentCommand>(valid).unwrap(),
             AgentCommand::ReadEvidence { .. }
+        ));
+
+        let legacy_edit = json!({
+            "command": "edit_workspace",
+            "task_id": "task:study_structure",
+            "branch_upserts": [],
+            "observation_upserts": [],
+            "observation_retractions": [],
+            "open_question_additions": [],
+            "open_question_resolutions": [],
+            "notes": "legacy generic edit"
+        });
+        assert!(serde_json::from_value::<AgentCommand>(legacy_edit).is_err());
+
+        let typed_study_edit = json!({
+            "command": "edit_study_structure",
+            "task_id": "task:study_structure",
+            "branch_upserts": [{
+                "id": "branch:source_supported",
+                "label": "source-supported study branch",
+                "status": "supported",
+                "evidence_refs": ["E0001"],
+                "linked_raw_files": [],
+                "linkage_status": "unresolved",
+                "notes": "conceptual branch; exact RAW mapping remains unresolved"
+            }],
+            "open_question_additions": [],
+            "open_question_resolutions": [],
+            "notes": "record source-supported structure"
+        });
+        assert!(matches!(
+            serde_json::from_value::<AgentCommand>(typed_study_edit).unwrap(),
+            AgentCommand::EditStudyStructure { .. }
+        ));
+
+        let typed_observation_edit = json!({
+            "command": "edit_scientific_observation",
+            "task_id": "task:single_cell_isolation_method",
+            "observation_upserts": [{
+                "concept_type": "isolation_method",
+                "observed_value": "source-defined microfluidic isolation platform",
+                "scope": "unresolved",
+                "branch_id": "",
+                "status": "supported",
+                "evidence_refs": ["E0001"],
+                "confidence": "high",
+                "reason": "the trusted source explicitly defines the platform as a single-cell isolation method",
+                "supersedes_observed_value": ""
+            }],
+            "observation_retractions": [],
+            "open_question_additions": [],
+            "open_question_resolutions": [],
+            "notes": "record source-faithful observation; Rust owns canonicalization"
+        });
+        assert!(matches!(
+            serde_json::from_value::<AgentCommand>(typed_observation_edit).unwrap(),
+            AgentCommand::EditScientificObservation { .. }
         ));
     }
 
