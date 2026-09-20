@@ -321,6 +321,83 @@ impl ScientificObservationRetraction {
     }
 }
 
+pub const SCIENTIFIC_AGENT_STUDY_GRAPH_STAGE1_MODE: &str = "study_graph_v2_stage1";
+pub const SCIENTIFIC_AGENT_STUDY_GRAPH_STAGE1_VERSION: &str =
+    "pride-scp-scientific-workspace-agent-v2-stage1";
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+struct StudyGraphBranchProposal {
+    label: String,
+    biological_material: String,
+    experimental_role: String,
+    isolation_context: String,
+    acquisition_context: String,
+    #[serde(default)]
+    evidence_refs: Vec<String>,
+    #[serde(default)]
+    linked_raw_files: Vec<String>,
+    linkage_status: String,
+    notes: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+struct StudyGraphProposal {
+    decision: String,
+    #[serde(default)]
+    branches: Vec<StudyGraphBranchProposal>,
+    #[serde(default)]
+    open_questions: Vec<String>,
+    reason: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct AcceptedStudyGraphBranch {
+    id: String,
+    label: String,
+    biological_material: String,
+    experimental_role: String,
+    isolation_context: String,
+    acquisition_context: String,
+    #[serde(default)]
+    evidence_refs: Vec<String>,
+    #[serde(default)]
+    linked_raw_files: Vec<String>,
+    linkage_status: String,
+    notes: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct StudyGraphRejectedBranch {
+    label: String,
+    reason: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct StudyGraphRemovedRawLink {
+    branch_label: String,
+    raw_file: String,
+    reason: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct StudyGraphAcceptance {
+    harness_version: String,
+    accession: String,
+    status: String,
+    #[serde(default)]
+    branches: Vec<AcceptedStudyGraphBranch>,
+    #[serde(default)]
+    open_questions: Vec<String>,
+    #[serde(default)]
+    rejected_branches: Vec<StudyGraphRejectedBranch>,
+    #[serde(default)]
+    removed_raw_links: Vec<StudyGraphRemovedRawLink>,
+    reason: String,
+    model_calls: usize,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "command", rename_all = "snake_case", deny_unknown_fields)]
 enum AgentCommand {
@@ -1330,6 +1407,496 @@ fn branch_file_is_source_grounded(
             })
             .unwrap_or(false)
     })
+}
+
+fn study_graph_stage1_schema() -> Value {
+    let branch = json!({
+        "type":"object",
+        "properties":{
+            "label":{"type":"string","minLength":1,"maxLength":240},
+            "biological_material":{"type":"string","minLength":1,"maxLength":700},
+            "experimental_role":{"type":"string","minLength":1,"maxLength":500},
+            "isolation_context":{"type":"string","maxLength":800},
+            "acquisition_context":{"type":"string","maxLength":800},
+            "evidence_refs":{"type":"array","items":{"type":"string","pattern":"^E[0-9]{4}$"},"minItems":1,"maxItems":16},
+            "linked_raw_files":{"type":"array","items":{"type":"string","maxLength":300},"maxItems":128},
+            "linkage_status":{"type":"string","enum":["supported","partial","unresolved"]},
+            "notes":{"type":"string","maxLength":1000}
+        },
+        "required":["label","biological_material","experimental_role","isolation_context","acquisition_context","evidence_refs","linked_raw_files","linkage_status","notes"],
+        "additionalProperties":false
+    });
+    json!({
+        "type":"object",
+        "properties":{
+            "decision":{"type":"string","enum":["propose_graph","human_review"]},
+            "branches":{"type":"array","items":branch,"maxItems":16},
+            "open_questions":{"type":"array","items":{"type":"string","maxLength":700},"maxItems":24},
+            "reason":{"type":"string","maxLength":1600}
+        },
+        "required":["decision","branches","open_questions","reason"],
+        "additionalProperties":false
+    })
+}
+
+fn study_graph_stage1_evidence_block(
+    evidence: &DatasetEvidence,
+    max_items: usize,
+    max_chars: usize,
+) -> String {
+    let refs = task_evidence_candidates(evidence, "study_structure", max_items.max(1));
+    let mut rendered = Vec::new();
+    let mut used = 0usize;
+    for id in refs {
+        let Some(item) = evidence.evidence.iter().find(|item| item.id == id) else {
+            continue;
+        };
+        let remaining = max_chars.saturating_sub(used);
+        if remaining == 0 {
+            break;
+        }
+        let source = format!("{} [{}:{}] ", item.id, item.source_kind, item.source_label);
+        let available = remaining.saturating_sub(source.chars().count());
+        if available == 0 {
+            break;
+        }
+        let text = item.text.replace('\0', " ");
+        let body = if text.chars().count() > available {
+            text.chars().take(available).collect::<String>() + "..."
+        } else {
+            text
+        };
+        let line = source + &body;
+        used += line.chars().count();
+        rendered.push(line);
+    }
+    if rendered.is_empty() {
+        "none".into()
+    } else {
+        rendered.join("\n\n")
+    }
+}
+
+fn study_graph_stage1_prompt(
+    opts: &SdrfScientificAgentOptions,
+    evidence: &DatasetEvidence,
+) -> String {
+    let evidence_block = study_graph_stage1_evidence_block(
+        evidence,
+        opts.max_evidence_items.min(32),
+        opts.max_evidence_chars.min(60000),
+    );
+    format!(
+        "You are constructing the prerequisite StudyGraph for PRIDE single-cell proteomics dataset {acc}.\n\n\
+This is a ONE-SHOT, BOUNDED STRUCTURAL SYNTHESIS. There is no conversational repair loop. Return either a source-grounded conceptual study graph or human_review.\n\n\
+STUDYGRAPH CONTRACT:\n\
+- A branch is a biologically or experimentally distinct material/regime that must not be silently collapsed into another branch.\n\
+- Use the trusted E#### evidence below. Every proposed branch requires at least one supporting E#### ref.\n\
+- Conceptual branch creation does NOT require exact RAW linkage. If the branch is supported but exact RAW basenames are not explicitly linked by trusted source text, use linked_raw_files=[] and linkage_status='unresolved'.\n\
+- Exact RAW linkage is allowed only when the cited trusted evidence explicitly names that RAW basename in connection with the branch. Filename words alone are never biological identity.\n\
+- Do not infer organism, cell line, cell type, isolation regime, acquisition regime, or branch membership from filenames.\n\
+- biological_material and experimental_role must summarize what the cited source actually supports. isolation_context and acquisition_context may be empty when not established.\n\
+- Do not choose SDRF controlled-vocabulary values and do not repair any SDRF field in this phase.\n\
+- Use human_review only when the conceptual study structure itself cannot be established safely from the registered evidence. Unresolved RAW linkage alone is NOT a reason for human_review.\n\
+- Prefer a small number of defensible branches over speculative fine-grained branches.\n\n\
+DETERMINISTIC CARDINALITY HINT (not biological identity):\n\
+relation_mode={relation}; confidence={confidence}; refs={refs:?}; repository_file_mode={repo_mode}; note={note}\n\n\
+TRUSTED STUDY-STRUCTURE EVIDENCE:\n{evidence_block}\n\n\
+Return ONLY the StudyGraphProposal JSON object matching the schema.",
+        acc = evidence.accession,
+        relation = evidence.study_design.relation_mode_hint,
+        confidence = evidence.study_design.relation_confidence,
+        refs = evidence.study_design.relation_evidence_refs,
+        repo_mode = evidence.study_design.repository_file_mode,
+        note = evidence.study_design.notes,
+        evidence_block = evidence_block,
+    )
+}
+
+async fn call_study_graph_stage1(
+    opts: &SdrfScientificAgentOptions,
+    evidence: &DatasetEvidence,
+) -> Result<StudyGraphProposal> {
+    let client = Client::builder()
+        .timeout(Duration::from_secs(opts.timeout_seconds))
+        .build()?;
+    let payload = json!({
+        "model": opts.model,
+        "prompt": study_graph_stage1_prompt(opts, evidence),
+        "stream": false,
+        "think": false,
+        "format": study_graph_stage1_schema(),
+        "options": {"temperature": 0.0}
+    });
+    let response = client
+        .post(&opts.ollama_url)
+        .json(&payload)
+        .send()
+        .await
+        .with_context(|| {
+            format!(
+                "Ollama StudyGraph v2-stage1 request for {}",
+                evidence.accession
+            )
+        })?;
+    let status = response.status();
+    let body: Value = response
+        .json()
+        .await
+        .context("decode Ollama StudyGraph v2-stage1 response")?;
+    if !status.is_success() {
+        bail!("Ollama StudyGraph v2-stage1 HTTP {status}: {body}");
+    }
+    let raw = body.get("response").and_then(Value::as_str).unwrap_or("");
+    if raw.trim().is_empty() {
+        bail!("Ollama returned empty StudyGraph v2-stage1 response");
+    }
+    serde_json::from_str(raw).context("parse structured StudyGraph v2-stage1 proposal")
+}
+
+fn normalize_study_graph_text(value: &str) -> String {
+    value
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .trim()
+        .to_string()
+}
+
+fn study_graph_branch_key(branch: &StudyGraphBranchProposal) -> String {
+    format!(
+        "{}|{}|{}|{}|{}",
+        normalize_study_graph_text(&branch.label).to_ascii_lowercase(),
+        normalize_study_graph_text(&branch.biological_material).to_ascii_lowercase(),
+        normalize_study_graph_text(&branch.experimental_role).to_ascii_lowercase(),
+        normalize_study_graph_text(&branch.isolation_context).to_ascii_lowercase(),
+        normalize_study_graph_text(&branch.acquisition_context).to_ascii_lowercase(),
+    )
+}
+
+fn accept_study_graph_stage1(
+    evidence: &DatasetEvidence,
+    proposal: &StudyGraphProposal,
+) -> StudyGraphAcceptance {
+    if proposal.decision == "human_review" {
+        return StudyGraphAcceptance {
+            harness_version: SCIENTIFIC_AGENT_STUDY_GRAPH_STAGE1_VERSION.into(),
+            accession: evidence.accession.clone(),
+            status: "human_review".into(),
+            open_questions: proposal.open_questions.clone(),
+            reason: normalize_study_graph_text(&proposal.reason),
+            model_calls: 1,
+            ..Default::default()
+        };
+    }
+    if proposal.decision != "propose_graph" {
+        return StudyGraphAcceptance {
+            harness_version: SCIENTIFIC_AGENT_STUDY_GRAPH_STAGE1_VERSION.into(),
+            accession: evidence.accession.clone(),
+            status: "human_review".into(),
+            reason: format!("unsupported StudyGraph decision '{}'", proposal.decision),
+            model_calls: 1,
+            ..Default::default()
+        };
+    }
+
+    let raw_names = evidence
+        .raw_files
+        .iter()
+        .map(|raw| raw.file_name.to_ascii_lowercase())
+        .collect::<BTreeSet<_>>();
+    let mut rejected_branches = Vec::new();
+    let mut removed_raw_links = Vec::new();
+    let mut accepted = Vec::<(String, StudyGraphBranchProposal, Vec<String>, Vec<String>)>::new();
+    let mut seen = BTreeSet::new();
+
+    for mut branch in proposal.branches.clone() {
+        branch.label = normalize_study_graph_text(&branch.label);
+        branch.biological_material = normalize_study_graph_text(&branch.biological_material);
+        branch.experimental_role = normalize_study_graph_text(&branch.experimental_role);
+        branch.isolation_context = normalize_study_graph_text(&branch.isolation_context);
+        branch.acquisition_context = normalize_study_graph_text(&branch.acquisition_context);
+        branch.notes = normalize_study_graph_text(&branch.notes);
+        let refs = valid_evidence_refs(evidence, &branch.evidence_refs);
+        if branch.label.is_empty()
+            || branch.biological_material.is_empty()
+            || branch.experimental_role.is_empty()
+            || refs.is_empty()
+        {
+            rejected_branches.push(StudyGraphRejectedBranch {
+                label: branch.label.clone(),
+                reason: "branch rejected: label, biological_material, experimental_role and at least one valid trusted evidence ref are required".into(),
+            });
+            continue;
+        }
+        let key = study_graph_branch_key(&branch);
+        if !seen.insert(key.clone()) {
+            rejected_branches.push(StudyGraphRejectedBranch {
+                label: branch.label.clone(),
+                reason: "branch rejected: semantic duplicate of an already proposed branch".into(),
+            });
+            continue;
+        }
+        let mut linked = Vec::new();
+        for raw in &branch.linked_raw_files {
+            let trimmed = raw.trim();
+            let Some(canonical) = evidence
+                .raw_files
+                .iter()
+                .find(|candidate| candidate.file_name.eq_ignore_ascii_case(trimmed))
+                .map(|candidate| candidate.file_name.clone())
+            else {
+                removed_raw_links.push(StudyGraphRemovedRawLink {
+                    branch_label: branch.label.clone(),
+                    raw_file: trimmed.to_string(),
+                    reason: "RAW basename is not present in the repository inventory".into(),
+                });
+                continue;
+            };
+            if !raw_names.contains(&canonical.to_ascii_lowercase())
+                || !branch_file_is_source_grounded(evidence, &refs, &canonical)
+            {
+                removed_raw_links.push(StudyGraphRemovedRawLink {
+                    branch_label: branch.label.clone(),
+                    raw_file: canonical,
+                    reason: "exact RAW linkage was not explicitly supported by the cited trusted evidence; linkage was removed rather than inferred from filename semantics".into(),
+                });
+                continue;
+            }
+            linked.push(canonical);
+        }
+        linked.sort();
+        linked.dedup();
+        accepted.push((key, branch, refs, linked));
+    }
+
+    accepted.sort_by(|a, b| a.0.cmp(&b.0));
+    let branches = accepted
+        .into_iter()
+        .enumerate()
+        .map(|(i, (_, branch, refs, linked))| AcceptedStudyGraphBranch {
+            id: format!("B{:03}", i + 1),
+            label: branch.label,
+            biological_material: branch.biological_material,
+            experimental_role: branch.experimental_role,
+            isolation_context: branch.isolation_context,
+            acquisition_context: branch.acquisition_context,
+            evidence_refs: refs,
+            linkage_status: if linked.is_empty() {
+                "unresolved".into()
+            } else if branch.linkage_status == "supported" {
+                "supported".into()
+            } else {
+                "partial".into()
+            },
+            linked_raw_files: linked,
+            notes: branch.notes,
+        })
+        .collect::<Vec<_>>();
+
+    let status = if branches.is_empty() {
+        "human_review"
+    } else {
+        "accepted"
+    };
+    let reason = if branches.is_empty() {
+        "Rust could not accept any source-grounded conceptual branch from the one-shot StudyGraph proposal".into()
+    } else {
+        format!(
+            "Rust accepted {} source-grounded conceptual branch(es); exact RAW linkage remains unresolved wherever trusted evidence did not explicitly support it",
+            branches.len()
+        )
+    };
+    StudyGraphAcceptance {
+        harness_version: SCIENTIFIC_AGENT_STUDY_GRAPH_STAGE1_VERSION.into(),
+        accession: evidence.accession.clone(),
+        status: status.into(),
+        branches,
+        open_questions: proposal.open_questions.clone(),
+        rejected_branches,
+        removed_raw_links,
+        reason,
+        model_calls: 1,
+    }
+}
+
+fn write_study_graph_stage1_review(path: &Path, acceptance: &StudyGraphAcceptance) -> Result<()> {
+    let mut out = String::new();
+    out.push_str(&format!(
+        "# PRIDE-SCP StudyGraph v2 Stage 1: {}\n\n",
+        acceptance.accession
+    ));
+    out.push_str(&format!("Status: **{}**\n\n", acceptance.status));
+    out.push_str(&format!("{}\n\n", acceptance.reason));
+    out.push_str("## Accepted conceptual branches\n\n");
+    if acceptance.branches.is_empty() {
+        out.push_str("None. Accession stops at human review before downstream annotation.\n\n");
+    } else {
+        for branch in &acceptance.branches {
+            out.push_str(&format!(
+                "- **{} — {}**\n  - biological material: {}\n  - experimental role: {}\n  - isolation context: {}\n  - acquisition context: {}\n  - evidence: {:?}\n  - linked RAW files: {:?}\n  - linkage status: {}\n  - notes: {}\n",
+                branch.id,
+                branch.label,
+                branch.biological_material,
+                branch.experimental_role,
+                branch.isolation_context,
+                branch.acquisition_context,
+                branch.evidence_refs,
+                branch.linked_raw_files,
+                branch.linkage_status,
+                branch.notes,
+            ));
+        }
+        out.push('\n');
+    }
+    if !acceptance.open_questions.is_empty() {
+        out.push_str("## Open structural questions\n\n");
+        for question in &acceptance.open_questions {
+            out.push_str(&format!("- {}\n", question));
+        }
+        out.push('\n');
+    }
+    if !acceptance.removed_raw_links.is_empty() {
+        out.push_str("## RAW links removed by Rust\n\n");
+        for removed in &acceptance.removed_raw_links {
+            out.push_str(&format!(
+                "- {}: {} — {}\n",
+                removed.branch_label, removed.raw_file, removed.reason
+            ));
+        }
+        out.push('\n');
+    }
+    fs::write(path, out)?;
+    Ok(())
+}
+
+async fn run_one_study_graph_stage1(
+    opts: &SdrfScientificAgentOptions,
+    accession: &str,
+) -> Result<ScientificAgentResultRow> {
+    let annotate_opts = opts.annotate_options();
+    let evidence = build_evidence(&annotate_opts, accession)?;
+    let root = opts.output_dir.join("study_graphs").join(accession);
+    fs::create_dir_all(&root)?;
+    let evidence_path = root.join("evidence.json");
+    let proposal_path = root.join("proposal.json");
+    let accepted_path = root.join("accepted_graph.json");
+    let review_path = root.join("REVIEW.md");
+    fs::write(&evidence_path, serde_json::to_string_pretty(&evidence)?)?;
+
+    let proposal = call_study_graph_stage1(opts, &evidence).await?;
+    fs::write(&proposal_path, serde_json::to_string_pretty(&proposal)?)?;
+    let acceptance = accept_study_graph_stage1(&evidence, &proposal);
+    fs::write(&accepted_path, serde_json::to_string_pretty(&acceptance)?)?;
+    write_study_graph_stage1_review(&review_path, &acceptance)?;
+
+    Ok(ScientificAgentResultRow {
+        accession: accession.into(),
+        status: "success".into(),
+        terminal_status: if acceptance.status == "accepted" {
+            "study_graph_accepted".into()
+        } else {
+            "study_graph_human_review".into()
+        },
+        turns: 1,
+        tool_actions: 0,
+        validator_cycles: 0,
+        branches: acceptance.branches.len(),
+        open_questions: acceptance.open_questions.len(),
+        relation_mode: evidence.study_design.relation_mode_hint.clone(),
+        locally_valid: false,
+        validation_errors: 0,
+        draft_path: accepted_path.display().to_string(),
+        review_path: review_path.display().to_string(),
+        workspace_path: root.display().to_string(),
+        error: String::new(),
+    })
+}
+
+async fn run_study_graph_stage1(
+    opts: SdrfScientificAgentOptions,
+) -> Result<SdrfScientificAgentSummary> {
+    let accessions = collect_accessions_values(&opts.accessions, opts.accessions_file.as_deref())?;
+    if accessions.len() > 1 && !opts.manuscript_text_paths.is_empty() {
+        bail!("--manuscript-text is accession-specific and may only be used for one accession");
+    }
+    fs::create_dir_all(&opts.output_dir)?;
+    let results_path = opts.output_dir.join("study_graph_stage1_results.tsv");
+    let mut rows = Vec::new();
+    for (i, accession) in accessions.iter().enumerate() {
+        if opts.progress {
+            eprintln!(
+                "[{}/{}] {} StudyGraph v2-stage1",
+                i + 1,
+                accessions.len(),
+                accession
+            );
+        }
+        match run_one_study_graph_stage1(&opts, accession).await {
+            Ok(row) => {
+                if opts.progress {
+                    eprintln!(
+                        "  -> terminal={} model_calls={} branches={} open_questions={}",
+                        row.terminal_status, row.turns, row.branches, row.open_questions
+                    );
+                }
+                rows.push(row);
+            }
+            Err(err) => {
+                eprintln!("  -> StudyGraph v2-stage1 error: {err:#}");
+                rows.push(ScientificAgentResultRow {
+                    accession: accession.clone(),
+                    status: "error".into(),
+                    terminal_status: "error".into(),
+                    turns: 0,
+                    tool_actions: 0,
+                    validator_cycles: 0,
+                    branches: 0,
+                    open_questions: 0,
+                    relation_mode: String::new(),
+                    locally_valid: false,
+                    validation_errors: 0,
+                    draft_path: String::new(),
+                    review_path: String::new(),
+                    workspace_path: String::new(),
+                    error: format!("{err:#}"),
+                });
+            }
+        }
+    }
+    let mut writer = WriterBuilder::new()
+        .delimiter(b'\t')
+        .from_path(&results_path)?;
+    for row in &rows {
+        writer.serialize(row)?;
+    }
+    writer.flush()?;
+    let successful = rows.iter().filter(|row| row.status == "success").count();
+    let summary = SdrfScientificAgentSummary {
+        harness_version: SCIENTIFIC_AGENT_STUDY_GRAPH_STAGE1_VERSION.into(),
+        generator_version: GENERATOR_VERSION.into(),
+        accessions_requested: accessions.len(),
+        successful,
+        errors: rows.len().saturating_sub(successful),
+        locally_valid_drafts: 0,
+        incomplete_drafts: 0,
+        total_validation_errors: 0,
+        total_agent_turns: rows.iter().map(|row| row.turns).sum(),
+        total_tool_actions: 0,
+        total_validator_cycles: 0,
+        results_tsv: results_path.display().to_string(),
+        workspace_root: opts.output_dir.join("study_graphs").display().to_string(),
+    };
+    let rendered = serde_json::to_string_pretty(&summary)?;
+    fs::write(
+        opts.output_dir.join("study_graph_stage1_summary.json"),
+        &rendered,
+    )?;
+    fs::write(
+        opts.output_dir.join("scientific_agent_summary.json"),
+        rendered,
+    )?;
+    Ok(summary)
 }
 
 fn claim_refs_are_relevant(
@@ -4287,6 +4854,17 @@ async fn run_one_scientific_agent(
 pub async fn run_scientific_sdrf_agent(
     opts: SdrfScientificAgentOptions,
 ) -> Result<SdrfScientificAgentSummary> {
+    let requested_mode = std::env::var("PRIDE_SCP_SCIENTIFIC_AGENT_MODE").unwrap_or_default();
+    if requested_mode == SCIENTIFIC_AGENT_STUDY_GRAPH_STAGE1_MODE {
+        return run_study_graph_stage1(opts).await;
+    }
+    if !requested_mode.trim().is_empty() {
+        bail!(
+            "unsupported PRIDE_SCP_SCIENTIFIC_AGENT_MODE='{}'; expected '{}' or unset for the v1.3 workspace agent",
+            requested_mode,
+            SCIENTIFIC_AGENT_STUDY_GRAPH_STAGE1_MODE
+        );
+    }
     if opts.max_agent_turns == 0 || opts.max_tool_actions == 0 || opts.max_validator_cycles == 0 {
         bail!("scientific-agent budgets must all be greater than zero");
     }
@@ -5782,5 +6360,127 @@ mod tests {
             compiled_workspace_fingerprint(&proposal, &headers, &rows),
             compiled_workspace_fingerprint(&proposal, &headers, &rows)
         );
+    }
+
+    #[test]
+    fn v2_stage1_schema_allows_supported_branch_with_unresolved_raw_linkage() {
+        let schema = study_graph_stage1_schema();
+        let text = serde_json::to_string(&schema).unwrap();
+        assert!(text.contains("propose_graph"));
+        assert!(text.contains("biological_material"));
+        assert!(text.contains("linked_raw_files"));
+        assert!(text.contains("unresolved"));
+        assert!(!text.contains("edit_scientific_observation"));
+    }
+
+    #[test]
+    fn v2_stage1_acceptance_assigns_rust_branch_ids_and_preserves_unresolved_linkage() {
+        let evidence = evidence_with(
+            vec![EvidenceItem {
+                id: "E0001".into(),
+                source_kind: "pride_project".into(),
+                source_label: "project:projectDescription".into(),
+                text: "Single HeLa cells were manually loaded by hydrodynamic pressure while a separate low-input material was introduced by spray voltage.".into(),
+            }],
+            vec!["one.raw", "two.raw"],
+        );
+        let proposal = StudyGraphProposal {
+            decision: "propose_graph".into(),
+            branches: vec![
+                StudyGraphBranchProposal {
+                    label: "single-cell HeLa".into(),
+                    biological_material: "single HeLa cells".into(),
+                    experimental_role: "single-cell proteomics".into(),
+                    isolation_context: "manual loading by hydrodynamic pressure".into(),
+                    acquisition_context: String::new(),
+                    evidence_refs: vec!["E0001".into()],
+                    linked_raw_files: Vec::new(),
+                    linkage_status: "unresolved".into(),
+                    notes: String::new(),
+                },
+                StudyGraphBranchProposal {
+                    label: "spray-voltage low-input".into(),
+                    biological_material: "low-input material".into(),
+                    experimental_role: "method comparison".into(),
+                    isolation_context: "spray voltage introduction".into(),
+                    acquisition_context: String::new(),
+                    evidence_refs: vec!["E0001".into()],
+                    linked_raw_files: Vec::new(),
+                    linkage_status: "unresolved".into(),
+                    notes: String::new(),
+                },
+            ],
+            open_questions: vec!["exact RAW linkage is unresolved".into()],
+            reason: "two source-supported experimental regimes".into(),
+        };
+        let accepted = accept_study_graph_stage1(&evidence, &proposal);
+        assert_eq!(accepted.status, "accepted");
+        assert_eq!(accepted.branches.len(), 2);
+        assert_eq!(accepted.branches[0].id, "B001");
+        assert_eq!(accepted.branches[1].id, "B002");
+        assert!(accepted
+            .branches
+            .iter()
+            .all(|branch| branch.linked_raw_files.is_empty()
+                && branch.linkage_status == "unresolved"));
+    }
+
+    #[test]
+    fn v2_stage1_strips_unsupported_filename_linkage_instead_of_inferencing_identity() {
+        let evidence = evidence_with(
+            vec![EvidenceItem {
+                id: "E0001".into(),
+                source_kind: "pride_project".into(),
+                source_label: "project:projectDescription".into(),
+                text: "The study contains a Xenopus embryo branch.".into(),
+            }],
+            vec!["xenopus_D11.raw"],
+        );
+        let proposal = StudyGraphProposal {
+            decision: "propose_graph".into(),
+            branches: vec![StudyGraphBranchProposal {
+                label: "Xenopus embryo".into(),
+                biological_material: "Xenopus embryo material".into(),
+                experimental_role: "embryo microsampling".into(),
+                isolation_context: String::new(),
+                acquisition_context: String::new(),
+                evidence_refs: vec!["E0001".into()],
+                linked_raw_files: vec!["xenopus_D11.raw".into()],
+                linkage_status: "supported".into(),
+                notes: String::new(),
+            }],
+            open_questions: Vec::new(),
+            reason: String::new(),
+        };
+        let accepted = accept_study_graph_stage1(&evidence, &proposal);
+        assert_eq!(accepted.status, "accepted");
+        assert!(accepted.branches[0].linked_raw_files.is_empty());
+        assert_eq!(accepted.branches[0].linkage_status, "unresolved");
+        assert_eq!(accepted.removed_raw_links.len(), 1);
+    }
+
+    #[test]
+    fn v2_stage1_human_review_stops_without_downstream_structure() {
+        let evidence = evidence_with(
+            vec![EvidenceItem {
+                id: "E0001".into(),
+                source_kind: "pride_project".into(),
+                source_label: "project:projectDescription".into(),
+                text: "ambiguous study".into(),
+            }],
+            vec!["run.raw"],
+        );
+        let proposal = StudyGraphProposal {
+            decision: "human_review".into(),
+            branches: Vec::new(),
+            open_questions: vec![
+                "study branches cannot be separated from available evidence".into()
+            ],
+            reason: "insufficient structural evidence".into(),
+        };
+        let accepted = accept_study_graph_stage1(&evidence, &proposal);
+        assert_eq!(accepted.status, "human_review");
+        assert!(accepted.branches.is_empty());
+        assert_eq!(accepted.model_calls, 1);
     }
 }
