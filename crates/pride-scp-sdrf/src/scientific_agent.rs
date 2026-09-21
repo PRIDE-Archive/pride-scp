@@ -583,6 +583,10 @@ pub const SCIENTIFIC_AGENT_FACTOR_CANONICAL_HARDENED_MODE: &str =
     "study_factor_graph_v2_canonicalization_hardened";
 pub const SCIENTIFIC_AGENT_FACTOR_CANONICAL_HARDENED_VERSION: &str =
     "pride-scp-scientific-workspace-agent-v2-factor-canonicalization-hardened";
+pub const SCIENTIFIC_AGENT_FACTOR_SEMANTIC_FIDELITY_HARDENED_MODE: &str =
+    "study_factor_graph_v2_semantic_fidelity_hardened";
+pub const SCIENTIFIC_AGENT_FACTOR_SEMANTIC_FIDELITY_HARDENED_VERSION: &str =
+    "pride-scp-scientific-workspace-agent-v2-factor-semantic-fidelity-hardened";
 const SCIENTIFIC_AGENT_FACTOR_GRAPH_ROOT_ENV: &str = "PRIDE_SCP_FACTOR_GRAPH_STAGE1_ROOT";
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -4448,6 +4452,243 @@ async fn run_factor_canonical_hardened(
     Ok(summary)
 }
 
+async fn run_one_factor_semantic_fidelity_hardened(
+    opts: &SdrfScientificAgentOptions,
+    accession: &str,
+) -> Result<ScientificAgentResultRow> {
+    let annotate_opts = opts.annotate_options();
+    let evidence = build_evidence(&annotate_opts, accession)?;
+    let explicit_mappings = if let Some(path) = opts.explicit_row_mapping_manifest.as_deref() {
+        if !path.is_file() {
+            bail!(
+                "explicit row-mapping manifest not found: {}",
+                path.display()
+            );
+        }
+        load_explicit_row_mappings(path, accession, &evidence.raw_files)?
+    } else {
+        Vec::new()
+    };
+    let (graph_path, graph) = load_factor_graph_for_phase_b(accession)?;
+    let root = opts
+        .output_dir
+        .join("semantic_fidelity_hardened")
+        .join(accession);
+    fs::create_dir_all(&root)?;
+    let evidence_path = root.join("evidence.json");
+    let accepted_path = root.join("derived_observations.json");
+    let adjudications_path = root.join("adjudications.json");
+    let draft_path = root.join(format!("{}.semantic_fidelity_hardened.sdrf.tsv", accession));
+    let validation_path = root.join("VALIDATION.md");
+    let review_path = root.join("REVIEW.md");
+    let result_path = root.join("result.json");
+    fs::write(&evidence_path, serde_json::to_string_pretty(&evidence)?)?;
+    fs::copy(&graph_path, root.join("accepted_factor_graph.json"))?;
+
+    let mut acceptance = derive_factor_graph_observations(&evidence, &graph);
+    acceptance.harness_version = SCIENTIFIC_AGENT_FACTOR_SEMANTIC_FIDELITY_HARDENED_VERSION.into();
+    fs::write(&accepted_path, serde_json::to_string_pretty(&acceptance)?)?;
+
+    let claims = acceptance
+        .observations
+        .iter()
+        .map(factor_observation_as_claim)
+        .collect::<Vec<_>>();
+    let state = ScientificWorkspaceState {
+        harness_version: SCIENTIFIC_AGENT_FACTOR_SEMANTIC_FIDELITY_HARDENED_VERSION.into(),
+        accession: accession.into(),
+        turn: 0,
+        relation: AgentRelation {
+            mode: if study_design_has_assertive_relation_hint(&evidence.study_design) {
+                evidence.study_design.relation_mode_hint.clone()
+            } else {
+                "unresolved".into()
+            },
+            scope: if study_design_has_assertive_relation_hint(&evidence.study_design) {
+                "project".into()
+            } else {
+                "unresolved".into()
+            },
+            evidence_refs: evidence.study_design.relation_evidence_refs.clone(),
+            confidence: evidence.study_design.relation_confidence.clone(),
+            reason: evidence.study_design.notes.clone(),
+        },
+        branches: factor_graph_as_agent_branches(&graph),
+        claims,
+        open_questions: acceptance.open_questions.clone(),
+        active_task_id: String::new(),
+        next_step: "compile".into(),
+        notes: "deterministic factor-to-observation bridge with observation-local isolation and acquisition semantic-fidelity hardening; no LLM call and no conversational retry are permitted".into(),
+        ..Default::default()
+    };
+
+    let compiled = compile_workspace(&evidence, &state, &explicit_mappings)?;
+    write_sdrf(&draft_path, &compiled.headers, &compiled.rows)?;
+    write_validation_review(&validation_path, &compiled.issues)?;
+    let validation = validation_cycle(1, &compiled.issues);
+    let adjudications = workspace_adjudications(&evidence, &state);
+    fs::write(
+        &adjudications_path,
+        serde_json::to_string_pretty(&adjudications)?,
+    )?;
+
+    let has_template_gap = adjudications
+        .iter()
+        .any(|record| matches!(&record.adjudication, ClaimAdjudication::TemplateGap { .. }));
+    let terminal_status = if validation.validation_errors == 0 {
+        "locally_valid"
+    } else if has_template_gap {
+        "partial_template_gap"
+    } else if !acceptance.observations.is_empty() {
+        "partial_human_review"
+    } else {
+        "human_review"
+    };
+
+    write_factor_deterministic_bridge_review(
+        &review_path,
+        &graph,
+        &acceptance,
+        &adjudications,
+        &validation,
+        terminal_status,
+    )?;
+    let result = json!({
+        "harness_version": SCIENTIFIC_AGENT_FACTOR_SEMANTIC_FIDELITY_HARDENED_VERSION,
+        "accession": accession,
+        "factor_graph_source": graph_path,
+        "model_calls": 0,
+        "tool_actions": 0,
+        "validator_cycles": 1,
+        "terminal_status": terminal_status,
+        "derived_observation_count": acceptance.observations.len(),
+        "rejected_observation_count": acceptance.rejected_observations.len(),
+        "derived_observations": &acceptance.observations,
+        "rejected_observations": &acceptance.rejected_observations,
+        "adjudications": &adjudications,
+        "validation": &validation,
+        "compiled_fingerprint": &compiled.fingerprint,
+        "draft_path": draft_path.display().to_string(),
+        "review_path": review_path.display().to_string()
+    });
+    fs::write(&result_path, serde_json::to_string_pretty(&result)?)?;
+
+    Ok(ScientificAgentResultRow {
+        accession: accession.into(),
+        status: "success".into(),
+        terminal_status: terminal_status.into(),
+        turns: 0,
+        tool_actions: 0,
+        validator_cycles: 1,
+        branches: graph.materials.len() + graph.regimes.len() + graph.acquisitions.len(),
+        open_questions: acceptance.open_questions.len(),
+        relation_mode: compiled.proposal.relation_mode,
+        locally_valid: validation.validation_errors == 0,
+        validation_errors: validation.validation_errors,
+        draft_path: draft_path.display().to_string(),
+        review_path: review_path.display().to_string(),
+        workspace_path: root.display().to_string(),
+        error: String::new(),
+    })
+}
+
+async fn run_factor_semantic_fidelity_hardened(
+    opts: SdrfScientificAgentOptions,
+) -> Result<SdrfScientificAgentSummary> {
+    let accessions = collect_accessions_values(&opts.accessions, opts.accessions_file.as_deref())?;
+    if accessions.len() > 1 && !opts.manuscript_text_paths.is_empty() {
+        bail!("--manuscript-text is accession-specific and may only be used for one accession");
+    }
+    fs::create_dir_all(&opts.output_dir)?;
+    let results_path = opts
+        .output_dir
+        .join("factor_semantic_fidelity_hardened_results.tsv");
+    let mut rows = Vec::new();
+    for (i, accession) in accessions.iter().enumerate() {
+        if opts.progress {
+            eprintln!(
+                "[{}/{}] {} FactorGraph v2 semantic-fidelity-hardened bridge",
+                i + 1,
+                accessions.len(),
+                accession
+            );
+        }
+        match run_one_factor_semantic_fidelity_hardened(&opts, accession).await {
+            Ok(row) => {
+                if opts.progress {
+                    eprintln!(
+                        "  -> terminal={} model_calls=0 validators={} valid={} errors={}",
+                        row.terminal_status,
+                        row.validator_cycles,
+                        row.locally_valid,
+                        row.validation_errors
+                    );
+                }
+                rows.push(row);
+            }
+            Err(err) => {
+                eprintln!("  -> FactorGraph semantic-fidelity-hardened bridge error: {err:#}");
+                rows.push(ScientificAgentResultRow {
+                    accession: accession.clone(),
+                    status: "error".into(),
+                    terminal_status: "error".into(),
+                    turns: 0,
+                    tool_actions: 0,
+                    validator_cycles: 0,
+                    branches: 0,
+                    open_questions: 0,
+                    relation_mode: String::new(),
+                    locally_valid: false,
+                    validation_errors: 0,
+                    draft_path: String::new(),
+                    review_path: String::new(),
+                    workspace_path: String::new(),
+                    error: format!("{err:#}"),
+                });
+            }
+        }
+    }
+    let mut writer = WriterBuilder::new()
+        .delimiter(b'\t')
+        .from_path(&results_path)?;
+    for row in &rows {
+        writer.serialize(row)?;
+    }
+    writer.flush()?;
+    let successful = rows.iter().filter(|row| row.status == "success").count();
+    let locally_valid_drafts = rows.iter().filter(|row| row.locally_valid).count();
+    let summary = SdrfScientificAgentSummary {
+        harness_version: SCIENTIFIC_AGENT_FACTOR_SEMANTIC_FIDELITY_HARDENED_VERSION.into(),
+        generator_version: GENERATOR_VERSION.into(),
+        accessions_requested: accessions.len(),
+        successful,
+        errors: rows.len().saturating_sub(successful),
+        locally_valid_drafts,
+        incomplete_drafts: successful.saturating_sub(locally_valid_drafts),
+        total_validation_errors: rows.iter().map(|row| row.validation_errors).sum(),
+        total_agent_turns: 0,
+        total_tool_actions: 0,
+        total_validator_cycles: rows.iter().map(|row| row.validator_cycles).sum(),
+        results_tsv: results_path.display().to_string(),
+        workspace_root: opts
+            .output_dir
+            .join("semantic_fidelity_hardened")
+            .display()
+            .to_string(),
+    };
+    let rendered = serde_json::to_string_pretty(&summary)?;
+    fs::write(
+        opts.output_dir
+            .join("factor_semantic_fidelity_hardened_summary.json"),
+        &rendered,
+    )?;
+    fs::write(
+        opts.output_dir.join("scientific_agent_summary.json"),
+        rendered,
+    )?;
+    Ok(summary)
+}
+
 fn claim_refs_are_relevant(
     evidence: &DatasetEvidence,
     concept_type: &str,
@@ -5670,12 +5911,80 @@ fn isolation_canonicalization_is_observation_faithful(
     }
 }
 
+fn acquisition_mode_semantic_class(value: &str) -> Option<&'static str> {
+    let normalized = normalize_semantic_mapping_phrase(value);
+    if normalized.is_empty() {
+        return None;
+    }
+    let tokens = normalized.split_whitespace().collect::<Vec<_>>();
+    let has_token = |token: &str| tokens.iter().any(|value| *value == token);
+
+    let dda = normalized.contains("data dependent")
+        || normalized.contains("dda pasef")
+        || normalized.contains("ddapasef")
+        || (has_token("dda")
+            && (normalized.contains(" ms")
+                || normalized.starts_with("ms ")
+                || normalized.contains("acquisition")
+                || normalized.contains("pasef")));
+
+    let dia_nn_only = normalized.contains("dia nn")
+        && !normalized.contains("data independent")
+        && !normalized.contains("dia pasef")
+        && !normalized.contains("diapasef")
+        && !normalized.contains("dia mode")
+        && !normalized.contains("swath");
+    let dia = normalized.contains("data independent")
+        || normalized.contains("dia pasef")
+        || normalized.contains("diapasef")
+        || normalized.contains("swath")
+        || (!dia_nn_only
+            && has_token("dia")
+            && (normalized.contains(" ms")
+                || normalized.starts_with("ms ")
+                || normalized.contains("acquisition")
+                || normalized.contains("mode")
+                || normalized.contains("pasef")));
+
+    match (dda, dia) {
+        (true, false) => Some("dda"),
+        (false, true) => Some("dia"),
+        _ => None,
+    }
+}
+
+fn acquisition_canonical_value(mode: &str) -> Option<String> {
+    match mode {
+        "dda" => Some("NT=data-dependent acquisition;AC=PRIDE:0000627".into()),
+        "dia" => Some("Data-independent acquisition".into()),
+        _ => None,
+    }
+}
+
+fn acquisition_canonicalization_is_observation_faithful(
+    observed_value: &str,
+    canonical_value: &str,
+) -> bool {
+    match (
+        acquisition_mode_semantic_class(observed_value),
+        acquisition_mode_semantic_class(canonical_value),
+    ) {
+        (Some(observed), Some(canonical)) => observed == canonical,
+        _ => false,
+    }
+}
+
+fn factor_isolation_hardening_enabled(state: &ScientificWorkspaceState) -> bool {
+    state.harness_version == SCIENTIFIC_AGENT_FACTOR_CANONICAL_HARDENED_VERSION
+        || state.harness_version == SCIENTIFIC_AGENT_FACTOR_SEMANTIC_FIDELITY_HARDENED_VERSION
+}
+
 fn harden_factor_isolation_project_baseline(
     proposal: &mut SdrfProposal,
     state: &ScientificWorkspaceState,
     issues: &mut Vec<ValidationIssue>,
 ) {
-    if state.harness_version != SCIENTIFIC_AGENT_FACTOR_CANONICAL_HARDENED_VERSION {
+    if !factor_isolation_hardening_enabled(state) {
         return;
     }
     let current = proposal.single_cell_isolation_method.trim().to_string();
@@ -5746,6 +6055,122 @@ fn adjudicate_hardened_factor_isolation_claim(
     }
 }
 
+fn harden_factor_acquisition_project_baseline(
+    proposal: &mut SdrfProposal,
+    state: &ScientificWorkspaceState,
+    issues: &mut Vec<ValidationIssue>,
+) {
+    if state.harness_version != SCIENTIFIC_AGENT_FACTOR_SEMANTIC_FIDELITY_HARDENED_VERSION {
+        return;
+    }
+    let current = proposal
+        .proteomics_data_acquisition_method
+        .trim()
+        .to_string();
+    if current.is_empty() || canonical_reserved_alias(&current).is_some() {
+        return;
+    }
+    let observations = state
+        .claims
+        .iter()
+        .filter(|claim| {
+            claim.concept_type == "acquisition_mode"
+                && matches!(claim.status.as_str(), "supported" | "hypothesis")
+                && !claim.value.trim().is_empty()
+        })
+        .collect::<Vec<_>>();
+    if observations.is_empty() {
+        return;
+    }
+    if observations
+        .iter()
+        .all(|claim| acquisition_canonicalization_is_observation_faithful(&claim.value, &current))
+    {
+        return;
+    }
+
+    proposal.proteomics_data_acquisition_method = "not available".into();
+    proposal
+        .evidence_refs
+        .remove("proteomics_data_acquisition_method");
+    issues.push(ValidationIssue {
+        level: "warning".into(),
+        code: "scientific_agent_factor_acquisition_semantic_fidelity_baseline_mask".into(),
+        row: 0,
+        column: "comment[proteomics data acquisition method]".into(),
+        message: format!(
+            "semantic-fidelity-hardened factor mode removed project acquisition value '{}' because it is not semantically faithful to the accepted factor-scoped acquisition observations",
+            current
+        ),
+    });
+}
+
+fn adjudicate_semantic_fidelity_factor_acquisition_claim(
+    evidence: &DatasetEvidence,
+    claim: &ScientificClaim,
+) -> ClaimAdjudication {
+    let observed_mode = acquisition_mode_semantic_class(&claim.value);
+    match adjudicate_claim(evidence, claim) {
+        ClaimAdjudication::Canonical {
+            value,
+            evidence_refs,
+        } => {
+            let canonical_mode = acquisition_mode_semantic_class(&value);
+            match (observed_mode, canonical_mode) {
+                (Some(observed), Some(canonical)) if observed == canonical => {
+                    ClaimAdjudication::Canonical {
+                        value,
+                        evidence_refs,
+                    }
+                }
+                (Some(observed), Some(_)) => {
+                    let refs = field_relevant_claim_refs(
+                        evidence,
+                        &claim.concept_type,
+                        &claim.evidence_refs,
+                    );
+                    match acquisition_canonical_value(observed) {
+                        Some(corrected) if !refs.is_empty() => ClaimAdjudication::Canonical {
+                            value: corrected,
+                            evidence_refs: refs,
+                        },
+                        _ => ClaimAdjudication::Conflict {
+                            reason: format!(
+                                "semantic-fidelity hardening rejected acquisition canonicalization '{}' for source-faithful observation '{}'",
+                                value,
+                                claim.value.trim()
+                            ),
+                        },
+                    }
+                }
+                _ => ClaimAdjudication::Conflict {
+                    reason: format!(
+                        "semantic-fidelity hardening could not prove that acquisition observation '{}' supports canonical value '{}'",
+                        claim.value.trim(),
+                        value
+                    ),
+                },
+            }
+        }
+        ClaimAdjudication::Conflict { reason } => {
+            if let Some(observed) = observed_mode {
+                let refs =
+                    field_relevant_claim_refs(evidence, &claim.concept_type, &claim.evidence_refs);
+                if let Some(corrected) = acquisition_canonical_value(observed) {
+                    if !refs.is_empty() {
+                        return ClaimAdjudication::Canonical {
+                            value: corrected,
+                            evidence_refs: refs,
+                        };
+                    }
+                }
+            }
+            ClaimAdjudication::Conflict { reason }
+        }
+        other => other,
+    }
+}
+
 fn adjudication_equivalence_key(
     evidence: &DatasetEvidence,
     claim: &ScientificClaim,
@@ -5783,10 +6208,13 @@ fn adjudicate_workspace_claim(
             ),
         };
     }
-    if state.harness_version == SCIENTIFIC_AGENT_FACTOR_CANONICAL_HARDENED_VERSION
-        && claim.concept_type == "isolation_method"
-    {
+    if factor_isolation_hardening_enabled(state) && claim.concept_type == "isolation_method" {
         return adjudicate_hardened_factor_isolation_claim(evidence, claim);
+    }
+    if state.harness_version == SCIENTIFIC_AGENT_FACTOR_SEMANTIC_FIDELITY_HARDENED_VERSION
+        && claim.concept_type == "acquisition_mode"
+    {
+        return adjudicate_semantic_fidelity_factor_acquisition_claim(evidence, claim);
     }
     adjudicate_claim(evidence, claim)
 }
@@ -6323,6 +6751,7 @@ fn compile_workspace(
     ));
     apply_dynamic_semantic_bootstrap(&mut proposal, evidence, &mut issues);
     harden_factor_isolation_project_baseline(&mut proposal, state, &mut issues);
+    harden_factor_acquisition_project_baseline(&mut proposal, state, &mut issues);
     apply_scientific_overlay(&mut proposal, evidence, state, &mut issues);
     issues.extend(apply_publication_compatibility_normalization(&mut proposal));
     if let Some(issue) = sanitize_nonindividual_semantic_proposal(&mut proposal) {
@@ -7528,6 +7957,9 @@ pub async fn run_scientific_sdrf_agent(
     opts: SdrfScientificAgentOptions,
 ) -> Result<SdrfScientificAgentSummary> {
     let requested_mode = std::env::var("PRIDE_SCP_SCIENTIFIC_AGENT_MODE").unwrap_or_default();
+    if requested_mode == SCIENTIFIC_AGENT_FACTOR_SEMANTIC_FIDELITY_HARDENED_MODE {
+        return run_factor_semantic_fidelity_hardened(opts).await;
+    }
     if requested_mode == SCIENTIFIC_AGENT_FACTOR_CANONICAL_HARDENED_MODE {
         return run_factor_canonical_hardened(opts).await;
     }
@@ -7545,8 +7977,9 @@ pub async fn run_scientific_sdrf_agent(
     }
     if !requested_mode.trim().is_empty() {
         bail!(
-            "unsupported PRIDE_SCP_SCIENTIFIC_AGENT_MODE='{}'; expected '{}', '{}', '{}', '{}', or '{}' or unset for the v1.3 workspace agent",
+            "unsupported PRIDE_SCP_SCIENTIFIC_AGENT_MODE='{}'; expected '{}', '{}', '{}', '{}', '{}', or '{}' or unset for the v1.3 workspace agent",
             requested_mode,
+            SCIENTIFIC_AGENT_FACTOR_SEMANTIC_FIDELITY_HARDENED_MODE,
             SCIENTIFIC_AGENT_FACTOR_CANONICAL_HARDENED_MODE,
             SCIENTIFIC_AGENT_FACTOR_DETERMINISTIC_BRIDGE_MODE,
             SCIENTIFIC_AGENT_FACTOR_PHASE_B_MODE,
@@ -10060,6 +10493,145 @@ mod tests {
         assert!(
             matches!(adjudicate_workspace_claim(&evidence, &state, &claim), ClaimAdjudication::Canonical { ref value, .. } if value == "Data-independent acquisition")
         );
+    }
+
+    #[test]
+    fn v2_semantic_fidelity_hardening_maps_explicit_dda_pasef_to_dda() {
+        let evidence = evidence_with(
+            vec![EvidenceItem {
+                id: "E0001".into(),
+                source_kind: "manuscript_semantic_evidence".into(),
+                source_label: "acquisition".into(),
+                text: "Library fractions were measured using DDA-PASEF on timsTOF SCP.".into(),
+            }],
+            vec!["run.raw"],
+        );
+        let claim = claim(
+            "acquisition_mode",
+            "DDA-PASEF on timsTOF SCP",
+            "branch",
+            "A002",
+        );
+        let state = ScientificWorkspaceState {
+            harness_version: SCIENTIFIC_AGENT_FACTOR_SEMANTIC_FIDELITY_HARDENED_VERSION.into(),
+            claims: vec![claim.clone()],
+            ..Default::default()
+        };
+        assert!(
+            matches!(adjudicate_workspace_claim(&evidence, &state, &claim), ClaimAdjudication::Canonical { ref value, .. } if value == "NT=data-dependent acquisition;AC=PRIDE:0000627")
+        );
+    }
+
+    #[test]
+    fn v2_semantic_fidelity_hardening_preserves_explicit_dia_pasef() {
+        let evidence = evidence_with(
+            vec![EvidenceItem {
+                id: "E0001".into(),
+                source_kind: "manuscript_semantic_evidence".into(),
+                source_label: "acquisition".into(),
+                text: "Single-fiber peptides were measured by DIA-PASEF.".into(),
+            }],
+            vec!["run.raw"],
+        );
+        let claim = claim(
+            "acquisition_mode",
+            "DIA-PASEF on timsTOF SCP",
+            "branch",
+            "A001",
+        );
+        let state = ScientificWorkspaceState {
+            harness_version: SCIENTIFIC_AGENT_FACTOR_SEMANTIC_FIDELITY_HARDENED_VERSION.into(),
+            claims: vec![claim.clone()],
+            ..Default::default()
+        };
+        assert!(
+            matches!(adjudicate_workspace_claim(&evidence, &state, &claim), ClaimAdjudication::Canonical { ref value, .. } if value == "Data-independent acquisition")
+        );
+    }
+
+    #[test]
+    fn v2_semantic_fidelity_hardening_never_flips_dda_observation_to_dia() {
+        let evidence = evidence_with(
+            vec![EvidenceItem { id:"E0001".into(), source_kind:"manuscript_semantic_evidence".into(), source_label:"acquisition".into(), text:"The experiment contains DIA-PASEF single-fiber runs and DDA-PASEF library fractions.".into() }],
+            vec!["run.raw"],
+        );
+        let claim = claim(
+            "acquisition_mode",
+            "DDA-PASEF on timsTOF SCP",
+            "branch",
+            "A002",
+        );
+        let state = ScientificWorkspaceState {
+            harness_version: SCIENTIFIC_AGENT_FACTOR_SEMANTIC_FIDELITY_HARDENED_VERSION.into(),
+            claims: vec![claim.clone()],
+            ..Default::default()
+        };
+        match adjudicate_workspace_claim(&evidence, &state, &claim) {
+            ClaimAdjudication::Canonical { value, .. } => {
+                assert_eq!(value, "NT=data-dependent acquisition;AC=PRIDE:0000627")
+            }
+            other => panic!("expected explicit DDA observation to remain DDA, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn v2_semantic_fidelity_hardening_does_not_promote_dia_nn_search_to_dia() {
+        let evidence = evidence_with(
+            vec![EvidenceItem {
+                id: "E0001".into(),
+                source_kind: "manuscript_semantic_evidence".into(),
+                source_label: "acquisition".into(),
+                text: "DIA-NN library-free search was used for data processing.".into(),
+            }],
+            vec!["run.raw"],
+        );
+        let claim = claim(
+            "acquisition_mode",
+            "DIA-NN library-free search on EvoSep One system",
+            "project",
+            "",
+        );
+        let state = ScientificWorkspaceState {
+            harness_version: SCIENTIFIC_AGENT_FACTOR_SEMANTIC_FIDELITY_HARDENED_VERSION.into(),
+            claims: vec![claim.clone()],
+            ..Default::default()
+        };
+        assert!(!matches!(
+            adjudicate_workspace_claim(&evidence, &state, &claim),
+            ClaimAdjudication::Canonical { .. }
+        ));
+    }
+
+    #[test]
+    fn v2_semantic_fidelity_hardening_masks_unfaithful_acquisition_baseline() {
+        let mut proposal = SdrfProposal::default();
+        proposal.proteomics_data_acquisition_method = "Data-independent acquisition".into();
+        proposal.evidence_refs.insert(
+            "proteomics_data_acquisition_method".into(),
+            vec!["E0001".into()],
+        );
+        let state = ScientificWorkspaceState {
+            harness_version: SCIENTIFIC_AGENT_FACTOR_SEMANTIC_FIDELITY_HARDENED_VERSION.into(),
+            claims: vec![ScientificClaim {
+                concept_type: "acquisition_mode".into(),
+                value: "DDA-PASEF on timsTOF SCP".into(),
+                scope: "branch".into(),
+                branch_id: "A002".into(),
+                status: "supported".into(),
+                evidence_refs: vec!["E0001".into()],
+                confidence: "high".into(),
+                reason: "accepted factor observation".into(),
+            }],
+            ..Default::default()
+        };
+        let mut issues = Vec::new();
+        harden_factor_acquisition_project_baseline(&mut proposal, &state, &mut issues);
+        assert_eq!(proposal.proteomics_data_acquisition_method, "not available");
+        assert!(!proposal
+            .evidence_refs
+            .contains_key("proteomics_data_acquisition_method"));
+        assert!(issues.iter().any(|issue| issue.code
+            == "scientific_agent_factor_acquisition_semantic_fidelity_baseline_mask"));
     }
 
     #[test]
