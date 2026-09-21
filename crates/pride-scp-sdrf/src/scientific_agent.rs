@@ -572,6 +572,70 @@ struct StudyFactorGraphAcceptance {
     model_calls: usize,
 }
 
+pub const SCIENTIFIC_AGENT_FACTOR_PHASE_B_MODE: &str = "study_factor_graph_v2_phase_b";
+pub const SCIENTIFIC_AGENT_FACTOR_PHASE_B_VERSION: &str =
+    "pride-scp-scientific-workspace-agent-v2-factor-phase-b";
+const SCIENTIFIC_AGENT_FACTOR_GRAPH_ROOT_ENV: &str = "PRIDE_SCP_FACTOR_GRAPH_STAGE1_ROOT";
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+struct FactorObservationProposal {
+    target_factor_id: String,
+    concept_type: String,
+    observed_value: String,
+    #[serde(default)]
+    evidence_refs: Vec<String>,
+    confidence: String,
+    notes: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+struct FactorObservationBundleProposal {
+    decision: String,
+    #[serde(default)]
+    observations: Vec<FactorObservationProposal>,
+    #[serde(default)]
+    open_questions: Vec<String>,
+    reason: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct AcceptedFactorObservation {
+    target_factor_id: String,
+    target_factor_kind: String,
+    concept_type: String,
+    observed_value: String,
+    #[serde(default)]
+    evidence_refs: Vec<String>,
+    confidence: String,
+    projection_scope: String,
+    notes: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct RejectedFactorObservation {
+    target_factor_id: String,
+    concept_type: String,
+    observed_value: String,
+    reason: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct FactorPhaseBAcceptance {
+    harness_version: String,
+    accession: String,
+    status: String,
+    #[serde(default)]
+    observations: Vec<AcceptedFactorObservation>,
+    #[serde(default)]
+    rejected_observations: Vec<RejectedFactorObservation>,
+    #[serde(default)]
+    open_questions: Vec<String>,
+    reason: String,
+    model_calls: usize,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "command", rename_all = "snake_case", deny_unknown_fields)]
 enum AgentCommand {
@@ -2842,6 +2906,779 @@ async fn run_factor_graph_stage1(
     fs::write(
         opts.output_dir
             .join("study_factor_graph_stage1_summary.json"),
+        &rendered,
+    )?;
+    fs::write(
+        opts.output_dir.join("scientific_agent_summary.json"),
+        rendered,
+    )?;
+    Ok(summary)
+}
+
+fn factor_phase_b_concept_types() -> Vec<&'static str> {
+    vec![
+        "organism_part",
+        "disease",
+        "cell_type",
+        "cell_line",
+        "sample_type",
+        "isolation_method",
+        "acquisition_mode",
+        "labeling",
+        "instrument",
+        "cleavage_agent",
+        "control_role",
+        "biological_condition",
+    ]
+}
+
+fn factor_phase_b_schema() -> Value {
+    json!({
+        "type":"object",
+        "properties":{
+            "decision":{"type":"string","enum":["propose_observations","human_review"]},
+            "observations":{
+                "type":"array",
+                "maxItems":48,
+                "items":{
+                    "type":"object",
+                    "properties":{
+                        "target_factor_id":{"type":"string","pattern":"^[MRA][0-9]{3}$"},
+                        "concept_type":{"type":"string","enum":factor_phase_b_concept_types()},
+                        "observed_value":{"type":"string","minLength":1,"maxLength":1200},
+                        "evidence_refs":{
+                            "type":"array",
+                            "items":{"type":"string","pattern":"^E[0-9]{4}$"},
+                            "minItems":1,
+                            "maxItems":16
+                        },
+                        "confidence":{"type":"string","enum":["high","medium","low"]},
+                        "notes":{"type":"string","maxLength":1000}
+                    },
+                    "required":["target_factor_id","concept_type","observed_value","evidence_refs","confidence","notes"],
+                    "additionalProperties":false
+                }
+            },
+            "open_questions":{"type":"array","items":{"type":"string","maxLength":700},"maxItems":24},
+            "reason":{"type":"string","maxLength":1800}
+        },
+        "required":["decision","observations","open_questions","reason"],
+        "additionalProperties":false
+    })
+}
+
+fn factor_graph_node_kind(graph: &StudyFactorGraphAcceptance, id: &str) -> Option<&'static str> {
+    if graph.materials.iter().any(|node| node.id == id) {
+        Some("material")
+    } else if graph.regimes.iter().any(|node| node.id == id) {
+        Some("regime")
+    } else if graph.acquisitions.iter().any(|node| node.id == id) {
+        Some("acquisition")
+    } else {
+        None
+    }
+}
+
+fn factor_concept_allowed_for_kind(kind: &str, concept: &str) -> bool {
+    match kind {
+        "material" => matches!(
+            concept,
+            "organism_part"
+                | "disease"
+                | "cell_type"
+                | "cell_line"
+                | "sample_type"
+                | "control_role"
+                | "biological_condition"
+        ),
+        "regime" => matches!(
+            concept,
+            "isolation_method"
+                | "sample_type"
+                | "labeling"
+                | "cleavage_agent"
+                | "control_role"
+                | "biological_condition"
+        ),
+        "acquisition" => matches!(concept, "acquisition_mode" | "instrument"),
+        _ => false,
+    }
+}
+
+fn factor_observation_project_safe(
+    graph: &StudyFactorGraphAcceptance,
+    target_factor_id: &str,
+    concept_type: &str,
+) -> bool {
+    match factor_graph_node_kind(graph, target_factor_id) {
+        Some("material") => {
+            if graph.materials.len() != 1 {
+                return false;
+            }
+            if matches!(concept_type, "sample_type" | "control_role") {
+                graph.regimes.len() <= 1
+            } else {
+                true
+            }
+        }
+        Some("regime") => {
+            if graph.regimes.len() != 1 {
+                return false;
+            }
+            let material_ids = graph
+                .materials
+                .iter()
+                .map(|node| node.id.as_str())
+                .collect::<BTreeSet<_>>();
+            let related_materials = graph
+                .relations
+                .iter()
+                .filter(|relation| {
+                    relation.relation_type == "material_to_regime"
+                        && relation.target_id == target_factor_id
+                })
+                .map(|relation| relation.source_id.as_str())
+                .collect::<BTreeSet<_>>();
+            material_ids.is_empty() || related_materials == material_ids
+        }
+        Some("acquisition") => {
+            if graph.acquisitions.len() != 1 {
+                return false;
+            }
+            let regime_ids = graph
+                .regimes
+                .iter()
+                .map(|node| node.id.as_str())
+                .collect::<BTreeSet<_>>();
+            let related_regimes = graph
+                .relations
+                .iter()
+                .filter(|relation| {
+                    relation.relation_type == "regime_to_acquisition"
+                        && relation.target_id == target_factor_id
+                })
+                .map(|relation| relation.source_id.as_str())
+                .collect::<BTreeSet<_>>();
+            regime_ids.is_empty() || related_regimes == regime_ids
+        }
+        _ => false,
+    }
+}
+
+fn factor_phase_b_prompt(
+    opts: &SdrfScientificAgentOptions,
+    evidence: &DatasetEvidence,
+    graph: &StudyFactorGraphAcceptance,
+) -> String {
+    let evidence_block = study_graph_stage1_evidence_block(
+        evidence,
+        opts.max_evidence_items.min(48),
+        opts.max_evidence_chars.min(60000),
+    );
+    let graph_json = serde_json::to_string_pretty(graph).unwrap_or_else(|_| "{}".into());
+    format!(
+        "You are performing bounded PHASE B scientific observation synthesis for PRIDE single-cell proteomics dataset {acc}.\n\n\
+The prerequisite factor graph below has already been accepted by Rust. You MUST use its canonical M###, R###, and A### IDs exactly. You cannot create, rename, merge, or infer factor IDs.\n\n\
+THIS IS ONE SHOT. There is no conversational repair loop. Return source-faithful observations or human_review.\n\n\
+OBSERVATION CONTRACT:\n\
+- Record what the trusted source actually says. Do NOT choose SDRF controlled-vocabulary values. Rust owns canonicalization, template-gap detection, conflicts, row construction, and validation.\n\
+- Preserve source terminology. Do not expand or normalize acronyms unless the cited source explicitly supplies that expansion.\n\
+- target_factor_id MUST be an existing accepted factor ID.\n\
+- isolation_method observations target R### experimental-regime nodes. Preserve a source-faithful cell isolation/loading/sampling operation represented by the regime even when Rust may later classify it unresolved or template_gap. A prepared digest being injected into CE/LC is NOT a single-cell isolation method.\n\
+- acquisition_mode means the proteomics acquisition strategy (for example DIA/DDA), not a metabolomics-only direct ESI workflow. It targets A### nodes.\n\
+- instrument observations target A### nodes.\n\
+- organism_part, disease, cell_type, cell_line and biological_condition observations target M### material nodes.\n\
+- sample_type may target the material or regime only when the cited source directly supports that scope.\n\
+- Do not restate organism identity merely because it is already present in the factor graph.\n\
+- Do not infer any RAW-file mapping from filenames. RAW mapping is outside Phase B.\n\
+- Every observation requires field-relevant E#### evidence. If a field cannot be supported, omit it rather than guessing.\n\n\
+ACCEPTED FACTOR GRAPH:\n{graph_json}\n\n\
+TRUSTED EVIDENCE:\n{evidence_block}\n\n\
+Return ONLY the FactorObservationBundleProposal JSON object matching the schema.",
+        acc = evidence.accession,
+        graph_json = graph_json,
+        evidence_block = evidence_block,
+    )
+}
+
+async fn call_factor_phase_b(
+    opts: &SdrfScientificAgentOptions,
+    evidence: &DatasetEvidence,
+    graph: &StudyFactorGraphAcceptance,
+) -> Result<FactorObservationBundleProposal> {
+    let client = Client::builder()
+        .timeout(Duration::from_secs(opts.timeout_seconds))
+        .build()?;
+    let payload = json!({
+        "model": opts.model,
+        "prompt": factor_phase_b_prompt(opts, evidence, graph),
+        "stream": false,
+        "think": false,
+        "format": factor_phase_b_schema(),
+        "options": {"temperature": 0.0}
+    });
+    let response = client
+        .post(&opts.ollama_url)
+        .json(&payload)
+        .send()
+        .await
+        .with_context(|| format!("Ollama factor Phase-B request for {}", evidence.accession))?;
+    let status = response.status();
+    let body: Value = response
+        .json()
+        .await
+        .context("decode Ollama factor Phase-B response")?;
+    if !status.is_success() {
+        bail!("Ollama factor Phase-B HTTP {status}: {body}");
+    }
+    let raw = body.get("response").and_then(Value::as_str).unwrap_or("");
+    if raw.trim().is_empty() {
+        bail!("Ollama returned empty factor Phase-B response");
+    }
+    serde_json::from_str(raw).context("parse structured factor Phase-B observation bundle")
+}
+
+fn accept_factor_phase_b_observations(
+    evidence: &DatasetEvidence,
+    graph: &StudyFactorGraphAcceptance,
+    proposal: &FactorObservationBundleProposal,
+) -> FactorPhaseBAcceptance {
+    if proposal.decision == "human_review" {
+        return FactorPhaseBAcceptance {
+            harness_version: SCIENTIFIC_AGENT_FACTOR_PHASE_B_VERSION.into(),
+            accession: evidence.accession.clone(),
+            status: "human_review".into(),
+            observations: Vec::new(),
+            rejected_observations: Vec::new(),
+            open_questions: proposal.open_questions.clone(),
+            reason: proposal.reason.clone(),
+            model_calls: 1,
+        };
+    }
+
+    let allowed_concepts = factor_phase_b_concept_types()
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+    let mut prelim = Vec::new();
+    let mut rejected = Vec::new();
+
+    for obs in &proposal.observations {
+        let target = obs.target_factor_id.trim().to_ascii_uppercase();
+        let concept = obs.concept_type.trim().to_ascii_lowercase();
+        let value = normalize_study_graph_text(&obs.observed_value);
+        let Some(kind) = factor_graph_node_kind(graph, &target) else {
+            rejected.push(RejectedFactorObservation {
+                target_factor_id: target,
+                concept_type: concept,
+                observed_value: value,
+                reason: "observation rejected: target factor ID is not present in the accepted Rust-owned factor graph".into(),
+            });
+            continue;
+        };
+        if !allowed_concepts.contains(concept.as_str())
+            || !factor_concept_allowed_for_kind(kind, &concept)
+        {
+            rejected.push(RejectedFactorObservation {
+                target_factor_id: target,
+                concept_type: concept,
+                observed_value: value,
+                reason: format!(
+                    "observation rejected: concept is not valid for {kind} factor scope"
+                ),
+            });
+            continue;
+        }
+        if value.is_empty() || canonical_reserved_alias(&value).is_some() {
+            rejected.push(RejectedFactorObservation {
+                target_factor_id: target,
+                concept_type: concept,
+                observed_value: value,
+                reason: "observation rejected: source-faithful value is empty or only a reserved placeholder".into(),
+            });
+            continue;
+        }
+        let refs = field_relevant_claim_refs(evidence, &concept, &obs.evidence_refs);
+        if refs.is_empty() {
+            rejected.push(RejectedFactorObservation {
+                target_factor_id: target,
+                concept_type: concept,
+                observed_value: value,
+                reason: "observation rejected: no field-relevant trusted evidence refs survived Rust validation".into(),
+            });
+            continue;
+        }
+        let confidence = match obs.confidence.trim().to_ascii_lowercase().as_str() {
+            "high" => "high",
+            "medium" => "medium",
+            "low" => "low",
+            _ => "low",
+        };
+        let projection_scope = if factor_observation_project_safe(graph, &target, &concept) {
+            "project".into()
+        } else {
+            "factor".into()
+        };
+        prelim.push(AcceptedFactorObservation {
+            target_factor_id: target.clone(),
+            target_factor_kind: kind.into(),
+            concept_type: concept,
+            observed_value: value,
+            evidence_refs: refs,
+            confidence: confidence.into(),
+            projection_scope,
+            notes: normalize_study_graph_text(&obs.notes),
+        });
+    }
+
+    let mut grouped: BTreeMap<(String, String), Vec<AcceptedFactorObservation>> = BTreeMap::new();
+    for obs in prelim {
+        grouped
+            .entry((obs.target_factor_id.clone(), obs.concept_type.clone()))
+            .or_default()
+            .push(obs);
+    }
+    let mut accepted = Vec::new();
+    for ((_target, _concept), mut values) in grouped {
+        let distinct = values
+            .iter()
+            .map(|obs| obs.observed_value.trim().to_ascii_lowercase())
+            .collect::<BTreeSet<_>>();
+        if distinct.len() > 1 {
+            for obs in values {
+                rejected.push(RejectedFactorObservation {
+                    target_factor_id: obs.target_factor_id,
+                    concept_type: obs.concept_type,
+                    observed_value: obs.observed_value,
+                    reason: "observation rejected: one factor/concept identity received conflicting source-faithful values in the same one-shot bundle".into(),
+                });
+            }
+            continue;
+        }
+        let mut first = values.remove(0);
+        for duplicate in values {
+            first.evidence_refs.extend(duplicate.evidence_refs);
+        }
+        first.evidence_refs.sort();
+        first.evidence_refs.dedup();
+        accepted.push(first);
+    }
+    accepted.sort_by(|a, b| {
+        (&a.target_factor_id, &a.concept_type, &a.observed_value).cmp(&(
+            &b.target_factor_id,
+            &b.concept_type,
+            &b.observed_value,
+        ))
+    });
+
+    let status = if accepted.is_empty() {
+        "human_review"
+    } else {
+        "accepted"
+    };
+    let reason = if status == "accepted" {
+        format!(
+            "Rust accepted {} factor-scoped source-faithful observation(s) from one bounded model call",
+            accepted.len()
+        )
+    } else {
+        "Rust could not accept any source-faithful Phase-B observations; stop at human review"
+            .into()
+    };
+
+    FactorPhaseBAcceptance {
+        harness_version: SCIENTIFIC_AGENT_FACTOR_PHASE_B_VERSION.into(),
+        accession: evidence.accession.clone(),
+        status: status.into(),
+        observations: accepted,
+        rejected_observations: rejected,
+        open_questions: proposal.open_questions.clone(),
+        reason,
+        model_calls: 1,
+    }
+}
+
+fn factor_graph_as_agent_branches(graph: &StudyFactorGraphAcceptance) -> Vec<AgentBranch> {
+    let mut result = Vec::new();
+    let mut add = |id: &str, label: &str, refs: &[String]| {
+        let mut raw_files = graph
+            .raw_links
+            .iter()
+            .filter(|link| link.node_id == id)
+            .map(|link| link.raw_file.clone())
+            .collect::<Vec<_>>();
+        raw_files.sort();
+        raw_files.dedup();
+        result.push(AgentBranch {
+            id: id.into(),
+            label: label.into(),
+            status: "supported".into(),
+            evidence_refs: refs.to_vec(),
+            linked_raw_files: raw_files.clone(),
+            linkage_status: if raw_files.is_empty() {
+                "unresolved".into()
+            } else {
+                "supported".into()
+            },
+            notes: "Rust-owned factor node exposed to the deterministic compiler as scoped scientific structure".into(),
+        });
+    };
+    for node in &graph.materials {
+        add(&node.id, &node.label, &node.evidence_refs);
+    }
+    for node in &graph.regimes {
+        add(&node.id, &node.label, &node.evidence_refs);
+    }
+    for node in &graph.acquisitions {
+        add(&node.id, &node.label, &node.evidence_refs);
+    }
+    result
+}
+
+fn factor_observation_as_claim(obs: &AcceptedFactorObservation) -> ScientificClaim {
+    let project = obs.projection_scope == "project";
+    ScientificClaim {
+        concept_type: obs.concept_type.clone(),
+        value: obs.observed_value.clone(),
+        scope: if project {
+            "project".into()
+        } else {
+            "branch".into()
+        },
+        branch_id: if project {
+            String::new()
+        } else {
+            obs.target_factor_id.clone()
+        },
+        status: "supported".into(),
+        evidence_refs: obs.evidence_refs.clone(),
+        confidence: obs.confidence.clone(),
+        reason: format!(
+            "factor-scoped Phase-B observation on {}: {}",
+            obs.target_factor_id, obs.notes
+        ),
+    }
+}
+
+fn load_factor_graph_for_phase_b(accession: &str) -> Result<(PathBuf, StudyFactorGraphAcceptance)> {
+    let root = std::env::var(SCIENTIFIC_AGENT_FACTOR_GRAPH_ROOT_ENV).with_context(|| {
+        format!(
+            "{} must point to a completed v2 factor Stage-1 output root",
+            SCIENTIFIC_AGENT_FACTOR_GRAPH_ROOT_ENV
+        )
+    })?;
+    let path = PathBuf::from(root)
+        .join("study_factor_graphs")
+        .join(accession)
+        .join("accepted_graph.json");
+    if !path.is_file() {
+        bail!(
+            "accepted factor graph not found for {accession}: {}",
+            path.display()
+        );
+    }
+    let graph: StudyFactorGraphAcceptance = serde_json::from_str(&fs::read_to_string(&path)?)
+        .with_context(|| format!("parse accepted factor graph {}", path.display()))?;
+    if graph.harness_version != SCIENTIFIC_AGENT_FACTOR_GRAPH_STAGE1_VERSION {
+        bail!(
+            "factor graph for {accession} has harness_version='{}', expected '{}'",
+            graph.harness_version,
+            SCIENTIFIC_AGENT_FACTOR_GRAPH_STAGE1_VERSION
+        );
+    }
+    if graph.accession != accession {
+        bail!(
+            "factor graph accession mismatch: expected {accession}, found {}",
+            graph.accession
+        );
+    }
+    if graph.status != "accepted" {
+        bail!(
+            "factor graph for {accession} is not accepted: status={}",
+            graph.status
+        );
+    }
+    Ok((path, graph))
+}
+
+fn write_factor_phase_b_review(
+    path: &Path,
+    graph: &StudyFactorGraphAcceptance,
+    acceptance: &FactorPhaseBAcceptance,
+    adjudications: &[ClaimAdjudicationRecord],
+    validation: &AgentValidationCycle,
+    terminal_status: &str,
+) -> Result<()> {
+    let mut out = String::new();
+    out.push_str(&format!(
+        "# PRIDE-SCP v2 Factor Phase B: {}\n\n",
+        acceptance.accession
+    ));
+    out.push_str(&format!("Terminal status: **{}**\n\n", terminal_status));
+    out.push_str(&format!(
+        "Accepted factor graph: materials={}, regimes={}, acquisitions={}, relations={}\n\n",
+        graph.materials.len(),
+        graph.regimes.len(),
+        graph.acquisitions.len(),
+        graph.relations.len()
+    ));
+    out.push_str("## Accepted source-faithful observations\n\n");
+    if acceptance.observations.is_empty() {
+        out.push_str("None.\n");
+    } else {
+        for obs in &acceptance.observations {
+            out.push_str(&format!(
+                "- {} [{}] {}='{}' | scope={} | evidence={:?} | confidence={}\n",
+                obs.target_factor_id,
+                obs.target_factor_kind,
+                obs.concept_type,
+                obs.observed_value,
+                obs.projection_scope,
+                obs.evidence_refs,
+                obs.confidence
+            ));
+        }
+    }
+    out.push_str("\n## Rust adjudications\n\n");
+    out.push_str(&serde_json::to_string_pretty(adjudications)?);
+    out.push_str("\n\n## One-pass validation\n\n");
+    out.push_str(&format!(
+        "errors={} warnings={}\n\n",
+        validation.validation_errors, validation.validation_warnings
+    ));
+    for message in &validation.representative_messages {
+        out.push_str(&format!("- {}\n", message));
+    }
+    if !acceptance.open_questions.is_empty() {
+        out.push_str("\n## Open questions\n\n");
+        for question in &acceptance.open_questions {
+            out.push_str(&format!("- {}\n", question));
+        }
+    }
+    fs::write(path, out)?;
+    Ok(())
+}
+
+async fn run_one_factor_phase_b(
+    opts: &SdrfScientificAgentOptions,
+    accession: &str,
+) -> Result<ScientificAgentResultRow> {
+    let annotate_opts = opts.annotate_options();
+    let evidence = build_evidence(&annotate_opts, accession)?;
+    let explicit_mappings = if let Some(path) = opts.explicit_row_mapping_manifest.as_deref() {
+        if !path.is_file() {
+            bail!(
+                "explicit row-mapping manifest not found: {}",
+                path.display()
+            );
+        }
+        load_explicit_row_mappings(path, accession, &evidence.raw_files)?
+    } else {
+        Vec::new()
+    };
+    let (graph_path, graph) = load_factor_graph_for_phase_b(accession)?;
+    let root = opts.output_dir.join("phase_b").join(accession);
+    fs::create_dir_all(&root)?;
+    let evidence_path = root.join("evidence.json");
+    let proposal_path = root.join("observation_bundle.proposal.json");
+    let accepted_path = root.join("accepted_observations.json");
+    let adjudications_path = root.join("adjudications.json");
+    let draft_path = root.join(format!("{}.phase_b.sdrf.tsv", accession));
+    let validation_path = root.join("VALIDATION.md");
+    let review_path = root.join("REVIEW.md");
+    let result_path = root.join("result.json");
+    fs::write(&evidence_path, serde_json::to_string_pretty(&evidence)?)?;
+    fs::copy(&graph_path, root.join("accepted_factor_graph.json"))?;
+
+    let proposal = call_factor_phase_b(opts, &evidence, &graph).await?;
+    fs::write(&proposal_path, serde_json::to_string_pretty(&proposal)?)?;
+    let acceptance = accept_factor_phase_b_observations(&evidence, &graph, &proposal);
+    fs::write(&accepted_path, serde_json::to_string_pretty(&acceptance)?)?;
+
+    let claims = acceptance
+        .observations
+        .iter()
+        .map(factor_observation_as_claim)
+        .collect::<Vec<_>>();
+    let state = ScientificWorkspaceState {
+        harness_version: SCIENTIFIC_AGENT_FACTOR_PHASE_B_VERSION.into(),
+        accession: accession.into(),
+        turn: 1,
+        relation: AgentRelation {
+            mode: if study_design_has_assertive_relation_hint(&evidence.study_design) {
+                evidence.study_design.relation_mode_hint.clone()
+            } else {
+                "unresolved".into()
+            },
+            scope: if study_design_has_assertive_relation_hint(&evidence.study_design) {
+                "project".into()
+            } else {
+                "unresolved".into()
+            },
+            evidence_refs: evidence.study_design.relation_evidence_refs.clone(),
+            confidence: evidence.study_design.relation_confidence.clone(),
+            reason: evidence.study_design.notes.clone(),
+        },
+        branches: factor_graph_as_agent_branches(&graph),
+        claims,
+        open_questions: acceptance.open_questions.clone(),
+        active_task_id: String::new(),
+        next_step: "compile".into(),
+        notes: "bounded factor-scoped Phase-B state; no conversational retry is permitted".into(),
+        ..Default::default()
+    };
+
+    let compiled = compile_workspace(&evidence, &state, &explicit_mappings)?;
+    write_sdrf(&draft_path, &compiled.headers, &compiled.rows)?;
+    write_validation_review(&validation_path, &compiled.issues)?;
+    let validation = validation_cycle(1, &compiled.issues);
+    let adjudications = workspace_adjudications(&evidence, &state);
+    fs::write(
+        &adjudications_path,
+        serde_json::to_string_pretty(&adjudications)?,
+    )?;
+
+    let has_template_gap = adjudications
+        .iter()
+        .any(|record| matches!(&record.adjudication, ClaimAdjudication::TemplateGap { .. }));
+    let terminal_status = if validation.validation_errors == 0 {
+        "locally_valid"
+    } else if has_template_gap {
+        "partial_template_gap"
+    } else if acceptance.status == "accepted" && !acceptance.observations.is_empty() {
+        "partial_human_review"
+    } else {
+        "human_review"
+    };
+
+    write_factor_phase_b_review(
+        &review_path,
+        &graph,
+        &acceptance,
+        &adjudications,
+        &validation,
+        terminal_status,
+    )?;
+    let result = json!({
+        "harness_version": SCIENTIFIC_AGENT_FACTOR_PHASE_B_VERSION,
+        "accession": accession,
+        "factor_graph_source": graph_path,
+        "model_calls": 1,
+        "tool_actions": 0,
+        "validator_cycles": 1,
+        "terminal_status": terminal_status,
+        "accepted_observation_count": acceptance.observations.len(),
+        "rejected_observation_count": acceptance.rejected_observations.len(),
+        "accepted_observations": &acceptance.observations,
+        "rejected_observations": &acceptance.rejected_observations,
+        "adjudications": &adjudications,
+        "validation": &validation,
+        "compiled_fingerprint": &compiled.fingerprint,
+        "draft_path": draft_path.display().to_string(),
+        "review_path": review_path.display().to_string()
+    });
+    fs::write(&result_path, serde_json::to_string_pretty(&result)?)?;
+
+    Ok(ScientificAgentResultRow {
+        accession: accession.into(),
+        status: "success".into(),
+        terminal_status: terminal_status.into(),
+        turns: 1,
+        tool_actions: 0,
+        validator_cycles: 1,
+        branches: graph.materials.len() + graph.regimes.len() + graph.acquisitions.len(),
+        open_questions: acceptance.open_questions.len(),
+        relation_mode: compiled.proposal.relation_mode,
+        locally_valid: validation.validation_errors == 0,
+        validation_errors: validation.validation_errors,
+        draft_path: draft_path.display().to_string(),
+        review_path: review_path.display().to_string(),
+        workspace_path: root.display().to_string(),
+        error: String::new(),
+    })
+}
+
+async fn run_factor_phase_b(
+    opts: SdrfScientificAgentOptions,
+) -> Result<SdrfScientificAgentSummary> {
+    let accessions = collect_accessions_values(&opts.accessions, opts.accessions_file.as_deref())?;
+    if accessions.len() > 1 && !opts.manuscript_text_paths.is_empty() {
+        bail!("--manuscript-text is accession-specific and may only be used for one accession");
+    }
+    fs::create_dir_all(&opts.output_dir)?;
+    let results_path = opts.output_dir.join("factor_phase_b_results.tsv");
+    let mut rows = Vec::new();
+    for (i, accession) in accessions.iter().enumerate() {
+        if opts.progress {
+            eprintln!(
+                "[{}/{}] {} FactorGraph v2 Phase B",
+                i + 1,
+                accessions.len(),
+                accession
+            );
+        }
+        match run_one_factor_phase_b(&opts, accession).await {
+            Ok(row) => {
+                if opts.progress {
+                    eprintln!(
+                        "  -> terminal={} model_calls={} validators={} valid={} errors={}",
+                        row.terminal_status,
+                        row.turns,
+                        row.validator_cycles,
+                        row.locally_valid,
+                        row.validation_errors
+                    );
+                }
+                rows.push(row);
+            }
+            Err(err) => {
+                eprintln!("  -> FactorGraph v2 Phase-B error: {err:#}");
+                rows.push(ScientificAgentResultRow {
+                    accession: accession.clone(),
+                    status: "error".into(),
+                    terminal_status: "error".into(),
+                    turns: 0,
+                    tool_actions: 0,
+                    validator_cycles: 0,
+                    branches: 0,
+                    open_questions: 0,
+                    relation_mode: String::new(),
+                    locally_valid: false,
+                    validation_errors: 0,
+                    draft_path: String::new(),
+                    review_path: String::new(),
+                    workspace_path: String::new(),
+                    error: format!("{err:#}"),
+                });
+            }
+        }
+    }
+    let mut writer = WriterBuilder::new()
+        .delimiter(b'\t')
+        .from_path(&results_path)?;
+    for row in &rows {
+        writer.serialize(row)?;
+    }
+    writer.flush()?;
+    let successful = rows.iter().filter(|row| row.status == "success").count();
+    let locally_valid_drafts = rows.iter().filter(|row| row.locally_valid).count();
+    let summary = SdrfScientificAgentSummary {
+        harness_version: SCIENTIFIC_AGENT_FACTOR_PHASE_B_VERSION.into(),
+        generator_version: GENERATOR_VERSION.into(),
+        accessions_requested: accessions.len(),
+        successful,
+        errors: rows.len().saturating_sub(successful),
+        locally_valid_drafts,
+        incomplete_drafts: successful.saturating_sub(locally_valid_drafts),
+        total_validation_errors: rows.iter().map(|row| row.validation_errors).sum(),
+        total_agent_turns: rows.iter().map(|row| row.turns).sum(),
+        total_tool_actions: 0,
+        total_validator_cycles: rows.iter().map(|row| row.validator_cycles).sum(),
+        results_tsv: results_path.display().to_string(),
+        workspace_root: opts.output_dir.join("phase_b").display().to_string(),
+    };
+    let rendered = serde_json::to_string_pretty(&summary)?;
+    fs::write(
+        opts.output_dir.join("factor_phase_b_summary.json"),
         &rendered,
     )?;
     fs::write(
@@ -5807,6 +6644,9 @@ pub async fn run_scientific_sdrf_agent(
     opts: SdrfScientificAgentOptions,
 ) -> Result<SdrfScientificAgentSummary> {
     let requested_mode = std::env::var("PRIDE_SCP_SCIENTIFIC_AGENT_MODE").unwrap_or_default();
+    if requested_mode == SCIENTIFIC_AGENT_FACTOR_PHASE_B_MODE {
+        return run_factor_phase_b(opts).await;
+    }
     if requested_mode == SCIENTIFIC_AGENT_FACTOR_GRAPH_STAGE1_MODE {
         return run_factor_graph_stage1(opts).await;
     }
@@ -5815,8 +6655,9 @@ pub async fn run_scientific_sdrf_agent(
     }
     if !requested_mode.trim().is_empty() {
         bail!(
-            "unsupported PRIDE_SCP_SCIENTIFIC_AGENT_MODE='{}'; expected '{}' or '{}' or unset for the v1.3 workspace agent",
+            "unsupported PRIDE_SCP_SCIENTIFIC_AGENT_MODE='{}'; expected '{}', '{}', or '{}' or unset for the v1.3 workspace agent",
             requested_mode,
+            SCIENTIFIC_AGENT_FACTOR_PHASE_B_MODE,
             SCIENTIFIC_AGENT_FACTOR_GRAPH_STAGE1_MODE,
             SCIENTIFIC_AGENT_STUDY_GRAPH_STAGE1_MODE
         );
@@ -7735,5 +8576,244 @@ mod tests {
         assert_eq!(accepted.model_calls, 1);
         assert!(accepted.materials.is_empty());
         assert!(accepted.regimes.is_empty());
+    }
+
+    fn phase_b_test_factor_graph() -> StudyFactorGraphAcceptance {
+        StudyFactorGraphAcceptance {
+            harness_version: SCIENTIFIC_AGENT_FACTOR_GRAPH_STAGE1_VERSION.into(),
+            accession: "PXDTEST".into(),
+            status: "accepted".into(),
+            materials: vec![AcceptedFactorMaterial {
+                id: "M001".into(),
+                label: "material".into(),
+                organism: "Homo sapiens".into(),
+                biological_material: "test cells".into(),
+                experimental_role: "source material".into(),
+                evidence_refs: vec!["E0001".into()],
+                notes: String::new(),
+            }],
+            regimes: vec![
+                AcceptedFactorRegime {
+                    id: "R001".into(),
+                    label: "hydrodynamic".into(),
+                    experimental_role: "single-cell".into(),
+                    isolation_or_loading_method: "manual hydrodynamic loading".into(),
+                    input_or_cell_count_regime: "single cell".into(),
+                    evidence_refs: vec!["E0001".into()],
+                    notes: String::new(),
+                },
+                AcceptedFactorRegime {
+                    id: "R002".into(),
+                    label: "spray".into(),
+                    experimental_role: "low input".into(),
+                    isolation_or_loading_method: "spray voltage injection".into(),
+                    input_or_cell_count_regime: "few cells".into(),
+                    evidence_refs: vec!["E0001".into()],
+                    notes: String::new(),
+                },
+            ],
+            acquisitions: vec![AcceptedFactorAcquisition {
+                id: "A001".into(),
+                label: "DIA".into(),
+                acquisition_method_or_platform: "DIA-MS".into(),
+                evidence_refs: vec!["E0001".into()],
+                notes: String::new(),
+            }],
+            relations: vec![
+                AcceptedFactorRelation {
+                    source_id: "M001".into(),
+                    relation_type: "material_to_regime".into(),
+                    target_id: "R001".into(),
+                    evidence_refs: vec!["E0001".into()],
+                    notes: String::new(),
+                },
+                AcceptedFactorRelation {
+                    source_id: "M001".into(),
+                    relation_type: "material_to_regime".into(),
+                    target_id: "R002".into(),
+                    evidence_refs: vec!["E0001".into()],
+                    notes: String::new(),
+                },
+            ],
+            raw_links: Vec::new(),
+            open_questions: Vec::new(),
+            rejected_items: Vec::new(),
+            removed_raw_links: Vec::new(),
+            reason: String::new(),
+            model_calls: 1,
+        }
+    }
+
+    #[test]
+    fn v2_factor_phase_b_schema_uses_rust_factor_ids_without_model_scope() {
+        let schema = factor_phase_b_schema();
+        let text = serde_json::to_string(&schema).unwrap();
+        assert!(text.contains("target_factor_id"));
+        assert!(text.contains("isolation_method"));
+        assert!(!text.contains("branch_id"));
+        assert!(!text.contains("projection_scope"));
+        assert!(!text.contains("canonical_value"));
+    }
+
+    #[test]
+    fn v2_factor_phase_b_rejects_orphan_factor_ids() {
+        let evidence = evidence_with(
+            vec![EvidenceItem {
+                id: "E0001".into(),
+                source_kind: "publication".into(),
+                source_label: "methods".into(),
+                text: "Single cells were manually loaded by hydrodynamic pressure.".into(),
+            }],
+            vec!["run.raw"],
+        );
+        let graph = phase_b_test_factor_graph();
+        let proposal = FactorObservationBundleProposal {
+            decision: "propose_observations".into(),
+            observations: vec![FactorObservationProposal {
+                target_factor_id: "R999".into(),
+                concept_type: "isolation_method".into(),
+                observed_value: "manual hydrodynamic pressure loading".into(),
+                evidence_refs: vec!["E0001".into()],
+                confidence: "high".into(),
+                notes: String::new(),
+            }],
+            open_questions: Vec::new(),
+            reason: String::new(),
+        };
+        let accepted = accept_factor_phase_b_observations(&evidence, &graph, &proposal);
+        assert_eq!(accepted.status, "human_review");
+        assert!(accepted.observations.is_empty());
+        assert_eq!(accepted.rejected_observations.len(), 1);
+    }
+
+    #[test]
+    fn v2_factor_phase_b_rejects_cross_kind_scientific_scope() {
+        let evidence = evidence_with(
+            vec![EvidenceItem {
+                id: "E0001".into(),
+                source_kind: "publication".into(),
+                source_label: "methods".into(),
+                text: "Single cells were manually loaded by hydrodynamic pressure.".into(),
+            }],
+            vec!["run.raw"],
+        );
+        let graph = phase_b_test_factor_graph();
+        let proposal = FactorObservationBundleProposal {
+            decision: "propose_observations".into(),
+            observations: vec![FactorObservationProposal {
+                target_factor_id: "M001".into(),
+                concept_type: "isolation_method".into(),
+                observed_value: "manual hydrodynamic pressure loading".into(),
+                evidence_refs: vec!["E0001".into()],
+                confidence: "high".into(),
+                notes: String::new(),
+            }],
+            open_questions: Vec::new(),
+            reason: String::new(),
+        };
+        let accepted = accept_factor_phase_b_observations(&evidence, &graph, &proposal);
+        assert!(accepted.observations.is_empty());
+        assert!(accepted.rejected_observations[0]
+            .reason
+            .contains("not valid for material"));
+    }
+
+    #[test]
+    fn v2_factor_phase_b_keeps_multi_regime_observations_factor_scoped() {
+        let evidence = evidence_with(
+            vec![EvidenceItem { id:"E0001".into(), source_kind:"publication".into(), source_label:"methods".into(), text:"Single cells were manually loaded by hydrodynamic pressure and low-input samples used spray voltage injection.".into() }],
+            vec!["run.raw"],
+        );
+        let graph = phase_b_test_factor_graph();
+        let proposal = FactorObservationBundleProposal {
+            decision: "propose_observations".into(),
+            observations: vec![
+                FactorObservationProposal {
+                    target_factor_id: "R001".into(),
+                    concept_type: "isolation_method".into(),
+                    observed_value: "manual hydrodynamic pressure loading".into(),
+                    evidence_refs: vec!["E0001".into()],
+                    confidence: "high".into(),
+                    notes: String::new(),
+                },
+                FactorObservationProposal {
+                    target_factor_id: "R002".into(),
+                    concept_type: "isolation_method".into(),
+                    observed_value: "spray voltage injection".into(),
+                    evidence_refs: vec!["E0001".into()],
+                    confidence: "high".into(),
+                    notes: String::new(),
+                },
+            ],
+            open_questions: Vec::new(),
+            reason: String::new(),
+        };
+        let accepted = accept_factor_phase_b_observations(&evidence, &graph, &proposal);
+        assert_eq!(accepted.status, "accepted");
+        assert_eq!(accepted.observations.len(), 2);
+        assert!(accepted
+            .observations
+            .iter()
+            .all(|obs| obs.projection_scope == "factor"));
+        let claims = accepted
+            .observations
+            .iter()
+            .map(factor_observation_as_claim)
+            .collect::<Vec<_>>();
+        assert!(claims.iter().all(|claim| claim.scope == "branch"));
+        assert!(claims.iter().any(|claim| claim.branch_id == "R001"));
+        assert!(claims.iter().any(|claim| claim.branch_id == "R002"));
+    }
+
+    #[test]
+    fn v2_factor_phase_b_projects_only_unique_factor_scope_project_wide() {
+        let evidence = evidence_with(
+            vec![EvidenceItem {
+                id: "E0001".into(),
+                source_kind: "publication".into(),
+                source_label: "methods".into(),
+                text: "Single cells were isolated using evDISCO.".into(),
+            }],
+            vec!["run.raw"],
+        );
+        let mut graph = phase_b_test_factor_graph();
+        graph.regimes.truncate(1);
+        let proposal = FactorObservationBundleProposal {
+            decision: "propose_observations".into(),
+            observations: vec![FactorObservationProposal {
+                target_factor_id: "R001".into(),
+                concept_type: "isolation_method".into(),
+                observed_value: "evDISCO".into(),
+                evidence_refs: vec!["E0001".into()],
+                confidence: "high".into(),
+                notes: String::new(),
+            }],
+            open_questions: Vec::new(),
+            reason: String::new(),
+        };
+        let accepted = accept_factor_phase_b_observations(&evidence, &graph, &proposal);
+        assert_eq!(accepted.observations.len(), 1);
+        assert_eq!(accepted.observations[0].projection_scope, "project");
+        let claim = factor_observation_as_claim(&accepted.observations[0]);
+        assert_eq!(claim.scope, "project");
+        assert!(claim.branch_id.is_empty());
+    }
+
+    #[test]
+    fn v2_factor_phase_b_synthetic_compiler_branches_preserve_rust_ids_and_unresolved_raw_linkage()
+    {
+        let graph = phase_b_test_factor_graph();
+        let branches = factor_graph_as_agent_branches(&graph);
+        assert_eq!(branches.len(), 4);
+        assert!(branches.iter().any(|branch| branch.id == "M001"));
+        assert!(branches.iter().any(|branch| branch.id == "R001"));
+        assert!(branches.iter().any(|branch| branch.id == "R002"));
+        assert!(branches.iter().any(|branch| branch.id == "A001"));
+        assert!(branches
+            .iter()
+            .all(|branch| branch.linkage_status == "unresolved"));
+        assert!(branches
+            .iter()
+            .all(|branch| branch.linked_raw_files.is_empty()));
     }
 }
