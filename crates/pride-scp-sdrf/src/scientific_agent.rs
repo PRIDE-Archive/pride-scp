@@ -6806,6 +6806,20 @@ fn set_row_if_unresolved(
     }
 }
 
+fn set_row_value(
+    row: &mut [String],
+    header_index: &HashMap<&str, usize>,
+    header: &str,
+    value: String,
+) {
+    let Some(&idx) = header_index.get(header) else {
+        return;
+    };
+    if idx < row.len() {
+        row[idx] = value;
+    }
+}
+
 fn scientific_agent_raw_file_role(name: &str, row_role_hardened: bool) -> RawFileRole {
     let role = raw_file_role(name);
     if !row_role_hardened || role != RawFileRole::Unknown {
@@ -6880,11 +6894,43 @@ fn enforce_deterministic_row_scaffold(
         );
         match role {
             RawFileRole::SingleCell => {
-                set_row_if_unresolved(row, &header_index, SC_SAMPLE_TYPE, "single cell".into());
-                set_row_if_unresolved(row, &header_index, SC_CELL_IDENTIFIER, stem);
-                set_row_if_unresolved(row, &header_index, SC_CELLS_PER_WELL, "1".into());
+                if row_role_hardened {
+                    set_row_value(row, &header_index, SC_SAMPLE_TYPE, "single cell".into());
+                    set_row_value(row, &header_index, SC_CELL_IDENTIFIER, stem);
+                    set_row_value(row, &header_index, SC_CELLS_PER_WELL, "1".into());
+                } else {
+                    set_row_if_unresolved(row, &header_index, SC_SAMPLE_TYPE, "single cell".into());
+                    set_row_if_unresolved(row, &header_index, SC_CELL_IDENTIFIER, stem);
+                    set_row_if_unresolved(row, &header_index, SC_CELLS_PER_WELL, "1".into());
+                }
             }
             RawFileRole::Unknown => {
+                if row_role_hardened {
+                    // Earlier proposal/bootstrap stages may already have broadcast a
+                    // project-level `single cell` scaffold. Once the file role is
+                    // deterministically unknown, that scaffold is no longer safe.
+                    // Generated rows are therefore reset to explicit unresolved values.
+                    // Existing/deposited SDRFs never enter this scaffold path.
+                    set_row_value(row, &header_index, SC_SAMPLE_TYPE, "not available".into());
+                    set_row_value(
+                        row,
+                        &header_index,
+                        SC_ISOLATION_METHOD,
+                        "not available".into(),
+                    );
+                    set_row_value(
+                        row,
+                        &header_index,
+                        SC_CELL_IDENTIFIER,
+                        "not available".into(),
+                    );
+                    set_row_value(
+                        row,
+                        &header_index,
+                        SC_CELLS_PER_WELL,
+                        "not available".into(),
+                    );
+                }
                 issues.push(ValidationIssue {
                     level: "error".into(),
                     code: "scientific_agent_raw_file_role_unresolved".into(),
@@ -6897,83 +6943,176 @@ fn enforce_deterministic_row_scaffold(
                 });
             }
             RawFileRole::FewCell(n) => {
-                set_row_if_unresolved(row, &header_index, SC_SAMPLE_TYPE, "not available".into());
-                set_row_if_unresolved(
-                    row,
-                    &header_index,
-                    SC_ISOLATION_METHOD,
-                    "not applicable".into(),
-                );
-                set_row_if_unresolved(
-                    row,
-                    &header_index,
-                    SC_CELL_IDENTIFIER,
-                    "not applicable".into(),
-                );
-                set_row_if_unresolved(row, &header_index, SC_CELLS_PER_WELL, n.to_string());
+                if row_role_hardened {
+                    set_row_value(row, &header_index, SC_SAMPLE_TYPE, "not available".into());
+                    set_row_value(
+                        row,
+                        &header_index,
+                        SC_ISOLATION_METHOD,
+                        "not applicable".into(),
+                    );
+                    set_row_value(
+                        row,
+                        &header_index,
+                        SC_CELL_IDENTIFIER,
+                        "not applicable".into(),
+                    );
+                    set_row_value(row, &header_index, SC_CELLS_PER_WELL, n.to_string());
+                } else {
+                    set_row_if_unresolved(
+                        row,
+                        &header_index,
+                        SC_SAMPLE_TYPE,
+                        "not available".into(),
+                    );
+                    set_row_if_unresolved(
+                        row,
+                        &header_index,
+                        SC_ISOLATION_METHOD,
+                        "not applicable".into(),
+                    );
+                    set_row_if_unresolved(
+                        row,
+                        &header_index,
+                        SC_CELL_IDENTIFIER,
+                        "not applicable".into(),
+                    );
+                    set_row_if_unresolved(row, &header_index, SC_CELLS_PER_WELL, n.to_string());
+                }
             }
             RawFileRole::Blank => {
-                set_row_if_unresolved(row, &header_index, SC_SAMPLE_TYPE, "empty".into());
-                set_row_if_unresolved(
-                    row,
-                    &header_index,
-                    SC_ISOLATION_METHOD,
-                    "not applicable".into(),
-                );
-                set_row_if_unresolved(row, &header_index, SC_CELL_IDENTIFIER, "empty".into());
-                set_row_if_unresolved(
-                    row,
-                    &header_index,
-                    SC_CELLS_PER_WELL,
-                    "not applicable".into(),
-                );
+                if row_role_hardened {
+                    set_row_value(row, &header_index, SC_SAMPLE_TYPE, "empty".into());
+                    set_row_value(
+                        row,
+                        &header_index,
+                        SC_ISOLATION_METHOD,
+                        "not applicable".into(),
+                    );
+                    set_row_value(row, &header_index, SC_CELL_IDENTIFIER, "empty".into());
+                    set_row_value(
+                        row,
+                        &header_index,
+                        SC_CELLS_PER_WELL,
+                        "not applicable".into(),
+                    );
+                } else {
+                    set_row_if_unresolved(row, &header_index, SC_SAMPLE_TYPE, "empty".into());
+                    set_row_if_unresolved(
+                        row,
+                        &header_index,
+                        SC_ISOLATION_METHOD,
+                        "not applicable".into(),
+                    );
+                    set_row_if_unresolved(row, &header_index, SC_CELL_IDENTIFIER, "empty".into());
+                    set_row_if_unresolved(
+                        row,
+                        &header_index,
+                        SC_CELLS_PER_WELL,
+                        "not applicable".into(),
+                    );
+                }
             }
             RawFileRole::QualityControl => {
-                set_row_if_unresolved(
-                    row,
-                    &header_index,
-                    SC_SAMPLE_TYPE,
-                    "quality control sample".into(),
-                );
-                set_row_if_unresolved(
-                    row,
-                    &header_index,
-                    SC_ISOLATION_METHOD,
-                    "not applicable".into(),
-                );
-                set_row_if_unresolved(
-                    row,
-                    &header_index,
-                    SC_CELL_IDENTIFIER,
-                    "not applicable".into(),
-                );
-                set_row_if_unresolved(
-                    row,
-                    &header_index,
-                    SC_CELLS_PER_WELL,
-                    "not applicable".into(),
-                );
+                if row_role_hardened {
+                    set_row_value(
+                        row,
+                        &header_index,
+                        SC_SAMPLE_TYPE,
+                        "quality control sample".into(),
+                    );
+                    set_row_value(
+                        row,
+                        &header_index,
+                        SC_ISOLATION_METHOD,
+                        "not applicable".into(),
+                    );
+                    set_row_value(
+                        row,
+                        &header_index,
+                        SC_CELL_IDENTIFIER,
+                        "not applicable".into(),
+                    );
+                    set_row_value(
+                        row,
+                        &header_index,
+                        SC_CELLS_PER_WELL,
+                        "not applicable".into(),
+                    );
+                } else {
+                    set_row_if_unresolved(
+                        row,
+                        &header_index,
+                        SC_SAMPLE_TYPE,
+                        "quality control sample".into(),
+                    );
+                    set_row_if_unresolved(
+                        row,
+                        &header_index,
+                        SC_ISOLATION_METHOD,
+                        "not applicable".into(),
+                    );
+                    set_row_if_unresolved(
+                        row,
+                        &header_index,
+                        SC_CELL_IDENTIFIER,
+                        "not applicable".into(),
+                    );
+                    set_row_if_unresolved(
+                        row,
+                        &header_index,
+                        SC_CELLS_PER_WELL,
+                        "not applicable".into(),
+                    );
+                }
             }
             RawFileRole::Bulk => {
-                set_row_if_unresolved(row, &header_index, SC_SAMPLE_TYPE, "bulk control".into());
-                set_row_if_unresolved(
-                    row,
-                    &header_index,
-                    SC_ISOLATION_METHOD,
-                    "not applicable".into(),
-                );
-                set_row_if_unresolved(
-                    row,
-                    &header_index,
-                    SC_CELL_IDENTIFIER,
-                    "not applicable".into(),
-                );
-                set_row_if_unresolved(
-                    row,
-                    &header_index,
-                    SC_CELLS_PER_WELL,
-                    "not applicable".into(),
-                );
+                if row_role_hardened {
+                    set_row_value(row, &header_index, SC_SAMPLE_TYPE, "bulk control".into());
+                    set_row_value(
+                        row,
+                        &header_index,
+                        SC_ISOLATION_METHOD,
+                        "not applicable".into(),
+                    );
+                    set_row_value(
+                        row,
+                        &header_index,
+                        SC_CELL_IDENTIFIER,
+                        "not applicable".into(),
+                    );
+                    set_row_value(
+                        row,
+                        &header_index,
+                        SC_CELLS_PER_WELL,
+                        "not applicable".into(),
+                    );
+                } else {
+                    set_row_if_unresolved(
+                        row,
+                        &header_index,
+                        SC_SAMPLE_TYPE,
+                        "bulk control".into(),
+                    );
+                    set_row_if_unresolved(
+                        row,
+                        &header_index,
+                        SC_ISOLATION_METHOD,
+                        "not applicable".into(),
+                    );
+                    set_row_if_unresolved(
+                        row,
+                        &header_index,
+                        SC_CELL_IDENTIFIER,
+                        "not applicable".into(),
+                    );
+                    set_row_if_unresolved(
+                        row,
+                        &header_index,
+                        SC_CELLS_PER_WELL,
+                        "not applicable".into(),
+                    );
+                }
             }
         }
     }
@@ -9648,7 +9787,7 @@ mod tests {
     }
 
     #[test]
-    fn v2_row_role_hardening_never_promotes_unknown_archive_to_single_cell() {
+    fn v2_row_role_hardening_clears_prepopulated_single_cell_for_unknown_archive() {
         let evidence = evidence_with(Vec::new(), vec!["xenopus.zip"]);
         let headers = vec![
             "comment[data file]".into(),
@@ -9659,12 +9798,14 @@ mod tests {
             "comment[fraction identifier]".into(),
             "comment[technical replicate]".into(),
         ];
+        // Mirror the real compiler state: an earlier project-level scaffold has
+        // already populated single-cell role fields before row-role hardening.
         let mut rows = vec![vec![
             "xenopus.zip".into(),
-            "not available".into(),
-            "not available".into(),
-            "not available".into(),
-            "not available".into(),
+            "single cell".into(),
+            "manual picking".into(),
+            "xenopus".into(),
+            "1".into(),
             "not available".into(),
             "not available".into(),
         ]];
@@ -9684,6 +9825,45 @@ mod tests {
         assert!(issues.iter().any(|issue| {
             issue.code == "scientific_agent_raw_file_role_unresolved" && issue.row == 1
         }));
+    }
+
+    #[test]
+    fn v2_row_role_hardening_overrides_prepopulated_single_cell_for_compact_mass_bulk() {
+        let evidence = evidence_with(Vec::new(), vec!["200pgHeLa_raw.zip"]);
+        let headers = vec![
+            "comment[data file]".into(),
+            SC_SAMPLE_TYPE.into(),
+            SC_ISOLATION_METHOD.into(),
+            SC_CELL_IDENTIFIER.into(),
+            SC_CELLS_PER_WELL.into(),
+            "comment[fraction identifier]".into(),
+            "comment[technical replicate]".into(),
+        ];
+        let mut rows = vec![vec![
+            "200pgHeLa_raw.zip".into(),
+            "single cell".into(),
+            "manual picking".into(),
+            "200pgHeLa_raw".into(),
+            "1".into(),
+            "not available".into(),
+            "not available".into(),
+        ]];
+        let issues = enforce_deterministic_row_scaffold(
+            &headers,
+            &mut rows,
+            &evidence,
+            "one_cell_per_data_file",
+            true,
+        );
+        assert_eq!(rows[0][1], "bulk control");
+        assert_eq!(rows[0][2], "not applicable");
+        assert_eq!(rows[0][3], "not applicable");
+        assert_eq!(rows[0][4], "not applicable");
+        assert_eq!(rows[0][5], "1");
+        assert_eq!(rows[0][6], "1");
+        assert!(!issues
+            .iter()
+            .any(|issue| { issue.code == "scientific_agent_raw_file_role_unresolved" }));
     }
 
     #[test]

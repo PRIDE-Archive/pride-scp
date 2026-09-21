@@ -66,3 +66,20 @@ This mode does not:
 - add validator retry loops.
 
 The next scientific step after this hardening is explicit deterministic RAW-to-factor linkage only where trusted deposited/source evidence supports it.
+
+## Runtime overwrite hardening (fix1)
+
+The first regression4 run exposed an ordering bug: an earlier project-level scaffold could
+pre-populate generated rows with `sample type = single cell` before deterministic row-role
+hardening ran. The hardening correctly detected `Bulk` or `Unknown`, but its original
+`set-if-unresolved` writes could not replace the stale role fields.
+
+In row-role-hardened mode, deterministic file-role classification is now authoritative for
+generated row-role fields. Recognized bulk/QC/blank/few-cell/single-cell roles overwrite
+prior generated scaffold values, and `Unknown` explicitly resets sample type, isolation,
+cell identifier, and cells-per-well to unresolved values before emitting
+`scientific_agent_raw_file_role_unresolved`. Existing/deposited SDRFs remain protected
+because deterministic row scaffolding is skipped whenever an existing SDRF is present.
+
+Regression tests now start from the real pre-populated state so this ordering bug cannot
+recur silently.
