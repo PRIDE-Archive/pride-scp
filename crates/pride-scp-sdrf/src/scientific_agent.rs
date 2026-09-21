@@ -587,6 +587,10 @@ pub const SCIENTIFIC_AGENT_FACTOR_SEMANTIC_FIDELITY_HARDENED_MODE: &str =
     "study_factor_graph_v2_semantic_fidelity_hardened";
 pub const SCIENTIFIC_AGENT_FACTOR_SEMANTIC_FIDELITY_HARDENED_VERSION: &str =
     "pride-scp-scientific-workspace-agent-v2-factor-semantic-fidelity-hardened";
+pub const SCIENTIFIC_AGENT_FACTOR_ROW_ROLE_HARDENED_MODE: &str =
+    "study_factor_graph_v2_row_role_hardened";
+pub const SCIENTIFIC_AGENT_FACTOR_ROW_ROLE_HARDENED_VERSION: &str =
+    "pride-scp-scientific-workspace-agent-v2-factor-row-role-hardened";
 const SCIENTIFIC_AGENT_FACTOR_GRAPH_ROOT_ENV: &str = "PRIDE_SCP_FACTOR_GRAPH_STAGE1_ROOT";
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -4689,6 +4693,238 @@ async fn run_factor_semantic_fidelity_hardened(
     Ok(summary)
 }
 
+async fn run_one_factor_row_role_hardened(
+    opts: &SdrfScientificAgentOptions,
+    accession: &str,
+) -> Result<ScientificAgentResultRow> {
+    let annotate_opts = opts.annotate_options();
+    let evidence = build_evidence(&annotate_opts, accession)?;
+    let explicit_mappings = if let Some(path) = opts.explicit_row_mapping_manifest.as_deref() {
+        if !path.is_file() {
+            bail!(
+                "explicit row-mapping manifest not found: {}",
+                path.display()
+            );
+        }
+        load_explicit_row_mappings(path, accession, &evidence.raw_files)?
+    } else {
+        Vec::new()
+    };
+    let (graph_path, graph) = load_factor_graph_for_phase_b(accession)?;
+    let root = opts.output_dir.join("row_role_hardened").join(accession);
+    fs::create_dir_all(&root)?;
+    let evidence_path = root.join("evidence.json");
+    let accepted_path = root.join("derived_observations.json");
+    let adjudications_path = root.join("adjudications.json");
+    let draft_path = root.join(format!("{}.row_role_hardened.sdrf.tsv", accession));
+    let validation_path = root.join("VALIDATION.md");
+    let review_path = root.join("REVIEW.md");
+    let result_path = root.join("result.json");
+    fs::write(&evidence_path, serde_json::to_string_pretty(&evidence)?)?;
+    fs::copy(&graph_path, root.join("accepted_factor_graph.json"))?;
+
+    let mut acceptance = derive_factor_graph_observations(&evidence, &graph);
+    acceptance.harness_version = SCIENTIFIC_AGENT_FACTOR_ROW_ROLE_HARDENED_VERSION.into();
+    fs::write(&accepted_path, serde_json::to_string_pretty(&acceptance)?)?;
+
+    let claims = acceptance
+        .observations
+        .iter()
+        .map(factor_observation_as_claim)
+        .collect::<Vec<_>>();
+    let state = ScientificWorkspaceState {
+        harness_version: SCIENTIFIC_AGENT_FACTOR_ROW_ROLE_HARDENED_VERSION.into(),
+        accession: accession.into(),
+        turn: 0,
+        relation: AgentRelation {
+            mode: if study_design_has_assertive_relation_hint(&evidence.study_design) {
+                evidence.study_design.relation_mode_hint.clone()
+            } else {
+                "unresolved".into()
+            },
+            scope: if study_design_has_assertive_relation_hint(&evidence.study_design) {
+                "project".into()
+            } else {
+                "unresolved".into()
+            },
+            evidence_refs: evidence.study_design.relation_evidence_refs.clone(),
+            confidence: evidence.study_design.relation_confidence.clone(),
+            reason: evidence.study_design.notes.clone(),
+        },
+        branches: factor_graph_as_agent_branches(&graph),
+        claims,
+        open_questions: acceptance.open_questions.clone(),
+        active_task_id: String::new(),
+        next_step: "compile".into(),
+        notes: "deterministic factor-to-observation bridge with observation-local isolation and acquisition semantic-fidelity plus row-role hardening; no LLM call and no conversational retry are permitted".into(),
+        ..Default::default()
+    };
+
+    let compiled = compile_workspace(&evidence, &state, &explicit_mappings)?;
+    write_sdrf(&draft_path, &compiled.headers, &compiled.rows)?;
+    write_validation_review(&validation_path, &compiled.issues)?;
+    let validation = validation_cycle(1, &compiled.issues);
+    let adjudications = workspace_adjudications(&evidence, &state);
+    fs::write(
+        &adjudications_path,
+        serde_json::to_string_pretty(&adjudications)?,
+    )?;
+
+    let has_template_gap = adjudications
+        .iter()
+        .any(|record| matches!(&record.adjudication, ClaimAdjudication::TemplateGap { .. }));
+    let terminal_status = if validation.validation_errors == 0 {
+        "locally_valid"
+    } else if has_template_gap {
+        "partial_template_gap"
+    } else if !acceptance.observations.is_empty() {
+        "partial_human_review"
+    } else {
+        "human_review"
+    };
+
+    write_factor_deterministic_bridge_review(
+        &review_path,
+        &graph,
+        &acceptance,
+        &adjudications,
+        &validation,
+        terminal_status,
+    )?;
+    let result = json!({
+        "harness_version": SCIENTIFIC_AGENT_FACTOR_ROW_ROLE_HARDENED_VERSION,
+        "accession": accession,
+        "factor_graph_source": graph_path,
+        "model_calls": 0,
+        "tool_actions": 0,
+        "validator_cycles": 1,
+        "terminal_status": terminal_status,
+        "derived_observation_count": acceptance.observations.len(),
+        "rejected_observation_count": acceptance.rejected_observations.len(),
+        "derived_observations": &acceptance.observations,
+        "rejected_observations": &acceptance.rejected_observations,
+        "adjudications": &adjudications,
+        "validation": &validation,
+        "compiled_fingerprint": &compiled.fingerprint,
+        "draft_path": draft_path.display().to_string(),
+        "review_path": review_path.display().to_string()
+    });
+    fs::write(&result_path, serde_json::to_string_pretty(&result)?)?;
+
+    Ok(ScientificAgentResultRow {
+        accession: accession.into(),
+        status: "success".into(),
+        terminal_status: terminal_status.into(),
+        turns: 0,
+        tool_actions: 0,
+        validator_cycles: 1,
+        branches: graph.materials.len() + graph.regimes.len() + graph.acquisitions.len(),
+        open_questions: acceptance.open_questions.len(),
+        relation_mode: compiled.proposal.relation_mode,
+        locally_valid: validation.validation_errors == 0,
+        validation_errors: validation.validation_errors,
+        draft_path: draft_path.display().to_string(),
+        review_path: review_path.display().to_string(),
+        workspace_path: root.display().to_string(),
+        error: String::new(),
+    })
+}
+
+async fn run_factor_row_role_hardened(
+    opts: SdrfScientificAgentOptions,
+) -> Result<SdrfScientificAgentSummary> {
+    let accessions = collect_accessions_values(&opts.accessions, opts.accessions_file.as_deref())?;
+    if accessions.len() > 1 && !opts.manuscript_text_paths.is_empty() {
+        bail!("--manuscript-text is accession-specific and may only be used for one accession");
+    }
+    fs::create_dir_all(&opts.output_dir)?;
+    let results_path = opts.output_dir.join("factor_row_role_hardened_results.tsv");
+    let mut rows = Vec::new();
+    for (i, accession) in accessions.iter().enumerate() {
+        if opts.progress {
+            eprintln!(
+                "[{}/{}] {} FactorGraph v2 row-role-hardened bridge",
+                i + 1,
+                accessions.len(),
+                accession
+            );
+        }
+        match run_one_factor_row_role_hardened(&opts, accession).await {
+            Ok(row) => {
+                if opts.progress {
+                    eprintln!(
+                        "  -> terminal={} model_calls=0 validators={} valid={} errors={}",
+                        row.terminal_status,
+                        row.validator_cycles,
+                        row.locally_valid,
+                        row.validation_errors
+                    );
+                }
+                rows.push(row);
+            }
+            Err(err) => {
+                eprintln!("  -> FactorGraph row-role-hardened bridge error: {err:#}");
+                rows.push(ScientificAgentResultRow {
+                    accession: accession.clone(),
+                    status: "error".into(),
+                    terminal_status: "error".into(),
+                    turns: 0,
+                    tool_actions: 0,
+                    validator_cycles: 0,
+                    branches: 0,
+                    open_questions: 0,
+                    relation_mode: String::new(),
+                    locally_valid: false,
+                    validation_errors: 0,
+                    draft_path: String::new(),
+                    review_path: String::new(),
+                    workspace_path: String::new(),
+                    error: format!("{err:#}"),
+                });
+            }
+        }
+    }
+    let mut writer = WriterBuilder::new()
+        .delimiter(b'\t')
+        .from_path(&results_path)?;
+    for row in &rows {
+        writer.serialize(row)?;
+    }
+    writer.flush()?;
+    let successful = rows.iter().filter(|row| row.status == "success").count();
+    let locally_valid_drafts = rows.iter().filter(|row| row.locally_valid).count();
+    let summary = SdrfScientificAgentSummary {
+        harness_version: SCIENTIFIC_AGENT_FACTOR_ROW_ROLE_HARDENED_VERSION.into(),
+        generator_version: GENERATOR_VERSION.into(),
+        accessions_requested: accessions.len(),
+        successful,
+        errors: rows.len().saturating_sub(successful),
+        locally_valid_drafts,
+        incomplete_drafts: successful.saturating_sub(locally_valid_drafts),
+        total_validation_errors: rows.iter().map(|row| row.validation_errors).sum(),
+        total_agent_turns: 0,
+        total_tool_actions: 0,
+        total_validator_cycles: rows.iter().map(|row| row.validator_cycles).sum(),
+        results_tsv: results_path.display().to_string(),
+        workspace_root: opts
+            .output_dir
+            .join("row_role_hardened")
+            .display()
+            .to_string(),
+    };
+    let rendered = serde_json::to_string_pretty(&summary)?;
+    fs::write(
+        opts.output_dir
+            .join("factor_row_role_hardened_summary.json"),
+        &rendered,
+    )?;
+    fs::write(
+        opts.output_dir.join("scientific_agent_summary.json"),
+        rendered,
+    )?;
+    Ok(summary)
+}
+
 fn claim_refs_are_relevant(
     evidence: &DatasetEvidence,
     concept_type: &str,
@@ -5977,6 +6213,7 @@ fn acquisition_canonicalization_is_observation_faithful(
 fn factor_isolation_hardening_enabled(state: &ScientificWorkspaceState) -> bool {
     state.harness_version == SCIENTIFIC_AGENT_FACTOR_CANONICAL_HARDENED_VERSION
         || state.harness_version == SCIENTIFIC_AGENT_FACTOR_SEMANTIC_FIDELITY_HARDENED_VERSION
+        || state.harness_version == SCIENTIFIC_AGENT_FACTOR_ROW_ROLE_HARDENED_VERSION
 }
 
 fn harden_factor_isolation_project_baseline(
@@ -6060,7 +6297,9 @@ fn harden_factor_acquisition_project_baseline(
     state: &ScientificWorkspaceState,
     issues: &mut Vec<ValidationIssue>,
 ) {
-    if state.harness_version != SCIENTIFIC_AGENT_FACTOR_SEMANTIC_FIDELITY_HARDENED_VERSION {
+    if state.harness_version != SCIENTIFIC_AGENT_FACTOR_SEMANTIC_FIDELITY_HARDENED_VERSION
+        && state.harness_version != SCIENTIFIC_AGENT_FACTOR_ROW_ROLE_HARDENED_VERSION
+    {
         return;
     }
     let current = proposal
@@ -6211,7 +6450,8 @@ fn adjudicate_workspace_claim(
     if factor_isolation_hardening_enabled(state) && claim.concept_type == "isolation_method" {
         return adjudicate_hardened_factor_isolation_claim(evidence, claim);
     }
-    if state.harness_version == SCIENTIFIC_AGENT_FACTOR_SEMANTIC_FIDELITY_HARDENED_VERSION
+    if (state.harness_version == SCIENTIFIC_AGENT_FACTOR_SEMANTIC_FIDELITY_HARDENED_VERSION
+        || state.harness_version == SCIENTIFIC_AGENT_FACTOR_ROW_ROLE_HARDENED_VERSION)
         && claim.concept_type == "acquisition_mode"
     {
         return adjudicate_semantic_fidelity_factor_acquisition_claim(evidence, claim);
@@ -6566,11 +6806,37 @@ fn set_row_if_unresolved(
     }
 }
 
+fn scientific_agent_raw_file_role(name: &str, row_role_hardened: bool) -> RawFileRole {
+    let role = raw_file_role(name);
+    if !row_role_hardened || role != RawFileRole::Unknown {
+        return role;
+    }
+
+    // The shared role classifier already treats explicit pg/ng amount tokens as
+    // reference/bulk inputs when they are delimiter-bounded. PRIDE archive names
+    // also commonly concatenate the amount directly with a material token
+    // (e.g. `200pgHeLa_raw.zip`). Treat that same explicit mass-amount signal as
+    // a bulk/reference input rather than silently assuming a single cell.
+    let normalized = name
+        .trim()
+        .to_ascii_lowercase()
+        .replace('-', "_")
+        .replace('.', "_")
+        .replace(' ', "_");
+    let compact_amount = Regex::new(r"(?i)(?:^|[_])\d+(?:\.\d+)?(?:pg|ng)[a-z]").unwrap();
+    if compact_amount.is_match(&normalized) {
+        return RawFileRole::Bulk;
+    }
+
+    RawFileRole::Unknown
+}
+
 fn enforce_deterministic_row_scaffold(
     headers: &[String],
     rows: &mut [Vec<String>],
     evidence: &DatasetEvidence,
     relation_mode: &str,
+    row_role_hardened: bool,
 ) -> Vec<ValidationIssue> {
     let mut issues = Vec::new();
     if relation_mode != "one_cell_per_data_file" || !evidence.existing_sdrf_path.is_empty() {
@@ -6585,15 +6851,20 @@ fn enforce_deterministic_row_scaffold(
         return issues;
     };
 
-    for row in rows.iter_mut() {
+    for (row_offset, row) in rows.iter_mut().enumerate() {
         let raw = row.get(data_file_idx).cloned().unwrap_or_default();
         if raw.trim().is_empty() {
             continue;
         }
         let stem = safe_identifier_from_file(&raw);
-        let role = match raw_file_role(&raw) {
-            RawFileRole::Unknown => RawFileRole::SingleCell,
-            role => role,
+        let detected_role = scientific_agent_raw_file_role(&raw, row_role_hardened);
+        let role = if row_role_hardened {
+            detected_role
+        } else {
+            match detected_role {
+                RawFileRole::Unknown => RawFileRole::SingleCell,
+                role => role,
+            }
         };
         set_row_if_unresolved(
             row,
@@ -6608,10 +6879,22 @@ fn enforce_deterministic_row_scaffold(
             "1".into(),
         );
         match role {
-            RawFileRole::SingleCell | RawFileRole::Unknown => {
+            RawFileRole::SingleCell => {
                 set_row_if_unresolved(row, &header_index, SC_SAMPLE_TYPE, "single cell".into());
                 set_row_if_unresolved(row, &header_index, SC_CELL_IDENTIFIER, stem);
                 set_row_if_unresolved(row, &header_index, SC_CELLS_PER_WELL, "1".into());
+            }
+            RawFileRole::Unknown => {
+                issues.push(ValidationIssue {
+                    level: "error".into(),
+                    code: "scientific_agent_raw_file_role_unresolved".into(),
+                    row: row_offset + 1,
+                    column: "comment[data file]".into(),
+                    message: format!(
+                        "RAW/archive '{}' has no deterministic single-cell/reference/QC/blank/few-cell role; row-role-hardened mode preserves the row as unresolved instead of coercing an unknown file into sample type 'single cell'",
+                        raw
+                    ),
+                });
             }
             RawFileRole::FewCell(n) => {
                 set_row_if_unresolved(row, &header_index, SC_SAMPLE_TYPE, "not available".into());
@@ -6779,6 +7062,7 @@ fn compile_workspace(
         &mut rows,
         evidence,
         &proposal.relation_mode,
+        state.harness_version == SCIENTIFIC_AGENT_FACTOR_ROW_ROLE_HARDENED_VERSION,
     ));
 
     let header_index = headers
@@ -7957,6 +8241,9 @@ pub async fn run_scientific_sdrf_agent(
     opts: SdrfScientificAgentOptions,
 ) -> Result<SdrfScientificAgentSummary> {
     let requested_mode = std::env::var("PRIDE_SCP_SCIENTIFIC_AGENT_MODE").unwrap_or_default();
+    if requested_mode == SCIENTIFIC_AGENT_FACTOR_ROW_ROLE_HARDENED_MODE {
+        return run_factor_row_role_hardened(opts).await;
+    }
     if requested_mode == SCIENTIFIC_AGENT_FACTOR_SEMANTIC_FIDELITY_HARDENED_MODE {
         return run_factor_semantic_fidelity_hardened(opts).await;
     }
@@ -7977,8 +8264,9 @@ pub async fn run_scientific_sdrf_agent(
     }
     if !requested_mode.trim().is_empty() {
         bail!(
-            "unsupported PRIDE_SCP_SCIENTIFIC_AGENT_MODE='{}'; expected '{}', '{}', '{}', '{}', '{}', or '{}' or unset for the v1.3 workspace agent",
+            "unsupported PRIDE_SCP_SCIENTIFIC_AGENT_MODE='{}'; expected '{}', '{}', '{}', '{}', '{}', '{}', or '{}' or unset for the v1.3 workspace agent",
             requested_mode,
+            SCIENTIFIC_AGENT_FACTOR_ROW_ROLE_HARDENED_MODE,
             SCIENTIFIC_AGENT_FACTOR_SEMANTIC_FIDELITY_HARDENED_MODE,
             SCIENTIFIC_AGENT_FACTOR_CANONICAL_HARDENED_MODE,
             SCIENTIFIC_AGENT_FACTOR_DETERMINISTIC_BRIDGE_MODE,
@@ -9350,12 +9638,68 @@ mod tests {
             &mut rows,
             &evidence,
             "one_cell_per_data_file",
+            false,
         );
         assert_eq!(rows[0][1], "single cell");
         assert_eq!(rows[0][2], "cellA");
         assert_eq!(rows[0][3], "1");
         assert_eq!(rows[0][4], "1");
         assert_eq!(rows[0][5], "1");
+    }
+
+    #[test]
+    fn v2_row_role_hardening_never_promotes_unknown_archive_to_single_cell() {
+        let evidence = evidence_with(Vec::new(), vec!["xenopus.zip"]);
+        let headers = vec![
+            "comment[data file]".into(),
+            SC_SAMPLE_TYPE.into(),
+            SC_ISOLATION_METHOD.into(),
+            SC_CELL_IDENTIFIER.into(),
+            SC_CELLS_PER_WELL.into(),
+            "comment[fraction identifier]".into(),
+            "comment[technical replicate]".into(),
+        ];
+        let mut rows = vec![vec![
+            "xenopus.zip".into(),
+            "not available".into(),
+            "not available".into(),
+            "not available".into(),
+            "not available".into(),
+            "not available".into(),
+            "not available".into(),
+        ]];
+        let issues = enforce_deterministic_row_scaffold(
+            &headers,
+            &mut rows,
+            &evidence,
+            "one_cell_per_data_file",
+            true,
+        );
+        assert_eq!(rows[0][1], "not available");
+        assert_eq!(rows[0][2], "not available");
+        assert_eq!(rows[0][3], "not available");
+        assert_eq!(rows[0][4], "not available");
+        assert_eq!(rows[0][5], "1");
+        assert_eq!(rows[0][6], "1");
+        assert!(issues.iter().any(|issue| {
+            issue.code == "scientific_agent_raw_file_role_unresolved" && issue.row == 1
+        }));
+    }
+
+    #[test]
+    fn v2_row_role_hardening_recognizes_compact_mass_amount_archive_as_bulk() {
+        assert_eq!(
+            scientific_agent_raw_file_role("200pgHeLa_raw.zip", true),
+            RawFileRole::Bulk
+        );
+        assert_eq!(
+            scientific_agent_raw_file_role("500pgHeLa_raw.zip", true),
+            RawFileRole::Bulk
+        );
+        assert_eq!(
+            scientific_agent_raw_file_role("xenopus.zip", true),
+            RawFileRole::Unknown
+        );
     }
 
     #[test]
