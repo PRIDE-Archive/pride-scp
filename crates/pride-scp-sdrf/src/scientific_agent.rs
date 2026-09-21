@@ -579,6 +579,10 @@ pub const SCIENTIFIC_AGENT_FACTOR_DETERMINISTIC_BRIDGE_MODE: &str =
     "study_factor_graph_v2_deterministic_bridge";
 pub const SCIENTIFIC_AGENT_FACTOR_DETERMINISTIC_BRIDGE_VERSION: &str =
     "pride-scp-scientific-workspace-agent-v2-factor-deterministic-bridge";
+pub const SCIENTIFIC_AGENT_FACTOR_CANONICAL_HARDENED_MODE: &str =
+    "study_factor_graph_v2_canonicalization_hardened";
+pub const SCIENTIFIC_AGENT_FACTOR_CANONICAL_HARDENED_VERSION: &str =
+    "pride-scp-scientific-workspace-agent-v2-factor-canonicalization-hardened";
 const SCIENTIFIC_AGENT_FACTOR_GRAPH_ROOT_ENV: &str = "PRIDE_SCP_FACTOR_GRAPH_STAGE1_ROOT";
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -4207,6 +4211,243 @@ async fn run_factor_deterministic_bridge(
     Ok(summary)
 }
 
+async fn run_one_factor_canonical_hardened(
+    opts: &SdrfScientificAgentOptions,
+    accession: &str,
+) -> Result<ScientificAgentResultRow> {
+    let annotate_opts = opts.annotate_options();
+    let evidence = build_evidence(&annotate_opts, accession)?;
+    let explicit_mappings = if let Some(path) = opts.explicit_row_mapping_manifest.as_deref() {
+        if !path.is_file() {
+            bail!(
+                "explicit row-mapping manifest not found: {}",
+                path.display()
+            );
+        }
+        load_explicit_row_mappings(path, accession, &evidence.raw_files)?
+    } else {
+        Vec::new()
+    };
+    let (graph_path, graph) = load_factor_graph_for_phase_b(accession)?;
+    let root = opts
+        .output_dir
+        .join("canonicalization_hardened")
+        .join(accession);
+    fs::create_dir_all(&root)?;
+    let evidence_path = root.join("evidence.json");
+    let accepted_path = root.join("derived_observations.json");
+    let adjudications_path = root.join("adjudications.json");
+    let draft_path = root.join(format!("{}.canonicalization_hardened.sdrf.tsv", accession));
+    let validation_path = root.join("VALIDATION.md");
+    let review_path = root.join("REVIEW.md");
+    let result_path = root.join("result.json");
+    fs::write(&evidence_path, serde_json::to_string_pretty(&evidence)?)?;
+    fs::copy(&graph_path, root.join("accepted_factor_graph.json"))?;
+
+    let mut acceptance = derive_factor_graph_observations(&evidence, &graph);
+    acceptance.harness_version = SCIENTIFIC_AGENT_FACTOR_CANONICAL_HARDENED_VERSION.into();
+    fs::write(&accepted_path, serde_json::to_string_pretty(&acceptance)?)?;
+
+    let claims = acceptance
+        .observations
+        .iter()
+        .map(factor_observation_as_claim)
+        .collect::<Vec<_>>();
+    let state = ScientificWorkspaceState {
+        harness_version: SCIENTIFIC_AGENT_FACTOR_CANONICAL_HARDENED_VERSION.into(),
+        accession: accession.into(),
+        turn: 0,
+        relation: AgentRelation {
+            mode: if study_design_has_assertive_relation_hint(&evidence.study_design) {
+                evidence.study_design.relation_mode_hint.clone()
+            } else {
+                "unresolved".into()
+            },
+            scope: if study_design_has_assertive_relation_hint(&evidence.study_design) {
+                "project".into()
+            } else {
+                "unresolved".into()
+            },
+            evidence_refs: evidence.study_design.relation_evidence_refs.clone(),
+            confidence: evidence.study_design.relation_confidence.clone(),
+            reason: evidence.study_design.notes.clone(),
+        },
+        branches: factor_graph_as_agent_branches(&graph),
+        claims,
+        open_questions: acceptance.open_questions.clone(),
+        active_task_id: String::new(),
+        next_step: "compile".into(),
+        notes: "deterministic factor-to-observation bridge with observation-local canonicalization fidelity hardening; no LLM call and no conversational retry are permitted".into(),
+        ..Default::default()
+    };
+
+    let compiled = compile_workspace(&evidence, &state, &explicit_mappings)?;
+    write_sdrf(&draft_path, &compiled.headers, &compiled.rows)?;
+    write_validation_review(&validation_path, &compiled.issues)?;
+    let validation = validation_cycle(1, &compiled.issues);
+    let adjudications = workspace_adjudications(&evidence, &state);
+    fs::write(
+        &adjudications_path,
+        serde_json::to_string_pretty(&adjudications)?,
+    )?;
+
+    let has_template_gap = adjudications
+        .iter()
+        .any(|record| matches!(&record.adjudication, ClaimAdjudication::TemplateGap { .. }));
+    let terminal_status = if validation.validation_errors == 0 {
+        "locally_valid"
+    } else if has_template_gap {
+        "partial_template_gap"
+    } else if !acceptance.observations.is_empty() {
+        "partial_human_review"
+    } else {
+        "human_review"
+    };
+
+    write_factor_deterministic_bridge_review(
+        &review_path,
+        &graph,
+        &acceptance,
+        &adjudications,
+        &validation,
+        terminal_status,
+    )?;
+    let result = json!({
+        "harness_version": SCIENTIFIC_AGENT_FACTOR_CANONICAL_HARDENED_VERSION,
+        "accession": accession,
+        "factor_graph_source": graph_path,
+        "model_calls": 0,
+        "tool_actions": 0,
+        "validator_cycles": 1,
+        "terminal_status": terminal_status,
+        "derived_observation_count": acceptance.observations.len(),
+        "rejected_observation_count": acceptance.rejected_observations.len(),
+        "derived_observations": &acceptance.observations,
+        "rejected_observations": &acceptance.rejected_observations,
+        "adjudications": &adjudications,
+        "validation": &validation,
+        "compiled_fingerprint": &compiled.fingerprint,
+        "draft_path": draft_path.display().to_string(),
+        "review_path": review_path.display().to_string()
+    });
+    fs::write(&result_path, serde_json::to_string_pretty(&result)?)?;
+
+    Ok(ScientificAgentResultRow {
+        accession: accession.into(),
+        status: "success".into(),
+        terminal_status: terminal_status.into(),
+        turns: 0,
+        tool_actions: 0,
+        validator_cycles: 1,
+        branches: graph.materials.len() + graph.regimes.len() + graph.acquisitions.len(),
+        open_questions: acceptance.open_questions.len(),
+        relation_mode: compiled.proposal.relation_mode,
+        locally_valid: validation.validation_errors == 0,
+        validation_errors: validation.validation_errors,
+        draft_path: draft_path.display().to_string(),
+        review_path: review_path.display().to_string(),
+        workspace_path: root.display().to_string(),
+        error: String::new(),
+    })
+}
+
+async fn run_factor_canonical_hardened(
+    opts: SdrfScientificAgentOptions,
+) -> Result<SdrfScientificAgentSummary> {
+    let accessions = collect_accessions_values(&opts.accessions, opts.accessions_file.as_deref())?;
+    if accessions.len() > 1 && !opts.manuscript_text_paths.is_empty() {
+        bail!("--manuscript-text is accession-specific and may only be used for one accession");
+    }
+    fs::create_dir_all(&opts.output_dir)?;
+    let results_path = opts
+        .output_dir
+        .join("factor_canonicalization_hardened_results.tsv");
+    let mut rows = Vec::new();
+    for (i, accession) in accessions.iter().enumerate() {
+        if opts.progress {
+            eprintln!(
+                "[{}/{}] {} FactorGraph v2 canonicalization-hardened bridge",
+                i + 1,
+                accessions.len(),
+                accession
+            );
+        }
+        match run_one_factor_canonical_hardened(&opts, accession).await {
+            Ok(row) => {
+                if opts.progress {
+                    eprintln!(
+                        "  -> terminal={} model_calls=0 validators={} valid={} errors={}",
+                        row.terminal_status,
+                        row.validator_cycles,
+                        row.locally_valid,
+                        row.validation_errors
+                    );
+                }
+                rows.push(row);
+            }
+            Err(err) => {
+                eprintln!("  -> FactorGraph canonicalization-hardened bridge error: {err:#}");
+                rows.push(ScientificAgentResultRow {
+                    accession: accession.clone(),
+                    status: "error".into(),
+                    terminal_status: "error".into(),
+                    turns: 0,
+                    tool_actions: 0,
+                    validator_cycles: 0,
+                    branches: 0,
+                    open_questions: 0,
+                    relation_mode: String::new(),
+                    locally_valid: false,
+                    validation_errors: 0,
+                    draft_path: String::new(),
+                    review_path: String::new(),
+                    workspace_path: String::new(),
+                    error: format!("{err:#}"),
+                });
+            }
+        }
+    }
+    let mut writer = WriterBuilder::new()
+        .delimiter(b'\t')
+        .from_path(&results_path)?;
+    for row in &rows {
+        writer.serialize(row)?;
+    }
+    writer.flush()?;
+    let successful = rows.iter().filter(|row| row.status == "success").count();
+    let locally_valid_drafts = rows.iter().filter(|row| row.locally_valid).count();
+    let summary = SdrfScientificAgentSummary {
+        harness_version: SCIENTIFIC_AGENT_FACTOR_CANONICAL_HARDENED_VERSION.into(),
+        generator_version: GENERATOR_VERSION.into(),
+        accessions_requested: accessions.len(),
+        successful,
+        errors: rows.len().saturating_sub(successful),
+        locally_valid_drafts,
+        incomplete_drafts: successful.saturating_sub(locally_valid_drafts),
+        total_validation_errors: rows.iter().map(|row| row.validation_errors).sum(),
+        total_agent_turns: 0,
+        total_tool_actions: 0,
+        total_validator_cycles: rows.iter().map(|row| row.validator_cycles).sum(),
+        results_tsv: results_path.display().to_string(),
+        workspace_root: opts
+            .output_dir
+            .join("canonicalization_hardened")
+            .display()
+            .to_string(),
+    };
+    let rendered = serde_json::to_string_pretty(&summary)?;
+    fs::write(
+        opts.output_dir
+            .join("factor_canonicalization_hardened_summary.json"),
+        &rendered,
+    )?;
+    fs::write(
+        opts.output_dir.join("scientific_agent_summary.json"),
+        rendered,
+    )?;
+    Ok(summary)
+}
+
 fn claim_refs_are_relevant(
     evidence: &DatasetEvidence,
     concept_type: &str,
@@ -5387,6 +5628,124 @@ fn adjudicate_claim(evidence: &DatasetEvidence, claim: &ScientificClaim) -> Clai
     }
 }
 
+fn normalize_semantic_mapping_phrase(value: &str) -> String {
+    value
+        .to_ascii_lowercase()
+        .chars()
+        .map(|ch| if ch.is_ascii_alphanumeric() { ch } else { ' ' })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn isolation_canonicalization_is_observation_faithful(
+    observed_value: &str,
+    canonical_value: &str,
+) -> bool {
+    let observed = normalize_semantic_mapping_phrase(observed_value);
+    let canonical = normalize_semantic_mapping_phrase(canonical_value);
+    if observed.is_empty() || canonical.is_empty() {
+        return false;
+    }
+    if observed == canonical || observed.contains(&canonical) || canonical.contains(&observed) {
+        return true;
+    }
+
+    // Keep aliasing intentionally tiny and meaning-preserving. The previous
+    // evidence-wide scaffold could map any hydrodynamic/spray-voltage regime
+    // to `manual picking` simply because picking language appeared somewhere
+    // in the cited evidence. Hardened mode only accepts that canonical value
+    // when the observation itself explicitly describes a picking operation.
+    match canonical.as_str() {
+        "manual picking" => {
+            observed.contains("manual picking")
+                || observed.contains("manual pick")
+                || observed.contains("manually picked")
+                || observed.contains("picked single cell")
+                || observed.contains("single cell picked")
+                || observed.contains("cell picking")
+        }
+        _ => false,
+    }
+}
+
+fn harden_factor_isolation_project_baseline(
+    proposal: &mut SdrfProposal,
+    state: &ScientificWorkspaceState,
+    issues: &mut Vec<ValidationIssue>,
+) {
+    if state.harness_version != SCIENTIFIC_AGENT_FACTOR_CANONICAL_HARDENED_VERSION {
+        return;
+    }
+    let current = proposal.single_cell_isolation_method.trim().to_string();
+    if current.is_empty() || canonical_reserved_alias(&current).is_some() {
+        return;
+    }
+    let observations = state
+        .claims
+        .iter()
+        .filter(|claim| {
+            claim.concept_type == "isolation_method"
+                && matches!(claim.status.as_str(), "supported" | "hypothesis")
+                && !claim.value.trim().is_empty()
+        })
+        .collect::<Vec<_>>();
+    if observations.is_empty() {
+        return;
+    }
+    if observations
+        .iter()
+        .all(|claim| isolation_canonicalization_is_observation_faithful(&claim.value, &current))
+    {
+        return;
+    }
+
+    proposal.single_cell_isolation_method = "not available".into();
+    proposal
+        .evidence_refs
+        .remove("single_cell_isolation_method");
+    issues.push(ValidationIssue {
+        level: "warning".into(),
+        code: "scientific_agent_factor_canonicalization_hardened_baseline_mask".into(),
+        row: 0,
+        column: SC_ISOLATION_METHOD.into(),
+        message: format!(
+            "canonicalization-hardened factor mode removed project isolation value '{}' because it is not semantically faithful to the accepted factor-scoped source observations",
+            current
+        ),
+    });
+}
+
+fn adjudicate_hardened_factor_isolation_claim(
+    evidence: &DatasetEvidence,
+    claim: &ScientificClaim,
+) -> ClaimAdjudication {
+    match adjudicate_claim(evidence, claim) {
+        ClaimAdjudication::Canonical {
+            value,
+            evidence_refs,
+        } => {
+            if isolation_canonicalization_is_observation_faithful(&claim.value, &value) {
+                ClaimAdjudication::Canonical {
+                    value,
+                    evidence_refs,
+                }
+            } else {
+                ClaimAdjudication::TemplateGap {
+                    observed_value: claim.value.trim().to_string(),
+                    evidence_refs,
+                    reason: format!(
+                        "hardened factor canonicalization rejected unrelated isolation vocabulary substitution: source-faithful observation '{}' does not directly support canonical value '{}'; retain the observation and fail closed instead of choosing a validator-compatible surrogate",
+                        claim.value.trim(), value
+                    ),
+                }
+            }
+        }
+        other => other,
+    }
+}
+
 fn adjudication_equivalence_key(
     evidence: &DatasetEvidence,
     claim: &ScientificClaim,
@@ -5423,6 +5782,11 @@ fn adjudicate_workspace_claim(
                 conflict.existing_value, conflict.proposed_value, conflict.reason
             ),
         };
+    }
+    if state.harness_version == SCIENTIFIC_AGENT_FACTOR_CANONICAL_HARDENED_VERSION
+        && claim.concept_type == "isolation_method"
+    {
+        return adjudicate_hardened_factor_isolation_claim(evidence, claim);
     }
     adjudicate_claim(evidence, claim)
 }
@@ -5958,6 +6322,7 @@ fn compile_workspace(
         None,
     ));
     apply_dynamic_semantic_bootstrap(&mut proposal, evidence, &mut issues);
+    harden_factor_isolation_project_baseline(&mut proposal, state, &mut issues);
     apply_scientific_overlay(&mut proposal, evidence, state, &mut issues);
     issues.extend(apply_publication_compatibility_normalization(&mut proposal));
     if let Some(issue) = sanitize_nonindividual_semantic_proposal(&mut proposal) {
@@ -7163,6 +7528,9 @@ pub async fn run_scientific_sdrf_agent(
     opts: SdrfScientificAgentOptions,
 ) -> Result<SdrfScientificAgentSummary> {
     let requested_mode = std::env::var("PRIDE_SCP_SCIENTIFIC_AGENT_MODE").unwrap_or_default();
+    if requested_mode == SCIENTIFIC_AGENT_FACTOR_CANONICAL_HARDENED_MODE {
+        return run_factor_canonical_hardened(opts).await;
+    }
     if requested_mode == SCIENTIFIC_AGENT_FACTOR_DETERMINISTIC_BRIDGE_MODE {
         return run_factor_deterministic_bridge(opts).await;
     }
@@ -7177,8 +7545,9 @@ pub async fn run_scientific_sdrf_agent(
     }
     if !requested_mode.trim().is_empty() {
         bail!(
-            "unsupported PRIDE_SCP_SCIENTIFIC_AGENT_MODE='{}'; expected '{}', '{}', '{}', or '{}' or unset for the v1.3 workspace agent",
+            "unsupported PRIDE_SCP_SCIENTIFIC_AGENT_MODE='{}'; expected '{}', '{}', '{}', '{}', or '{}' or unset for the v1.3 workspace agent",
             requested_mode,
+            SCIENTIFIC_AGENT_FACTOR_CANONICAL_HARDENED_MODE,
             SCIENTIFIC_AGENT_FACTOR_DETERMINISTIC_BRIDGE_MODE,
             SCIENTIFIC_AGENT_FACTOR_PHASE_B_MODE,
             SCIENTIFIC_AGENT_FACTOR_GRAPH_STAGE1_MODE,
@@ -9536,5 +9905,193 @@ mod tests {
         assert!(branches
             .iter()
             .all(|branch| branch.linkage_status == "unresolved"));
+    }
+
+    #[test]
+    fn v2_canonical_hardening_rejects_spray_voltage_to_manual_picking() {
+        let evidence = evidence_with(
+            vec![EvidenceItem { id:"E0001".into(), source_kind:"manuscript_semantic_evidence".into(), source_label:"single cell isolation method".into(), text:"Single cells were also manually picked in a comparison experiment; low-input intact cells were introduced by spray voltage injection.".into() }],
+            vec!["run.raw"],
+        );
+        let claim = claim(
+            "isolation_method",
+            "Spray voltage injection",
+            "branch",
+            "R001",
+        );
+        let state = ScientificWorkspaceState {
+            harness_version: SCIENTIFIC_AGENT_FACTOR_CANONICAL_HARDENED_VERSION.into(),
+            claims: vec![claim.clone()],
+            ..Default::default()
+        };
+        match adjudicate_workspace_claim(&evidence, &state, &claim) {
+            ClaimAdjudication::TemplateGap { observed_value, .. } => {
+                assert_eq!(observed_value, "Spray voltage injection")
+            }
+            ClaimAdjudication::Unresolved { .. } => {}
+            ClaimAdjudication::Canonical { value, .. } => {
+                panic!("hardened mode must not canonicalize spray-voltage injection to {value:?}")
+            }
+            other => panic!("expected fail-closed template gap/unresolved outcome, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn v2_canonical_hardening_rejects_hydrodynamic_to_manual_picking() {
+        let evidence = evidence_with(
+            vec![EvidenceItem { id:"E0001".into(), source_kind:"manuscript_semantic_evidence".into(), source_label:"single cell isolation method".into(), text:"Individual cells were manually loaded by hydrodynamic pressure; another section mentions manually picked cells.".into() }],
+            vec!["run.raw"],
+        );
+        let claim = claim(
+            "isolation_method",
+            "Manual hydrodynamic pressure loading",
+            "branch",
+            "R002",
+        );
+        let state = ScientificWorkspaceState {
+            harness_version: SCIENTIFIC_AGENT_FACTOR_CANONICAL_HARDENED_VERSION.into(),
+            claims: vec![claim.clone()],
+            ..Default::default()
+        };
+        match adjudicate_workspace_claim(&evidence, &state, &claim) {
+            ClaimAdjudication::TemplateGap { observed_value, .. } => {
+                assert_eq!(observed_value, "Manual hydrodynamic pressure loading")
+            }
+            other => panic!("expected hardened template gap, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn v2_canonical_hardening_allows_explicit_manual_picking() {
+        let evidence = evidence_with(
+            vec![EvidenceItem {
+                id: "E0001".into(),
+                source_kind: "manuscript_semantic_evidence".into(),
+                source_label: "single cell isolation method".into(),
+                text: "Single cells were isolated by manual picking.".into(),
+            }],
+            vec!["run.raw"],
+        );
+        let claim = claim("isolation_method", "manual picking", "project", "");
+        let state = ScientificWorkspaceState {
+            harness_version: SCIENTIFIC_AGENT_FACTOR_CANONICAL_HARDENED_VERSION.into(),
+            claims: vec![claim.clone()],
+            ..Default::default()
+        };
+        assert!(
+            matches!(adjudicate_workspace_claim(&evidence, &state, &claim), ClaimAdjudication::Canonical { ref value, .. } if value == "manual picking")
+        );
+    }
+
+    #[test]
+    fn v2_canonical_hardening_preserves_capillary_template_gap() {
+        let evidence = evidence_with(
+            vec![EvidenceItem {
+                id: "E0001".into(),
+                source_kind: "manuscript_semantic_evidence".into(),
+                source_label: "single cell isolation method".into(),
+                text: "Proteome was collected by capillary microsampling from an identified cell."
+                    .into(),
+            }],
+            vec!["run.raw"],
+        );
+        let claim = claim(
+            "isolation_method",
+            "Capillary microsampling and electrokinetic injection",
+            "branch",
+            "R002",
+        );
+        let state = ScientificWorkspaceState {
+            harness_version: SCIENTIFIC_AGENT_FACTOR_CANONICAL_HARDENED_VERSION.into(),
+            claims: vec![claim.clone()],
+            ..Default::default()
+        };
+        assert!(matches!(
+            adjudicate_workspace_claim(&evidence, &state, &claim),
+            ClaimAdjudication::TemplateGap { .. } | ClaimAdjudication::Unresolved { .. }
+        ));
+    }
+
+    #[test]
+    fn v2_canonical_hardening_never_promotes_tdisco_to_manual_picking() {
+        let evidence = evidence_with(
+            vec![EvidenceItem {
+                id: "E0001".into(),
+                source_kind: "manuscript_semantic_evidence".into(),
+                source_label: "single cell isolation method".into(),
+                text: "Single-cell isolation used tDISCO/evDISCO digital microfluidic isolation."
+                    .into(),
+            }],
+            vec!["run.raw"],
+        );
+        let claim = claim(
+            "isolation_method",
+            "tDISCO (transient digital microfluidic isolation)",
+            "project",
+            "",
+        );
+        let state = ScientificWorkspaceState {
+            harness_version: SCIENTIFIC_AGENT_FACTOR_CANONICAL_HARDENED_VERSION.into(),
+            claims: vec![claim.clone()],
+            ..Default::default()
+        };
+        assert!(
+            !matches!(adjudicate_workspace_claim(&evidence, &state, &claim), ClaimAdjudication::Canonical { ref value, .. } if value == "manual picking")
+        );
+    }
+
+    #[test]
+    fn v2_canonical_hardening_leaves_acquisition_canonicalization_unchanged() {
+        let evidence = evidence_with(
+            vec![EvidenceItem {
+                id: "E0001".into(),
+                source_kind: "manuscript_semantic_evidence".into(),
+                source_label: "acquisition".into(),
+                text: "Data-independent acquisition (DIA) was used.".into(),
+            }],
+            vec!["run.raw"],
+        );
+        let claim = claim("acquisition_mode", "DIA-MS/MS", "project", "");
+        let state = ScientificWorkspaceState {
+            harness_version: SCIENTIFIC_AGENT_FACTOR_CANONICAL_HARDENED_VERSION.into(),
+            claims: vec![claim.clone()],
+            ..Default::default()
+        };
+        assert!(
+            matches!(adjudicate_workspace_claim(&evidence, &state, &claim), ClaimAdjudication::Canonical { ref value, .. } if value == "Data-independent acquisition")
+        );
+    }
+
+    #[test]
+    fn v2_canonical_hardening_masks_unfaithful_bootstrap_before_projection() {
+        let mut proposal = SdrfProposal::default();
+        proposal.single_cell_isolation_method = "manual picking".into();
+        proposal
+            .evidence_refs
+            .insert("single_cell_isolation_method".into(), vec!["E0001".into()]);
+        let state = ScientificWorkspaceState {
+            harness_version: SCIENTIFIC_AGENT_FACTOR_CANONICAL_HARDENED_VERSION.into(),
+            claims: vec![ScientificClaim {
+                concept_type: "isolation_method".into(),
+                value: "Spray voltage injection".into(),
+                scope: "branch".into(),
+                branch_id: "R001".into(),
+                status: "supported".into(),
+                evidence_refs: vec!["E0001".into()],
+                confidence: "high".into(),
+                reason: "accepted factor observation".into(),
+            }],
+            ..Default::default()
+        };
+        let mut issues = Vec::new();
+        harden_factor_isolation_project_baseline(&mut proposal, &state, &mut issues);
+        assert_eq!(proposal.single_cell_isolation_method, "not available");
+        assert!(!proposal
+            .evidence_refs
+            .contains_key("single_cell_isolation_method"));
+        assert!(issues
+            .iter()
+            .any(|issue| issue.code
+                == "scientific_agent_factor_canonicalization_hardened_baseline_mask"));
     }
 }
