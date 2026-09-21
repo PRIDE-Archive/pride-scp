@@ -575,6 +575,10 @@ struct StudyFactorGraphAcceptance {
 pub const SCIENTIFIC_AGENT_FACTOR_PHASE_B_MODE: &str = "study_factor_graph_v2_phase_b";
 pub const SCIENTIFIC_AGENT_FACTOR_PHASE_B_VERSION: &str =
     "pride-scp-scientific-workspace-agent-v2-factor-phase-b";
+pub const SCIENTIFIC_AGENT_FACTOR_DETERMINISTIC_BRIDGE_MODE: &str =
+    "study_factor_graph_v2_deterministic_bridge";
+pub const SCIENTIFIC_AGENT_FACTOR_DETERMINISTIC_BRIDGE_VERSION: &str =
+    "pride-scp-scientific-workspace-agent-v2-factor-deterministic-bridge";
 const SCIENTIFIC_AGENT_FACTOR_GRAPH_ROOT_ENV: &str = "PRIDE_SCP_FACTOR_GRAPH_STAGE1_ROOT";
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -3458,6 +3462,288 @@ fn write_factor_phase_b_review(
     Ok(())
 }
 
+fn factor_text_has_token(text: &str, token: &str) -> bool {
+    text.split(|ch: char| !ch.is_ascii_alphanumeric())
+        .any(|part| part.eq_ignore_ascii_case(token))
+}
+
+fn regime_is_source_cell_handling(regime: &AcceptedFactorRegime) -> bool {
+    let text = format!(
+        "{} {} {} {} {}",
+        regime.label,
+        regime.experimental_role,
+        regime.isolation_or_loading_method,
+        regime.input_or_cell_count_regime,
+        regime.notes
+    )
+    .to_ascii_lowercase();
+    let cellular = [
+        "single-cell",
+        "single cell",
+        "single cells",
+        "intact cell",
+        "intact cells",
+        "low-number cell",
+        "cells",
+        "subcellular",
+    ]
+    .iter()
+    .any(|needle| text.contains(needle));
+    let handling = [
+        "isolat",
+        "hydrodynamic",
+        "spray voltage",
+        "microsampl",
+        "aspirat",
+        "microwell",
+        "pick",
+        "microfluidic",
+        "disco",
+    ]
+    .iter()
+    .any(|needle| text.contains(needle));
+    cellular && handling
+}
+
+fn regime_supports_single_cell_sample_type(regime: &AcceptedFactorRegime) -> bool {
+    let value = regime
+        .input_or_cell_count_regime
+        .trim()
+        .to_ascii_lowercase();
+    (value.contains("single-cell")
+        || value.contains("single cell")
+        || value.contains("single cells"))
+        && !value.contains("subcellular")
+}
+
+fn material_role_is_reference_or_control(role: &str) -> bool {
+    let value = role.to_ascii_lowercase();
+    value.contains("reference") || value.contains("control") || value.contains("validation")
+}
+
+fn acquisition_exposes_proteomics_mode(acquisition: &AcceptedFactorAcquisition) -> bool {
+    let value = acquisition
+        .acquisition_method_or_platform
+        .to_ascii_lowercase();
+    value.contains("data independent")
+        || value.contains("data-independent")
+        || value.contains("data dependent")
+        || value.contains("data-dependent")
+        || factor_text_has_token(&value, "dia")
+        || factor_text_has_token(&value, "dda")
+}
+
+fn push_deterministic_factor_observation(
+    evidence: &DatasetEvidence,
+    graph: &StudyFactorGraphAcceptance,
+    observations: &mut Vec<AcceptedFactorObservation>,
+    rejected: &mut Vec<RejectedFactorObservation>,
+    target_factor_id: &str,
+    target_factor_kind: &str,
+    concept_type: &str,
+    observed_value: &str,
+    evidence_refs: &[String],
+    notes: &str,
+) {
+    let value = normalize_study_graph_text(observed_value);
+    let refs = valid_evidence_refs(evidence, evidence_refs);
+    if value.is_empty() || refs.is_empty() {
+        rejected.push(RejectedFactorObservation {
+            target_factor_id: target_factor_id.into(),
+            concept_type: concept_type.into(),
+            observed_value: value,
+            reason: "deterministic bridge rejected factor property because it lacked a concrete value or valid accepted-factor evidence refs".into(),
+        });
+        return;
+    }
+    let projection_scope = if factor_observation_project_safe(graph, target_factor_id, concept_type)
+    {
+        "project".into()
+    } else {
+        "factor".into()
+    };
+    observations.push(AcceptedFactorObservation {
+        target_factor_id: target_factor_id.into(),
+        target_factor_kind: target_factor_kind.into(),
+        concept_type: concept_type.into(),
+        observed_value: value,
+        evidence_refs: refs,
+        confidence: "high".into(),
+        projection_scope,
+        notes: normalize_study_graph_text(notes),
+    });
+}
+
+fn derive_factor_graph_observations(
+    evidence: &DatasetEvidence,
+    graph: &StudyFactorGraphAcceptance,
+) -> FactorPhaseBAcceptance {
+    let mut observations = Vec::new();
+    let mut rejected = Vec::new();
+
+    for material in &graph.materials {
+        push_deterministic_factor_observation(
+            evidence,
+            graph,
+            &mut observations,
+            &mut rejected,
+            &material.id,
+            "material",
+            "organism",
+            &material.organism,
+            &material.evidence_refs,
+            "deterministically derived from accepted MaterialNode.organism",
+        );
+        if material_role_is_reference_or_control(&material.experimental_role) {
+            push_deterministic_factor_observation(
+                evidence,
+                graph,
+                &mut observations,
+                &mut rejected,
+                &material.id,
+                "material",
+                "control_role",
+                &material.experimental_role,
+                &material.evidence_refs,
+                "deterministically derived from an accepted material experimental role explicitly describing reference/control/validation use",
+            );
+        }
+    }
+
+    for regime in &graph.regimes {
+        if regime_is_source_cell_handling(regime) {
+            push_deterministic_factor_observation(
+                evidence,
+                graph,
+                &mut observations,
+                &mut rejected,
+                &regime.id,
+                "regime",
+                "isolation_method",
+                &regime.isolation_or_loading_method,
+                &regime.evidence_refs,
+                "deterministically derived from accepted ExperimentalRegimeNode.isolation_or_loading_method; no second LLM reinterpretation",
+            );
+        }
+        if regime_supports_single_cell_sample_type(regime) {
+            push_deterministic_factor_observation(
+                evidence,
+                graph,
+                &mut observations,
+                &mut rejected,
+                &regime.id,
+                "regime",
+                "sample_type",
+                "single cell",
+                &regime.evidence_refs,
+                "deterministically derived from an accepted explicit single-cell input regime",
+            );
+        }
+    }
+
+    for acquisition in &graph.acquisitions {
+        if acquisition_exposes_proteomics_mode(acquisition) {
+            push_deterministic_factor_observation(
+                evidence,
+                graph,
+                &mut observations,
+                &mut rejected,
+                &acquisition.id,
+                "acquisition",
+                "acquisition_mode",
+                &acquisition.acquisition_method_or_platform,
+                &acquisition.evidence_refs,
+                "deterministically derived from accepted AcquisitionNode acquisition text containing an explicit DIA/DDA mode",
+            );
+        }
+    }
+
+    observations.sort_by(|a, b| {
+        (&a.target_factor_id, &a.concept_type, &a.observed_value).cmp(&(
+            &b.target_factor_id,
+            &b.concept_type,
+            &b.observed_value,
+        ))
+    });
+    observations.dedup_by(|a, b| {
+        a.target_factor_id == b.target_factor_id
+            && a.concept_type == b.concept_type
+            && a.observed_value.eq_ignore_ascii_case(&b.observed_value)
+    });
+
+    let status = if observations.is_empty() {
+        "human_review"
+    } else {
+        "accepted"
+    };
+    FactorPhaseBAcceptance {
+        harness_version: SCIENTIFIC_AGENT_FACTOR_DETERMINISTIC_BRIDGE_VERSION.into(),
+        accession: evidence.accession.clone(),
+        status: status.into(),
+        observations,
+        rejected_observations: rejected,
+        open_questions: graph.open_questions.clone(),
+        reason: if status == "accepted" {
+            "Rust deterministically derived source-faithful annotation observations from the already accepted factor graph; no Phase-B LLM call was made".into()
+        } else {
+            "accepted factor graph contained no safely bridgeable source-faithful annotation properties; stop at human review without invoking another model".into()
+        },
+        model_calls: 0,
+    }
+}
+
+fn write_factor_deterministic_bridge_review(
+    path: &Path,
+    graph: &StudyFactorGraphAcceptance,
+    acceptance: &FactorPhaseBAcceptance,
+    adjudications: &[ClaimAdjudicationRecord],
+    validation: &AgentValidationCycle,
+    terminal_status: &str,
+) -> Result<()> {
+    let mut out = String::new();
+    out.push_str(&format!(
+        "# PRIDE-SCP v2 Deterministic Factor Bridge: {}\n\n",
+        acceptance.accession
+    ));
+    out.push_str(&format!("Terminal status: **{}**\n\n", terminal_status));
+    out.push_str("Model calls in this stage: **0**\n\n");
+    out.push_str(&format!(
+        "Frozen accepted factor graph: materials={}, regimes={}, acquisitions={}, relations={}\n\n",
+        graph.materials.len(),
+        graph.regimes.len(),
+        graph.acquisitions.len(),
+        graph.relations.len()
+    ));
+    out.push_str("## Deterministically derived source observations\n\n");
+    if acceptance.observations.is_empty() {
+        out.push_str("None.\n");
+    } else {
+        for obs in &acceptance.observations {
+            out.push_str(&format!(
+                "- {} [{}] {}='{}' | scope={} | evidence={:?}\n",
+                obs.target_factor_id,
+                obs.target_factor_kind,
+                obs.concept_type,
+                obs.observed_value,
+                obs.projection_scope,
+                obs.evidence_refs
+            ));
+        }
+    }
+    out.push_str("\n## Rust adjudications\n\n");
+    out.push_str(&serde_json::to_string_pretty(adjudications)?);
+    out.push_str("\n\n## One-pass validation\n\n");
+    out.push_str(&format!(
+        "errors={} warnings={}\n\n",
+        validation.validation_errors, validation.validation_warnings
+    ));
+    for message in &validation.representative_messages {
+        out.push_str(&format!("- {}\n", message));
+    }
+    fs::write(path, out)?;
+    Ok(())
+}
+
 async fn run_one_factor_phase_b(
     opts: &SdrfScientificAgentOptions,
     accession: &str,
@@ -3679,6 +3965,239 @@ async fn run_factor_phase_b(
     let rendered = serde_json::to_string_pretty(&summary)?;
     fs::write(
         opts.output_dir.join("factor_phase_b_summary.json"),
+        &rendered,
+    )?;
+    fs::write(
+        opts.output_dir.join("scientific_agent_summary.json"),
+        rendered,
+    )?;
+    Ok(summary)
+}
+
+async fn run_one_factor_deterministic_bridge(
+    opts: &SdrfScientificAgentOptions,
+    accession: &str,
+) -> Result<ScientificAgentResultRow> {
+    let annotate_opts = opts.annotate_options();
+    let evidence = build_evidence(&annotate_opts, accession)?;
+    let explicit_mappings = if let Some(path) = opts.explicit_row_mapping_manifest.as_deref() {
+        if !path.is_file() {
+            bail!(
+                "explicit row-mapping manifest not found: {}",
+                path.display()
+            );
+        }
+        load_explicit_row_mappings(path, accession, &evidence.raw_files)?
+    } else {
+        Vec::new()
+    };
+    let (graph_path, graph) = load_factor_graph_for_phase_b(accession)?;
+    let root = opts.output_dir.join("deterministic_bridge").join(accession);
+    fs::create_dir_all(&root)?;
+    let evidence_path = root.join("evidence.json");
+    let accepted_path = root.join("derived_observations.json");
+    let adjudications_path = root.join("adjudications.json");
+    let draft_path = root.join(format!("{}.deterministic_bridge.sdrf.tsv", accession));
+    let validation_path = root.join("VALIDATION.md");
+    let review_path = root.join("REVIEW.md");
+    let result_path = root.join("result.json");
+    fs::write(&evidence_path, serde_json::to_string_pretty(&evidence)?)?;
+    fs::copy(&graph_path, root.join("accepted_factor_graph.json"))?;
+
+    let acceptance = derive_factor_graph_observations(&evidence, &graph);
+    fs::write(&accepted_path, serde_json::to_string_pretty(&acceptance)?)?;
+
+    let claims = acceptance
+        .observations
+        .iter()
+        .map(factor_observation_as_claim)
+        .collect::<Vec<_>>();
+    let state = ScientificWorkspaceState {
+        harness_version: SCIENTIFIC_AGENT_FACTOR_DETERMINISTIC_BRIDGE_VERSION.into(),
+        accession: accession.into(),
+        turn: 0,
+        relation: AgentRelation {
+            mode: if study_design_has_assertive_relation_hint(&evidence.study_design) {
+                evidence.study_design.relation_mode_hint.clone()
+            } else {
+                "unresolved".into()
+            },
+            scope: if study_design_has_assertive_relation_hint(&evidence.study_design) {
+                "project".into()
+            } else {
+                "unresolved".into()
+            },
+            evidence_refs: evidence.study_design.relation_evidence_refs.clone(),
+            confidence: evidence.study_design.relation_confidence.clone(),
+            reason: evidence.study_design.notes.clone(),
+        },
+        branches: factor_graph_as_agent_branches(&graph),
+        claims,
+        open_questions: acceptance.open_questions.clone(),
+        active_task_id: String::new(),
+        next_step: "compile".into(),
+        notes: "deterministic factor-to-observation bridge; no LLM call and no conversational retry are permitted".into(),
+        ..Default::default()
+    };
+
+    let compiled = compile_workspace(&evidence, &state, &explicit_mappings)?;
+    write_sdrf(&draft_path, &compiled.headers, &compiled.rows)?;
+    write_validation_review(&validation_path, &compiled.issues)?;
+    let validation = validation_cycle(1, &compiled.issues);
+    let adjudications = workspace_adjudications(&evidence, &state);
+    fs::write(
+        &adjudications_path,
+        serde_json::to_string_pretty(&adjudications)?,
+    )?;
+
+    let has_template_gap = adjudications
+        .iter()
+        .any(|record| matches!(&record.adjudication, ClaimAdjudication::TemplateGap { .. }));
+    let terminal_status = if validation.validation_errors == 0 {
+        "locally_valid"
+    } else if has_template_gap {
+        "partial_template_gap"
+    } else if !acceptance.observations.is_empty() {
+        "partial_human_review"
+    } else {
+        "human_review"
+    };
+
+    write_factor_deterministic_bridge_review(
+        &review_path,
+        &graph,
+        &acceptance,
+        &adjudications,
+        &validation,
+        terminal_status,
+    )?;
+    let result = json!({
+        "harness_version": SCIENTIFIC_AGENT_FACTOR_DETERMINISTIC_BRIDGE_VERSION,
+        "accession": accession,
+        "factor_graph_source": graph_path,
+        "model_calls": 0,
+        "tool_actions": 0,
+        "validator_cycles": 1,
+        "terminal_status": terminal_status,
+        "derived_observation_count": acceptance.observations.len(),
+        "rejected_observation_count": acceptance.rejected_observations.len(),
+        "derived_observations": &acceptance.observations,
+        "rejected_observations": &acceptance.rejected_observations,
+        "adjudications": &adjudications,
+        "validation": &validation,
+        "compiled_fingerprint": &compiled.fingerprint,
+        "draft_path": draft_path.display().to_string(),
+        "review_path": review_path.display().to_string()
+    });
+    fs::write(&result_path, serde_json::to_string_pretty(&result)?)?;
+
+    Ok(ScientificAgentResultRow {
+        accession: accession.into(),
+        status: "success".into(),
+        terminal_status: terminal_status.into(),
+        turns: 0,
+        tool_actions: 0,
+        validator_cycles: 1,
+        branches: graph.materials.len() + graph.regimes.len() + graph.acquisitions.len(),
+        open_questions: acceptance.open_questions.len(),
+        relation_mode: compiled.proposal.relation_mode,
+        locally_valid: validation.validation_errors == 0,
+        validation_errors: validation.validation_errors,
+        draft_path: draft_path.display().to_string(),
+        review_path: review_path.display().to_string(),
+        workspace_path: root.display().to_string(),
+        error: String::new(),
+    })
+}
+
+async fn run_factor_deterministic_bridge(
+    opts: SdrfScientificAgentOptions,
+) -> Result<SdrfScientificAgentSummary> {
+    let accessions = collect_accessions_values(&opts.accessions, opts.accessions_file.as_deref())?;
+    if accessions.len() > 1 && !opts.manuscript_text_paths.is_empty() {
+        bail!("--manuscript-text is accession-specific and may only be used for one accession");
+    }
+    fs::create_dir_all(&opts.output_dir)?;
+    let results_path = opts
+        .output_dir
+        .join("factor_deterministic_bridge_results.tsv");
+    let mut rows = Vec::new();
+    for (i, accession) in accessions.iter().enumerate() {
+        if opts.progress {
+            eprintln!(
+                "[{}/{}] {} FactorGraph v2 deterministic bridge",
+                i + 1,
+                accessions.len(),
+                accession
+            );
+        }
+        match run_one_factor_deterministic_bridge(&opts, accession).await {
+            Ok(row) => {
+                if opts.progress {
+                    eprintln!(
+                        "  -> terminal={} model_calls=0 validators={} valid={} errors={}",
+                        row.terminal_status,
+                        row.validator_cycles,
+                        row.locally_valid,
+                        row.validation_errors
+                    );
+                }
+                rows.push(row);
+            }
+            Err(err) => {
+                eprintln!("  -> FactorGraph deterministic bridge error: {err:#}");
+                rows.push(ScientificAgentResultRow {
+                    accession: accession.clone(),
+                    status: "error".into(),
+                    terminal_status: "error".into(),
+                    turns: 0,
+                    tool_actions: 0,
+                    validator_cycles: 0,
+                    branches: 0,
+                    open_questions: 0,
+                    relation_mode: String::new(),
+                    locally_valid: false,
+                    validation_errors: 0,
+                    draft_path: String::new(),
+                    review_path: String::new(),
+                    workspace_path: String::new(),
+                    error: format!("{err:#}"),
+                });
+            }
+        }
+    }
+    let mut writer = WriterBuilder::new()
+        .delimiter(b'\t')
+        .from_path(&results_path)?;
+    for row in &rows {
+        writer.serialize(row)?;
+    }
+    writer.flush()?;
+    let successful = rows.iter().filter(|row| row.status == "success").count();
+    let locally_valid_drafts = rows.iter().filter(|row| row.locally_valid).count();
+    let summary = SdrfScientificAgentSummary {
+        harness_version: SCIENTIFIC_AGENT_FACTOR_DETERMINISTIC_BRIDGE_VERSION.into(),
+        generator_version: GENERATOR_VERSION.into(),
+        accessions_requested: accessions.len(),
+        successful,
+        errors: rows.len().saturating_sub(successful),
+        locally_valid_drafts,
+        incomplete_drafts: successful.saturating_sub(locally_valid_drafts),
+        total_validation_errors: rows.iter().map(|row| row.validation_errors).sum(),
+        total_agent_turns: 0,
+        total_tool_actions: 0,
+        total_validator_cycles: rows.iter().map(|row| row.validator_cycles).sum(),
+        results_tsv: results_path.display().to_string(),
+        workspace_root: opts
+            .output_dir
+            .join("deterministic_bridge")
+            .display()
+            .to_string(),
+    };
+    let rendered = serde_json::to_string_pretty(&summary)?;
+    fs::write(
+        opts.output_dir
+            .join("factor_deterministic_bridge_summary.json"),
         &rendered,
     )?;
     fs::write(
@@ -6644,6 +7163,9 @@ pub async fn run_scientific_sdrf_agent(
     opts: SdrfScientificAgentOptions,
 ) -> Result<SdrfScientificAgentSummary> {
     let requested_mode = std::env::var("PRIDE_SCP_SCIENTIFIC_AGENT_MODE").unwrap_or_default();
+    if requested_mode == SCIENTIFIC_AGENT_FACTOR_DETERMINISTIC_BRIDGE_MODE {
+        return run_factor_deterministic_bridge(opts).await;
+    }
     if requested_mode == SCIENTIFIC_AGENT_FACTOR_PHASE_B_MODE {
         return run_factor_phase_b(opts).await;
     }
@@ -6655,8 +7177,9 @@ pub async fn run_scientific_sdrf_agent(
     }
     if !requested_mode.trim().is_empty() {
         bail!(
-            "unsupported PRIDE_SCP_SCIENTIFIC_AGENT_MODE='{}'; expected '{}', '{}', or '{}' or unset for the v1.3 workspace agent",
+            "unsupported PRIDE_SCP_SCIENTIFIC_AGENT_MODE='{}'; expected '{}', '{}', '{}', or '{}' or unset for the v1.3 workspace agent",
             requested_mode,
+            SCIENTIFIC_AGENT_FACTOR_DETERMINISTIC_BRIDGE_MODE,
             SCIENTIFIC_AGENT_FACTOR_PHASE_B_MODE,
             SCIENTIFIC_AGENT_FACTOR_GRAPH_STAGE1_MODE,
             SCIENTIFIC_AGENT_STUDY_GRAPH_STAGE1_MODE
@@ -8815,5 +9338,203 @@ mod tests {
         assert!(branches
             .iter()
             .all(|branch| branch.linked_raw_files.is_empty()));
+    }
+    #[test]
+    fn v2_deterministic_bridge_derives_regime_isolation_without_model_call() {
+        let evidence = evidence_with(
+            vec![EvidenceItem { id:"E0001".into(), source_kind:"publication".into(), source_label:"methods".into(), text:"Single cells were manually loaded by hydrodynamic pressure and low-input intact cells were introduced by spray voltage injection.".into() }],
+            vec!["run.raw"],
+        );
+        let graph = phase_b_test_factor_graph();
+        let accepted = derive_factor_graph_observations(&evidence, &graph);
+        assert_eq!(accepted.model_calls, 0);
+        assert_eq!(accepted.status, "accepted");
+        assert!(accepted
+            .observations
+            .iter()
+            .any(|obs| obs.target_factor_id == "R001"
+                && obs.concept_type == "isolation_method"
+                && obs
+                    .observed_value
+                    .to_ascii_lowercase()
+                    .contains("hydrodynamic")));
+        assert!(accepted
+            .observations
+            .iter()
+            .any(|obs| obs.target_factor_id == "R002"
+                && obs.concept_type == "isolation_method"
+                && obs.observed_value.to_ascii_lowercase().contains("spray")));
+    }
+
+    #[test]
+    fn v2_deterministic_bridge_does_not_turn_commercial_digest_loading_into_isolation() {
+        let evidence = evidence_with(
+            vec![EvidenceItem {
+                id: "E0001".into(),
+                source_kind: "publication".into(),
+                source_label: "methods".into(),
+                text: "A commercial reference digest was loaded for validation.".into(),
+            }],
+            vec!["run.raw"],
+        );
+        let mut graph = phase_b_test_factor_graph();
+        graph.regimes = vec![AcceptedFactorRegime {
+            id: "R001".into(),
+            label: "reference".into(),
+            experimental_role: "Validation/Method Development".into(),
+            isolation_or_loading_method: "Standard loading of commercial digest".into(),
+            input_or_cell_count_regime: "Commercial digest input".into(),
+            evidence_refs: vec!["E0001".into()],
+            notes: String::new(),
+        }];
+        let accepted = derive_factor_graph_observations(&evidence, &graph);
+        assert!(!accepted
+            .observations
+            .iter()
+            .any(|obs| obs.target_factor_id == "R001" && obs.concept_type == "isolation_method"));
+    }
+
+    #[test]
+    fn v2_deterministic_bridge_preserves_distinct_material_organisms() {
+        let evidence = evidence_with(
+            vec![EvidenceItem {
+                id: "E0001".into(),
+                source_kind: "repository_metadata".into(),
+                source_label: "organism".into(),
+                text: "Homo sapiens and Mus musculus".into(),
+            }],
+            vec!["run.raw"],
+        );
+        let mut graph = phase_b_test_factor_graph();
+        graph.materials = vec![
+            AcceptedFactorMaterial {
+                id: "M001".into(),
+                label: "human".into(),
+                organism: "Homo sapiens".into(),
+                biological_material: "human cells".into(),
+                experimental_role: "source".into(),
+                evidence_refs: vec!["E0001".into()],
+                notes: String::new(),
+            },
+            AcceptedFactorMaterial {
+                id: "M002".into(),
+                label: "mouse".into(),
+                organism: "Mus musculus".into(),
+                biological_material: "mouse cells".into(),
+                experimental_role: "source".into(),
+                evidence_refs: vec!["E0001".into()],
+                notes: String::new(),
+            },
+        ];
+        let accepted = derive_factor_graph_observations(&evidence, &graph);
+        assert!(accepted
+            .observations
+            .iter()
+            .any(|obs| obs.target_factor_id == "M001"
+                && obs.concept_type == "organism"
+                && obs.observed_value == "Homo sapiens"));
+        assert!(accepted
+            .observations
+            .iter()
+            .any(|obs| obs.target_factor_id == "M002"
+                && obs.concept_type == "organism"
+                && obs.observed_value == "Mus musculus"));
+        assert!(accepted
+            .observations
+            .iter()
+            .filter(|obs| obs.concept_type == "organism")
+            .all(|obs| obs.projection_scope == "factor"));
+    }
+
+    #[test]
+    fn v2_deterministic_bridge_only_derives_explicit_dia_or_dda_acquisition_mode() {
+        let evidence = evidence_with(
+            vec![EvidenceItem {
+                id: "E0001".into(),
+                source_kind: "publication".into(),
+                source_label: "acquisition".into(),
+                text: "DIA-MS acquisition was used.".into(),
+            }],
+            vec!["run.raw"],
+        );
+        let mut graph = phase_b_test_factor_graph();
+        graph.acquisitions = vec![
+            AcceptedFactorAcquisition {
+                id: "A001".into(),
+                label: "dia".into(),
+                acquisition_method_or_platform: "CE-ESI-MS/MS with DIA".into(),
+                evidence_refs: vec!["E0001".into()],
+                notes: String::new(),
+            },
+            AcceptedFactorAcquisition {
+                id: "A002".into(),
+                label: "esi".into(),
+                acquisition_method_or_platform: "Direct ESI-MS".into(),
+                evidence_refs: vec!["E0001".into()],
+                notes: String::new(),
+            },
+        ];
+        let accepted = derive_factor_graph_observations(&evidence, &graph);
+        assert!(accepted
+            .observations
+            .iter()
+            .any(|obs| obs.target_factor_id == "A001" && obs.concept_type == "acquisition_mode"));
+        assert!(!accepted
+            .observations
+            .iter()
+            .any(|obs| obs.target_factor_id == "A002" && obs.concept_type == "acquisition_mode"));
+    }
+
+    #[test]
+    fn v2_deterministic_bridge_single_cell_sample_type_requires_explicit_input_regime() {
+        let evidence = evidence_with(
+            vec![EvidenceItem {
+                id: "E0001".into(),
+                source_kind: "publication".into(),
+                source_label: "methods".into(),
+                text: "Single cells were isolated.".into(),
+            }],
+            vec!["run.raw"],
+        );
+        let mut graph = phase_b_test_factor_graph();
+        graph.regimes.truncate(1);
+        graph.regimes[0].input_or_cell_count_regime = "Single cells".into();
+        let accepted = derive_factor_graph_observations(&evidence, &graph);
+        assert!(accepted
+            .observations
+            .iter()
+            .any(|obs| obs.target_factor_id == "R001"
+                && obs.concept_type == "sample_type"
+                && obs.observed_value == "single cell"));
+    }
+
+    #[test]
+    fn v2_deterministic_bridge_factor_claims_keep_rust_ids_and_unresolved_linkage() {
+        let evidence = evidence_with(
+            vec![EvidenceItem {
+                id: "E0001".into(),
+                source_kind: "publication".into(),
+                source_label: "methods".into(),
+                text: "Single cells were manually loaded by hydrodynamic pressure.".into(),
+            }],
+            vec!["run.raw"],
+        );
+        let graph = phase_b_test_factor_graph();
+        let accepted = derive_factor_graph_observations(&evidence, &graph);
+        let claims = accepted
+            .observations
+            .iter()
+            .map(factor_observation_as_claim)
+            .collect::<Vec<_>>();
+        assert!(claims
+            .iter()
+            .filter(|claim| claim.scope == "branch")
+            .all(|claim| claim.branch_id.starts_with('M')
+                || claim.branch_id.starts_with('R')
+                || claim.branch_id.starts_with('A')));
+        let branches = factor_graph_as_agent_branches(&graph);
+        assert!(branches
+            .iter()
+            .all(|branch| branch.linkage_status == "unresolved"));
     }
 }
