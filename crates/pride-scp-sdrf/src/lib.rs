@@ -2749,11 +2749,6 @@ fn build_evidence(opts: &SdrfAnnotateOptions, accession: &str) -> Result<Dataset
         .resolved_sdrf_dir
         .as_ref()
         .map(|dir| dir.join(format!("{accession}.sdrf.tsv")));
-    let existing_sdrf = resolved_sdrf
-        .as_ref()
-        .filter(|p| existing_sdrf_is_usable(p))
-        .cloned()
-        .unwrap_or_else(|| snapshot_sdrf.clone());
     if !project_path.is_file() {
         bail!("missing PRIDE project snapshot {}", project_path.display());
     }
@@ -2769,6 +2764,20 @@ fn build_evidence(opts: &SdrfAnnotateOptions, accession: &str) -> Result<Dataset
             files_path.display()
         );
     }
+
+    // Preservation-first reuse is safe only when the candidate SDRF represents the
+    // complete repository RAW inventory in both directions. A parseable/usable SDRF
+    // may be a historical or partial subset (for example, 39 mapped files while the
+    // current repository exposes 326 RAW files), so usability alone must not activate
+    // the locked existing-SDRF path.
+    let existing_sdrf = resolved_sdrf
+        .as_ref()
+        .filter(|p| existing_sdrf_has_bidirectional_repository_coverage(p, &raw_files))
+        .cloned()
+        .or_else(|| {
+            existing_sdrf_has_bidirectional_repository_coverage(&snapshot_sdrf, &raw_files)
+                .then(|| snapshot_sdrf.clone())
+        });
 
     let mut manuscript_paths = Vec::new();
     if let Some(manifest) = &opts.publication_manifest {
@@ -2787,17 +2796,17 @@ fn build_evidence(opts: &SdrfAnnotateOptions, accession: &str) -> Result<Dataset
     // Existing SDRF is the highest-value source only when it contains a real
     // sample-to-data mapping. The PRIDE SDRF endpoint can yield header-only cache
     // files, so file existence alone must never activate the preservation path.
-    let usable_existing_sdrf = existing_sdrf_is_usable(&existing_sdrf);
+    let usable_existing_sdrf = existing_sdrf.is_some();
     let (pre_manuscript_max_items, pre_manuscript_max_chars) = pre_manuscript_evidence_caps(
         usable_existing_sdrf,
         !manuscript_paths.is_empty(),
         opts.max_evidence_items,
         opts.max_evidence_chars,
     );
-    if usable_existing_sdrf {
+    if let Some(existing_sdrf) = existing_sdrf.as_ref() {
         add_existing_sdrf_evidence(
             &mut evidence,
-            &existing_sdrf,
+            existing_sdrf,
             pre_manuscript_max_items,
             pre_manuscript_max_chars,
         )?;
@@ -2917,8 +2926,9 @@ fn build_evidence(opts: &SdrfAnnotateOptions, accession: &str) -> Result<Dataset
         accession: accession.to_string(),
         project_json_path: project_path.display().to_string(),
         files_json_path: files_path.display().to_string(),
-        existing_sdrf_path: usable_existing_sdrf
-            .then(|| existing_sdrf.display().to_string())
+        existing_sdrf_path: existing_sdrf
+            .as_ref()
+            .map(|p| p.display().to_string())
             .unwrap_or_default(),
         raw_files,
         study_design,
@@ -7605,6 +7615,19 @@ fn data_file_linkage_stats(
     stats
 }
 
+fn existing_sdrf_has_bidirectional_repository_coverage(path: &Path, raw_files: &[RawFile]) -> bool {
+    if raw_files.is_empty() || !existing_sdrf_is_usable(path) {
+        return false;
+    }
+    let Ok((headers, rows)) = read_existing_sdrf_table(path) else {
+        return false;
+    };
+    let stats = data_file_linkage_stats(&headers, &rows, raw_files);
+    stats.unmatched_unique_data_files == 0
+        && stats.matched_unique_data_files == stats.snapshot_raw_files
+        && stats.sdrf_unique_data_files == stats.snapshot_raw_files
+}
+
 fn row_explicit_non_single_cell_role(index: &HashMap<&str, usize>, row: &[String]) -> bool {
     let sample_type = index
         .get(SC_SAMPLE_TYPE)
@@ -10852,6 +10875,83 @@ mod tests {
         .unwrap();
         assert_eq!(existing_sdrf_status(&path), "usable");
         assert!(existing_sdrf_is_usable(&path));
+    }
+
+    #[test]
+    fn existing_sdrf_bidirectional_coverage_accepts_complete_inventory() {
+        let dir = tmp();
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("complete.sdrf.tsv");
+        fs::write(
+            &path,
+            "source name\tcomment[data file]\ncell_1\trun_1.raw\ncell_2\trun_2.raw\n",
+        )
+        .unwrap();
+        let raw = vec![
+            RawFile {
+                file_name: "run_1.raw".into(),
+                file_uri: String::new(),
+                category: "RAW".into(),
+            },
+            RawFile {
+                file_name: "run_2.raw".into(),
+                file_uri: String::new(),
+                category: "RAW".into(),
+            },
+        ];
+        assert!(existing_sdrf_has_bidirectional_repository_coverage(
+            &path, &raw
+        ));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn existing_sdrf_bidirectional_coverage_rejects_repository_subset() {
+        let dir = tmp();
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("partial.sdrf.tsv");
+        fs::write(
+            &path,
+            "source name\tcomment[data file]\ncell_1\trun_1.raw\n",
+        )
+        .unwrap();
+        let raw = vec![
+            RawFile {
+                file_name: "run_1.raw".into(),
+                file_uri: String::new(),
+                category: "RAW".into(),
+            },
+            RawFile {
+                file_name: "run_2.raw".into(),
+                file_uri: String::new(),
+                category: "RAW".into(),
+            },
+        ];
+        assert!(!existing_sdrf_has_bidirectional_repository_coverage(
+            &path, &raw
+        ));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn existing_sdrf_bidirectional_coverage_preserves_archive_alias_matching() {
+        let dir = tmp();
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("wrapped.sdrf.tsv");
+        fs::write(
+            &path,
+            "source name\tcomment[data file]\ncell_1\trun_001.d\n",
+        )
+        .unwrap();
+        let raw = vec![RawFile {
+            file_name: "run_001.d.zip".into(),
+            file_uri: String::new(),
+            category: "RAW".into(),
+        }];
+        assert!(existing_sdrf_has_bidirectional_repository_coverage(
+            &path, &raw
+        ));
+        let _ = fs::remove_dir_all(dir);
     }
 
     #[test]
