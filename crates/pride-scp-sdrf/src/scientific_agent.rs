@@ -402,6 +402,17 @@ pub const SCIENTIFIC_AGENT_FACTOR_GRAPH_STAGE1_MODE: &str = "study_factor_graph_
 pub const SCIENTIFIC_AGENT_FACTOR_GRAPH_STAGE1_VERSION: &str =
     "pride-scp-scientific-workspace-agent-v2-factor-stage1";
 
+const FACTOR_GRAPH_STAGE1_DECISION_CONTRACT: &str = "\
+DECISION CONTRACT:\n\
+- Return propose_graph whenever trusted evidence supports a safe conceptual graph with at least one Material node and one Experimental Regime node. Acquisition nodes, exact RAW links, and complete answers to every open question are NOT prerequisites for propose_graph.\n\
+- open_questions may coexist with propose_graph. Use human_review only when no source-grounded conceptual Material + Regime graph can be expressed safely after preserving the distinctions that trusted evidence actually establishes.\n\
+- Missing exact RAW-to-factor linkage is never, by itself, a reason for human_review. Do not treat repository filenames or absent file mappings as a requirement for conceptual graph construction.\n\
+- Distinct Material nodes MAY share the same source-supported Regime and/or Acquisition node. A shared workflow does not collapse biological material identity, and you must not duplicate a Regime merely because multiple materials use it.\n\
+- Preserve source-defined biological source cohorts or states that are central to the study and cannot be represented by the Regime or Acquisition axes. For example, explicitly distinguished GV, IVM, and IVO oocyte maturation states should remain distinct Material nodes while sharing a common preparation Regime when the source says the workflow is shared. Do not split Material nodes merely for technical processing conditions.\n\
+- NODE-TEXT SOURCE FIDELITY IS STRICT: every substantive organism, material, biological state, isolation/loading method, acquisition method, platform, and named technology written into a node's core fields must be explicitly stated by, or directly entailed by, that node's cited E#### evidence. Never add a method, platform, acronym, or modality from model memory, filename wording, another dataset, or an uncited inference.\n\
+- When evidence supports a narrower statement than you initially considered, use the narrower source-faithful wording. If acquisition details are not safely supported, omit the Acquisition node rather than inventing them; a supported Material + Regime graph may still be proposed.\n\
+- The reason field MUST agree with decision. If reason says the graph is valid, safe, constructible, source-grounded, or that no conflicting evidence prevents construction, decision must be propose_graph unless the reason also identifies a concrete conceptual Material/Regime ambiguity that makes the graph unsafe.\n";
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
 struct FactorMaterialProposal {
@@ -2278,6 +2289,7 @@ SAFETY AND SCOPE:\n\
 - Every node and relation requires at least one supporting E#### ref.\n\
 - Do not choose SDRF controlled-vocabulary values and do not repair SDRF fields in this phase.\n\
 - Use human_review only when the conceptual factor graph itself cannot be established safely.\n\n\
+{decision_contract}\n\
 DETERMINISTIC CARDINALITY HINT (not biological identity):\n\
 relation_mode={relation}; confidence={confidence}; refs={refs:?}; repository_file_mode={repo_mode}; note={note}\n\n\
 TRUSTED STUDY-STRUCTURE EVIDENCE:\n{evidence_block}\n\n\
@@ -2288,6 +2300,7 @@ Return ONLY the StudyFactorGraphProposal JSON object matching the schema.",
         refs = evidence.study_design.relation_evidence_refs,
         repo_mode = evidence.study_design.repository_file_mode,
         note = evidence.study_design.notes,
+        decision_contract = FACTOR_GRAPH_STAGE1_DECISION_CONTRACT,
         evidence_block = evidence_block,
     )
 }
@@ -10696,6 +10709,26 @@ mod tests {
         assert_eq!(accepted.status, "human_review");
         assert!(accepted.branches.is_empty());
         assert_eq!(accepted.model_calls, 1);
+    }
+
+    #[test]
+    fn v2_factor_stage1_decision_contract_encodes_decision4_safety_rules() {
+        let text = FACTOR_GRAPH_STAGE1_DECISION_CONTRACT;
+        assert!(text.contains("open_questions may coexist with propose_graph"));
+        assert!(text.contains("Missing exact RAW-to-factor linkage is never"));
+        assert!(text.contains("Distinct Material nodes MAY share"));
+        assert!(text.contains("GV, IVM, and IVO"));
+        assert!(text.contains("NODE-TEXT SOURCE FIDELITY IS STRICT"));
+        assert!(text.contains("omit the Acquisition node rather than inventing"));
+        assert!(text.contains("reason field MUST agree with decision"));
+    }
+
+    #[test]
+    fn v2_factor_stage1_decision_contract_keeps_minimum_safe_graph_at_material_plus_regime() {
+        let text = FACTOR_GRAPH_STAGE1_DECISION_CONTRACT;
+        assert!(text.contains("at least one Material node and one Experimental Regime node"));
+        assert!(text.contains("Acquisition nodes, exact RAW links, and complete answers"));
+        assert!(!text.contains("automatically accept"));
     }
 
     #[test]

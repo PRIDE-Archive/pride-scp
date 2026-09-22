@@ -22,6 +22,18 @@ Every node and relation must cite trusted `E####` evidence. Rust assigns canonic
 
 Absence of exact RAW linkage is not a reason to merge scientific nodes and is not a reason for human review.
 
+## Decision contract
+
+Stage 1 must return `propose_graph` whenever trusted evidence supports a safe conceptual graph containing at least one Material and one Experimental Regime. Acquisition nodes, exact RAW linkage, and complete answers to every open question are not prerequisites. `open_questions` may coexist with `propose_graph`.
+
+`human_review` is reserved for cases where the conceptual Material + Regime graph itself cannot be expressed safely from trusted evidence. The `reason` text must agree with the decision: a reason that says the graph is valid, safe, constructible, or unobstructed by conflicting evidence cannot accompany `human_review` unless it also identifies a concrete conceptual Material/Regime ambiguity.
+
+Distinct Material nodes may share the same source-supported Regime and/or Acquisition node. Sharing a workflow preserves orthogonal material identity; it is not a reason to duplicate regimes or to fail closed.
+
+Source-defined biological source cohorts or states that are central to the study and cannot be represented on the Regime or Acquisition axes must remain distinct Material nodes. For example, explicitly distinguished GV, IVM, and IVO oocyte maturation states can be represented as separate materials while sharing one source-supported preparation regime. Technical processing differences alone do not create separate Material nodes.
+
+Node text is source-faithful. Every substantive organism, material, biological-state, isolation/loading-method, acquisition-method, platform, or named-technology term in a node's core fields must be explicitly stated by, or directly entailed by, that node's cited `E####` evidence. If the evidence supports a narrower statement, use it. If acquisition details are unsafe or unsupported, omit the Acquisition node rather than inventing terminology; a supported Material + Regime graph may still proceed.
+
 ## One-shot orchestration
 
 ```text
