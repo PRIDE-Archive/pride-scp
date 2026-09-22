@@ -7126,6 +7126,33 @@ fn enforce_deterministic_row_scaffold(
     issues
 }
 
+fn validate_scientific_workspace_rows(
+    headers: &[String],
+    rows: &[Vec<String>],
+    evidence: &DatasetEvidence,
+    relation_mode: &str,
+    explicit_mappings: &[ExplicitRowMapping],
+) -> Vec<ValidationIssue> {
+    let unresolved_de_novo_multiplex = evidence.existing_sdrf_path.is_empty()
+        && explicit_mappings.is_empty()
+        && relation_mode == "multiplexed_cells_per_data_file"
+        && evidence
+            .study_design
+            .multiplex_mapping_status
+            .ends_with("mapping_unresolved");
+
+    if unresolved_de_novo_multiplex {
+        // Preserve the mature SDRF-generator contract: when the acquisition is
+        // reporter-multiplexed but the source does not provide an exact
+        // sample/channel mapping, do not validate the one-row-per-RAW skeleton
+        // as though it were a finalized per-channel SDRF. Doing so creates a
+        // misleading row-error storm for one causal mapping gap.
+        validate_incomplete_mapping_scaffold(headers, rows, evidence, relation_mode, false)
+    } else {
+        validate_annotation_draft(headers, rows, evidence, false)
+    }
+}
+
 fn compiled_workspace_fingerprint(
     proposal: &SdrfProposal,
     headers: &[String],
@@ -7270,7 +7297,13 @@ fn compile_workspace(
         }
     }
 
-    issues.extend(validate_annotation_draft(&headers, &rows, evidence, false));
+    issues.extend(validate_scientific_workspace_rows(
+        &headers,
+        &rows,
+        evidence,
+        &proposal.relation_mode,
+        explicit_mappings,
+    ));
     let adjudications = state
         .claims
         .iter()
@@ -9913,6 +9946,66 @@ mod tests {
         assert!(issues
             .iter()
             .any(|issue| issue.code == "scientific_agent_branch_scope_masks_project_value"));
+    }
+
+    #[test]
+    fn v2_unresolved_multiplex_uses_mapping_level_validation() {
+        let mut evidence = evidence_with(Vec::new(), vec!["plex.raw"]);
+        evidence.study_design.relation_mode_hint = "multiplexed_cells_per_data_file".into();
+        evidence.study_design.relation_confidence = "high".into();
+        evidence.study_design.multiplex_chemistry_hint = "TMTpro".into();
+        evidence.study_design.multiplex_mapping_status =
+            "chemistry_detected_channel_mapping_unresolved".into();
+        evidence.study_design.repository_file_mode = "direct_acquisitions".into();
+
+        let headers = vec![
+            "source name".into(),
+            "assay name".into(),
+            "technology type".into(),
+            "comment[data file]".into(),
+            SC_SAMPLE_TYPE.into(),
+            SC_ISOLATION_METHOD.into(),
+            SC_CELL_IDENTIFIER.into(),
+            SC_CELLS_PER_WELL.into(),
+            "comment[fraction identifier]".into(),
+            "comment[technical replicate]".into(),
+        ];
+        let rows = vec![vec![
+            "run_0001".into(),
+            "run_0001".into(),
+            "proteomic profiling by mass spectrometry".into(),
+            "plex.raw".into(),
+            "single cell".into(),
+            "not available".into(),
+            "not available".into(),
+            "not available".into(),
+            "not available".into(),
+            "not available".into(),
+        ]];
+
+        let issues = validate_scientific_workspace_rows(
+            &headers,
+            &rows,
+            &evidence,
+            "multiplexed_cells_per_data_file",
+            &[],
+        );
+
+        let errors = issues
+            .iter()
+            .filter(|issue| issue.level == "error")
+            .collect::<Vec<_>>();
+
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].code, "sample_to_channel_mapping_unresolved");
+        assert!(!issues.iter().any(|issue| {
+            matches!(
+                issue.code.as_str(),
+                "single_cell_isolation_unresolved"
+                    | "cell_identifier_invalid_or_unresolved"
+                    | "required_integer_invalid"
+            )
+        }));
     }
 
     #[test]
