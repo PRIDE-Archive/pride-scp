@@ -812,6 +812,10 @@ struct ScientificTask {
     sdrf_field: String,
     status: String,
     #[serde(default)]
+    task_source: String,
+    #[serde(default)]
+    completion_mode: String,
+    #[serde(default)]
     error_codes: Vec<String>,
     error_count: usize,
     #[serde(default)]
@@ -1229,6 +1233,8 @@ fn build_scientific_tasks(
             concept_type: "study_structure".into(),
             sdrf_field: "study_structure".into(),
             status: "open".into(),
+            task_source: "validator".into(),
+            completion_mode: "validator_clear".into(),
             error_codes: vec!["scientific_study_structure_review".into()],
             error_count: 1,
             representative_rows: Vec::new(),
@@ -1260,6 +1266,8 @@ fn build_scientific_tasks(
                     concept_type,
                     sdrf_field: task.field.clone(),
                     status: "open".into(),
+                    task_source: "validator".into(),
+                    completion_mode: "validator_clear".into(),
                     error_codes: task.error_codes,
                     error_count: task.error_count,
                     representative_rows: task.representative_rows,
@@ -1282,7 +1290,174 @@ fn build_scientific_tasks(
 }
 
 fn task_is_terminal(task: &ScientificTask) -> bool {
-    matches!(task.status.as_str(), "resolved" | "human_review")
+    matches!(
+        task.status.as_str(),
+        "resolved" | "human_review" | "repair_attempted" | "template_gap"
+    )
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct ReadinessTaskSpec {
+    id: String,
+    concept_type: String,
+    sdrf_field: String,
+    #[serde(default)]
+    error_codes: Vec<String>,
+    #[serde(default)]
+    error_count: usize,
+    #[serde(default)]
+    representative_rows: Vec<usize>,
+    #[serde(default)]
+    representative_messages: Vec<String>,
+    objective: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct ReadinessTaskManifest {
+    accession: String,
+    #[serde(default)]
+    tasks: Vec<ReadinessTaskSpec>,
+}
+
+fn load_readiness_tasks(
+    evidence: &DatasetEvidence,
+    accession: &str,
+) -> Result<Vec<ScientificTask>> {
+    let Ok(root) = std::env::var("PRIDE_SCP_SCIENTIFIC_AGENT_READINESS_TASKS_DIR") else {
+        return Ok(Vec::new());
+    };
+    if root.trim().is_empty() {
+        return Ok(Vec::new());
+    }
+    let path = Path::new(&root).join(format!("{accession}.json"));
+    if !path.is_file() {
+        return Ok(Vec::new());
+    }
+    let manifest: ReadinessTaskManifest = serde_json::from_str(
+        &fs::read_to_string(&path)
+            .with_context(|| format!("read readiness task manifest {}", path.display()))?,
+    )
+    .with_context(|| format!("parse readiness task manifest {}", path.display()))?;
+    if manifest.accession.trim() != accession {
+        bail!(
+            "readiness task manifest accession mismatch for {}: {}",
+            accession,
+            manifest.accession
+        );
+    }
+    let allowed = scientific_concept_types()
+        .into_iter()
+        .chain(std::iter::once("study_structure"))
+        .collect::<BTreeSet<_>>();
+    let mut seen = BTreeSet::new();
+    let mut tasks = Vec::new();
+    for spec in manifest.tasks {
+        let id = spec.id.trim().to_string();
+        let concept = spec.concept_type.trim().to_string();
+        let field = spec.sdrf_field.trim().to_string();
+        if !id.starts_with("readiness:") {
+            bail!(
+                "readiness task id must start with 'readiness:' for {}: {}",
+                accession,
+                id
+            );
+        }
+        if !seen.insert(id.clone()) {
+            bail!("duplicate readiness task id for {}: {}", accession, id);
+        }
+        if !allowed.contains(concept.as_str()) {
+            bail!(
+                "unsupported readiness task concept for {}: {}",
+                accession,
+                concept
+            );
+        }
+        if field.is_empty() {
+            bail!(
+                "readiness task has empty sdrf_field for {}: {}",
+                accession,
+                id
+            );
+        }
+        let error_count = spec.error_count.max(1);
+        tasks.push(ScientificTask {
+            id,
+            concept_type: concept,
+            sdrf_field: field.clone(),
+            status: "open".into(),
+            task_source: "readiness".into(),
+            completion_mode: "outer_readiness".into(),
+            error_codes: spec.error_codes,
+            error_count,
+            representative_rows: spec.representative_rows,
+            representative_messages: spec.representative_messages,
+            objective: spec.objective,
+            evidence_candidates: task_evidence_candidates(
+                evidence,
+                &field,
+                SCIENTIFIC_AGENT_TASK_EVIDENCE_LIMIT,
+            ),
+            evidence_reads: Vec::new(),
+            decision_required: false,
+            search_blocked: false,
+            attempts: 0,
+            notes: String::new(),
+        });
+    }
+    Ok(tasks)
+}
+
+fn merge_readiness_tasks(state: &mut ScientificWorkspaceState, tasks: Vec<ScientificTask>) {
+    for task in tasks {
+        if !state.tasks.iter().any(|existing| existing.id == task.id) {
+            state.tasks.push(task);
+        }
+    }
+    state.tasks.sort_by(|a, b| {
+        b.error_count
+            .cmp(&a.error_count)
+            .then_with(|| a.id.cmp(&b.id))
+    });
+    ensure_active_task(state);
+}
+
+fn finalize_readiness_task_after_edit(
+    state: &mut ScientificWorkspaceState,
+    task_id: &str,
+    adjudications: &[ClaimAdjudicationRecord],
+) {
+    let Some(task) = state.tasks.iter_mut().find(|task| task.id == task_id) else {
+        return;
+    };
+    if !task_is_readiness(task) {
+        return;
+    }
+    let template_gap = adjudications.iter().any(|record| {
+        record.concept_type == task.concept_type
+            && matches!(&record.adjudication, ClaimAdjudication::TemplateGap { .. })
+    });
+    task.status = if template_gap {
+        "template_gap".into()
+    } else {
+        "repair_attempted".into()
+    };
+    task.error_count = 0;
+    task.decision_required = false;
+    task.search_blocked = false;
+    if state.active_task_id == task_id {
+        state.active_task_id.clear();
+    }
+    ensure_active_task(state);
+}
+
+fn task_is_readiness(task: &ScientificTask) -> bool {
+    task.task_source == "readiness" || task.completion_mode == "outer_readiness"
+}
+
+fn active_task_is_study_structure(state: &ScientificWorkspaceState) -> bool {
+    active_task(state)
+        .map(|task| task.concept_type == "study_structure")
+        .unwrap_or_else(|| state.active_task_id == "task:study_structure")
 }
 
 fn ensure_active_task(state: &mut ScientificWorkspaceState) {
@@ -1321,6 +1496,14 @@ fn refresh_scientific_tasks(
         .map(|task| (task.field.clone(), task))
         .collect::<BTreeMap<_, _>>();
     for task in &mut state.tasks {
+        if task_is_readiness(task) {
+            task.evidence_candidates = task_evidence_candidates(
+                evidence,
+                &task.sdrf_field,
+                SCIENTIFIC_AGENT_TASK_EVIDENCE_LIMIT,
+            );
+            continue;
+        }
         if task.sdrf_field == "study_structure" {
             task.evidence_candidates = task_evidence_candidates(
                 evidence,
@@ -1399,9 +1582,11 @@ fn task_board_block(state: &ScientificWorkspaceState) -> String {
         .iter()
         .map(|task| {
             format!(
-                "- {} status={} concept={} errors={} codes={:?} candidates={} reads={} decision_required={} search_blocked={} attempts={} objective={}",
+                "- {} status={} source={} completion={} concept={} errors={} codes={:?} candidates={} reads={} decision_required={} search_blocked={} attempts={} objective={}",
                 task.id,
                 task.status,
+                task.task_source,
+                task.completion_mode,
                 task.concept_type,
                 task.error_count,
                 task.error_codes,
@@ -1527,7 +1712,7 @@ fn scientific_agent_prompt(
         serde_json::to_string_pretty(&recent_validations).unwrap_or_else(|_| "[]".into());
     let feedback_json =
         serde_json::to_string_pretty(changed_harness_feedback).unwrap_or_else(|_| "[]".into());
-    let study_structure_active = active.is_some_and(|task| task.id == "task:study_structure");
+    let study_structure_active = active.is_some_and(|task| task.concept_type == "study_structure");
     let edit_command = if study_structure_active {
         "edit_study_structure"
     } else {
@@ -1644,7 +1829,7 @@ async fn call_scientific_agent(
         "format": scientific_agent_schema(
             active_task(workspace).is_some_and(|task| !task.decision_required),
             active_task(workspace).is_some_and(|task| !task.search_blocked),
-            active_task(workspace).is_some_and(|task| task.id == "task:study_structure"),
+            active_task(workspace).is_some_and(|task| task.concept_type == "study_structure"),
         ),
         "options": {"temperature": 0.0}
     });
@@ -7608,6 +7793,103 @@ fn set_row_value(
     }
 }
 
+fn evidence_backed_concrete_override_authorized(
+    state: &ScientificWorkspaceState,
+    concept_type: &str,
+) -> bool {
+    state.tasks.iter().any(|task| {
+        task.concept_type == concept_type
+            && task.attempts > 0
+            && (task_is_readiness(task)
+                || task
+                    .error_codes
+                    .iter()
+                    .any(|code| code == "data_file_name_acquisition_contradiction"))
+    })
+}
+
+fn apply_evidence_backed_existing_sdrf_repairs(
+    headers: &[String],
+    rows: &mut [Vec<String>],
+    evidence: &DatasetEvidence,
+    state: &ScientificWorkspaceState,
+) -> Vec<ValidationIssue> {
+    if evidence.existing_sdrf_path.is_empty()
+        || !evidence_backed_concrete_override_authorized(state, "acquisition_mode")
+    {
+        return Vec::new();
+    }
+    let Some(claim) = state.claims.iter().find(|claim| {
+        claim.concept_type == "acquisition_mode"
+            && claim.scope == "project"
+            && matches!(claim.status.as_str(), "supported" | "hypothesis")
+    }) else {
+        return Vec::new();
+    };
+    let Some((canonical, refs)) = canonical_workspace_claim_value(evidence, state, claim) else {
+        return Vec::new();
+    };
+    let Some(idx) = headers
+        .iter()
+        .position(|header| header == "comment[proteomics data acquisition method]")
+    else {
+        return Vec::new();
+    };
+
+    let existing_values = rows
+        .iter()
+        .filter_map(|row| row.get(idx))
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty() && canonical_reserved_alias(value).is_none())
+        .map(|value| value.to_ascii_lowercase())
+        .collect::<BTreeSet<_>>();
+    if existing_values.len() != 1 {
+        return vec![ValidationIssue {
+            level: "warning".into(),
+            code: "scientific_agent_concrete_override_requires_uniform_existing_value".into(),
+            row: 0,
+            column: "comment[proteomics data acquisition method]".into(),
+            message: format!(
+                "source-backed project acquisition repair '{}' was not broadcast because the existing SDRF has {} distinct concrete acquisition value(s)",
+                canonical,
+                existing_values.len()
+            ),
+        }];
+    }
+    let previous = existing_values.into_iter().next().unwrap_or_default();
+    if previous.eq_ignore_ascii_case(canonical.trim()) {
+        return Vec::new();
+    }
+
+    let mut changed = 0usize;
+    for row in rows.iter_mut() {
+        if idx >= row.len() {
+            continue;
+        }
+        let current = row[idx].trim();
+        if !current.is_empty() && canonical_reserved_alias(current).is_none() {
+            row[idx] = canonical.clone();
+            changed += 1;
+        }
+    }
+    if changed == 0 {
+        return Vec::new();
+    }
+    vec![ValidationIssue {
+        level: "warning".into(),
+        code: "scientific_agent_evidence_backed_existing_acquisition_override".into(),
+        row: 0,
+        column: "comment[proteomics data acquisition method]".into(),
+        message: format!(
+            "replaced one uniform existing acquisition value '{}' with source-adjudicated project value '{}' across {} row(s); evidence_refs={:?}; filename tokens alone cannot authorize this override",
+            previous,
+            canonical,
+            changed,
+            refs
+        ),
+    }]
+}
+
 fn scientific_agent_raw_file_role(name: &str, row_role_hardened: bool) -> RawFileRole {
     let role = raw_file_role(name);
     if !row_role_hardened || role != RawFileRole::Unknown {
@@ -8607,6 +8889,14 @@ fn compile_workspace_with_trusted_partial_sdrf(
 
     let (mut headers, mut rows, mut generation_mode) =
         draft_rows_with_explicit_mappings(&proposal, evidence, explicit_mappings)?;
+    let evidence_backed_repair_issues =
+        apply_evidence_backed_existing_sdrf_repairs(&headers, &mut rows, evidence, state);
+    deterministic_repairs.extend(
+        evidence_backed_repair_issues
+            .iter()
+            .map(|issue| issue.code.clone()),
+    );
+    issues.extend(evidence_backed_repair_issues);
     let row_scaffold_issues = enforce_deterministic_row_scaffold(
         &headers,
         &mut rows,
@@ -8919,10 +9209,8 @@ fn command_matches_active_task(state: &ScientificWorkspaceState, command: &Agent
         return false;
     }
     match command {
-        AgentCommand::EditStudyStructure { .. } => state.active_task_id == "task:study_structure",
-        AgentCommand::EditScientificObservation { .. } => {
-            state.active_task_id != "task:study_structure"
-        }
+        AgentCommand::EditStudyStructure { .. } => active_task_is_study_structure(state),
+        AgentCommand::EditScientificObservation { .. } => !active_task_is_study_structure(state),
         _ => true,
     }
 }
@@ -9185,6 +9473,8 @@ async fn run_one_scientific_agent(
     let baseline_errors = baseline_cycle.validation_errors;
     trace.validation_history.push(baseline_cycle);
     refresh_scientific_tasks(&evidence, &mut state, &baseline.issues);
+    let readiness_tasks = load_readiness_tasks(&evidence, accession)?;
+    merge_readiness_tasks(&mut state, readiness_tasks);
     trace.states[0] = state.clone();
     fs::write(
         workspace_dir.join("state.turn00.json"),
@@ -9219,7 +9509,7 @@ async fn run_one_scientific_agent(
     )?;
     let mut last_compile_fingerprint: Option<String> = Some(baseline.fingerprint.clone());
     let mut compiled: Option<CompiledWorkspace> = Some(baseline);
-    if baseline_errors == 0 {
+    if baseline_errors == 0 && state.active_task_id.is_empty() {
         trace.terminal_status = "resolved_baseline".into();
         state.next_step = "finish".into();
         state.notes =
@@ -9639,6 +9929,11 @@ async fn run_one_scientific_agent(
                         workspace_dir.join("adjudication_history.json"),
                         serde_json::to_string_pretty(&trace.adjudication_history)?,
                     )?;
+                    finalize_readiness_task_after_edit(
+                        &mut state,
+                        &edit.task_id,
+                        &compiled_now.adjudications,
+                    );
                     refresh_scientific_tasks(&evidence, &mut state, &compiled_now.issues);
 
                     if last_compile_fingerprint
@@ -9705,9 +10000,12 @@ async fn run_one_scientific_agent(
                         &trace.validation_history,
                     )?;
 
-                    if errors == 0 {
+                    if errors == 0 && state.active_task_id.is_empty() {
                         trace.terminal_status = "resolved".into();
                         break;
+                    }
+                    if errors == 0 {
+                        continue;
                     }
                     if state.active_task_id.is_empty() {
                         trace.terminal_status = "partial_no_active_scientific_task".into();
@@ -9794,6 +10092,7 @@ async fn run_one_scientific_agent(
         "open_questions": state.open_questions.clone(),
         "conflicts": state.conflicts.clone(),
         "tasks": state.tasks.clone(),
+        "readiness_tasks": state.tasks.iter().filter(|task| task_is_readiness(task)).cloned().collect::<Vec<_>>(),
         "active_task_id": state.active_task_id.clone(),
         "harness_feedback": trace.harness_feedback.clone(),
         "deterministic_repairs": compiled.deterministic_repairs,
@@ -13630,5 +13929,174 @@ mod tests {
         output[0][7] = "pride-scp".into();
         assert!(trusted_full_sdrf_preservation_audit(&path, &headers, &output).is_ok());
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn readiness_task_survives_validator_refresh_until_outer_readiness_rerun() {
+        let evidence = evidence_with(Vec::new(), vec!["runA.raw"]);
+        let mut state = ScientificWorkspaceState {
+            tasks: vec![ScientificTask {
+                id: "readiness:isolation_template_or_value".into(),
+                concept_type: "isolation_method".into(),
+                sdrf_field: "single_cell_isolation_method".into(),
+                status: "open".into(),
+                task_source: "readiness".into(),
+                completion_mode: "outer_readiness".into(),
+                error_count: 1,
+                ..Default::default()
+            }],
+            active_task_id: "readiness:isolation_template_or_value".into(),
+            ..Default::default()
+        };
+        refresh_scientific_tasks(&evidence, &mut state, &[]);
+        assert_eq!(state.tasks.len(), 1);
+        assert_eq!(state.tasks[0].status, "open");
+        assert_eq!(state.tasks[0].error_count, 1);
+        assert_eq!(
+            state.active_task_id,
+            "readiness:isolation_template_or_value"
+        );
+    }
+
+    #[test]
+    fn readiness_template_gap_becomes_terminal_without_fake_repair() {
+        let mut state = ScientificWorkspaceState {
+            tasks: vec![ScientificTask {
+                id: "readiness:isolation_template_or_value".into(),
+                concept_type: "isolation_method".into(),
+                sdrf_field: "single_cell_isolation_method".into(),
+                status: "investigating".into(),
+                task_source: "readiness".into(),
+                completion_mode: "outer_readiness".into(),
+                error_count: 1,
+                ..Default::default()
+            }],
+            active_task_id: "readiness:isolation_template_or_value".into(),
+            ..Default::default()
+        };
+        let adjudications = vec![ClaimAdjudicationRecord {
+            concept_type: "isolation_method".into(),
+            scope: "project".into(),
+            branch_id: String::new(),
+            model_status: "supported".into(),
+            proposed_value: "patch-clamp-guided microaspiration".into(),
+            evidence_refs: vec!["E0001".into()],
+            adjudication: ClaimAdjudication::TemplateGap {
+                observed_value: "patch-clamp-guided microaspiration".into(),
+                evidence_refs: vec!["E0001".into()],
+                reason: "not representable by pinned template".into(),
+            },
+        }];
+        finalize_readiness_task_after_edit(
+            &mut state,
+            "readiness:isolation_template_or_value",
+            &adjudications,
+        );
+        assert_eq!(state.tasks[0].status, "template_gap");
+        assert_eq!(state.tasks[0].error_count, 0);
+        assert!(state.active_task_id.is_empty());
+    }
+
+    #[test]
+    fn evidence_backed_uniform_existing_acquisition_can_be_repaired() {
+        let mut evidence = evidence_with(
+            vec![EvidenceItem {
+                id: "E0001".into(),
+                source_kind: "publication_methods".into(),
+                source_label: "paper methods".into(),
+                text: "All samples were acquired by data-independent acquisition (DIA).".into(),
+            }],
+            vec!["runA.raw", "runB.raw"],
+        );
+        evidence.existing_sdrf_path = "/tmp/existing.sdrf.tsv".into();
+        let state = ScientificWorkspaceState {
+            claims: vec![ScientificClaim {
+                concept_type: "acquisition_mode".into(),
+                value: "data-independent acquisition".into(),
+                scope: "project".into(),
+                branch_id: String::new(),
+                status: "supported".into(),
+                evidence_refs: vec!["E0001".into()],
+                confidence: "high".into(),
+                reason: "publication methods".into(),
+            }],
+            tasks: vec![ScientificTask {
+                id: "task:proteomics_data_acquisition_method".into(),
+                concept_type: "acquisition_mode".into(),
+                sdrf_field: "proteomics_data_acquisition_method".into(),
+                status: "investigating".into(),
+                task_source: "validator".into(),
+                completion_mode: "validator_clear".into(),
+                error_codes: vec!["data_file_name_acquisition_contradiction".into()],
+                error_count: 2,
+                attempts: 1,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let headers = vec!["comment[proteomics data acquisition method]".to_string()];
+        let mut rows = vec![
+            vec!["NT=Data-dependent acquisition;AC=PRIDE:0000627".into()],
+            vec!["NT=Data-dependent acquisition;AC=PRIDE:0000627".into()],
+        ];
+        let issues =
+            apply_evidence_backed_existing_sdrf_repairs(&headers, &mut rows, &evidence, &state);
+        assert!(issues.iter().any(|issue| {
+            issue.code == "scientific_agent_evidence_backed_existing_acquisition_override"
+        }));
+        assert!(rows
+            .iter()
+            .all(|row| { row[0].to_ascii_lowercase().contains("data-independent") }));
+    }
+
+    #[test]
+    fn mixed_existing_acquisition_values_are_never_broadcast_over() {
+        let mut evidence = evidence_with(
+            vec![EvidenceItem {
+                id: "E0001".into(),
+                source_kind: "publication_methods".into(),
+                source_label: "paper methods".into(),
+                text: "A data-independent acquisition arm was used.".into(),
+            }],
+            vec!["runA.raw", "runB.raw"],
+        );
+        evidence.existing_sdrf_path = "/tmp/existing.sdrf.tsv".into();
+        let state = ScientificWorkspaceState {
+            claims: vec![ScientificClaim {
+                concept_type: "acquisition_mode".into(),
+                value: "data-independent acquisition".into(),
+                scope: "project".into(),
+                branch_id: String::new(),
+                status: "supported".into(),
+                evidence_refs: vec!["E0001".into()],
+                confidence: "high".into(),
+                reason: "publication methods".into(),
+            }],
+            tasks: vec![ScientificTask {
+                id: "readiness:acquisition_mode".into(),
+                concept_type: "acquisition_mode".into(),
+                sdrf_field: "proteomics_data_acquisition_method".into(),
+                status: "investigating".into(),
+                task_source: "readiness".into(),
+                completion_mode: "outer_readiness".into(),
+                error_codes: vec!["readiness_acquisition_conflict".into()],
+                error_count: 1,
+                attempts: 1,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let headers = vec!["comment[proteomics data acquisition method]".to_string()];
+        let mut rows = vec![
+            vec!["Data-dependent acquisition".into()],
+            vec!["Data-independent acquisition".into()],
+        ];
+        let original = rows.clone();
+        let issues =
+            apply_evidence_backed_existing_sdrf_repairs(&headers, &mut rows, &evidence, &state);
+        assert_eq!(rows, original);
+        assert!(issues.iter().any(|issue| {
+            issue.code == "scientific_agent_concrete_override_requires_uniform_existing_value"
+        }));
     }
 }
