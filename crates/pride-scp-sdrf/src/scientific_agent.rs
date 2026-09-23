@@ -10691,7 +10691,9 @@ mod tests {
 
         let empty = rows
             .iter()
-            .find(|row| row[at("comment[data file]")] == "plex_1.raw")
+            .find(|row| {
+                row[at("comment[data file]")] == "plex_1.raw" && row[at("source name")] == "blank_1"
+            })
             .unwrap();
         assert_eq!(empty[at("characteristics[cell type]")], "not applicable");
         assert_eq!(empty[at("characteristics[individual]")], "not applicable");
