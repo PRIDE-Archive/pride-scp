@@ -6863,6 +6863,13 @@ fn scientific_agent_raw_file_role(name: &str, row_role_hardened: bool) -> RawFil
         .replace('-', "_")
         .replace('.', "_")
         .replace(' ', "_");
+    if normalized.contains("cvcheck") || normalized.contains("cv_check") {
+        return RawFileRole::QualityControl;
+    }
+    if normalized.contains("booster") {
+        return RawFileRole::Bulk;
+    }
+
     let compact_amount = Regex::new(r"(?i)(?:^|[_])\d+(?:\.\d+)?(?:pg|ng)[a-z]").unwrap();
     if compact_amount.is_match(&normalized) {
         return RawFileRole::Bulk;
@@ -7186,6 +7193,48 @@ fn unique_named_header_index_for_trusted_partial_sdrf(
     }
 }
 
+fn unique_trusted_partial_single_cell_isolation(
+    headers: &[String],
+    rows: &[Vec<String>],
+) -> Option<String> {
+    let unique_index = |name: &str| -> Option<usize> {
+        let mut matches = headers
+            .iter()
+            .enumerate()
+            .filter_map(|(index, header)| (header == name).then_some(index));
+        let first = matches.next()?;
+        matches.next().is_none().then_some(first)
+    };
+    let sample_type_idx = unique_index(SC_SAMPLE_TYPE)?;
+    let isolation_idx = unique_index(SC_ISOLATION_METHOD)?;
+
+    let mut values: BTreeMap<String, String> = BTreeMap::new();
+    for row in rows {
+        if sample_type_idx >= row.len() || isolation_idx >= row.len() {
+            continue;
+        }
+        if !row[sample_type_idx]
+            .trim()
+            .eq_ignore_ascii_case("single cell")
+        {
+            continue;
+        }
+        let value = row[isolation_idx].trim();
+        if row_value_is_unresolved(value) {
+            continue;
+        }
+        values
+            .entry(value.to_ascii_lowercase())
+            .or_insert_with(|| value.to_string());
+    }
+
+    if values.len() == 1 {
+        values.into_values().next()
+    } else {
+        None
+    }
+}
+
 fn canonical_repository_raw_for_value(value: &str, raw_files: &[RawFile]) -> Result<String> {
     let aliases = normalized_data_file_aliases(value);
     let matches = raw_files
@@ -7223,6 +7272,8 @@ fn fuse_trusted_partial_sdrf_rows(
     }
 
     let (deposited_headers, deposited_rows) = read_existing_sdrf_table(partial_path)?;
+    let deposited_single_cell_isolation =
+        unique_trusted_partial_single_cell_isolation(&deposited_headers, &deposited_rows);
     let deposited_data_idx = unique_named_header_index_for_trusted_partial_sdrf(
         &deposited_headers,
         "comment[data file]",
@@ -7327,8 +7378,162 @@ fn fuse_trusted_partial_sdrf_rows(
     // metadata, assigns deterministic single-cell identifiers from source
     // names, and sanitizes empty-control biological identity without changing
     // explicit deposited channel/sample values.
-    let (union_headers, fused_rows, _) =
+    let (union_headers, mut fused_rows, _) =
         enrich_existing_sdrf_rows(proposal, evidence, union_headers, fused_rows)?;
+
+    let data_idx = unique_named_header_index_for_trusted_partial_sdrf(
+        &union_headers,
+        "comment[data file]",
+        "fused SDRF",
+    )?;
+    let header_index = union_headers
+        .iter()
+        .enumerate()
+        .map(|(index, header)| (header.as_str(), index))
+        .collect::<HashMap<_, _>>();
+    let mut propagated_isolation_rows = 0usize;
+    let mut hardened_qc_rows = 0usize;
+    let mut hardened_bulk_rows = 0usize;
+    let mut hardened_blank_rows = 0usize;
+    let mut hardened_few_cell_rows = 0usize;
+    let mut unresolved_fallback_rows = 0usize;
+
+    for row in &mut fused_rows {
+        if data_idx >= row.len() {
+            continue;
+        }
+        let raw = canonical_repository_raw_for_value(&row[data_idx], &evidence.raw_files)?;
+        if deposited_by_raw.contains_key(&raw) {
+            continue;
+        }
+
+        match scientific_agent_raw_file_role(&row[data_idx], true) {
+            RawFileRole::SingleCell => {
+                set_row_value(row, &header_index, SC_SAMPLE_TYPE, "single cell".into());
+                set_row_if_unresolved(row, &header_index, SC_CELLS_PER_WELL, "1".into());
+                if let Some(isolation_value) = deposited_single_cell_isolation.as_ref() {
+                    let isolation_idx = header_index.get(SC_ISOLATION_METHOD).copied();
+                    if isolation_idx
+                        .and_then(|idx| row.get(idx))
+                        .is_some_and(|value| row_value_is_unresolved(value))
+                    {
+                        set_row_value(
+                            row,
+                            &header_index,
+                            SC_ISOLATION_METHOD,
+                            isolation_value.clone(),
+                        );
+                        propagated_isolation_rows += 1;
+                    }
+                }
+            }
+            RawFileRole::FewCell(n) => {
+                set_row_value(row, &header_index, SC_SAMPLE_TYPE, "not available".into());
+                set_row_value(
+                    row,
+                    &header_index,
+                    SC_ISOLATION_METHOD,
+                    "not applicable".into(),
+                );
+                set_row_value(
+                    row,
+                    &header_index,
+                    SC_CELL_IDENTIFIER,
+                    "not applicable".into(),
+                );
+                set_row_value(row, &header_index, SC_CELLS_PER_WELL, n.to_string());
+                hardened_few_cell_rows += 1;
+            }
+            RawFileRole::Blank => {
+                set_row_value(row, &header_index, SC_SAMPLE_TYPE, "empty".into());
+                set_row_value(
+                    row,
+                    &header_index,
+                    SC_ISOLATION_METHOD,
+                    "not applicable".into(),
+                );
+                set_row_value(row, &header_index, SC_CELL_IDENTIFIER, "empty".into());
+                set_row_value(
+                    row,
+                    &header_index,
+                    SC_CELLS_PER_WELL,
+                    "not applicable".into(),
+                );
+                hardened_blank_rows += 1;
+            }
+            RawFileRole::QualityControl => {
+                set_row_value(
+                    row,
+                    &header_index,
+                    SC_SAMPLE_TYPE,
+                    "quality control sample".into(),
+                );
+                set_row_value(
+                    row,
+                    &header_index,
+                    SC_ISOLATION_METHOD,
+                    "not applicable".into(),
+                );
+                set_row_value(
+                    row,
+                    &header_index,
+                    SC_CELL_IDENTIFIER,
+                    "not applicable".into(),
+                );
+                set_row_value(
+                    row,
+                    &header_index,
+                    SC_CELLS_PER_WELL,
+                    "not applicable".into(),
+                );
+                hardened_qc_rows += 1;
+            }
+            RawFileRole::Bulk => {
+                set_row_value(row, &header_index, SC_SAMPLE_TYPE, "bulk control".into());
+                set_row_value(
+                    row,
+                    &header_index,
+                    SC_ISOLATION_METHOD,
+                    "not applicable".into(),
+                );
+                set_row_value(
+                    row,
+                    &header_index,
+                    SC_CELL_IDENTIFIER,
+                    "not applicable".into(),
+                );
+                set_row_value(
+                    row,
+                    &header_index,
+                    SC_CELLS_PER_WELL,
+                    "not applicable".into(),
+                );
+                hardened_bulk_rows += 1;
+            }
+            RawFileRole::Unknown => {
+                set_row_value(row, &header_index, SC_SAMPLE_TYPE, "not available".into());
+                set_row_value(
+                    row,
+                    &header_index,
+                    SC_ISOLATION_METHOD,
+                    "not available".into(),
+                );
+                set_row_value(
+                    row,
+                    &header_index,
+                    SC_CELL_IDENTIFIER,
+                    "not available".into(),
+                );
+                set_row_value(
+                    row,
+                    &header_index,
+                    SC_CELLS_PER_WELL,
+                    "not available".into(),
+                );
+                unresolved_fallback_rows += 1;
+            }
+        }
+    }
 
     let issue = ValidationIssue {
         level: "warning".into(),
@@ -7336,12 +7541,19 @@ fn fuse_trusted_partial_sdrf_rows(
         row: 0,
         column: "comment[data file]".into(),
         message: format!(
-            "trusted resolved SDRF {} supplied explicit multiplex rows for {} repository RAW file(s); deterministic generated rows were retained for the remaining {} repository RAW file(s); deposited_rows={} fused_rows={}",
+            "trusted resolved SDRF {} supplied explicit multiplex rows for {} repository RAW file(s); deterministic generated rows were retained for the remaining {} repository RAW file(s); deposited_rows={} fused_rows={} unique_deposited_single_cell_isolation={:?} propagated_single_cell_isolation_rows={} hardened_qc_rows={} hardened_bulk_rows={} hardened_blank_rows={} hardened_few_cell_rows={} unresolved_fallback_rows={}",
             partial_path.display(),
             mapped_raws,
             retained_raws,
             deposited_rows.len(),
-            fused_rows.len()
+            fused_rows.len(),
+            deposited_single_cell_isolation,
+            propagated_isolation_rows,
+            hardened_qc_rows,
+            hardened_bulk_rows,
+            hardened_blank_rows,
+            hardened_few_cell_rows,
+            unresolved_fallback_rows
         ),
     };
     Ok((union_headers, fused_rows, issue))
@@ -7469,7 +7681,7 @@ fn apply_consensus_single_cell_isolation_projection(
     if state.harness_version != SCIENTIFIC_AGENT_FACTOR_ROW_ROLE_HARDENED_VERSION
         || !evidence.existing_sdrf_path.is_empty()
         || !explicit_mappings.is_empty()
-        || (has_unresolved_raw_roles && !trusted_partial_mapping_applied)
+        || has_unresolved_raw_roles
         || unresolved_de_novo_multiplex_mapping(
             evidence,
             relation_mode,
@@ -10385,7 +10597,8 @@ mod tests {
             &partial,
             concat!(
                 "source name\tcharacteristics[cell type]\tcharacteristics[individual]\tcharacteristics[sample type]\tcharacteristics[cell identifier]\tcharacteristics[cells per well]\tcharacteristics[single cell isolation protocol]\tcomment[data file]\tcomment[label]\n",
-                "blank_1\tHeLa\tdonor_1\tempty\tempty\t0\tnot available\tplex_1.raw\tTMT127N\n"
+                "cell_A\tHeLa\tdonor_1\tsingle cell\tcell_A\t1\tFACS\tplex_1.raw\tTMT127N\n",
+                "blank_1\tHeLa\tdonor_1\tempty\tempty\t0\tnot available\tplex_1.raw\tTMT128N\n"
             ),
         )
         .unwrap();
@@ -10401,7 +10614,7 @@ mod tests {
                     category: "RAW".into(),
                 },
                 RawFile {
-                    file_name: "fallback.raw".into(),
+                    file_name: "singlecell_fallback.raw".into(),
                     file_uri: String::new(),
                     category: "RAW".into(),
                 },
@@ -10444,7 +10657,7 @@ mod tests {
                 "not available".into(),
                 "not available".into(),
                 "1".into(),
-                "fallback.raw".into(),
+                "singlecell_fallback.raw".into(),
                 "not available".into(),
                 "not available".into(),
                 "not available".into(),
@@ -10453,7 +10666,7 @@ mod tests {
         let proposal = SdrfProposal {
             relation_mode: "multiplexed_cells_per_data_file".into(),
             organism: "Homo sapiens (human)".into(),
-            single_cell_isolation_method: "FACS".into(),
+            single_cell_isolation_method: "not available".into(),
             ..Default::default()
         };
         let (headers, rows, _) = fuse_trusted_partial_sdrf_rows(
@@ -10467,7 +10680,7 @@ mod tests {
         let at = |name: &str| headers.iter().position(|h| h == name).unwrap();
         let fallback = rows
             .iter()
-            .find(|row| row[at("comment[data file]")] == "fallback.raw")
+            .find(|row| row[at("comment[data file]")] == "singlecell_fallback.raw")
             .unwrap();
         assert_eq!(
             fallback[at("characteristics[organism]")],
@@ -10624,6 +10837,28 @@ mod tests {
         assert_eq!(
             scientific_agent_raw_file_role("xenopus.zip", true),
             RawFileRole::Unknown
+        );
+    }
+
+    #[test]
+    fn v2_row_role_hardening_recognizes_partial_fusion_auxiliary_raw_roles() {
+        assert_eq!(
+            scientific_agent_raw_file_role(
+                "20200715_mk_es_e1200_precol_scms_8227_cvcheck_1000ms_1.raw",
+                true,
+            ),
+            RawFileRole::QualityControl
+        );
+        assert_eq!(
+            scientific_agent_raw_file_role(
+                "20201124_mk_bf_e1200_precol_scms_160mins_500ms_8227_celltype_booster.raw",
+                true,
+            ),
+            RawFileRole::Bulk
+        );
+        assert_eq!(
+            scientific_agent_raw_file_role("10ng_a549_h_iso16_30countfromkit.raw", true),
+            RawFileRole::Bulk
         );
     }
 
@@ -10946,11 +11181,10 @@ mod tests {
         assert_eq!(unresolved_raw_rows[0][1], "not available");
         assert!(unresolved_raw_issues.is_empty());
 
-        // Once a trusted partial SDRF mapping has succeeded, unresolved RAW-role
-        // status must no longer suppress consensus isolation on deterministic
-        // fallback rows. The trusted mapping closes the multiplex relation gap,
-        // while the unanimous accepted FactorGraph regimes supply the canonical
-        // isolation value.
+        // Trusted partial mapping does not weaken the workspace-consensus RAW-role
+        // safety guard. Fallback isolation propagation is handled separately from
+        // the trusted deposited SDRF itself when its mapped single-cell rows carry
+        // one explicit source-closed isolation value.
         let mut trusted_partial_rows = vec![vec!["single cell".into(), "not available".into()]];
         let trusted_partial_issues = apply_consensus_single_cell_isolation_projection(
             &headers,
@@ -10962,10 +11196,8 @@ mod tests {
             true,
             true,
         );
-        assert_eq!(trusted_partial_rows[0][1], "FACS");
-        assert!(trusted_partial_issues.iter().any(|issue| {
-            issue.code == "scientific_agent_consensus_single_cell_isolation_projected"
-        }));
+        assert_eq!(trusted_partial_rows[0][1], "not available");
+        assert!(trusted_partial_issues.is_empty());
     }
 
     #[test]
