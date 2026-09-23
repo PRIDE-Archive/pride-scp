@@ -83,3 +83,45 @@ because deterministic row scaffolding is skipped whenever an existing SDRF is pr
 
 Regression tests now start from the real pre-populated state so this ordering bug cannot
 recur silently.
+
+## Trusted partial SDRF mapping evidence
+
+Row-role-hardened compilation may now consume a **strict repository-subset SDRF**
+from the existing `--resolved-sdrf-dir` as trusted multiplex mapping evidence.
+This is intentionally narrower than the preservation-first existing-SDRF path.
+
+A resolved SDRF is eligible only when all of the following hold:
+
+- it is a usable SDRF with mapped `comment[data file]` rows;
+- every SDRF data file resolves to the current frozen PRIDE RAW inventory;
+- it covers at least one, but fewer than all, current repository RAW files;
+- the FactorGraph relation mode is `multiplexed_cells_per_data_file`;
+- no explicit row-mapping manifest is active;
+- the row-role-hardened harness is running.
+
+For eligible candidates, deposited rows replace the unresolved generated skeleton
+for exactly matched repository RAW files. One RAW may therefore expand into many
+source-grounded channel rows. Generated rows are retained only for repository
+RAW files not represented in the deposited SDRF. Deposited-only RAW files,
+ambiguous RAW aliases, duplicate normalized headers, and missing fallback RAW
+rows fail closed.
+
+The mapping-level `sample_to_channel_mapping_unresolved` guard is suppressed
+only after this trusted partial fusion succeeds. All ordinary row-level
+validators then run on the fused candidate. This means uncovered auxiliary RAW
+files can still expose concrete metadata blockers rather than being hidden by
+the former global multiplex error.
+
+The feature does **not**:
+
+- infer reporter channels from file names;
+- infer channel identity from row or channel order;
+- treat a partial SDRF as complete repository coverage;
+- weaken the existing bidirectional full-SDRF preservation gate;
+- alter the one-row-per-RAW explicit mapping manifest contract.
+
+The initial evidence-backed pilot was PXD020586, PXD040455 and PXD063590. In
+that pilot the trusted deposited SDRFs cleared `sample_to_channel_mapping_unresolved`
+for all three and made PXD063590 locally valid. PXD020586 and PXD040455 retained
+only concrete `required_integer_invalid` errors on repository-only auxiliary
+files not represented in the deposited SDRFs.

@@ -4773,7 +4773,20 @@ async fn run_one_factor_row_role_hardened(
         ..Default::default()
     };
 
-    let compiled = compile_workspace(&evidence, &state, &explicit_mappings)?;
+    let trusted_partial_sdrf = opts
+        .resolved_sdrf_dir
+        .as_ref()
+        .map(|dir| dir.join(format!("{accession}.sdrf.tsv")))
+        .filter(|path| {
+            evidence.existing_sdrf_path.is_empty()
+                && existing_sdrf_is_strict_repository_subset(path, &evidence.raw_files)
+        });
+    let compiled = compile_workspace_with_trusted_partial_sdrf(
+        &evidence,
+        &state,
+        &explicit_mappings,
+        trusted_partial_sdrf.as_deref(),
+    )?;
     write_sdrf(&draft_path, &compiled.headers, &compiled.rows)?;
     write_validation_review(&validation_path, &compiled.issues)?;
     let validation = validation_cycle(1, &compiled.issues);
@@ -7139,13 +7152,177 @@ fn enforce_deterministic_row_scaffold(
     issues
 }
 
+fn unique_header_index_for_trusted_partial_sdrf(
+    headers: &[String],
+    context: &str,
+) -> Result<HashMap<String, usize>> {
+    let mut out = HashMap::new();
+    for (index, header) in headers.iter().enumerate() {
+        if out.insert(header.clone(), index).is_some() {
+            bail!(
+                "trusted partial SDRF fusion requires unique normalized headers; duplicate '{}' in {}",
+                header,
+                context
+            );
+        }
+    }
+    Ok(out)
+}
+
+fn canonical_repository_raw_for_value(value: &str, raw_files: &[RawFile]) -> Result<String> {
+    let aliases = normalized_data_file_aliases(value);
+    let matches = raw_files
+        .iter()
+        .filter(|file| {
+            normalized_data_file_aliases(&file.file_name)
+                .iter()
+                .any(|alias| aliases.contains(alias))
+        })
+        .map(|file| file.file_name.trim().to_ascii_lowercase())
+        .collect::<BTreeSet<_>>();
+    if matches.len() != 1 {
+        bail!(
+            "trusted partial SDRF data file '{}' resolves to {} repository RAW candidates: {:?}",
+            value,
+            matches.len(),
+            matches
+        );
+    }
+    Ok(matches.into_iter().next().unwrap_or_default())
+}
+
+fn fuse_trusted_partial_sdrf_rows(
+    current_headers: &[String],
+    current_rows: &[Vec<String>],
+    evidence: &DatasetEvidence,
+    partial_path: &Path,
+) -> Result<(Vec<String>, Vec<Vec<String>>, ValidationIssue)> {
+    if !existing_sdrf_is_strict_repository_subset(partial_path, &evidence.raw_files) {
+        bail!(
+            "trusted partial SDRF is not a strict repository subset: {}",
+            partial_path.display()
+        );
+    }
+
+    let (deposited_headers, deposited_rows) = read_existing_sdrf_table(partial_path)?;
+    let deposited_index =
+        unique_header_index_for_trusted_partial_sdrf(&deposited_headers, "deposited SDRF")?;
+    let current_index =
+        unique_header_index_for_trusted_partial_sdrf(current_headers, "current generated SDRF")?;
+    let deposited_data_idx = *deposited_index
+        .get("comment[data file]")
+        .ok_or_else(|| anyhow!("trusted partial SDRF is missing comment[data file]"))?;
+    let current_data_idx = *current_index
+        .get("comment[data file]")
+        .ok_or_else(|| anyhow!("generated SDRF is missing comment[data file]"))?;
+
+    let mut union_headers = deposited_headers.clone();
+    let mut union_seen = union_headers.iter().cloned().collect::<BTreeSet<_>>();
+    for header in current_headers {
+        if union_seen.insert(header.clone()) {
+            union_headers.push(header.clone());
+        }
+    }
+    let union_index = unique_header_index_for_trusted_partial_sdrf(&union_headers, "fused SDRF")?;
+
+    let project_row = |headers: &[String], row: &[String]| -> Vec<String> {
+        let source_index = headers
+            .iter()
+            .enumerate()
+            .map(|(index, header)| (header.as_str(), index))
+            .collect::<HashMap<_, _>>();
+        let mut out = vec!["not available".to_string(); union_headers.len()];
+        for (header, &source_idx) in &source_index {
+            if let Some(&target_idx) = union_index.get(*header) {
+                if source_idx < row.len() {
+                    out[target_idx] = row[source_idx].clone();
+                }
+            }
+        }
+        out
+    };
+
+    let mut deposited_by_raw: BTreeMap<String, Vec<Vec<String>>> = BTreeMap::new();
+    for row in &deposited_rows {
+        let value = row
+            .get(deposited_data_idx)
+            .map(String::as_str)
+            .unwrap_or_default();
+        let raw = canonical_repository_raw_for_value(value, &evidence.raw_files)?;
+        deposited_by_raw
+            .entry(raw)
+            .or_default()
+            .push(project_row(&deposited_headers, row));
+    }
+
+    let mut current_by_raw: BTreeMap<String, Vec<Vec<String>>> = BTreeMap::new();
+    for row in current_rows {
+        let value = row
+            .get(current_data_idx)
+            .map(String::as_str)
+            .unwrap_or_default();
+        let raw = canonical_repository_raw_for_value(value, &evidence.raw_files)?;
+        current_by_raw
+            .entry(raw)
+            .or_default()
+            .push(project_row(current_headers, row));
+    }
+
+    let mut fused_rows = Vec::new();
+    let mut mapped_raws = 0usize;
+    let mut retained_raws = 0usize;
+    for file in &evidence.raw_files {
+        let raw = file.file_name.trim().to_ascii_lowercase();
+        if let Some(rows) = deposited_by_raw.get(&raw) {
+            mapped_raws += 1;
+            fused_rows.extend(rows.iter().cloned());
+            continue;
+        }
+        let rows = current_by_raw.get(&raw).ok_or_else(|| {
+            anyhow!(
+                "generated SDRF has no fallback row for repository RAW {} while fusing {}",
+                file.file_name,
+                partial_path.display()
+            )
+        })?;
+        retained_raws += 1;
+        fused_rows.extend(rows.iter().cloned());
+    }
+
+    if mapped_raws == 0 || retained_raws == 0 {
+        bail!(
+            "trusted partial SDRF fusion expected strict subset coverage but observed mapped_raws={} retained_raws={}",
+            mapped_raws,
+            retained_raws
+        );
+    }
+
+    let issue = ValidationIssue {
+        level: "warning".into(),
+        code: "scientific_agent_trusted_partial_sdrf_mapping_applied".into(),
+        row: 0,
+        column: "comment[data file]".into(),
+        message: format!(
+            "trusted resolved SDRF {} supplied explicit multiplex rows for {} repository RAW file(s); deterministic generated rows were retained for the remaining {} repository RAW file(s); deposited_rows={} fused_rows={}",
+            partial_path.display(),
+            mapped_raws,
+            retained_raws,
+            deposited_rows.len(),
+            fused_rows.len()
+        ),
+    };
+    Ok((union_headers, fused_rows, issue))
+}
+
 fn unresolved_de_novo_multiplex_mapping(
     evidence: &DatasetEvidence,
     relation_mode: &str,
     explicit_mappings: &[ExplicitRowMapping],
+    trusted_partial_mapping_applied: bool,
 ) -> bool {
     evidence.existing_sdrf_path.is_empty()
         && explicit_mappings.is_empty()
+        && !trusted_partial_mapping_applied
         && relation_mode == "multiplexed_cells_per_data_file"
         && evidence
             .study_design
@@ -7254,12 +7431,18 @@ fn apply_consensus_single_cell_isolation_projection(
     relation_mode: &str,
     explicit_mappings: &[ExplicitRowMapping],
     has_unresolved_raw_roles: bool,
+    trusted_partial_mapping_applied: bool,
 ) -> Vec<ValidationIssue> {
     if state.harness_version != SCIENTIFIC_AGENT_FACTOR_ROW_ROLE_HARDENED_VERSION
         || !evidence.existing_sdrf_path.is_empty()
         || !explicit_mappings.is_empty()
         || has_unresolved_raw_roles
-        || unresolved_de_novo_multiplex_mapping(evidence, relation_mode, explicit_mappings)
+        || unresolved_de_novo_multiplex_mapping(
+            evidence,
+            relation_mode,
+            explicit_mappings,
+            trusted_partial_mapping_applied,
+        )
     {
         return Vec::new();
     }
@@ -7319,8 +7502,14 @@ fn validate_scientific_workspace_rows(
     evidence: &DatasetEvidence,
     relation_mode: &str,
     explicit_mappings: &[ExplicitRowMapping],
+    trusted_partial_mapping_applied: bool,
 ) -> Vec<ValidationIssue> {
-    if unresolved_de_novo_multiplex_mapping(evidence, relation_mode, explicit_mappings) {
+    if unresolved_de_novo_multiplex_mapping(
+        evidence,
+        relation_mode,
+        explicit_mappings,
+        trusted_partial_mapping_applied,
+    ) {
         // Preserve the mature SDRF-generator contract: when the acquisition is
         // reporter-multiplexed but the source does not provide an exact
         // sample/channel mapping, do not validate the one-row-per-RAW skeleton
@@ -7349,6 +7538,15 @@ fn compile_workspace(
     evidence: &DatasetEvidence,
     state: &ScientificWorkspaceState,
     explicit_mappings: &[ExplicitRowMapping],
+) -> Result<CompiledWorkspace> {
+    compile_workspace_with_trusted_partial_sdrf(evidence, state, explicit_mappings, None)
+}
+
+fn compile_workspace_with_trusted_partial_sdrf(
+    evidence: &DatasetEvidence,
+    state: &ScientificWorkspaceState,
+    explicit_mappings: &[ExplicitRowMapping],
+    trusted_partial_sdrf: Option<&Path>,
 ) -> Result<CompiledWorkspace> {
     let mut proposal = SdrfProposal::default();
     let mut issues = Vec::new();
@@ -7400,7 +7598,7 @@ fn compile_workspace(
     }
     validate_proposal_refs(&proposal, evidence)?;
 
-    let (headers, mut rows, generation_mode) =
+    let (mut headers, mut rows, mut generation_mode) =
         draft_rows_with_explicit_mappings(&proposal, evidence, explicit_mappings)?;
     let row_scaffold_issues = enforce_deterministic_row_scaffold(
         &headers,
@@ -7413,6 +7611,23 @@ fn compile_workspace(
         .iter()
         .any(|issue| issue.code == "scientific_agent_raw_file_role_unresolved");
     issues.extend(row_scaffold_issues);
+
+    let mut trusted_partial_mapping_applied = false;
+    if state.harness_version == SCIENTIFIC_AGENT_FACTOR_ROW_ROLE_HARDENED_VERSION
+        && proposal.relation_mode == "multiplexed_cells_per_data_file"
+        && evidence.existing_sdrf_path.is_empty()
+        && explicit_mappings.is_empty()
+    {
+        if let Some(partial_path) = trusted_partial_sdrf {
+            let (fused_headers, fused_rows, issue) =
+                fuse_trusted_partial_sdrf_rows(&headers, &rows, evidence, partial_path)?;
+            headers = fused_headers;
+            rows = fused_rows;
+            generation_mode = "generated_trusted_partial_sdrf_fusion".into();
+            trusted_partial_mapping_applied = true;
+            issues.push(issue);
+        }
+    }
 
     let header_index = headers
         .iter()
@@ -7488,6 +7703,7 @@ fn compile_workspace(
         &proposal.relation_mode,
         explicit_mappings,
         has_unresolved_raw_roles,
+        trusted_partial_mapping_applied,
     ));
 
     issues.extend(validate_scientific_workspace_rows(
@@ -7496,6 +7712,7 @@ fn compile_workspace(
         evidence,
         &proposal.relation_mode,
         explicit_mappings,
+        trusted_partial_mapping_applied,
     ));
     let adjudications = state
         .claims
@@ -10013,6 +10230,141 @@ mod tests {
     }
 
     #[test]
+    fn trusted_partial_sdrf_fusion_expands_mapped_raw_and_retains_unmapped_raw() {
+        let root = std::env::temp_dir().join(format!(
+            "pride-scp-trusted-partial-sdrf-fusion-expand-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let partial = root.join("partial.sdrf.tsv");
+        fs::write(
+            &partial,
+            concat!(
+                "source name\tassay name\ttechnology type\tcomment[data file]\tcomment[label]\tcomment[fraction identifier]\tcomment[technical replicate]\n",
+                "cell_A\tassay_A\tproteomic profiling by mass spectrometry\tplex_1.raw\tTMT127N\t1\t1\n",
+                "cell_B\tassay_B\tproteomic profiling by mass spectrometry\tplex_1.raw\tTMT128N\t1\t1\n"
+            ),
+        )
+        .unwrap();
+        let evidence = DatasetEvidence {
+            accession: "PXD999999".into(),
+            project_json_path: String::new(),
+            files_json_path: String::new(),
+            existing_sdrf_path: String::new(),
+            raw_files: vec![
+                RawFile {
+                    file_name: "plex_1.raw".into(),
+                    file_uri: String::new(),
+                    category: "RAW".into(),
+                },
+                RawFile {
+                    file_name: "qc_1.raw".into(),
+                    file_uri: String::new(),
+                    category: "RAW".into(),
+                },
+            ],
+            study_design: StudyDesignScaffold::default(),
+            metadata_scaffold: DeterministicMetadataScaffold::default(),
+            evidence: vec![],
+            manuscript_sources: vec![],
+            annotation_sources: vec![],
+        };
+        let current_headers = vec![
+            "source name".into(),
+            "assay name".into(),
+            "technology type".into(),
+            "comment[data file]".into(),
+            "comment[label]".into(),
+            "comment[fraction identifier]".into(),
+            "comment[technical replicate]".into(),
+        ];
+        let current_rows = vec![
+            vec![
+                "run_1".into(),
+                "plex_1".into(),
+                "proteomic profiling by mass spectrometry".into(),
+                "plex_1.raw".into(),
+                "not available".into(),
+                "not available".into(),
+                "not available".into(),
+            ],
+            vec![
+                "qc_1".into(),
+                "qc_1".into(),
+                "proteomic profiling by mass spectrometry".into(),
+                "qc_1.raw".into(),
+                "not available".into(),
+                "1".into(),
+                "1".into(),
+            ],
+        ];
+        let (headers, rows, issue) =
+            fuse_trusted_partial_sdrf_rows(&current_headers, &current_rows, &evidence, &partial)
+                .unwrap();
+        assert_eq!(rows.len(), 3);
+        let at = |name: &str| headers.iter().position(|h| h == name).unwrap();
+        let plex_rows = rows
+            .iter()
+            .filter(|row| row[at("comment[data file]")] == "plex_1.raw")
+            .collect::<Vec<_>>();
+        assert_eq!(plex_rows.len(), 2);
+        assert_eq!(plex_rows[0][at("comment[label]")], "TMT127N");
+        assert_eq!(plex_rows[1][at("comment[label]")], "TMT128N");
+        assert!(rows.iter().any(|row| {
+            row[at("comment[data file]")] == "qc_1.raw"
+                && row[at("comment[technical replicate]")] == "1"
+        }));
+        assert_eq!(
+            issue.code,
+            "scientific_agent_trusted_partial_sdrf_mapping_applied"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn trusted_partial_sdrf_fusion_rejects_deposited_only_raw() {
+        let root = std::env::temp_dir().join(format!(
+            "pride-scp-trusted-partial-sdrf-fusion-reject-extra-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let partial = root.join("partial.sdrf.tsv");
+        fs::write(
+            &partial,
+            "source name\tcomment[data file]\ncell_X\textra.raw\n",
+        )
+        .unwrap();
+        let evidence = DatasetEvidence {
+            accession: "PXD999999".into(),
+            project_json_path: String::new(),
+            files_json_path: String::new(),
+            existing_sdrf_path: String::new(),
+            raw_files: vec![RawFile {
+                file_name: "plex_1.raw".into(),
+                file_uri: String::new(),
+                category: "RAW".into(),
+            }],
+            study_design: StudyDesignScaffold::default(),
+            metadata_scaffold: DeterministicMetadataScaffold::default(),
+            evidence: vec![],
+            manuscript_sources: vec![],
+            annotation_sources: vec![],
+        };
+        let err = fuse_trusted_partial_sdrf_rows(
+            &["source name".into(), "comment[data file]".into()],
+            &[vec!["run_1".into(), "plex_1.raw".into()]],
+            &evidence,
+            &partial,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("not a strict repository subset"), "{err}");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn v2_row_role_hardening_clears_prepopulated_single_cell_for_unknown_archive() {
         let evidence = evidence_with(Vec::new(), vec!["xenopus.zip"]);
         let headers = vec![
@@ -10187,6 +10539,46 @@ mod tests {
     }
 
     #[test]
+    fn trusted_partial_mapping_disables_global_multiplex_mapping_error() {
+        let mut evidence = evidence_with(Vec::new(), vec!["plex.raw"]);
+        evidence.study_design.relation_mode_hint = "multiplexed_cells_per_data_file".into();
+        evidence.study_design.relation_confidence = "high".into();
+        evidence.study_design.multiplex_chemistry_hint = "TMTpro".into();
+        evidence.study_design.multiplex_mapping_status =
+            "chemistry_detected_channel_mapping_unresolved".into();
+        evidence.study_design.repository_file_mode = "direct_acquisitions".into();
+        let headers = vec![
+            "source name".into(),
+            "assay name".into(),
+            "technology type".into(),
+            "comment[data file]".into(),
+            "comment[label]".into(),
+            "comment[fraction identifier]".into(),
+            "comment[technical replicate]".into(),
+        ];
+        let rows = vec![vec![
+            "cell_A".into(),
+            "assay_A".into(),
+            "proteomic profiling by mass spectrometry".into(),
+            "plex.raw".into(),
+            "TMT127N".into(),
+            "1".into(),
+            "1".into(),
+        ]];
+        let issues = validate_scientific_workspace_rows(
+            &headers,
+            &rows,
+            &evidence,
+            "multiplexed_cells_per_data_file",
+            &[],
+            true,
+        );
+        assert!(!issues
+            .iter()
+            .any(|issue| issue.code == "sample_to_channel_mapping_unresolved"));
+    }
+
+    #[test]
     fn v2_consensus_isolation_projects_one_canonical_single_cell_regime() {
         let evidence = consensus_projection_evidence();
         let state = row_role_state_with_claims(vec![
@@ -10224,6 +10616,7 @@ mod tests {
             "one_cell_per_data_file",
             &[],
             false,
+            false,
         );
 
         assert_eq!(rows[0][2], "FACS");
@@ -10253,6 +10646,7 @@ mod tests {
             "one_cell_per_data_file",
             &[],
             false,
+            false,
         );
 
         assert_eq!(rows[0][1], "FACS");
@@ -10279,6 +10673,7 @@ mod tests {
             "one_cell_per_data_file",
             &[],
             false,
+            false,
         );
 
         assert_eq!(rows[0][1], "not available");
@@ -10304,6 +10699,7 @@ mod tests {
             &state,
             "one_cell_per_data_file",
             &[],
+            false,
             false,
         );
 
@@ -10334,6 +10730,7 @@ mod tests {
             "one_cell_per_data_file",
             &[],
             false,
+            false,
         );
 
         assert_eq!(rows, before);
@@ -10361,6 +10758,7 @@ mod tests {
             "multiplexed_cells_per_data_file",
             &[],
             false,
+            false,
         );
         assert_eq!(multiplex_rows[0][1], "not available");
         assert!(multiplex_issues.is_empty());
@@ -10376,6 +10774,7 @@ mod tests {
             "one_cell_per_data_file",
             &[],
             true,
+            false,
         );
         assert_eq!(unresolved_raw_rows[0][1], "not available");
         assert!(unresolved_raw_issues.is_empty());
@@ -10399,6 +10798,7 @@ mod tests {
             &state,
             "one_cell_per_data_file",
             &[],
+            false,
             false,
         );
         assert_eq!(existing_rows[0][1], "not available");
@@ -10430,6 +10830,7 @@ mod tests {
             &state,
             "one_cell_per_data_file",
             &explicit_mappings,
+            false,
             false,
         );
         assert_eq!(mapped_rows[0][1], "not available");
@@ -10477,6 +10878,7 @@ mod tests {
             &evidence,
             "multiplexed_cells_per_data_file",
             &[],
+            false,
         );
 
         let errors = issues

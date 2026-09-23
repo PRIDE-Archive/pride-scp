@@ -7628,6 +7628,20 @@ fn existing_sdrf_has_bidirectional_repository_coverage(path: &Path, raw_files: &
         && stats.sdrf_unique_data_files == stats.snapshot_raw_files
 }
 
+fn existing_sdrf_is_strict_repository_subset(path: &Path, raw_files: &[RawFile]) -> bool {
+    if raw_files.is_empty() || !existing_sdrf_is_usable(path) {
+        return false;
+    }
+    let Ok((headers, rows)) = read_existing_sdrf_table(path) else {
+        return false;
+    };
+    let stats = data_file_linkage_stats(&headers, &rows, raw_files);
+    stats.unmatched_unique_data_files == 0
+        && stats.matched_unique_data_files > 0
+        && stats.matched_unique_data_files < stats.snapshot_raw_files
+        && stats.sdrf_unique_data_files == stats.matched_unique_data_files
+}
+
 fn row_explicit_non_single_cell_role(index: &HashMap<&str, usize>, row: &[String]) -> bool {
     let sample_type = index
         .get(SC_SAMPLE_TYPE)
@@ -10930,6 +10944,61 @@ mod tests {
         assert!(!existing_sdrf_has_bidirectional_repository_coverage(
             &path, &raw
         ));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn strict_repository_subset_accepts_source_grounded_partial_design() {
+        let dir = tmp();
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("partial.sdrf.tsv");
+        fs::write(
+            &path,
+            "source name\tcomment[data file]\tcomment[label]\ncell_1\trun_1.raw\tTMT127N\ncell_2\trun_1.raw\tTMT128N\n",
+        )
+        .unwrap();
+        let raw = vec![
+            RawFile {
+                file_name: "run_1.raw".into(),
+                file_uri: String::new(),
+                category: "RAW".into(),
+            },
+            RawFile {
+                file_name: "run_2.raw".into(),
+                file_uri: String::new(),
+                category: "RAW".into(),
+            },
+        ];
+        assert!(existing_sdrf_is_strict_repository_subset(&path, &raw));
+        assert!(!existing_sdrf_has_bidirectional_repository_coverage(
+            &path, &raw
+        ));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn strict_repository_subset_rejects_deposited_only_raw() {
+        let dir = tmp();
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("partial-with-extra.sdrf.tsv");
+        fs::write(
+            &path,
+            "source name\tcomment[data file]\ncell_1\trun_1.raw\ncell_x\textra.raw\n",
+        )
+        .unwrap();
+        let raw = vec![
+            RawFile {
+                file_name: "run_1.raw".into(),
+                file_uri: String::new(),
+                category: "RAW".into(),
+            },
+            RawFile {
+                file_name: "run_2.raw".into(),
+                file_uri: String::new(),
+                category: "RAW".into(),
+            },
+        ];
+        assert!(!existing_sdrf_is_strict_repository_subset(&path, &raw));
         let _ = fs::remove_dir_all(dir);
     }
 
