@@ -603,6 +603,49 @@ pub const SCIENTIFIC_AGENT_FACTOR_ROW_ROLE_HARDENED_MODE: &str =
 pub const SCIENTIFIC_AGENT_FACTOR_ROW_ROLE_HARDENED_VERSION: &str =
     "pride-scp-scientific-workspace-agent-v2-factor-row-role-hardened";
 const SCIENTIFIC_AGENT_FACTOR_GRAPH_ROOT_ENV: &str = "PRIDE_SCP_FACTOR_GRAPH_STAGE1_ROOT";
+const SCIENTIFIC_AGENT_TRUSTED_FULL_SDRF_ELIGIBILITY_ENV: &str =
+    "PRIDE_SCP_TRUSTED_FULL_SDRF_ELIGIBILITY_MANIFEST";
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct TrustedFullSdrfEligibilityRecord {
+    accession: String,
+    candidate_sha256: String,
+    candidate_type: String,
+    coverage_class: String,
+    trusted_source: String,
+    structured_scp_evidence: String,
+    non_proteomic_conflict: String,
+    eligibility: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct TrustedFullSdrfEligibilityAudit {
+    accession: String,
+    candidate_path: String,
+    declared_sha256: String,
+    computed_sha256: String,
+    candidate_type: String,
+    coverage_class: String,
+    trusted_source: String,
+    structured_scp_evidence: String,
+    non_proteomic_conflict: String,
+    eligibility: String,
+    exact_raw_mapping: bool,
+    structured_biological_evidence: bool,
+    structured_scp_role_evidence: bool,
+    proteomics_branch_evidence: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct TrustedFullSdrfPreservationAudit {
+    input_rows: usize,
+    output_rows: usize,
+    input_columns: usize,
+    output_columns: usize,
+    concrete_values_checked: usize,
+    protected_isolation_acquisition_cells_checked: usize,
+    violations: Vec<String>,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
@@ -3388,6 +3431,698 @@ fn factor_observation_as_claim(obs: &AcceptedFactorObservation) -> ScientificCla
     }
 }
 
+fn sha256sum_file(path: &Path) -> Result<String> {
+    let output = std::process::Command::new("sha256sum")
+        .arg(path)
+        .output()
+        .with_context(|| format!("execute sha256sum for {}", path.display()))?;
+    if !output.status.success() {
+        bail!(
+            "sha256sum failed for {} with status {}: {}",
+            path.display(),
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    let stdout = String::from_utf8(output.stdout).context("decode sha256sum output")?;
+    let digest = stdout.split_whitespace().next().unwrap_or_default().trim();
+    if digest.len() != 64 || !digest.chars().all(|ch| ch.is_ascii_hexdigit()) {
+        bail!(
+            "sha256sum returned malformed digest for {}: {:?}",
+            path.display(),
+            digest
+        );
+    }
+    Ok(digest.to_ascii_lowercase())
+}
+
+fn load_trusted_full_sdrf_eligibility_record(
+    manifest: &Path,
+    accession: &str,
+) -> Result<TrustedFullSdrfEligibilityRecord> {
+    if !manifest.is_file() {
+        bail!(
+            "trusted full-SDRF eligibility manifest not found: {}",
+            manifest.display()
+        );
+    }
+    let mut reader = ReaderBuilder::new()
+        .delimiter(b'\t')
+        .from_path(manifest)
+        .with_context(|| {
+            format!(
+                "read trusted full-SDRF eligibility manifest {}",
+                manifest.display()
+            )
+        })?;
+    let mut matched = Vec::new();
+    for record in reader.deserialize::<TrustedFullSdrfEligibilityRecord>() {
+        let record = record.with_context(|| {
+            format!(
+                "parse trusted full-SDRF eligibility manifest {}",
+                manifest.display()
+            )
+        })?;
+        if record.accession.trim() == accession {
+            matched.push(record);
+        }
+    }
+    match matched.len() {
+        1 => Ok(matched.remove(0)),
+        0 => bail!(
+            "trusted full-SDRF eligibility manifest {} has no row for {accession}",
+            manifest.display()
+        ),
+        n => bail!(
+            "trusted full-SDRF eligibility manifest {} has {n} rows for {accession}; expected exactly one",
+            manifest.display()
+        ),
+    }
+}
+
+fn trusted_full_sdrf_exact_raw_mapping(path: &Path, raw_files: &[RawFile]) -> Result<()> {
+    if raw_files.is_empty() {
+        bail!("trusted full-SDRF exact RAW mapping requires a non-empty repository inventory");
+    }
+    let (headers, rows) = read_existing_sdrf_table(path)?;
+    if rows.is_empty() {
+        bail!("trusted full SDRF has no data rows: {}", path.display());
+    }
+    let data_idx = header_first_index(&headers, "comment[data file]").ok_or_else(|| {
+        anyhow!(
+            "trusted full SDRF {} lacks comment[data file]",
+            path.display()
+        )
+    })?;
+
+    let mut alias_to_raw: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    for raw in raw_files {
+        for alias in normalized_data_file_aliases(&raw.file_name) {
+            alias_to_raw
+                .entry(alias)
+                .or_default()
+                .insert(raw.file_name.clone());
+        }
+    }
+
+    let mut seen_repository_raws = BTreeSet::new();
+    for (offset, row) in rows.iter().enumerate() {
+        let value = row
+            .get(data_idx)
+            .map(|value| value.trim())
+            .unwrap_or_default();
+        if value.is_empty() || value.eq_ignore_ascii_case("not available") {
+            bail!(
+                "trusted full SDRF {} row {} has no exact data-file mapping",
+                path.display(),
+                offset + 2
+            );
+        }
+        let mut candidates = BTreeSet::new();
+        for alias in normalized_data_file_aliases(value) {
+            if let Some(raws) = alias_to_raw.get(&alias) {
+                candidates.extend(raws.iter().cloned());
+            }
+        }
+        if candidates.len() != 1 {
+            bail!(
+                "trusted full SDRF {} row {} data file {:?} resolves to {} repository RAW candidates; expected exactly one",
+                path.display(),
+                offset + 2,
+                value,
+                candidates.len()
+            );
+        }
+        seen_repository_raws.insert(candidates.into_iter().next().unwrap());
+    }
+
+    let expected = raw_files
+        .iter()
+        .map(|raw| raw.file_name.clone())
+        .collect::<BTreeSet<_>>();
+    if seen_repository_raws != expected {
+        let missing = expected
+            .difference(&seen_repository_raws)
+            .cloned()
+            .collect::<Vec<_>>();
+        let unexpected = seen_repository_raws
+            .difference(&expected)
+            .cloned()
+            .collect::<Vec<_>>();
+        bail!(
+            "trusted full SDRF {} exact RAW coverage mismatch: missing={:?} unexpected={:?}",
+            path.display(),
+            missing,
+            unexpected
+        );
+    }
+    Ok(())
+}
+
+fn trusted_full_sdrf_structured_evidence(path: &Path) -> Result<(bool, bool, bool)> {
+    let (headers, rows) = read_existing_sdrf_table(path)?;
+    let values = |header: &str| -> Vec<String> {
+        let Some(idx) = header_first_index(&headers, header) else {
+            return Vec::new();
+        };
+        rows.iter()
+            .filter_map(|row| row.get(idx))
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+            .collect()
+    };
+
+    let biology = [
+        "characteristics[organism]",
+        "characteristics[cell type]",
+        "characteristics[cell line]",
+        "characteristics[material type]",
+    ]
+    .iter()
+    .flat_map(|header| values(header))
+    .any(|value| concrete_table_value(&value));
+
+    let sample_type_scp = values(SC_SAMPLE_TYPE).iter().any(|value| {
+        let low = value.to_ascii_lowercase();
+        low == "single cell"
+            || low == "single-cell"
+            || matches!(
+                low.as_str(),
+                "carrier" | "reference" | "bulk control" | "pooled" | "empty"
+            )
+    });
+    let cell_identifier_scp = values(SC_CELL_IDENTIFIER)
+        .iter()
+        .any(|value| concrete_semantic_value(value));
+    let cells_per_well_scp = values(SC_CELLS_PER_WELL).iter().any(|value| {
+        value
+            .parse::<usize>()
+            .map(|count| count > 0)
+            .unwrap_or(false)
+    });
+    let structured_scp = sample_type_scp || cell_identifier_scp || cells_per_well_scp;
+
+    let technology_values = values("technology type");
+    let acquisition_values = values("comment[proteomics data acquisition method]");
+    let instrument_values = values("comment[instrument]");
+    let proteomics = technology_values
+        .iter()
+        .chain(acquisition_values.iter())
+        .chain(instrument_values.iter())
+        .any(|value| {
+            let low = value.to_ascii_lowercase();
+            low.contains("proteom")
+                || low.contains("mass spectrom")
+                || low.contains("orbitrap")
+                || low.contains("q exactive")
+                || low.contains("tims")
+                || low.contains("astral")
+                || low.contains("data-independent")
+                || low.contains("data dependent")
+                || low.contains("data-dependent")
+                || low == "dia"
+                || low == "dda"
+        });
+
+    for value in technology_values {
+        let low = value.to_ascii_lowercase();
+        let non_proteomic = low.contains("rna-seq")
+            || low.contains("rna sequencing")
+            || low.contains("transcriptom")
+            || low.contains("genom")
+            || low.contains("metabolom")
+            || low.contains("elemental")
+            || low.contains("la-icp")
+            || low.contains("icp-ms");
+        let proteomic_same_value = low.contains("proteom") || low.contains("mass spectrom");
+        if non_proteomic && !proteomic_same_value {
+            bail!(
+                "trusted full SDRF {} contains explicit non-proteomic technology branch {:?}",
+                path.display(),
+                value
+            );
+        }
+    }
+
+    Ok((biology, structured_scp, proteomics))
+}
+
+fn validate_trusted_full_sdrf_manifest_record(
+    record: &TrustedFullSdrfEligibilityRecord,
+    accession: &str,
+) -> Result<()> {
+    let expect_token = |field: &str, observed: &str, expected: &str| -> Result<()> {
+        if observed.trim() != expected {
+            bail!(
+                "trusted full-SDRF eligibility for {accession} requires {field}={expected:?}, found {:?}",
+                observed
+            );
+        }
+        Ok(())
+    };
+    expect_token("candidate_type", &record.candidate_type, "sdrf")?;
+    expect_token(
+        "coverage_class",
+        &record.coverage_class,
+        "full_repository_coverage",
+    )?;
+    expect_token(
+        "trusted_source",
+        &record.trusted_source,
+        "trusted_local_deposited_sdrf",
+    )?;
+    expect_token(
+        "structured_scp_evidence",
+        &record.structured_scp_evidence,
+        "strong_structured_scp_evidence",
+    )?;
+    expect_token(
+        "non_proteomic_conflict",
+        &record.non_proteomic_conflict,
+        "none",
+    )?;
+    expect_token("eligibility", &record.eligibility, "eligible")?;
+    Ok(())
+}
+
+fn verify_trusted_full_sdrf_sha256(
+    record: &TrustedFullSdrfEligibilityRecord,
+    candidate: &Path,
+    accession: &str,
+) -> Result<String> {
+    let computed_sha256 = sha256sum_file(candidate)?;
+    let declared_sha256 = record.candidate_sha256.trim().to_ascii_lowercase();
+    if declared_sha256.len() != 64 || !declared_sha256.chars().all(|ch| ch.is_ascii_hexdigit()) {
+        bail!(
+            "trusted full-SDRF eligibility manifest has malformed candidate_sha256 for {accession}: {:?}",
+            record.candidate_sha256
+        );
+    }
+    if computed_sha256 != declared_sha256 {
+        bail!(
+            "trusted full-SDRF hash mismatch for {accession}: manifest={} runtime={}",
+            declared_sha256,
+            computed_sha256
+        );
+    }
+    Ok(computed_sha256)
+}
+
+fn validate_trusted_full_sdrf_eligibility(
+    opts: &SdrfScientificAgentOptions,
+    evidence: &DatasetEvidence,
+    accession: &str,
+) -> Result<TrustedFullSdrfEligibilityAudit> {
+    let manifest = std::env::var(SCIENTIFIC_AGENT_TRUSTED_FULL_SDRF_ELIGIBILITY_ENV)
+        .with_context(|| {
+            format!(
+                "{} must point to an explicit hash-bound trusted full-SDRF eligibility manifest before the Stage1 fallback can be used",
+                SCIENTIFIC_AGENT_TRUSTED_FULL_SDRF_ELIGIBILITY_ENV
+            )
+        })?;
+    let manifest = PathBuf::from(manifest);
+    let record = load_trusted_full_sdrf_eligibility_record(&manifest, accession)?;
+
+    validate_trusted_full_sdrf_manifest_record(&record, accession)?;
+
+    let candidate = opts
+        .resolved_sdrf_dir
+        .as_ref()
+        .ok_or_else(|| anyhow!("trusted full-SDRF fallback requires --resolved-sdrf-dir"))?
+        .join(format!("{accession}.sdrf.tsv"));
+    if !candidate.is_file() {
+        bail!(
+            "trusted full-SDRF candidate missing for {accession}: {}",
+            candidate.display()
+        );
+    }
+    if evidence.existing_sdrf_path.is_empty() {
+        bail!(
+            "trusted full-SDRF candidate for {accession} did not pass the existing bidirectional repository-coverage gate"
+        );
+    }
+    let candidate_canonical = fs::canonicalize(&candidate)
+        .with_context(|| format!("canonicalize trusted full SDRF {}", candidate.display()))?;
+    let selected_canonical = fs::canonicalize(Path::new(&evidence.existing_sdrf_path))
+        .with_context(|| {
+            format!(
+                "canonicalize selected existing SDRF {}",
+                evidence.existing_sdrf_path
+            )
+        })?;
+    if candidate_canonical != selected_canonical {
+        bail!(
+            "trusted full-SDRF fallback candidate {} is not the exact preservation-first SDRF selected by build_evidence ({})",
+            candidate.display(),
+            evidence.existing_sdrf_path
+        );
+    }
+    if !existing_sdrf_has_bidirectional_repository_coverage(&candidate, &evidence.raw_files) {
+        bail!(
+            "trusted full-SDRF candidate for {accession} no longer has bidirectional repository coverage"
+        );
+    }
+    trusted_full_sdrf_exact_raw_mapping(&candidate, &evidence.raw_files)?;
+
+    let computed_sha256 = verify_trusted_full_sdrf_sha256(&record, &candidate, accession)?;
+    let declared_sha256 = record.candidate_sha256.trim().to_ascii_lowercase();
+
+    let (biology, structured_scp, proteomics) = trusted_full_sdrf_structured_evidence(&candidate)?;
+    if !biology {
+        bail!(
+            "trusted full-SDRF candidate for {accession} lacks explicit structured biological evidence"
+        );
+    }
+    if !structured_scp {
+        bail!(
+            "trusted full-SDRF candidate for {accession} lacks explicit structured SCP/sample-role evidence"
+        );
+    }
+    if !proteomics {
+        bail!(
+            "trusted full-SDRF candidate for {accession} lacks explicit proteomics/mass-spectrometry branch evidence"
+        );
+    }
+
+    Ok(TrustedFullSdrfEligibilityAudit {
+        accession: accession.into(),
+        candidate_path: candidate.display().to_string(),
+        declared_sha256,
+        computed_sha256,
+        candidate_type: record.candidate_type,
+        coverage_class: record.coverage_class,
+        trusted_source: record.trusted_source,
+        structured_scp_evidence: record.structured_scp_evidence,
+        non_proteomic_conflict: record.non_proteomic_conflict,
+        eligibility: record.eligibility,
+        exact_raw_mapping: true,
+        structured_biological_evidence: biology,
+        structured_scp_role_evidence: structured_scp,
+        proteomics_branch_evidence: proteomics,
+    })
+}
+
+fn trusted_full_sdrf_preservation_audit(
+    input_path: &Path,
+    output_headers: &[String],
+    output_rows: &[Vec<String>],
+) -> Result<TrustedFullSdrfPreservationAudit> {
+    let (input_headers, input_rows) = read_existing_sdrf_table(input_path)?;
+    let mut audit = TrustedFullSdrfPreservationAudit {
+        input_rows: input_rows.len(),
+        output_rows: output_rows.len(),
+        input_columns: input_headers.len(),
+        output_columns: output_headers.len(),
+        ..Default::default()
+    };
+
+    if input_rows.len() != output_rows.len() {
+        audit.violations.push(format!(
+            "row count changed: input={} output={}",
+            input_rows.len(),
+            output_rows.len()
+        ));
+    }
+    if output_headers.len() < input_headers.len()
+        || output_headers[..input_headers.len()] != input_headers[..]
+    {
+        audit.violations.push(
+            "original SDRF header prefix changed or was reordered during preservation-first compile"
+                .into(),
+        );
+    }
+
+    let metadata_mutation_allowed = |header: &str| {
+        matches!(
+            header,
+            "comment[sdrf version]" | "comment[sdrf annotation tool]"
+        )
+    };
+    let protected_no_invention = |header: &str| {
+        header == SC_ISOLATION_METHOD || header == "comment[proteomics data acquisition method]"
+    };
+
+    for (row_index, input_row) in input_rows.iter().enumerate() {
+        let Some(output_row) = output_rows.get(row_index) else {
+            break;
+        };
+        for (column_index, header) in input_headers.iter().enumerate() {
+            let before = input_row
+                .get(column_index)
+                .map(|value| value.as_str())
+                .unwrap_or_default();
+            let after = output_row
+                .get(column_index)
+                .map(|value| value.as_str())
+                .unwrap_or_default();
+
+            if protected_no_invention(header) {
+                audit.protected_isolation_acquisition_cells_checked += 1;
+                let before_reserved = canonical_reserved_alias(before);
+                let after_concrete = concrete_table_value(after);
+                if before.trim().is_empty() || before_reserved == Some("not available") {
+                    if after_concrete {
+                        audit.violations.push(format!(
+                            "row {} {} invented concrete value {:?} from deposited unresolved value {:?}",
+                            row_index + 2,
+                            header,
+                            after,
+                            before
+                        ));
+                    }
+                } else if before != after {
+                    audit.violations.push(format!(
+                        "row {} {} changed deposited value {:?} -> {:?}",
+                        row_index + 2,
+                        header,
+                        before,
+                        after
+                    ));
+                }
+            }
+
+            if metadata_mutation_allowed(header) || !concrete_table_value(before) {
+                continue;
+            }
+            audit.concrete_values_checked += 1;
+            if before != after {
+                audit.violations.push(format!(
+                    "row {} {} changed concrete deposited value {:?} -> {:?}",
+                    row_index + 2,
+                    header,
+                    before,
+                    after
+                ));
+            }
+        }
+    }
+
+    if !audit.violations.is_empty() {
+        bail!(
+            "trusted full-SDRF preservation guard failed for {}: {}",
+            input_path.display(),
+            audit.violations.join("; ")
+        );
+    }
+    Ok(audit)
+}
+
+fn write_trusted_full_sdrf_review(
+    path: &Path,
+    eligibility: &TrustedFullSdrfEligibilityAudit,
+    preservation: &TrustedFullSdrfPreservationAudit,
+    validation: &AgentValidationCycle,
+    terminal_status: &str,
+    stage1_error: &str,
+) -> Result<()> {
+    let mut out = String::new();
+    out.push_str(&format!(
+        "# PRIDE-SCP trusted full-SDRF Stage1 fallback: {}\n\n",
+        eligibility.accession
+    ));
+    out.push_str(&format!("Terminal status: **{}**\n\n", terminal_status));
+    out.push_str("## Stage1 prerequisite\n\n");
+    out.push_str(&format!(
+        "Accepted FactorGraph unavailable: `{}`\n\n",
+        stage1_error
+    ));
+    out.push_str("## Eligibility\n\n```json\n");
+    out.push_str(&serde_json::to_string_pretty(eligibility)?);
+    out.push_str("\n```\n\n## Preservation audit\n\n```json\n");
+    out.push_str(&serde_json::to_string_pretty(preservation)?);
+    out.push_str("\n```\n\n## Validation\n\n```json\n");
+    out.push_str(&serde_json::to_string_pretty(validation)?);
+    out.push_str("\n```\n");
+    fs::write(path, out)?;
+    Ok(())
+}
+
+fn run_trusted_full_sdrf_stage1_fallback(
+    opts: &SdrfScientificAgentOptions,
+    evidence: &DatasetEvidence,
+    explicit_mappings: &[ExplicitRowMapping],
+    accession: &str,
+    stage1_error: &str,
+) -> Result<ScientificAgentResultRow> {
+    if !explicit_mappings.is_empty() {
+        bail!(
+            "trusted full-SDRF Stage1 fallback for {accession} is incompatible with an explicit row-mapping manifest; the deposited full SDRF must remain the sole row-mapping authority"
+        );
+    }
+    let eligibility = validate_trusted_full_sdrf_eligibility(opts, evidence, accession)?;
+    let root = opts.output_dir.join("row_role_hardened").join(accession);
+    fs::create_dir_all(&root)?;
+    let evidence_path = root.join("evidence.json");
+    let eligibility_path = root.join("trusted_full_sdrf_eligibility.json");
+    let preservation_path = root.join("trusted_full_sdrf_preservation.json");
+    let adjudications_path = root.join("adjudications.json");
+    let draft_path = root.join(format!("{}.row_role_hardened.sdrf.tsv", accession));
+    let validation_path = root.join("VALIDATION.md");
+    let review_path = root.join("REVIEW.md");
+    let result_path = root.join("result.json");
+    fs::write(&evidence_path, serde_json::to_string_pretty(evidence)?)?;
+    fs::write(
+        &eligibility_path,
+        serde_json::to_string_pretty(&eligibility)?,
+    )?;
+
+    let state = ScientificWorkspaceState {
+        harness_version: SCIENTIFIC_AGENT_FACTOR_ROW_ROLE_HARDENED_VERSION.into(),
+        accession: accession.into(),
+        turn: 0,
+        relation: AgentRelation {
+            mode: if study_design_has_assertive_relation_hint(&evidence.study_design) {
+                evidence.study_design.relation_mode_hint.clone()
+            } else {
+                "unresolved".into()
+            },
+            scope: if study_design_has_assertive_relation_hint(&evidence.study_design) {
+                "project".into()
+            } else {
+                "unresolved".into()
+            },
+            evidence_refs: evidence.study_design.relation_evidence_refs.clone(),
+            confidence: evidence.study_design.relation_confidence.clone(),
+            reason: evidence.study_design.notes.clone(),
+        },
+        active_task_id: String::new(),
+        next_step: "compile".into(),
+        notes: "hash-bound trusted full deposited SDRF preservation-first Stage1 fallback; no FactorGraph synthesis, no LLM call, no invented isolation/acquisition, validators and scientific guards remain required".into(),
+        ..Default::default()
+    };
+
+    let compiled = compile_workspace(evidence, &state, explicit_mappings)?;
+    let input_path = Path::new(&eligibility.candidate_path);
+    let preservation =
+        trusted_full_sdrf_preservation_audit(input_path, &compiled.headers, &compiled.rows)?;
+    fs::write(
+        &preservation_path,
+        serde_json::to_string_pretty(&preservation)?,
+    )?;
+    write_sdrf(&draft_path, &compiled.headers, &compiled.rows)?;
+    write_validation_review(&validation_path, &compiled.issues)?;
+    let validation = validation_cycle(1, &compiled.issues);
+    let adjudications = workspace_adjudications(evidence, &state);
+    fs::write(
+        &adjudications_path,
+        serde_json::to_string_pretty(&adjudications)?,
+    )?;
+
+    let has_template_gap = adjudications
+        .iter()
+        .any(|record| matches!(&record.adjudication, ClaimAdjudication::TemplateGap { .. }));
+    let terminal_status = if validation.validation_errors == 0 {
+        "locally_valid"
+    } else if has_template_gap {
+        "partial_template_gap"
+    } else {
+        "partial_human_review"
+    };
+    write_trusted_full_sdrf_review(
+        &review_path,
+        &eligibility,
+        &preservation,
+        &validation,
+        terminal_status,
+        stage1_error,
+    )?;
+
+    let result = json!({
+        "harness_version": SCIENTIFIC_AGENT_FACTOR_ROW_ROLE_HARDENED_VERSION,
+        "accession": accession,
+        "factor_graph_source": Value::Null,
+        "trusted_full_sdrf_stage1_fallback": true,
+        "stage1_error": stage1_error,
+        "eligibility": &eligibility,
+        "preservation": &preservation,
+        "model_calls": 0,
+        "tool_actions": 0,
+        "validator_cycles": 1,
+        "terminal_status": terminal_status,
+        "adjudications": &adjudications,
+        "validation": &validation,
+        "compiled_fingerprint": &compiled.fingerprint,
+        "draft_path": draft_path.display().to_string(),
+        "review_path": review_path.display().to_string()
+    });
+    fs::write(&result_path, serde_json::to_string_pretty(&result)?)?;
+
+    Ok(ScientificAgentResultRow {
+        accession: accession.into(),
+        status: "success".into(),
+        terminal_status: terminal_status.into(),
+        turns: 0,
+        tool_actions: 0,
+        validator_cycles: 1,
+        branches: 0,
+        open_questions: 0,
+        relation_mode: compiled.proposal.relation_mode,
+        locally_valid: validation.validation_errors == 0,
+        validation_errors: validation.validation_errors,
+        draft_path: draft_path.display().to_string(),
+        review_path: review_path.display().to_string(),
+        workspace_path: root.display().to_string(),
+        error: String::new(),
+    })
+}
+
+fn load_factor_graph_for_row_role_stage1_decision(
+    accession: &str,
+) -> Result<(PathBuf, StudyFactorGraphAcceptance)> {
+    let root = std::env::var(SCIENTIFIC_AGENT_FACTOR_GRAPH_ROOT_ENV).with_context(|| {
+        format!(
+            "{} must point to a completed v2 factor Stage-1 output root",
+            SCIENTIFIC_AGENT_FACTOR_GRAPH_ROOT_ENV
+        )
+    })?;
+    let path = PathBuf::from(root)
+        .join("study_factor_graphs")
+        .join(accession)
+        .join("accepted_graph.json");
+    if !path.is_file() {
+        bail!(
+            "Stage1 decision artifact not found for {accession}: {}",
+            path.display()
+        );
+    }
+    let graph: StudyFactorGraphAcceptance = serde_json::from_str(&fs::read_to_string(&path)?)
+        .with_context(|| format!("parse Stage1 decision artifact {}", path.display()))?;
+    if graph.harness_version != SCIENTIFIC_AGENT_FACTOR_GRAPH_STAGE1_VERSION {
+        bail!(
+            "factor graph for {accession} has harness_version='{}', expected '{}'",
+            graph.harness_version,
+            SCIENTIFIC_AGENT_FACTOR_GRAPH_STAGE1_VERSION
+        );
+    }
+    if graph.accession != accession {
+        bail!(
+            "factor graph accession mismatch: expected {accession}, found {}",
+            graph.accession
+        );
+    }
+    Ok((path, graph))
+}
+
 fn load_factor_graph_for_phase_b(accession: &str) -> Result<(PathBuf, StudyFactorGraphAcceptance)> {
     let root = std::env::var(SCIENTIFIC_AGENT_FACTOR_GRAPH_ROOT_ENV).with_context(|| {
         format!(
@@ -4723,7 +5458,34 @@ async fn run_one_factor_row_role_hardened(
     } else {
         Vec::new()
     };
-    let (graph_path, graph) = load_factor_graph_for_phase_b(accession)?;
+    let (graph_path, graph) = load_factor_graph_for_row_role_stage1_decision(accession)?;
+    if graph.status != "accepted" {
+        if graph.status != "human_review" {
+            bail!(
+                "factor graph for {accession} has unsupported non-accepted status={}",
+                graph.status
+            );
+        }
+        if std::env::var_os(SCIENTIFIC_AGENT_TRUSTED_FULL_SDRF_ELIGIBILITY_ENV).is_none() {
+            bail!(
+                "factor graph for {accession} is not accepted: status={}",
+                graph.status
+            );
+        }
+        let stage1_error = format!("factor graph status={}: {}", graph.status, graph.reason);
+        return run_trusted_full_sdrf_stage1_fallback(
+            opts,
+            &evidence,
+            &explicit_mappings,
+            accession,
+            &stage1_error,
+        )
+        .with_context(|| {
+            format!(
+                "accepted FactorGraph unavailable for {accession}; trusted full-SDRF fallback rejected"
+            )
+        });
+    }
     let root = opts.output_dir.join("row_role_hardened").join(accession);
     fs::create_dir_all(&root)?;
     let evidence_path = root.join("evidence.json");
@@ -12614,5 +13376,259 @@ mod tests {
             .iter()
             .any(|issue| issue.code
                 == "scientific_agent_factor_canonicalization_hardened_baseline_mask"));
+    }
+
+    fn trusted_full_record() -> TrustedFullSdrfEligibilityRecord {
+        TrustedFullSdrfEligibilityRecord {
+            accession: "PXDTEST".into(),
+            candidate_sha256: "0".repeat(64),
+            candidate_type: "sdrf".into(),
+            coverage_class: "full_repository_coverage".into(),
+            trusted_source: "trusted_local_deposited_sdrf".into(),
+            structured_scp_evidence: "strong_structured_scp_evidence".into(),
+            non_proteomic_conflict: "none".into(),
+            eligibility: "eligible".into(),
+        }
+    }
+
+    fn trusted_full_test_dir(label: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "pride-scp-trusted-full-sdrf-{label}-{}",
+            std::process::id()
+        ))
+    }
+
+    fn write_trusted_full_test_sdrf(path: &Path, data_files: &[&str], technology: &str) {
+        let headers = [
+            "source name",
+            "characteristics[organism]",
+            "characteristics[sample type]",
+            "characteristics[cell identifier]",
+            "characteristics[cells per well]",
+            "technology type",
+            "comment[proteomics data acquisition method]",
+            SC_ISOLATION_METHOD,
+            "comment[data file]",
+        ];
+        let mut out = headers.join("\t");
+        out.push('\n');
+        for (index, raw) in data_files.iter().enumerate() {
+            out.push_str(&format!(
+                "cell_{index}\tHomo sapiens\tsingle cell\tcell_{index}\t1\t{technology}\tData-independent acquisition\tmanual picking\t{raw}\n"
+            ));
+        }
+        fs::write(path, out).unwrap();
+    }
+
+    #[test]
+    fn trusted_full_sdrf_manifest_accepts_only_explicit_eligible_contract() {
+        let record = trusted_full_record();
+        assert!(validate_trusted_full_sdrf_manifest_record(&record, "PXDTEST").is_ok());
+    }
+
+    #[test]
+    fn trusted_full_sdrf_manifest_rejects_non_sdrf_candidate() {
+        let mut record = trusted_full_record();
+        record.candidate_type = "xlsx".into();
+        assert!(validate_trusted_full_sdrf_manifest_record(&record, "PXDTEST").is_err());
+    }
+
+    #[test]
+    fn trusted_full_sdrf_manifest_rejects_partial_coverage() {
+        let mut record = trusted_full_record();
+        record.coverage_class = "strict_repository_subset".into();
+        assert!(validate_trusted_full_sdrf_manifest_record(&record, "PXDTEST").is_err());
+    }
+
+    #[test]
+    fn trusted_full_sdrf_manifest_rejects_weak_or_conflicting_scientific_evidence() {
+        let mut weak = trusted_full_record();
+        weak.structured_scp_evidence = "weak_or_no_structured_scp_evidence".into();
+        assert!(validate_trusted_full_sdrf_manifest_record(&weak, "PXDTEST").is_err());
+
+        let mut conflict = trusted_full_record();
+        conflict.non_proteomic_conflict = "present".into();
+        assert!(validate_trusted_full_sdrf_manifest_record(&conflict, "PXDTEST").is_err());
+    }
+
+    #[test]
+    fn trusted_full_sdrf_sha256_is_bound_to_exact_candidate_bytes() {
+        let dir = trusted_full_test_dir("hash");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("candidate.sdrf.tsv");
+        fs::write(&path, "a\tb\n1\t2\n").unwrap();
+        let mut record = trusted_full_record();
+        record.candidate_sha256 = sha256sum_file(&path).unwrap();
+        assert_eq!(
+            verify_trusted_full_sdrf_sha256(&record, &path, "PXDTEST").unwrap(),
+            record.candidate_sha256
+        );
+        record.candidate_sha256 = "f".repeat(64);
+        assert!(verify_trusted_full_sdrf_sha256(&record, &path, "PXDTEST").is_err());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn trusted_full_sdrf_exact_raw_mapping_accepts_full_repeated_channel_rows() {
+        let dir = trusted_full_test_dir("exact-full");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("candidate.sdrf.tsv");
+        write_trusted_full_test_sdrf(
+            &path,
+            &["runA.raw", "runA.raw", "runB.raw"],
+            "proteomic profiling by mass spectrometry",
+        );
+        let raw = vec![
+            RawFile {
+                file_name: "runA.raw".into(),
+                file_uri: String::new(),
+                category: "RAW".into(),
+            },
+            RawFile {
+                file_name: "runB.raw".into(),
+                file_uri: String::new(),
+                category: "RAW".into(),
+            },
+        ];
+        assert!(trusted_full_sdrf_exact_raw_mapping(&path, &raw).is_ok());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn trusted_full_sdrf_exact_raw_mapping_rejects_ambiguous_aliases() {
+        let dir = trusted_full_test_dir("ambiguous");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("candidate.sdrf.tsv");
+        write_trusted_full_test_sdrf(
+            &path,
+            &["sample.d.zip"],
+            "proteomic profiling by mass spectrometry",
+        );
+        let raw = vec![
+            RawFile {
+                file_name: "sample.d".into(),
+                file_uri: String::new(),
+                category: "RAW".into(),
+            },
+            RawFile {
+                file_name: "sample.d.zip".into(),
+                file_uri: String::new(),
+                category: "RAW".into(),
+            },
+        ];
+        assert!(trusted_full_sdrf_exact_raw_mapping(&path, &raw).is_err());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn trusted_full_sdrf_structured_evidence_requires_biology_scp_and_proteomics() {
+        let dir = trusted_full_test_dir("structured");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("candidate.sdrf.tsv");
+        write_trusted_full_test_sdrf(
+            &path,
+            &["runA.raw"],
+            "proteomic profiling by mass spectrometry",
+        );
+        assert_eq!(
+            trusted_full_sdrf_structured_evidence(&path).unwrap(),
+            (true, true, true)
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn trusted_full_sdrf_structured_evidence_rejects_explicit_nonproteomic_branch() {
+        let dir = trusted_full_test_dir("nonproteomic");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("candidate.sdrf.tsv");
+        write_trusted_full_test_sdrf(&path, &["runA.raw"], "RNA sequencing");
+        assert!(trusted_full_sdrf_structured_evidence(&path).is_err());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn trusted_full_sdrf_preservation_guard_rejects_concrete_deposited_value_mutation() {
+        let dir = trusted_full_test_dir("preserve-concrete");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("candidate.sdrf.tsv");
+        write_trusted_full_test_sdrf(
+            &path,
+            &["runA.raw"],
+            "proteomic profiling by mass spectrometry",
+        );
+        let (headers, mut rows) = read_existing_sdrf_table(&path).unwrap();
+        let org = header_first_index(&headers, "characteristics[organism]").unwrap();
+        rows[0][org] = "Mus musculus".into();
+        assert!(trusted_full_sdrf_preservation_audit(&path, &headers, &rows).is_err());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn trusted_full_sdrf_preservation_guard_rejects_invented_isolation_or_acquisition() {
+        let dir = trusted_full_test_dir("no-invention");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("candidate.sdrf.tsv");
+        write_trusted_full_test_sdrf(
+            &path,
+            &["runA.raw"],
+            "proteomic profiling by mass spectrometry",
+        );
+        let (headers, mut input_rows) = read_existing_sdrf_table(&path).unwrap();
+        let isolation = header_first_index(&headers, SC_ISOLATION_METHOD).unwrap();
+        let acquisition =
+            header_first_index(&headers, "comment[proteomics data acquisition method]").unwrap();
+        input_rows[0][isolation] = "not available".into();
+        input_rows[0][acquisition] = "not available".into();
+        write_sdrf(&path, &headers, &input_rows).unwrap();
+
+        let (_, mut output_rows) = read_existing_sdrf_table(&path).unwrap();
+        output_rows[0][isolation] = "manual picking".into();
+        output_rows[0][acquisition] = "Data-independent acquisition".into();
+        assert!(trusted_full_sdrf_preservation_audit(&path, &headers, &output_rows).is_err());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn trusted_full_sdrf_preservation_guard_allows_metadata_stamp_and_nonprotected_blank_enrichment(
+    ) {
+        let dir = trusted_full_test_dir("allowed-normalization");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("candidate.sdrf.tsv");
+        let headers = vec![
+            "source name".to_string(),
+            "characteristics[organism]".to_string(),
+            "characteristics[disease]".to_string(),
+            "comment[proteomics data acquisition method]".to_string(),
+            SC_ISOLATION_METHOD.to_string(),
+            "comment[data file]".to_string(),
+            "comment[sdrf version]".to_string(),
+            "comment[sdrf annotation tool]".to_string(),
+        ];
+        let rows = vec![vec![
+            "cell_1".into(),
+            "Homo sapiens".into(),
+            "not available".into(),
+            "not available".into(),
+            "not available".into(),
+            "runA.raw".into(),
+            "old".into(),
+            "old-tool".into(),
+        ]];
+        write_sdrf(&path, &headers, &rows).unwrap();
+        let mut output = rows.clone();
+        output[0][2] = "healthy".into();
+        output[0][6] = "1.1".into();
+        output[0][7] = "pride-scp".into();
+        assert!(trusted_full_sdrf_preservation_audit(&path, &headers, &output).is_ok());
+        let _ = fs::remove_dir_all(&dir);
     }
 }
