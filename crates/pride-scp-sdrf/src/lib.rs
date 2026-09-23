@@ -6541,9 +6541,21 @@ fn merge_existing_sdrf(
     evidence: &DatasetEvidence,
 ) -> Result<(Vec<String>, Vec<Vec<String>>, String)> {
     let path = Path::new(&evidence.existing_sdrf_path);
-    let (mut headers, mut rows) = read_existing_sdrf_table(path)?;
+    let (headers, rows) = read_existing_sdrf_table(path)?;
     if rows.is_empty() {
         bail!("existing SDRF has no data rows: {}", path.display());
+    }
+    enrich_existing_sdrf_rows(proposal, evidence, headers, rows)
+}
+
+fn enrich_existing_sdrf_rows(
+    proposal: &SdrfProposal,
+    evidence: &DatasetEvidence,
+    mut headers: Vec<String>,
+    mut rows: Vec<Vec<String>>,
+) -> Result<(Vec<String>, Vec<Vec<String>>, String)> {
+    if rows.is_empty() {
+        bail!("existing SDRF normalization requires at least one data row");
     }
     let original_header_count = headers.len();
 

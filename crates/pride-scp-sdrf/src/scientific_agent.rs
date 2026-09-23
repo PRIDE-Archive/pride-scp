@@ -7211,6 +7211,7 @@ fn canonical_repository_raw_for_value(value: &str, raw_files: &[RawFile]) -> Res
 fn fuse_trusted_partial_sdrf_rows(
     current_headers: &[String],
     current_rows: &[Vec<String>],
+    proposal: &SdrfProposal,
     evidence: &DatasetEvidence,
     partial_path: &Path,
 ) -> Result<(Vec<String>, Vec<Vec<String>>, ValidationIssue)> {
@@ -7320,6 +7321,14 @@ fn fuse_trusted_partial_sdrf_rows(
             retained_raws
         );
     }
+
+    // Match the preservation-first semantics of a fully resolved SDRF after
+    // source-grounded row fusion. This fills only missing proposal-backed
+    // metadata, assigns deterministic single-cell identifiers from source
+    // names, and sanitizes empty-control biological identity without changing
+    // explicit deposited channel/sample values.
+    let (union_headers, fused_rows, _) =
+        enrich_existing_sdrf_rows(proposal, evidence, union_headers, fused_rows)?;
 
     let issue = ValidationIssue {
         level: "warning".into(),
@@ -7644,7 +7653,7 @@ fn compile_workspace_with_trusted_partial_sdrf(
     {
         if let Some(partial_path) = trusted_partial_sdrf {
             let (fused_headers, fused_rows, issue) =
-                fuse_trusted_partial_sdrf_rows(&headers, &rows, evidence, partial_path)?;
+                fuse_trusted_partial_sdrf_rows(&headers, &rows, &proposal, evidence, partial_path)?;
             headers = fused_headers;
             rows = fused_rows;
             generation_mode = "generated_trusted_partial_sdrf_fusion".into();
@@ -10323,9 +10332,15 @@ mod tests {
                 "1".into(),
             ],
         ];
-        let (headers, rows, issue) =
-            fuse_trusted_partial_sdrf_rows(&current_headers, &current_rows, &evidence, &partial)
-                .unwrap();
+        let proposal = SdrfProposal::default();
+        let (headers, rows, issue) = fuse_trusted_partial_sdrf_rows(
+            &current_headers,
+            &current_rows,
+            &proposal,
+            &evidence,
+            &partial,
+        )
+        .unwrap();
         assert_eq!(rows.len(), 3);
         let at = |name: &str| headers.iter().position(|h| h == name).unwrap();
         let plex_rows = rows
@@ -10353,6 +10368,122 @@ mod tests {
             issue.code,
             "scientific_agent_trusted_partial_sdrf_mapping_applied"
         );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn trusted_partial_sdrf_fusion_matches_existing_sdrf_normalization_for_fallback_and_empty_rows()
+    {
+        let root = std::env::temp_dir().join(format!(
+            "pride-scp-trusted-partial-sdrf-fusion-normalize-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let partial = root.join("partial.sdrf.tsv");
+        fs::write(
+            &partial,
+            concat!(
+                "source name\tcharacteristics[cell type]\tcharacteristics[individual]\tcharacteristics[sample type]\tcharacteristics[cell identifier]\tcharacteristics[cells per well]\tcharacteristics[single cell isolation protocol]\tcomment[data file]\tcomment[label]\n",
+                "blank_1\tHeLa\tdonor_1\tempty\tempty\t0\tnot available\tplex_1.raw\tTMT127N\n"
+            ),
+        )
+        .unwrap();
+        let evidence = DatasetEvidence {
+            accession: "PXD999999".into(),
+            project_json_path: String::new(),
+            files_json_path: String::new(),
+            existing_sdrf_path: String::new(),
+            raw_files: vec![
+                RawFile {
+                    file_name: "plex_1.raw".into(),
+                    file_uri: String::new(),
+                    category: "RAW".into(),
+                },
+                RawFile {
+                    file_name: "fallback.raw".into(),
+                    file_uri: String::new(),
+                    category: "RAW".into(),
+                },
+            ],
+            study_design: StudyDesignScaffold::default(),
+            metadata_scaffold: DeterministicMetadataScaffold::default(),
+            evidence: vec![],
+            manuscript_sources: vec![],
+            annotation_sources: vec![],
+        };
+        let current_headers = vec![
+            "source name".into(),
+            "characteristics[organism]".into(),
+            SC_SAMPLE_TYPE.into(),
+            SC_ISOLATION_METHOD.into(),
+            SC_CELL_IDENTIFIER.into(),
+            SC_CELLS_PER_WELL.into(),
+            "comment[data file]".into(),
+            "comment[label]".into(),
+            "comment[fraction identifier]".into(),
+            "comment[technical replicate]".into(),
+        ];
+        let current_rows = vec![
+            vec![
+                "run_1".into(),
+                "not available".into(),
+                "single cell".into(),
+                "not available".into(),
+                "not available".into(),
+                "1".into(),
+                "plex_1.raw".into(),
+                "not available".into(),
+                "not available".into(),
+                "not available".into(),
+            ],
+            vec![
+                "run_2".into(),
+                "not available".into(),
+                "single cell".into(),
+                "not available".into(),
+                "not available".into(),
+                "1".into(),
+                "fallback.raw".into(),
+                "not available".into(),
+                "not available".into(),
+                "not available".into(),
+            ],
+        ];
+        let proposal = SdrfProposal {
+            relation_mode: "multiplexed_cells_per_data_file".into(),
+            organism: "Homo sapiens (human)".into(),
+            single_cell_isolation_method: "FACS".into(),
+            ..Default::default()
+        };
+        let (headers, rows, _) = fuse_trusted_partial_sdrf_rows(
+            &current_headers,
+            &current_rows,
+            &proposal,
+            &evidence,
+            &partial,
+        )
+        .unwrap();
+        let at = |name: &str| headers.iter().position(|h| h == name).unwrap();
+        let fallback = rows
+            .iter()
+            .find(|row| row[at("comment[data file]")] == "fallback.raw")
+            .unwrap();
+        assert_eq!(
+            fallback[at("characteristics[organism]")],
+            "Homo sapiens (human)"
+        );
+        assert_eq!(fallback[at(SC_CELL_IDENTIFIER)], "run_2");
+        assert_eq!(fallback[at(SC_ISOLATION_METHOD)], "FACS");
+
+        let empty = rows
+            .iter()
+            .find(|row| row[at("comment[data file]")] == "plex_1.raw")
+            .unwrap();
+        assert_eq!(empty[at("characteristics[cell type]")], "not applicable");
+        assert_eq!(empty[at("characteristics[individual]")], "not applicable");
+        assert_eq!(empty[at(SC_CELL_IDENTIFIER)], "empty");
+        assert_eq!(empty[at(SC_ISOLATION_METHOD)], "not applicable");
         let _ = fs::remove_dir_all(root);
     }
 
@@ -10386,9 +10517,11 @@ mod tests {
             manuscript_sources: vec![],
             annotation_sources: vec![],
         };
+        let proposal = SdrfProposal::default();
         let err = fuse_trusted_partial_sdrf_rows(
             &["source name".into(), "comment[data file]".into()],
             &[vec!["run_1".into(), "plex_1.raw".into()]],
+            &proposal,
             &evidence,
             &partial,
         )

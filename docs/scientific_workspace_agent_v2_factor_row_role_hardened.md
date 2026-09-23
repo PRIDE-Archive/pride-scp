@@ -125,3 +125,8 @@ that pilot the trusted deposited SDRFs cleared `sample_to_channel_mapping_unreso
 for all three and made PXD063590 locally valid. PXD020586 and PXD040455 retained
 only concrete `required_integer_invalid` errors on repository-only auxiliary
 files not represented in the deposited SDRFs.
+
+## Trusted partial SDRF normalization parity
+
+When a strict repository-subset resolved SDRF is fused into a generated multiplex scaffold, the fused table is passed through the same preservation-first normalization used for a fully resolved SDRF before validation. This is required so repository-only fallback rows receive only missing proposal-backed metadata (including canonical isolation and deterministic cell identifiers), while deposited empty/control rows receive the same biological-identity sanitization as full trusted SDRFs. Explicit deposited sample/channel values are preserved; no reporter-channel identity is inferred.
+
