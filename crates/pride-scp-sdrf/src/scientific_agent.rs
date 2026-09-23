@@ -7469,7 +7469,7 @@ fn apply_consensus_single_cell_isolation_projection(
     if state.harness_version != SCIENTIFIC_AGENT_FACTOR_ROW_ROLE_HARDENED_VERSION
         || !evidence.existing_sdrf_path.is_empty()
         || !explicit_mappings.is_empty()
-        || has_unresolved_raw_roles
+        || (has_unresolved_raw_roles && !trusted_partial_mapping_applied)
         || unresolved_de_novo_multiplex_mapping(
             evidence,
             relation_mode,
@@ -10945,6 +10945,27 @@ mod tests {
         );
         assert_eq!(unresolved_raw_rows[0][1], "not available");
         assert!(unresolved_raw_issues.is_empty());
+
+        // Once a trusted partial SDRF mapping has succeeded, unresolved RAW-role
+        // status must no longer suppress consensus isolation on deterministic
+        // fallback rows. The trusted mapping closes the multiplex relation gap,
+        // while the unanimous accepted FactorGraph regimes supply the canonical
+        // isolation value.
+        let mut trusted_partial_rows = vec![vec!["single cell".into(), "not available".into()]];
+        let trusted_partial_issues = apply_consensus_single_cell_isolation_projection(
+            &headers,
+            &mut trusted_partial_rows,
+            &evidence,
+            &state,
+            "one_cell_per_data_file",
+            &[],
+            true,
+            true,
+        );
+        assert_eq!(trusted_partial_rows[0][1], "FACS");
+        assert!(trusted_partial_issues.iter().any(|issue| {
+            issue.code == "scientific_agent_consensus_single_cell_isolation_projected"
+        }));
     }
 
     #[test]
