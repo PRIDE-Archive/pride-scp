@@ -7152,21 +7152,38 @@ fn enforce_deterministic_row_scaffold(
     issues
 }
 
-fn unique_header_index_for_trusted_partial_sdrf(
+fn trusted_partial_sdrf_header_occurrences(headers: &[String]) -> Vec<(String, usize)> {
+    let mut counts: HashMap<String, usize> = HashMap::new();
+    headers
+        .iter()
+        .map(|header| {
+            let occurrence = counts.entry(header.clone()).or_insert(0);
+            *occurrence += 1;
+            (header.clone(), *occurrence)
+        })
+        .collect()
+}
+
+fn unique_named_header_index_for_trusted_partial_sdrf(
     headers: &[String],
+    name: &str,
     context: &str,
-) -> Result<HashMap<String, usize>> {
-    let mut out = HashMap::new();
-    for (index, header) in headers.iter().enumerate() {
-        if out.insert(header.clone(), index).is_some() {
-            bail!(
-                "trusted partial SDRF fusion requires unique normalized headers; duplicate '{}' in {}",
-                header,
-                context
-            );
-        }
+) -> Result<usize> {
+    let matches = headers
+        .iter()
+        .enumerate()
+        .filter_map(|(index, header)| (header == name).then_some(index))
+        .collect::<Vec<_>>();
+    match matches.as_slice() {
+        [index] => Ok(*index),
+        [] => bail!("{} is missing {}", context, name),
+        _ => bail!(
+            "trusted partial SDRF fusion requires exactly one '{}'; found {} in {}",
+            name,
+            matches.len(),
+            context
+        ),
     }
-    Ok(out)
 }
 
 fn canonical_repository_raw_for_value(value: &str, raw_files: &[RawFile]) -> Result<String> {
@@ -7205,35 +7222,42 @@ fn fuse_trusted_partial_sdrf_rows(
     }
 
     let (deposited_headers, deposited_rows) = read_existing_sdrf_table(partial_path)?;
-    let deposited_index =
-        unique_header_index_for_trusted_partial_sdrf(&deposited_headers, "deposited SDRF")?;
-    let current_index =
-        unique_header_index_for_trusted_partial_sdrf(current_headers, "current generated SDRF")?;
-    let deposited_data_idx = *deposited_index
-        .get("comment[data file]")
-        .ok_or_else(|| anyhow!("trusted partial SDRF is missing comment[data file]"))?;
-    let current_data_idx = *current_index
-        .get("comment[data file]")
-        .ok_or_else(|| anyhow!("generated SDRF is missing comment[data file]"))?;
+    let deposited_data_idx = unique_named_header_index_for_trusted_partial_sdrf(
+        &deposited_headers,
+        "comment[data file]",
+        "deposited SDRF",
+    )?;
+    let current_data_idx = unique_named_header_index_for_trusted_partial_sdrf(
+        current_headers,
+        "comment[data file]",
+        "current generated SDRF",
+    )?;
 
-    let mut union_headers = deposited_headers.clone();
-    let mut union_seen = union_headers.iter().cloned().collect::<BTreeSet<_>>();
-    for header in current_headers {
-        if union_seen.insert(header.clone()) {
-            union_headers.push(header.clone());
+    let deposited_tokens = trusted_partial_sdrf_header_occurrences(&deposited_headers);
+    let current_tokens = trusted_partial_sdrf_header_occurrences(current_headers);
+    let mut union_tokens = deposited_tokens.clone();
+    let mut union_seen = union_tokens.iter().cloned().collect::<BTreeSet<_>>();
+    for token in current_tokens {
+        if union_seen.insert(token.clone()) {
+            union_tokens.push(token);
         }
     }
-    let union_index = unique_header_index_for_trusted_partial_sdrf(&union_headers, "fused SDRF")?;
+    let union_headers = union_tokens
+        .iter()
+        .map(|(header, _)| header.clone())
+        .collect::<Vec<_>>();
+    let union_index = union_tokens
+        .iter()
+        .cloned()
+        .enumerate()
+        .map(|(index, token)| (token, index))
+        .collect::<HashMap<_, _>>();
 
     let project_row = |headers: &[String], row: &[String]| -> Vec<String> {
-        let source_index = headers
-            .iter()
-            .enumerate()
-            .map(|(index, header)| (header.as_str(), index))
-            .collect::<HashMap<_, _>>();
+        let source_tokens = trusted_partial_sdrf_header_occurrences(headers);
         let mut out = vec!["not available".to_string(); union_headers.len()];
-        for (header, &source_idx) in &source_index {
-            if let Some(&target_idx) = union_index.get(*header) {
+        for (source_idx, token) in source_tokens.iter().enumerate() {
+            if let Some(&target_idx) = union_index.get(token) {
                 if source_idx < row.len() {
                     out[target_idx] = row[source_idx].clone();
                 }
@@ -10241,9 +10265,9 @@ mod tests {
         fs::write(
             &partial,
             concat!(
-                "source name\tassay name\ttechnology type\tcomment[data file]\tcomment[label]\tcomment[fraction identifier]\tcomment[technical replicate]\n",
-                "cell_A\tassay_A\tproteomic profiling by mass spectrometry\tplex_1.raw\tTMT127N\t1\t1\n",
-                "cell_B\tassay_B\tproteomic profiling by mass spectrometry\tplex_1.raw\tTMT128N\t1\t1\n"
+                "source name\tassay name\ttechnology type\tcomment[data file]\tcomment[label]\tcomment[modification parameters]\tcomment[modification parameters]\tcomment[fraction identifier]\tcomment[technical replicate]\n",
+                "cell_A\tassay_A\tproteomic profiling by mass spectrometry\tplex_1.raw\tTMT127N\tNT=Oxidation\tNT=Carbamidomethyl\t1\t1\n",
+                "cell_B\tassay_B\tproteomic profiling by mass spectrometry\tplex_1.raw\tTMT128N\tNT=Oxidation\tNT=Carbamidomethyl\t1\t1\n"
             ),
         )
         .unwrap();
@@ -10311,6 +10335,16 @@ mod tests {
         assert_eq!(plex_rows.len(), 2);
         assert_eq!(plex_rows[0][at("comment[label]")], "TMT127N");
         assert_eq!(plex_rows[1][at("comment[label]")], "TMT128N");
+        let modification_columns = headers
+            .iter()
+            .enumerate()
+            .filter_map(|(index, header)| {
+                (header == "comment[modification parameters]").then_some(index)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(modification_columns.len(), 2);
+        assert_eq!(plex_rows[0][modification_columns[0]], "NT=Oxidation");
+        assert_eq!(plex_rows[0][modification_columns[1]], "NT=Carbamidomethyl");
         assert!(rows.iter().any(|row| {
             row[at("comment[data file]")] == "qc_1.raw"
                 && row[at("comment[technical replicate]")] == "1"
