@@ -101,6 +101,98 @@ def prepare_resolved(accessions: list[str], roots: list[Path], out: Path) -> dic
     return info
 
 
+def wrap_preflight_candidates(
+    accessions: list[str],
+    resolved: Path,
+    discovery: dict[str, dict[str, str]],
+    out: Path,
+) -> dict[str, dict[str, Any]]:
+    """Expose raw candidates to frozen readiness without claiming local validity.
+
+    The co-located audit is provenance-only. It deliberately omits `locally_valid`
+    and completeness assertions so frozen readiness performs its own checks and
+    emits a diagnostic preflight task board without treating the candidate as
+    already approved by PRIDE-SCP.
+    """
+    shutil.rmtree(out, ignore_errors=True)
+    out.mkdir(parents=True, exist_ok=True)
+    written: dict[str, dict[str, Any]] = {}
+    for accession in accessions:
+        source = resolved / f"{accession}.sdrf.tsv"
+        if not source.is_file():
+            written[accession] = {"status": "missing_candidate"}
+            continue
+        dest_dir = out / accession
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        dest = dest_dir / f"{accession}.sdrf.tsv"
+        shutil.copy2(source, dest)
+        provenance = discovery.get(accession, {})
+        audit = {
+            "accession": accession,
+            "generation_mode": "batch_autorepair_preflight_unvalidated",
+            "controller_preflight": True,
+            "source_path": str(provenance.get("source") or source),
+            "source_sha256": str(provenance.get("sha256") or sha256_file(source)),
+            "note": "diagnostic preflight only; no locally_valid or completeness assertion is made",
+        }
+        (dest_dir / f"{accession}.sdrf_audit.json").write_text(
+            json.dumps(audit, indent=2) + "\n", encoding="utf-8"
+        )
+        written[accession] = {
+            "status": "candidate_written",
+            "sha256": sha256_file(dest),
+            "candidate": str(dest),
+        }
+    return written
+
+
+def merge_readiness_dirs(
+    accessions: list[str],
+    primary: Path | None,
+    supplemental: Path | None,
+    out: Path,
+) -> None:
+    """Merge frozen preflight diagnostics with optional prior seed findings.
+
+    Primary (fresh preflight) state/candidate provenance wins. List-like diagnostics
+    are unioned so accession-specific historical findings are not lost.
+    """
+    shutil.rmtree(out, ignore_errors=True)
+    accessions_out = out / "accessions"
+    accessions_out.mkdir(parents=True, exist_ok=True)
+
+    list_keys = {
+        "blockers", "warnings", "missing_required_columns",
+        "placeholder_required_columns", "parse_sdrf",
+    }
+    for accession in accessions:
+        objs: list[dict[str, Any]] = []
+        for root in (primary, supplemental):
+            if root is None:
+                continue
+            path = root / "accessions" / f"{accession}.readiness.json"
+            if path.is_file():
+                objs.append(read_json(path))
+        if not objs:
+            continue
+        merged = dict(objs[0])
+        for extra in objs[1:]:
+            for key in list_keys:
+                combined: list[Any] = []
+                for source in (merged.get(key) or [], extra.get(key) or []):
+                    if source not in combined:
+                        combined.append(source)
+                if combined:
+                    merged[key] = combined
+            if not merged.get("skills_diagnostic") and extra.get("skills_diagnostic"):
+                merged["skills_diagnostic"] = extra["skills_diagnostic"]
+            if not merged.get("state") and extra.get("state"):
+                merged["state"] = extra["state"]
+        (accessions_out / f"{accession}.readiness.json").write_text(
+            json.dumps(merged, indent=2) + "\n", encoding="utf-8"
+        )
+
+
 def wrap_agent_candidates(accessions: list[str], agent_root: Path, out: Path) -> dict[str, dict[str, Any]]:
     shutil.rmtree(out, ignore_errors=True)
     out.mkdir(parents=True, exist_ok=True)
@@ -218,6 +310,25 @@ def load_task_manifest(task_dir: Path, accession: str) -> list[dict[str, Any]]:
     return list(read_json(path).get("tasks") or [])
 
 
+def task_terminal_class(tasks: list[dict[str, Any]]) -> tuple[str, str]:
+    concepts = {str(x.get("concept_type") or "") for x in tasks}
+    fields = {str(x.get("sdrf_field") or "") for x in tasks}
+    ids = {str(x.get("id") or "") for x in tasks}
+    if "labeling" in concepts:
+        return "row_mapping_required", "source_grounded_labeling_mapping_unresolved"
+    if "study_structure" in concepts:
+        return "provenance_conflict", "source_scope_unresolved"
+    if "cell_line" in concepts:
+        if "cellosaurus_accession" in fields or any("ontology" in x for x in ids):
+            return "ontology_mapping_required", "cell_line_ontology_mapping_unresolved"
+        return "row_mapping_required", "cell_line_row_scope_unresolved"
+    if concepts & {"cell_identifier", "biological_replicate", "control_role"}:
+        return "row_mapping_required", "row_scoped_metadata_mapping_unresolved"
+    if "dissociation_method" in concepts:
+        return "unsupported_or_exhausted", "source_grounded_dissociation_unresolved"
+    return "", ""
+
+
 def agent_terminal_class(agent_root: Path, accession: str) -> tuple[str, dict[str, Any]]:
     path = agent_root / "audit" / f"{accession}.scientific_agent.json"
     if not path.is_file():
@@ -227,17 +338,11 @@ def agent_terminal_class(agent_root: Path, accession: str) -> tuple[str, dict[st
     for t in tasks:
         if str(t.get("status") or "") == "template_gap":
             return "template_gap", audit
-    for t in tasks:
-        if str(t.get("status") or "") != "human_review":
-            continue
-        codes = " ".join(str(x) for x in t.get("error_codes") or []).lower()
-        concept = str(t.get("concept_type") or "")
-        if "provenance" in codes or "scope_conflict" in codes or concept == "study_structure":
-            return "provenance_conflict", audit
-        if "multiplex" in codes or concept == "labeling":
-            return "row_mapping_required", audit
+    human_review = [t for t in tasks if str(t.get("status") or "") == "human_review"]
+    terminal, _ = task_terminal_class(human_review)
+    if terminal:
+        return terminal, audit
     return "", audit
-
 
 def readiness_result(readiness_root: Path, accession: str) -> dict[str, Any]:
     path = readiness_root / "accessions" / f"{accession}.readiness.json"
@@ -265,13 +370,17 @@ def classify_after_round(
     if state == "needs_independent_review" and not tasks:
         return True, "needs_independent_review", "frozen_readiness_needs_independent_review"
     if input_sha and output_sha and input_sha == output_sha and tasks:
-        concepts = {str(x.get("concept_type") or "") for x in tasks}
-        if "labeling" in concepts:
-            return True, "row_mapping_required", "no_progress_after_source_grounded_labeling_attempt"
-        if "study_structure" in concepts:
-            return True, "provenance_conflict", "no_progress_after_source_scope_attempt"
+        terminal, reason = task_terminal_class(tasks)
+        if terminal:
+            return True, terminal, "no_progress_after_" + reason
         return True, "unsupported_or_exhausted", "no_candidate_fingerprint_progress"
     if round_no >= max_rounds:
+        if tasks:
+            terminal, reason = task_terminal_class(tasks)
+            if terminal:
+                return True, terminal, f"repair_round_budget_exhausted:{reason}"
+        if state.startswith("blocked_") and not tasks:
+            return True, "bridge_gap", f"no_repair_task_for:{state}"
         if state.startswith("blocked_"):
             return True, "unsupported_or_exhausted", f"repair_round_budget_exhausted:{state}"
         return True, state or "unsupported_or_exhausted", "repair_round_budget_exhausted"
@@ -280,7 +389,6 @@ def classify_after_round(
     if not bool(audit.get("locally_valid", True)):
         return False, "", "continue_local_validation_repair"
     return True, state or "unsupported_or_exhausted", "no_repairable_task"
-
 
 def write_queues(root: Path, ledger: list[dict[str, str]]) -> None:
     by_state: dict[str, list[str]] = defaultdict(list)
@@ -297,10 +405,66 @@ def controller(args: argparse.Namespace) -> dict[str, Any]:
     accessions = parse_accessions(args.accessions_file)
     args.output.mkdir(parents=True, exist_ok=True)
     current_roots = [x.resolve() for x in args.candidate_root]
-    active = list(accessions)
     final: dict[str, dict[str, str]] = {}
     cumulative: dict[str, dict[str, int]] = defaultdict(lambda: {"turns": 0, "tools": 0, "validators": 0})
-    previous_readiness = args.seed_readiness_dir if args.seed_readiness_dir and args.seed_readiness_dir.is_dir() else None
+
+    # Phase 0: frozen-readiness diagnostic preflight. This does not consume an
+    # LLM repair round and makes both repair rounds readiness-informed.
+    preflight = args.output / "preflight"
+    preflight_accessions = preflight / "accessions.txt"
+    write_accessions(preflight_accessions, accessions)
+    preflight_resolved = preflight / "resolved"
+    origin = prepare_resolved(accessions, current_roots, preflight_resolved)
+    preflight_candidates = preflight / "candidates"
+    wrap_preflight_candidates(accessions, preflight_resolved, origin, preflight_candidates)
+    preflight_readiness = preflight / "readiness"
+    rc = run_readiness(args, preflight_accessions, preflight_candidates, preflight_readiness, preflight / "readiness.log")
+    if rc != 0 and not (preflight_readiness / "sdrf_readiness_summary.json").is_file():
+        raise SystemExit(f"readiness preflight failed: rc={rc}; see {preflight / 'readiness.log'}")
+    merged_preflight = preflight / "merged_readiness"
+    seed = args.seed_readiness_dir if args.seed_readiness_dir and args.seed_readiness_dir.is_dir() else None
+    merge_readiness_dirs(accessions, preflight_readiness, seed, merged_preflight)
+    preflight_tasks = preflight / "readiness_tasks"
+    build_tasks(preflight_accessions, merged_preflight, preflight_candidates, args.stage1_root, preflight_tasks)
+
+    active: list[str] = []
+    for accession in accessions:
+        rr = readiness_result(merged_preflight, accession)
+        tasks = load_task_manifest(preflight_tasks, accession)
+        state = str(rr.get("state") or "")
+        if state == "submission_ready":
+            final[accession] = {
+                "accession": accession,
+                "initial_candidate_sha256": str(origin.get(accession, {}).get("sha256") or ""),
+                "final_candidate_sha256": str(origin.get(accession, {}).get("sha256") or ""),
+                "projected_sha256": str(rr.get("projected_sha256") or ""),
+                "final_state": "submission_ready",
+                "reason_code": "preflight_frozen_readiness_submission_ready",
+                "review_status": "not_applicable",
+                "submission_ready": "true",
+                "candidate_path": str(preflight_candidates / accession / f"{accession}.sdrf.tsv"),
+                "readiness_path": str(merged_preflight / "accessions" / f"{accession}.readiness.json"),
+                "rounds": "0",
+            }
+        elif state == "needs_independent_review" and not tasks:
+            final[accession] = {
+                "accession": accession,
+                "initial_candidate_sha256": str(origin.get(accession, {}).get("sha256") or ""),
+                "final_candidate_sha256": str(origin.get(accession, {}).get("sha256") or ""),
+                "projected_sha256": str(rr.get("projected_sha256") or ""),
+                "final_state": "needs_independent_review",
+                "reason_code": "preflight_frozen_readiness_needs_independent_review",
+                "review_status": "pending",
+                "submission_ready": "false",
+                "candidate_path": str(preflight_candidates / accession / f"{accession}.sdrf.tsv"),
+                "readiness_path": str(merged_preflight / "accessions" / f"{accession}.readiness.json"),
+                "rounds": "0",
+            }
+        else:
+            active.append(accession)
+
+    current_roots = [preflight_resolved]
+    previous_readiness: Path | None = merged_preflight
 
     for round_no in range(1, args.max_repair_rounds + 1):
         if not active:
@@ -316,14 +480,11 @@ def controller(args: argparse.Namespace) -> dict[str, Any]:
         agent_root = round_root / "agent"
         rc = run_agent(args, round_accessions, resolved, task_dir, agent_root, round_root / "agent.log")
         if rc != 0:
-            # Per-accession errors are normally represented in the agent summary;
-            # a nonzero process is an infrastructure failure and stops the cohort.
             raise SystemExit(f"scientific agent process failed in round {round_no}: rc={rc}; see {round_root / 'agent.log'}")
 
         summary_path = agent_root / "scientific_agent_summary.json"
         if summary_path.is_file():
             summary = read_json(summary_path)
-            # Totals are retained at round level; per-accession exact counts come from audits below.
             (round_root / "agent_summary.snapshot.json").write_text(json.dumps(summary, indent=2) + "\n")
 
         candidate_root = round_root / "candidates"
@@ -331,13 +492,10 @@ def controller(args: argparse.Namespace) -> dict[str, Any]:
         readiness_root = round_root / "readiness"
         rc = run_readiness(args, round_accessions, candidate_root, readiness_root, round_root / "readiness.log")
         if rc != 0:
-            # Readiness may return nonzero for missing required tools. Treat that as
-            # infrastructure-fatal instead of silently classifying scientific blockers.
             summary = readiness_root / "sdrf_readiness_summary.json"
             if not summary.is_file():
                 raise SystemExit(f"readiness process failed in round {round_no}: rc={rc}; see {round_root / 'readiness.log'}")
 
-        # Build tasks from the *new* readiness state for stopping/classification.
         next_tasks = round_root / "next_readiness_tasks"
         build_tasks(round_accessions, readiness_root, candidate_root, args.stage1_root, next_tasks)
 
@@ -351,20 +509,13 @@ def controller(args: argparse.Namespace) -> dict[str, Any]:
             cumulative[accession]["tools"] += int(audit.get("tool_actions_completed") or 0)
             cumulative[accession]["validators"] += int(audit.get("validator_cycles_completed") or 0)
             done, final_state, reason = classify_after_round(
-                accession,
-                readiness_root,
-                next_tasks,
-                agent_root,
-                input_sha,
-                output_sha,
-                round_no,
-                args.max_repair_rounds,
+                accession, readiness_root, next_tasks, agent_root, input_sha, output_sha, round_no, args.max_repair_rounds
             )
             if done:
                 rr = readiness_result(readiness_root, accession)
                 final[accession] = {
                     "accession": accession,
-                    "initial_candidate_sha256": input_sha,
+                    "initial_candidate_sha256": str(origin.get(accession, {}).get("sha256") or input_sha),
                     "final_candidate_sha256": output_sha,
                     "projected_sha256": str(rr.get("projected_sha256") or ""),
                     "final_state": final_state,
@@ -383,10 +534,9 @@ def controller(args: argparse.Namespace) -> dict[str, Any]:
         previous_readiness = readiness_root
 
     for accession in active:
-        # Defensive fallback; normal flow exhausts at max rounds in classify_after_round.
         final[accession] = {
             "accession": accession,
-            "initial_candidate_sha256": "",
+            "initial_candidate_sha256": str(origin.get(accession, {}).get("sha256") or ""),
             "final_candidate_sha256": "",
             "projected_sha256": "",
             "final_state": "unsupported_or_exhausted",
@@ -420,8 +570,10 @@ def controller(args: argparse.Namespace) -> dict[str, Any]:
     write_queues(args.output, ledger)
     counts = Counter(row["final_state"] for row in ledger)
     summary = {
-        "controller": "pride-scp-batch-autorepair-v1",
+        "controller": "pride-scp-batch-autorepair-v2",
         "readiness_policy_required": POLICY_VERSION,
+        "preflight_readiness": str(preflight_readiness),
+        "preflight_task_manifest": str(preflight_tasks / "readiness_task_manifest.tsv"),
         "agent_runtime": {
             "sif": str(args.agent_sif or ""),
             "sif_sha256": sha256_file(args.agent_sif) if args.agent_sif is not None and args.agent_sif.is_file() else "",
@@ -490,10 +642,24 @@ def self_test() -> None:
         assert classify_after_round(a5, root / "readiness", tasks, root / "agent", "a", "a", 1, 2)[:2] == (True, "provenance_conflict")
 
         a6 = "PXD000016"
-        acquisition = {"id": "readiness:acq", "concept_type": "acquisition_mode", "status": "repair_attempted", "error_codes": ["readiness_acquisition_conflict"]}
-        write_case(a6, "blocked_scientific_conflict", [acquisition], [acquisition])
-        done, state, reason = classify_after_round(a6, root / "readiness", tasks, root / "agent", "same", "same", 1, 2)
-        assert done and state == "unsupported_or_exhausted" and reason == "no_candidate_fingerprint_progress"
+        cell = {"id": "readiness:cell_identifier_mapping", "concept_type": "cell_identifier", "status": "repair_attempted", "sdrf_field": "cell_identifier", "error_codes": ["required"]}
+        write_case(a6, "blocked_metadata_incomplete", [cell], [cell])
+        assert classify_after_round(a6, root / "readiness", tasks, root / "agent", "same", "same", 1, 2)[:2] == (True, "row_mapping_required")
+
+        a7 = "PXD000017"
+        write_case(a7, "blocked_parse_sdrf", [], [])
+        done, state, reason = classify_after_round(a7, root / "readiness", tasks, root / "agent", "a", "b", 2, 2)
+        assert done and state == "bridge_gap" and reason == "no_repair_task_for:blocked_parse_sdrf"
+
+        # Preflight wrappers must not claim local validity.
+        resolved = root / "resolved"
+        resolved.mkdir()
+        (resolved / f"{a1}.sdrf.tsv").write_text("source name\tcomment[data file]\nx\tx.raw\n", encoding="utf-8")
+        wrapped = root / "preflight_candidates"
+        wrap_preflight_candidates([a1], resolved, {a1: {"sha256": sha256_file(resolved / f"{a1}.sdrf.tsv")}}, wrapped)
+        audit_obj = read_json(wrapped / a1 / f"{a1}.sdrf_audit.json")
+        assert "locally_valid" not in audit_obj
+        assert audit_obj["controller_preflight"] is True
 
     print("sdrf_batch_autorepair self-test: PASS")
 

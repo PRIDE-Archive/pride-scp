@@ -97,6 +97,147 @@ def task(
     }
 
 
+
+def flatten_text(value: Any) -> list[str]:
+    out: list[str] = []
+    if isinstance(value, dict):
+        for key, item in value.items():
+            out.append(str(key))
+            out.extend(flatten_text(item))
+    elif isinstance(value, list):
+        for item in value:
+            out.extend(flatten_text(item))
+    elif value is not None:
+        out.append(str(value))
+    return out
+
+
+def row_numbers(messages: list[str]) -> list[int]:
+    rows: list[int] = []
+    for message in messages:
+        for raw in re.findall(r"(?:row[_= ]|row=)(\d+)", message.lower()):
+            try:
+                row = int(raw)
+            except ValueError:
+                continue
+            if row not in rows:
+                rows.append(row)
+    return rows[:24]
+
+
+def task_for_column(column: str, code: str, messages: list[str] | None = None, error_count: int = 1) -> dict[str, Any] | None:
+    lower = column.strip().lower()
+    common = messages or []
+    if "single cell isolation protocol" in lower or "single_cell_isolation" in lower:
+        return task(
+            "isolation_template_or_value", "isolation_method", "single_cell_isolation_method", code,
+            "Determine the real single-cell isolation/sampling method from trusted sources. Record the source-faithful method; if the pinned SDRF template cannot represent it faithfully, preserve a template_gap rather than substituting another allowed method.",
+            common, row_numbers(common), error_count,
+        )
+    if "cell identifier" in lower or "cell_identifier" in lower:
+        return task(
+            "cell_identifier_mapping", "cell_identifier", "cell_identifier", code,
+            "Recover exact source-grounded cell identifiers for true single-cell rows. Do not derive biological identity from row order, arbitrary numbering, or filename tokens. If exact row identity cannot be established, retain a row_mapping_required terminal state.",
+            common, row_numbers(common), error_count,
+        )
+    if "biological replicate" in lower or "biological_replicate" in lower:
+        return task(
+            "biological_replicate_mapping", "biological_replicate", "biological_replicate", code,
+            "Recover biological replicate identity from trusted structured design/publication evidence. Replicate identity is row-scoped: do not broadcast a project-wide replicate number or infer one from row order.",
+            common, row_numbers(common), error_count,
+        )
+    if "cellosaurus" in lower:
+        return task(
+            "cell_line_ontology", "cell_line", "cellosaurus_accession", code,
+            "Resolve the source-backed cell-line identity and corresponding Cellosaurus accession. Preserve multiple cell lines as distinct row/material contexts; never split a composite project string and broadcast the pieces without exact row linkage.",
+            common, row_numbers(common), error_count,
+        )
+    if "cell line" in lower or "cell_line" in lower:
+        return task(
+            "cell_line_scope", "cell_line", "cell_line", code,
+            "Resolve cell-line identity from trusted evidence with exact material/row scope. Composite project labels such as multiple cell lines must not be blindly split or broadcast across rows.",
+            common, row_numbers(common), error_count,
+        )
+    if "organism part" in lower or "organism_part" in lower:
+        return task(
+            "organism_part_scope", "organism_part", "organism_part", code,
+            "Reconstruct source-grounded organism-part scope. Preserve distinct biological materials/parts as branches when multiple contexts are supported; do not broadcast one part across the project.",
+            common, row_numbers(common), error_count,
+        )
+    if "organism" in lower:
+        return task(
+            "organism_scope", "organism", "organism", code,
+            "Reconstruct source-grounded organism scope. Preserve multiple supported organisms as distinct row/material contexts and never collapse the project to one organism without exact evidence.",
+            common, row_numbers(common), error_count,
+        )
+    if "proteomics data acquisition method" in lower or "acquisition" in lower:
+        return task(
+            "acquisition_mode", "acquisition_mode", "proteomics_data_acquisition_method", code,
+            "Resolve acquisition mode from direct trusted publication/repository evidence. Filename tokens are hints only and cannot authorize DDA/DIA replacement.",
+            common, row_numbers(common), error_count,
+        )
+    if "dissociation method" in lower or "dissociation_method" in lower:
+        return task(
+            "dissociation_method", "dissociation_method", "dissociation_method", code,
+            "Resolve fragmentation/dissociation chemistry from direct trusted evidence. For Q Exactive-family instruments, do not replace generic CID with HCD unless the source evidence or deterministic instrument-specific policy supports the exact acquisition context.",
+            common, row_numbers(common), error_count,
+        )
+    if "sample type" in lower or "sample_type" in lower:
+        return task(
+            "sample_type", "sample_type", "sample_type", code,
+            "Resolve sample role/type from trusted evidence and preserve single-cell, pooled, carrier, reference, bulk, blank, and control contexts distinctly.",
+            common, row_numbers(common), error_count,
+        )
+    if "individual" in lower:
+        return task(
+            "individual_scope", "individual", "individual", code,
+            "Resolve true donor/subject/individual identity from trusted evidence. Do not leak cell line, sample role, organism part, or experimental condition into the individual field.",
+            common, row_numbers(common), error_count,
+        )
+    if "instrument" in lower:
+        return task(
+            "instrument", "instrument", "instrument", code,
+            "Resolve the mass-spectrometry instrument from trusted source evidence without inferring a more specific platform than the source supports.",
+            common, row_numbers(common), error_count,
+        )
+    return None
+
+
+def required_value_tasks(readiness: dict[str, Any]) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    findings = [str(x) for x in (readiness.get("blockers") or []) + (readiness.get("warnings") or [])]
+    pattern = re.compile(r"bigbio_required_(?:value_unresolved|column_missing):([^:]+)(?::(\d+)_rows)?", re.I)
+    for finding in findings:
+        match = pattern.search(finding)
+        if not match:
+            continue
+        column = match.group(1).strip()
+        count = int(match.group(2) or 1)
+        item = task_for_column(column, "bigbio_required_value_unresolved", [finding], count)
+        if item:
+            out.append(item)
+    for column in readiness.get("missing_required_columns") or []:
+        item = task_for_column(str(column), "missing_bigbio_single_cell_required_column", [str(column)], 1)
+        if item:
+            out.append(item)
+    return out
+
+
+def skills_tasks(readiness: dict[str, Any]) -> list[dict[str, Any]]:
+    diagnostic = readiness.get("skills_diagnostic") or {}
+    texts = flatten_text(diagnostic)
+    joined = "\n".join(texts).lower()
+    out: list[dict[str, Any]] = []
+    if "cellosaurus" in joined:
+        item = task_for_column("characteristics[cellosaurus accession]", "sdrf_skills_cell_line_ontology_failure", texts[:24], 1)
+        if item:
+            out.append(item)
+    if "cell line" in joined or "characteristics[cell line]" in joined:
+        item = task_for_column("characteristics[cell line]", "sdrf_skills_cell_line_failure", texts[:24], 1)
+        if item:
+            out.append(item)
+    return out
+
 def placeholder_tasks(readiness: dict[str, Any]) -> list[dict[str, Any]]:
     cols = [str(x) for x in readiness.get("placeholder_required_columns") or []]
     blockers = [str(x) for x in readiness.get("blockers") or []]
@@ -104,80 +245,101 @@ def placeholder_tasks(readiness: dict[str, Any]) -> list[dict[str, Any]]:
         return []
     out: list[dict[str, Any]] = []
     for col in cols:
-        lower = col.lower()
-        if "single cell isolation protocol" in lower:
-            out.append(task(
-                "isolation_template_or_value",
-                "isolation_method",
-                "single_cell_isolation_method",
-                "all_rows_placeholder_in_required_single_cell_column",
-                "Determine the real single-cell isolation/sampling method from trusted sources. Record the source-faithful method; if the pinned SDRF template cannot represent it faithfully, preserve a template_gap rather than substituting another allowed method.",
-            ))
-        elif "organism part" in lower:
-            out.append(task(
-                "organism_part",
-                "organism_part",
-                "organism_part",
-                "all_rows_placeholder_in_required_single_cell_column",
-                "Recover the organism-part context from trusted sources without collapsing distinct biological materials.",
-            ))
+        item = task_for_column(
+            col,
+            "all_rows_placeholder_in_required_single_cell_column",
+            [f"all rows unresolved for required column {col}"],
+            1,
+        )
+        if item:
+            out.append(item)
     return out
 
-
 def scientific_guard_tasks(readiness: dict[str, Any]) -> list[dict[str, Any]]:
-    out: list[dict[str, Any]] = []
     findings = [str(x) for x in (readiness.get("blockers") or []) + (readiness.get("warnings") or [])]
+    groups: dict[str, list[str]] = defaultdict(list)
     for finding in findings:
         lower = finding.lower()
         if "multi_organism_part_project_collapsed_to_single_candidate_part" in lower:
-            out.append(task(
-                "organism_part_scope",
-                "organism_part",
-                "organism_part",
-                "scientific_guard_multi_organism_part_project_collapsed_to_single_candidate_part",
-                "Reconstruct source-grounded organism-part scope. Preserve distinct biological materials/parts as branches when the project contains more than one supported context; do not broadcast one part across the project.",
-                [finding],
-            ))
-        if "acquisition" in lower and ("contradict" in lower or "mapping" in lower):
-            out.append(task(
-                "acquisition_mode",
-                "acquisition_mode",
-                "proteomics_data_acquisition_method",
-                "readiness_acquisition_conflict",
-                "Resolve acquisition mode from direct trusted publication/repository evidence. Filename tokens are hints only and cannot authorize DDA/DIA replacement.",
-                [finding],
-            ))
-    return out
+            groups["organism_part"].append(finding)
+        if "multiorganism_project_collapsed_to_single_candidate_organism" in lower:
+            groups["organism"].append(finding)
+        if "q_exactive_row_uses_generic_cid_instead_of_hcd" in lower:
+            groups["dissociation"].append(finding)
+        if "empty_control_has_concrete_biological_identity" in lower:
+            groups["control"].append(finding)
+        if "individual_semantic_leakage" in lower:
+            groups["individual"].append(finding)
+        if "acquisition" in lower and ("contradict" in lower or "mapping" in lower or "conflict" in lower):
+            groups["acquisition"].append(finding)
 
+    out: list[dict[str, Any]] = []
+    if groups["organism_part"]:
+        out.append(task_for_column(
+            "characteristics[organism part]",
+            "scientific_guard_multi_organism_part_project_collapsed_to_single_candidate_part",
+            groups["organism_part"], len(groups["organism_part"]),
+        ))
+    if groups["organism"]:
+        out.append(task_for_column(
+            "characteristics[organism]",
+            "scientific_guard_multiorganism_project_collapsed_to_single_candidate_organism",
+            groups["organism"], len(groups["organism"]),
+        ))
+    if groups["dissociation"]:
+        out.append(task_for_column(
+            "comment[dissociation method]",
+            "scientific_guard_q_exactive_generic_cid",
+            groups["dissociation"], len(groups["dissociation"]),
+        ))
+    if groups["control"]:
+        out.append(task(
+            "empty_control_role_mapping", "control_role", "control_role",
+            "scientific_guard_empty_control_has_concrete_biological_identity",
+            "Identify empty/blank/control rows from trusted design evidence and determine which biological identity fields must remain unresolved for those rows. Do not erase identity from real biological samples and do not broadcast control status project-wide.",
+            groups["control"], row_numbers(groups["control"]), len(groups["control"]),
+        ))
+    if groups["individual"]:
+        out.append(task_for_column(
+            "characteristics[individual]", "scientific_guard_individual_semantic_leakage",
+            groups["individual"], len(groups["individual"]),
+        ))
+    if groups["acquisition"]:
+        out.append(task_for_column(
+            "comment[proteomics data acquisition method]", "readiness_acquisition_conflict",
+            groups["acquisition"], len(groups["acquisition"]),
+        ))
+    return [x for x in out if x is not None]
 
 def parse_sdrf_tasks(readiness: dict[str, Any]) -> list[dict[str, Any]]:
-    out: list[dict[str, Any]] = []
-    messages: list[str] = []
-    for result in readiness.get("parse_sdrf") or []:
-        if not isinstance(result, dict) or result.get("passed") is True:
-            continue
-        messages.extend(str(result.get(key) or "") for key in ("stderr", "stdout"))
+    failed = [
+        result for result in (readiness.get("parse_sdrf") or [])
+        if isinstance(result, dict) and result.get("passed") is not True
+    ]
+    messages = flatten_text(failed)
     joined = "\n".join(messages).lower()
+    out: list[dict[str, Any]] = []
+    if "cellosaurus" in joined:
+        item = task_for_column("characteristics[cellosaurus accession]", "parse_sdrf_cellosaurus_failure", messages[:24], 1)
+        if item:
+            out.append(item)
+    if "cell line" in joined or "characteristics[cell line]" in joined:
+        item = task_for_column("characteristics[cell line]", "parse_sdrf_cell_line_failure", messages[:24], 1)
+        if item:
+            out.append(item)
     if "acquisition" in joined or "data-dependent" in joined or "data-independent" in joined:
-        out.append(task(
-            "parse_acquisition",
-            "acquisition_mode",
-            "proteomics_data_acquisition_method",
-            "parse_sdrf_acquisition_failure",
-            "Resolve the acquisition regime from trusted source evidence and let Rust canonicalize the SDRF representation.",
-            [x for x in messages if x][:12],
-        ))
+        item = task_for_column("comment[proteomics data acquisition method]", "parse_sdrf_acquisition_failure", messages[:24], 1)
+        if item:
+            out.append(item)
     if "isolation" in joined:
-        out.append(task(
-            "parse_isolation",
-            "isolation_method",
-            "single_cell_isolation_method",
-            "parse_sdrf_isolation_failure",
-            "Resolve the source-faithful isolation method or explicit template gap from trusted evidence.",
-            [x for x in messages if x][:12],
-        ))
+        item = task_for_column("characteristics[single cell isolation protocol]", "parse_sdrf_isolation_failure", messages[:24], 1)
+        if item:
+            out.append(item)
+    if "biological replicate" in joined:
+        item = task_for_column("characteristics[biological replicate]", "parse_sdrf_biological_replicate_failure", messages[:24], 1)
+        if item:
+            out.append(item)
     return out
-
 
 def multiplex_mapping_task(candidate: Path | None) -> list[dict[str, Any]]:
     if candidate is None or not candidate.is_file():
@@ -302,8 +464,10 @@ def build_for_accession(
     tasks: list[dict[str, Any]] = []
     if readiness:
         tasks.extend(placeholder_tasks(readiness))
+        tasks.extend(required_value_tasks(readiness))
         tasks.extend(scientific_guard_tasks(readiness))
         tasks.extend(parse_sdrf_tasks(readiness))
+        tasks.extend(skills_tasks(readiness))
     tasks.extend(multiplex_mapping_task(candidate))
     tasks.extend(stage1_provenance_task(accession, stage1_root))
     tasks = dedup_tasks(tasks)
@@ -365,20 +529,19 @@ def self_test() -> None:
     with tempfile.TemporaryDirectory(prefix="pride-scp-autorepair-tasks-") as td:
         root = Path(td)
         accessions = root / "accessions.txt"
-        accessions.write_text("PXD000001\nPXD000002\nPXD000003\n", encoding="utf-8")
+        accessions.write_text("PXD000001\nPXD000002\nPXD000003\nPXD000004\n", encoding="utf-8")
         readiness = root / "readiness" / "accessions"
         readiness.mkdir(parents=True)
         candidate_root = root / "candidates"
         stage1 = root / "stage1"
         out = root / "tasks"
 
-        # Template gap / organism-part scope fixture.
         a1 = "PXD000001"
         c1 = candidate_root / a1 / f"{a1}.sdrf.tsv"
         c1.parent.mkdir(parents=True)
         c1.write_text(
-            "source name\tcomment[data file]\tcharacteristics[sample type]\tcharacteristics[single cell isolation protocol]\n"
-            "c1\tc1.raw\tsingle cell\tnot applicable\n",
+            "source name\tcomment[data file]\tcharacteristics[sample type]\tcharacteristics[single cell isolation protocol]\tcharacteristics[cell identifier]\n"
+            "c1\tc1.raw\tsingle cell\tnot applicable\tnot available\n",
             encoding="utf-8",
         )
         (readiness / f"{a1}.readiness.json").write_text(json.dumps({
@@ -386,10 +549,12 @@ def self_test() -> None:
             "candidate": {"path": str(c1)},
             "blockers": ["all_rows_placeholder_in_required_single_cell_column"],
             "warnings": ["scientific_guard:multi_organism_part_project_collapsed_to_single_candidate_part"],
-            "placeholder_required_columns": ["characteristics[single cell isolation protocol]"],
+            "placeholder_required_columns": [
+                "characteristics[single cell isolation protocol]",
+                "characteristics[cell identifier]",
+            ],
         }), encoding="utf-8")
 
-        # Multiplex mapping fixture.
         a2 = "PXD000002"
         c2 = candidate_root / a2 / f"{a2}.sdrf.tsv"
         c2.parent.mkdir(parents=True)
@@ -406,7 +571,6 @@ def self_test() -> None:
             "blockers": [], "warnings": [], "placeholder_required_columns": [],
         }), encoding="utf-8")
 
-        # Provenance conflict fixture.
         a3 = "PXD000003"
         c3 = candidate_root / a3 / f"{a3}.sdrf.tsv"
         c3.parent.mkdir(parents=True)
@@ -418,6 +582,24 @@ def self_test() -> None:
             "reason": "trusted sources do not contain evidence for single-cell proteomics and constructing it would require hallucinating data",
         }), encoding="utf-8")
 
+        a4 = "PXD000004"
+        c4 = candidate_root / a4 / f"{a4}.sdrf.tsv"
+        c4.parent.mkdir(parents=True)
+        c4.write_text("source name\tcomment[data file]\tcharacteristics[cell line]\nx\tx.raw\tHeLa; K562\n", encoding="utf-8")
+        (readiness / f"{a4}.readiness.json").write_text(json.dumps({
+            "state": "blocked_bigbio_check",
+            "candidate": {"path": str(c4)},
+            "blockers": [
+                "sdrf_skills_check_failed",
+                "bigbio_required_value_unresolved:characteristics[biological replicate]:4_rows",
+                "scientific_guard:q_exactive_row_uses_generic_cid_instead_of_hcd:row_2",
+            ],
+            "warnings": ["scientific_guard:empty_control_has_concrete_biological_identity:row_3"],
+            "placeholder_required_columns": [],
+            "skills_diagnostic": {"report": {"hallucinated": [{"column": "characteristics[cell line]"}]}},
+            "parse_sdrf": [{"passed": False, "stderr": "Required column characteristics[cellosaurus accession] is missing"}],
+        }), encoding="utf-8")
+
         ns = argparse.Namespace(
             accessions_file=accessions,
             readiness_dir=root / "readiness",
@@ -426,16 +608,19 @@ def self_test() -> None:
             output=out,
         )
         summary = build(ns)
-        assert summary["accessions"] == 3
-        assert summary["accessions_with_tasks"] == 3
+        assert summary["accessions"] == 4
+        assert summary["accessions_with_tasks"] == 4
         m1 = read_json(out / f"{a1}.json")
-        assert {x["concept_type"] for x in m1["tasks"]} == {"isolation_method", "organism_part"}
+        concepts1 = {x["concept_type"] for x in m1["tasks"]}
+        assert {"isolation_method", "cell_identifier", "organism_part"} <= concepts1
         m2 = read_json(out / f"{a2}.json")
         assert any(x["error_codes"] == ["multiplex_reporter_channel_mapping_unresolved"] for x in m2["tasks"])
         m3 = read_json(out / f"{a3}.json")
         assert any(x["concept_type"] == "study_structure" for x in m3["tasks"])
+        m4 = read_json(out / f"{a4}.json")
+        concepts4 = {x["concept_type"] for x in m4["tasks"]}
+        assert {"cell_line", "biological_replicate", "dissociation_method", "control_role"} <= concepts4
     print("sdrf_autorepair_tasks self-test: PASS")
-
 
 def parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description=__doc__)

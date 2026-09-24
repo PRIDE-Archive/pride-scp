@@ -921,6 +921,9 @@ fn scientific_concept_types() -> Vec<&'static str> {
         "disease",
         "cell_type",
         "cell_line",
+        "cell_identifier",
+        "biological_replicate",
+        "dissociation_method",
         "sample_type",
         "isolation_method",
         "individual",
@@ -948,11 +951,16 @@ fn concept_to_sdrf_field(concept: &str) -> Option<&'static str> {
         "labeling" => Some("label"),
         "instrument" => Some("instrument"),
         "cleavage_agent" => Some("cleavage_agent_details"),
-        // cell_line, control_role, and biological_condition are first-class
-        // scientific concepts in the workspace, but the current SdrfProposal
-        // has no safe one-to-one project field for them. They therefore remain
-        // scientific state until a deterministic compiler mapping exists.
-        "cell_line" | "control_role" | "biological_condition" => None,
+        // These are first-class scientific reasoning concepts, but the current
+        // SdrfProposal has no safe one-to-one project field for them. They
+        // therefore remain scientific state until a deterministic row/material
+        // compiler mapping exists; never broadcast them project-wide.
+        "cell_line"
+        | "cell_identifier"
+        | "biological_replicate"
+        | "dissociation_method"
+        | "control_role"
+        | "biological_condition" => None,
         _ => None,
     }
 }
@@ -13929,6 +13937,19 @@ mod tests {
         output[0][7] = "pride-scp".into();
         assert!(trusted_full_sdrf_preservation_audit(&path, &headers, &output).is_ok());
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn readiness_bridge_v2_exposes_row_scoped_concepts_without_project_broadcast() {
+        let concepts = scientific_concept_types();
+        for concept in [
+            "cell_identifier",
+            "biological_replicate",
+            "dissociation_method",
+        ] {
+            assert!(concepts.contains(&concept));
+            assert_eq!(concept_to_sdrf_field(concept), None);
+        }
     }
 
     #[test]
