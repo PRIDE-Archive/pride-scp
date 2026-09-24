@@ -191,3 +191,18 @@ candidate
 ```
 
 No readiness, scientific-guard, ontology, or M+R policy is weakened.
+
+## Runtime-domain separation for frozen readiness
+
+The bridge has two distinct Python execution domains:
+
+- `--python` is the outer/orchestrator Python. It may be a host-side dispatcher.
+- `--readiness-python` is the Python executable *inside* `--readiness-sif` and defaults to `python`.
+
+When `--readiness-sif` is supplied, the bridge invokes readiness as:
+
+```text
+singularity exec <readiness.sif> <readiness-python> <readiness-script> ...
+```
+
+It must never propagate a host-side Python wrapper into the frozen readiness image. This separation prevents nested-dispatch/runtime lookup failures while leaving the scientific and readiness policies unchanged.

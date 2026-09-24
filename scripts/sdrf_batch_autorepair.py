@@ -231,12 +231,24 @@ def wrap_agent_candidates(accessions: list[str], agent_root: Path, out: Path) ->
     return result
 
 
+def readiness_prefix(args: argparse.Namespace) -> list[str]:
+    # `--python` belongs to the outer/orchestrator execution domain.  When
+    # readiness is isolated in a Singularity image, use a container-local
+    # Python executable instead of propagating a host wrapper/path inside the
+    # image.  This keeps the two runtime domains explicit and prevents nested
+    # dispatcher failures (typically rc=127).
+    if args.readiness_sif is not None:
+        return [
+            args.singularity,
+            "exec",
+            str(args.readiness_sif),
+            args.readiness_python,
+        ]
+    return [args.python]
+
+
 def run_readiness(args: argparse.Namespace, accessions_file: Path, candidates: Path, out: Path, log: Path) -> int:
-    prefix = (
-        [args.singularity, "exec", str(args.readiness_sif), args.python]
-        if args.readiness_sif is not None
-        else [args.python]
-    )
+    prefix = readiness_prefix(args)
     cmd = prefix + [
         str(args.readiness_script),
         "--accessions-file", str(accessions_file),
@@ -661,6 +673,20 @@ def self_test() -> None:
         assert "locally_valid" not in audit_obj
         assert audit_obj["controller_preflight"] is True
 
+    # Runtime-domain regression: a host/orchestrator Python wrapper must never
+    # be propagated inside the frozen readiness SIF.
+    ns = argparse.Namespace(
+        singularity="singularity",
+        readiness_sif=Path("/frozen/readiness.sif"),
+        python="/host/python_dispatch",
+        readiness_python="python",
+    )
+    assert readiness_prefix(ns) == [
+        "singularity", "exec", "/frozen/readiness.sif", "python"
+    ]
+    ns.readiness_sif = None
+    assert readiness_prefix(ns) == ["/host/python_dispatch"]
+
     print("sdrf_batch_autorepair self-test: PASS")
 
 def parser() -> argparse.ArgumentParser:
@@ -687,6 +713,14 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--singularity", default="singularity")
     p.add_argument("--pride-scp", default="pride-scp")
     p.add_argument("--python", default="python")
+    p.add_argument(
+        "--readiness-python",
+        default="python",
+        help=(
+            "Python executable inside --readiness-sif. Kept separate from "
+            "--python, which may be a host-side orchestration wrapper."
+        ),
+    )
     p.add_argument("--readiness-script", type=Path, default=Path("/opt/pride-scp/scripts/sdrf_bigbio_readiness.py"))
     return p
 
