@@ -26,7 +26,7 @@ from pathlib import Path
 from typing import Any, Iterable
 from xml.etree import ElementTree as ET
 
-SCHEMA_VERSION = "pride-scp-structured-row-mapping-resolver-v1"
+SCHEMA_VERSION = "pride-scp-structured-row-mapping-resolver-v2"
 PLACEHOLDERS = {"", "not available", "not applicable", "unknown", "na", "n/a", "none"}
 
 
@@ -110,6 +110,22 @@ def is_concrete(value: str) -> bool:
     return norm_text(value) not in PLACEHOLDERS
 
 
+def row_specific_value(field: str, value: str) -> bool:
+    """Return whether a structured value can resolve one SDRF row.
+
+    Project-level composite biological values such as ``HeLa; Jurkat`` are useful
+    context but are not row-scoped mapping evidence and must never be applied as if
+    they selected one member.
+    """
+    if not is_concrete(value):
+        return False
+    if field in NARROWABLE_COMPOSITE_FIELDS:
+        parts = [x.strip() for x in re.split(r"[;|]", value) if x.strip()]
+        if len(parts) > 1:
+            return False
+    return True
+
+
 def scalar(value: Any) -> str:
     if isinstance(value, (str, int, float, bool)):
         return str(value).strip()
@@ -130,7 +146,7 @@ def canonical_record(row: dict[str, Any], source: Path) -> dict[str, str] | None
         if nk in ACCESSION_KEYS and not accession_value and re.fullmatch(r"PXD\d{6,}", sval, re.I):
             accession_value = sval.upper()
         field = ALIAS_TO_FIELD.get(nk)
-        if field and is_concrete(sval):
+        if field and row_specific_value(field, sval):
             prev = fields.get(field)
             if prev and norm_text(prev) != norm_text(sval):
                 return None
@@ -412,24 +428,54 @@ def safe_composite_narrowing(field: str, current: str, value: str) -> bool:
     return sum(norm_text(x) == target for x in parts) == 1
 
 
-def apply_record(base: dict[str, str], rec: dict[str, str], headers: list[str]) -> tuple[dict[str, str], list[dict[str, str]], str]:
+def apply_record(
+    base: dict[str, str],
+    rec: dict[str, str],
+    headers: list[str],
+    *,
+    allow_expansion_identity_replace: bool = False,
+) -> tuple[dict[str, str], list[dict[str, str]], str]:
     row = dict(base)
     edges: list[dict[str, str]] = []
     for field in headers:
         if field == "comment[data file]":
             continue
         value = rec.get(field, "")
-        if not is_concrete(value):
+        if not row_specific_value(field, value):
             continue
         current = row.get(field, "")
         if is_concrete(current) and norm_text(current) != norm_text(value):
+            if allow_expansion_identity_replace and field in {"source name", "assay name"}:
+                row[field] = value
+                edges.append({
+                    "field": field,
+                    "old": current,
+                    "new": value,
+                    "source_path": rec.get("source_path", ""),
+                    "source_sha256": rec.get("source_sha256", ""),
+                    "explicit_multiplex_identity_split": "true",
+                })
+                continue
             if not safe_composite_narrowing(field, current, value):
                 return base, [], f"concrete_conflict:{field}:{current}!={value}"
             row[field] = value
-            edges.append({"field": field, "old": current, "new": value, "source_path": rec.get("source_path", ""), "source_sha256": rec.get("source_sha256", ""), "narrowed_composite": "true"})
+            edges.append({
+                "field": field,
+                "old": current,
+                "new": value,
+                "source_path": rec.get("source_path", ""),
+                "source_sha256": rec.get("source_sha256", ""),
+                "narrowed_composite": "true",
+            })
         elif not is_concrete(current):
             row[field] = value
-            edges.append({"field": field, "old": current, "new": value, "source_path": rec.get("source_path", ""), "source_sha256": rec.get("source_sha256", "")})
+            edges.append({
+                "field": field,
+                "old": current,
+                "new": value,
+                "source_path": rec.get("source_path", ""),
+                "source_sha256": rec.get("source_sha256", ""),
+            })
     return row, edges, ""
 
 
@@ -445,6 +491,18 @@ def resolve(candidate: Path, output: Path, report: Path, roots: list[Path], acce
     by_raw: dict[str, list[dict[str, str]]] = defaultdict(list)
     for rec in records:
         by_raw[norm_file(rec.get("raw_file", ""))].append(rec)
+
+    # A resolver may add a recognized SDRF column only when structured evidence
+    # contains at least one concrete row-scoped value for that field.  Empty/all-
+    # placeholder shape-only columns are never added.  Rows without exact evidence
+    # remain blank and are caught by the immediate validator gate.
+    added_columns: list[str] = []
+    for field in FIELD_ALIASES:
+        if field in headers:
+            continue
+        if any(row_specific_value(field, rec.get(field, "")) for rec in records):
+            headers.append(field)
+            added_columns.append(field)
 
     candidate_by_raw: dict[str, list[dict[str, str]]] = defaultdict(list)
     for row in source_rows:
@@ -463,7 +521,9 @@ def resolve(candidate: Path, output: Path, report: Path, roots: list[Path], acce
             expanded_edges: list[dict[str, Any]] = []
             ok = True
             for rec in sorted(explicit_records, key=lambda r: norm_text(r.get("comment[label]", ""))):
-                new_row, edges, err = apply_record(group[0], rec, headers)
+                new_row, edges, err = apply_record(
+                    group[0], rec, headers, allow_expansion_identity_replace=True
+                )
                 if err:
                     ok = False
                     conflicts.append({"data_file": group[0].get("comment[data file]", ""), "status": "multiplex_expansion_conflict", "detail": err, "source_path": rec.get("source_path", "")})
@@ -524,20 +584,30 @@ def resolve(candidate: Path, output: Path, report: Path, roots: list[Path], acce
         output_rows = rebuilt
 
     output.parent.mkdir(parents=True, exist_ok=True)
-    with output.open("w", newline="", encoding="utf-8") as fh:
-        writer = csv.DictWriter(fh, fieldnames=headers, delimiter="\t", lineterminator="\n", extrasaction="ignore")
-        writer.writeheader()
-        writer.writerows(output_rows)
+    substantive_change = bool(applied or expansions)
+    if substantive_change:
+        with output.open("w", newline="", encoding="utf-8") as fh:
+            writer = csv.DictWriter(fh, fieldnames=headers, delimiter="\t", lineterminator="\n", extrasaction="ignore")
+            writer.writeheader()
+            writer.writerows(output_rows)
+    else:
+        # Do not turn formatting/newline/BOM differences into false scientific
+        # progress.  With no accepted mapping edge and no explicit expansion the
+        # resolver must preserve the candidate byte-for-byte.
+        shutil.copy2(candidate, output)
+        added_columns = []
 
+    changed = substantive_change and sha256_file(candidate) != sha256_file(output)
     result = {
         "schema_version": SCHEMA_VERSION,
-        "status": "changed" if sha256_file(candidate) != sha256_file(output) else "unchanged",
-        "changed": sha256_file(candidate) != sha256_file(output),
+        "status": "changed" if changed else "unchanged",
+        "changed": changed,
         "input": str(candidate),
         "output": str(output),
         "input_sha256": sha256_file(candidate),
         "output_sha256": sha256_file(output),
         "structured_records": len(records),
+        "added_columns": added_columns,
         "applied_edges": applied,
         "applied_edge_count": len(applied),
         "multiplex_expansions": expansions,
@@ -548,6 +618,8 @@ def resolve(candidate: Path, output: Path, report: Path, roots: list[Path], acce
             "row_order_inference": False,
             "filename_semantic_inference": False,
             "concrete_value_overwrite": False,
+            "explicit_multiplex_source_assay_split_only": True,
+            "project_level_composite_not_row_mapping_evidence": True,
             "explicit_composite_member_narrowing_only": True,
             "structured_explicit_mapping_only": True,
         },
@@ -625,6 +697,55 @@ def self_test() -> None:
         with out.open(newline="") as fh:
             rows = list(csv.DictReader(fh, delimiter="\t"))
         assert len(rows) == 2 and {x["characteristics[cell identifier]"] for x in rows} == {"cell-A", "cell-B"}
+
+        # Recognized missing columns may be added only when explicit structured
+        # evidence supplies a concrete value.
+        src4 = root / "missing_column.tsv"
+        ev4 = root / "missing_column_evidence.tsv"
+        out4 = root / "missing_column_out.tsv"
+        rep4 = root / "missing_column_report.json"
+        src4.write_text("source name\tcomment[data file]\nS1\ta.raw\n")
+        ev4.write_text("raw_file\tcell identifier\na.raw\tcell-1\n")
+        r4 = resolve(src4, out4, rep4, [ev4], "")
+        assert r4["changed"] is True
+        assert "characteristics[cell identifier]" in r4["added_columns"]
+        assert "cell-1" in out4.read_text()
+
+        # Explicit multiplex expansion may replace the pre-expansion technical
+        # source identity with source-backed channel identities.
+        src5 = root / "multiplex_source.tsv"
+        ev5 = root / "multiplex_source_evidence.tsv"
+        out5 = root / "multiplex_source_out.tsv"
+        rep5 = root / "multiplex_source_report.json"
+        src5.write_text("source name\tcomment[data file]\nrun_0001\tm.raw\n")
+        ev5.write_text(
+            "raw_file\tlabel\tsource name\tcell identifier\n"
+            "m.raw\tTMT126\tcell-A\tA\n"
+            "m.raw\tTMT127N\tcell-B\tB\n"
+        )
+        r5 = resolve(src5, out5, rep5, [ev5], "")
+        assert r5["multiplex_expansion_count"] == 1
+        rows5 = list(csv.DictReader(out5.open(), delimiter="\t"))
+        assert {x["source name"] for x in rows5} == {"cell-A", "cell-B"}
+
+        # Composite project-level identity must not be treated as row-scoped
+        # structured mapping evidence.
+        src6 = root / "composite.tsv"
+        ev6 = root / "composite_evidence.tsv"
+        out6 = root / "composite_out.tsv"
+        rep6 = root / "composite_report.json"
+        src6.write_text("source name\tcharacteristics[cell line]\tcomment[data file]\nS1\tnot applicable\tc.raw\n")
+        ev6.write_text("raw_file\tcell line\nc.raw\tHeLa; Jurkat\n")
+        r6 = resolve(src6, out6, rep6, [ev6], "")
+        assert r6["applied_edge_count"] == 0
+        assert "HeLa; Jurkat" not in out6.read_text()
+        assert out6.read_bytes() == src6.read_bytes()
+
+        noev = root / "noev.tsv"; noev_out = root / "noev_out.tsv"; noev_rep = root / "noev.json"
+        noev.write_bytes(b"source name\tcomment[data file]\r\nS1\ta.raw\r\n")
+        r7 = resolve(noev, noev_out, noev_rep, [], "")
+        assert r7["changed"] is False
+        assert noev_out.read_bytes() == noev.read_bytes()
 
     print("sdrf_structured_mapping_resolver self-test: PASS")
 

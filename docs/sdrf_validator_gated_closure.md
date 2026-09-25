@@ -123,3 +123,48 @@ structured source explicitly maps that RAW/channel to exactly one member of the 
 The structured resolver may narrow only to an exact member already present in the composite,
 never to a new value. This rule is limited to biological identity fields and still requires
 an exact source-backed row mapping; it does not authorize filename or row-order inference.
+
+## v3 substrate hardening (2026-09-25)
+
+The v4 Tier1-18 acceptance proved that class-level dispatch was wired, but it also exposed
+three shared substrate failures. Closure v3 addresses those generically rather than adding
+accession-specific rules.
+
+### Canonical mutation serialization
+
+Every bridge/resolver/evidence mutation may now be followed by the frozen readiness
+projection serializer before another candidate is allowed to advance. The serializer calls
+the exact runtime `sdrf_bigbio_readiness.py` implementation (`derive_templates` and
+`normalize_bigbio_projection`) instead of duplicating SDRF ordering or validator
+compatibility logic. This covers BigBio 1.1 column grouping, factor-column placement,
+reserved-word representation and the pinned validator's DIA serialization contract without
+inventing scientific values.
+
+### Nested SLURM isolation
+
+Evidence escalation clears the parent `SLURM_ARRAY_TASK_ID` from child subprocesses. The
+publication annotation runner interprets that variable as its own zero-based row selector;
+leaking the outer closure-array index caused Stage06 to fail with out-of-range row indexes.
+Nested evidence annotation now always executes its intended local batch.
+
+### Structured review contract
+
+The independent reviewer now uses the same Ollama structured-extraction contract as the
+production semantic readers: JSON schema output, `think=false`, deterministic generation
+options, a compact evidence packet, and one bounded retry for malformed output. A malformed
+model envelope remains an infrastructure failure and is never converted into approval.
+
+### Mapping/ontology progression
+
+Structured mapping now:
+
+- ignores project-level composite biological values as row-scoped evidence;
+- can add recognized SDRF columns only when explicit structured evidence contains concrete
+  values for them;
+- permits source/assay replacement only during explicit source-backed multiplex expansion,
+  where one pre-expansion RAW row is split into multiple channel rows;
+- continues to forbid arbitrary concrete biological overwrites and row/filename inference.
+
+The Cellosaurus resolver no longer changes bytes merely by adding an empty accession column.
+Composite cell-line identities are routed through structured mapping evidence first; an exact
+Cellosaurus lookup is retried only after row-specific identity is available.

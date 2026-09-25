@@ -32,7 +32,7 @@ from collections import Counter
 from pathlib import Path
 from typing import Any
 
-VERSION = "pride-scp-validator-gated-closure-v2"
+VERSION = "pride-scp-validator-gated-closure-v3"
 
 
 def sha256_file(path: Path) -> str:
@@ -157,6 +157,37 @@ def append_validation(rows: list[dict[str, Any]], receipt: dict[str, Any], stage
         "validator_version": receipt.get("validator_version", ""),
         "runtime_sha256": receipt.get("runtime_sha256", ""),
     })
+
+
+def run_canonical_serializer(
+    args: argparse.Namespace,
+    acc: str,
+    candidate: Path,
+    tag: str,
+    out: Path,
+    validation_rows: list[dict[str, Any]],
+) -> tuple[Path, bool, dict[str, Any]]:
+    """Apply the frozen readiness projection contract, then immediately validate it."""
+    root = out / "canonical_serialization" / acc / tag
+    resolved = root / f"{acc}.sdrf.tsv"
+    report = root / "serializer.json"
+    cmd = [
+        args.python, str(args.canonicalizer_script),
+        "--candidate", str(candidate),
+        "--output", str(resolved),
+        "--report", str(report),
+        "--readiness-script", str(args.readiness_script),
+    ]
+    rc = run(cmd, log=root / "serializer.log")
+    if rc != 0 or not resolved.is_file() or not report.is_file():
+        return candidate, False, {"status": "infrastructure_failure", "returncode": rc}
+    result = read_json(report)
+    changed = bool(result.get("changed"))
+    if not changed:
+        return candidate, False, result
+    receipt = validator_gate(args, acc, resolved, f"{tag}_canonical", out)
+    append_validation(validation_rows, receipt, "canonical_serializer")
+    return resolved, True, result
 
 
 def run_bridge(args: argparse.Namespace, accs: list[str], candidate_root: Path, seed: Path | None, stage: Path) -> int:
@@ -592,7 +623,10 @@ def run_cellosaurus(args: argparse.Namespace, acc: str, candidate: Path, stage: 
         return candidate, False
     rec = validator_gate(args, acc, resolved, f"{stage.name}_cellosaurus", out)
     append_validation(validation_rows, rec, "cellosaurus_resolver")
-    return resolved, True
+    canonical, _, _ = run_canonical_serializer(
+        args, acc, resolved, f"{stage.name}_cellosaurus", out, validation_rows
+    )
+    return canonical, True
 
 
 def synthetic_readiness_root(stage: Path, states: dict[str, tuple[str, str]]) -> Path:
@@ -691,7 +725,10 @@ def run_structured_mapping(
         return candidate, False
     rec = validator_gate(args, acc, resolved, f"{stage.name}_structured_mapping", out)
     append_validation(validation_rows, rec, "structured_mapping_resolver")
-    return resolved, True
+    canonical, _, _ = run_canonical_serializer(
+        args, acc, resolved, f"{stage.name}_structured_mapping", out, validation_rows
+    )
+    return canonical, True
 
 
 def self_test() -> None:
@@ -751,6 +788,7 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--autorepair-script", type=Path, default=Path("/opt/pride-scp/scripts/sdrf_batch_autorepair.py"))
     p.add_argument("--cellosaurus-script", type=Path, default=Path("/opt/pride-scp/scripts/sdrf_cellosaurus_resolver.py"))
     p.add_argument("--mapping-script", type=Path, default=Path(__file__).resolve().parent / "sdrf_structured_mapping_resolver.py")
+    p.add_argument("--canonicalizer-script", type=Path, default=Path(__file__).resolve().parent / "sdrf_canonical_serializer.py")
     p.add_argument("--review-script", type=Path, default=Path("/opt/pride-scp/scripts/sdrf_independent_review_agent.py"))
     p.add_argument("--evidence-script", type=Path, default=Path("/opt/pride-scp/scripts/sdrf_evidence_escalation_harness.py"))
     return p
@@ -831,6 +869,28 @@ def main() -> int:
             append_validation(validation_rows, rec, "bridge_candidate")
             state = terminal_from_bridge(row)
             reason = row.get("reason_code", "")
+            canonical_cand, canonical_changed, _ = run_canonical_serializer(
+                args, acc, cand, f"pass{pass_no:02d}_bridge_candidate", out, validation_rows
+            )
+            cand = canonical_cand
+
+            if state == "needs_independent_review" and canonical_changed:
+                result = recheck_deterministic_candidate(
+                    args, acc, cand, out, validation_rows,
+                    f"pass{pass_no:02d}_bridge_canonical", evidence_roots_by_acc.get(acc),
+                )
+                terminal[acc] = result
+                if (
+                    result.get("final_state") == "needs_independent_review"
+                    and result.get("review_status") == "insufficient_evidence"
+                    and pass_no < args.max_closure_passes
+                    and acc not in evidence_attempted
+                ):
+                    terminal.pop(acc, None)
+                    enrich_states[acc] = ("blocked_internal_evidence", "review_insufficient_evidence")
+                    enrich_candidates[acc] = cand
+                    enrich_bridge_rows[acc] = row
+                continue
 
             if state == "needs_independent_review":
                 readiness_path = readiness_json_for_bridge(row)
@@ -919,12 +979,26 @@ def main() -> int:
                 if evidence_candidate and evidence_candidate.is_file():
                     ev_rec = validator_gate(args, acc, evidence_candidate, f"pass{pass_no:02d}_evidence_candidate", out)
                     append_validation(validation_rows, ev_rec, "evidence_enrichment")
+                    canonical_ev, canonical_ev_changed, _ = run_canonical_serializer(
+                        args, acc, evidence_candidate, f"pass{pass_no:02d}_evidence_candidate", out, validation_rows
+                    )
+                    if canonical_ev_changed:
+                        selected = canonical_ev
                 changed = sha256_file(selected) != sha256_file(base)
 
-                if state == "row_mapping_required":
+                if state in {"row_mapping_required", "ontology_mapping_required"}:
                     mapped, mapped_changed = run_structured_mapping(args, acc, selected, evidence_root, stage, out, validation_rows)
                     if mapped_changed:
                         selected = mapped
+                        changed = True
+                    # Mapping evidence may turn a composite/project-level cell-line value
+                    # into a row-specific exact identity. Give the exact ontology resolver
+                    # one bounded post-mapping attempt before the next bridge/readiness pass.
+                    cell_stage = stage / "post_mapping"
+                    cell_stage.mkdir(parents=True, exist_ok=True)
+                    ont, ont_changed = run_cellosaurus(args, acc, selected, cell_stage, out, validation_rows)
+                    if ont_changed:
+                        selected = ont
                         changed = True
 
                 if pass_no < args.max_closure_passes:
@@ -987,6 +1061,7 @@ def main() -> int:
             "structured_row_mapping": True,
             "explicit_multiplex_expansion": True,
             "bounded_evidence_enrichment": True,
+            "canonical_readiness_serializer": True,
         },
     }
     (out / "closure_summary.json").write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")

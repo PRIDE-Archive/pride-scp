@@ -213,3 +213,16 @@ Bridge-v2 remains a bounded repair/classification component. It does not own dow
 `row_mapping_required`, `ontology_mapping_required`, or `needs_independent_review`. Those states are
 consumed by `sdrf_batch_closure.py`, which now provides class-level deterministic/evidence/review
 resolvers. Do not add accession-specific repair rules to bridge-v2 merely to increase ready counts.
+
+## Closure v3 integration note
+
+Bridge-v2 remains frozen. The validator-gated closure controller now treats bridge output as
+an input to a shared deterministic serialization boundary before downstream closure actions.
+This does not change bridge scientific decisions; it prevents representation-only defects
+(column grouping, factor placement, known validator-compatible serialization) from obscuring
+the next evidence/resolution state.
+
+Evidence escalation launched under an outer SLURM array must not inherit
+`SLURM_ARRAY_TASK_ID` into the nested publication annotation driver. The closure evidence
+harness removes that variable from child environments so the annotation stage runs all valid
+jobs locally with its configured worker count.

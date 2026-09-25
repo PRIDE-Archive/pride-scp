@@ -33,7 +33,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Iterable
 
-VERSION = "pride-scp-sdrf-evidence-escalation-v0.1.3"
+VERSION = "pride-scp-sdrf-evidence-escalation-v0.1.4"
 POLICY_VERSION = "pride-scp-evidence-escalation-policy-v0.1.3"
 
 VALID_STATES_NO_ESCALATION = {"submission_ready", "needs_independent_review"}
@@ -168,7 +168,11 @@ def classify_lane(state: str, blockers: list[str], warnings: list[str]) -> str:
     # evidence, while ontology cases may benefit from publication/source enrichment after
     # the exact deterministic ontology resolver has had its bounded attempt.
     if state_l == "ontology_mapping_required":
-        return "required_metadata"
+        # The exact Cellosaurus resolver gets first refusal in the closure controller.
+        # If it cannot resolve the ontology state, the usual cause is row-scoped or
+        # composite cell-line identity.  That is a mapping-evidence problem, not a
+        # free-form ontology-generation problem.
+        return "mapping"
     if state_l == "row_mapping_required" or "mapping_unresolved" in text:
         return "mapping"
     if "validator" in text or "skills" in text or "ontology" in text:
@@ -345,6 +349,13 @@ def command_record(argv: list[str], *, stage: str, accession_file: str = "") -> 
     }
 
 
+def child_subprocess_environment() -> dict[str, str]:
+    """Return a child environment that cannot inherit an outer array row selector."""
+    env = os.environ.copy()
+    env.pop("SLURM_ARRAY_TASK_ID", None)
+    return env
+
+
 def run_command(
     argv: list[str],
     *,
@@ -361,7 +372,19 @@ def run_command(
     logs.mkdir(parents=True, exist_ok=True)
     log = logs / f"{stage}.log"
     started = time.time()
-    proc = subprocess.run(argv, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    # This harness is itself often launched from an outer SLURM array.  Nested
+    # batch-oriented tools (notably 04_run_pride_scp_annotations.py) interpret
+    # SLURM_ARRAY_TASK_ID as their own zero-based row selector.  Never leak the
+    # parent array index into child orchestration; doing so silently turns a
+    # cohort run into one invalid/out-of-range nested row.
+    child_env = child_subprocess_environment()
+    proc = subprocess.run(
+        argv,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        env=child_env,
+    )
     log.write_text(proc.stdout or "", encoding="utf-8")
     ok = proc.returncode == 0
     print(f"{stage}: returncode={proc.returncode} wall={time.time()-started:.1f}s log={log}")
@@ -465,7 +488,14 @@ def self_test() -> None:
             online_requested=True, external_analysis_requested=True, model_requested=True,
         )
         assert classify_lane(p5.state, p5.blockers, []) == "mapping"
-        assert classify_lane("ontology_mapping_required", ["cell_line_ontology_mapping_unresolved"], []) == "required_metadata"
+        assert classify_lane("ontology_mapping_required", ["cell_line_ontology_mapping_unresolved"], []) == "mapping"
+        old_array = os.environ.get("SLURM_ARRAY_TASK_ID")
+        os.environ["SLURM_ARRAY_TASK_ID"] = "3"
+        assert "SLURM_ARRAY_TASK_ID" not in child_subprocess_environment()
+        if old_array is None:
+            os.environ.pop("SLURM_ARRAY_TASK_ID", None)
+        else:
+            os.environ["SLURM_ARRAY_TASK_ID"] = old_array
         assert content_missing_accessions(pub, ["PXD900001", "PXD900002"]) == ["PXD900002"]
         assert snapshot_missing_inputs(snap, ["PXD900001"] ) == {"projects": [], "files": []}
         assert absolute_without_symlink_resolution(Path("relative/path")).is_absolute()
@@ -638,9 +668,12 @@ def main() -> int:
             cmd += ["--supplementary-links", str(supplementary_links)]
         run_command(cmd, stage="05_generalized_evidence_graph", logs=logs, records=command_records, execute=args.execute, required=False)
 
+    annotation_ok = True
+    annotation_result_summary: dict[str, int] = {}
+    sdrf_annotate_ok = True
     annotation_dir = out / "publication_annotations"
     if model and current_manifest:
-        run_command([
+        annotation_ok = run_command([
             args.python, str(root / "python" / "stages" / "04_run_pride_scp_annotations.py"),
             str(current_manifest),
             "--targeted-script", str(root / "python" / "stages" / "pride_scp_targeted_ollama.py"),
@@ -651,7 +684,7 @@ def main() -> int:
             "--workers", "1",
             "--all-valid-content",
             *( ["--force"] if args.force else [] ),
-        ], stage="06_small_llm_publication_annotation", logs=logs, records=command_records, execute=args.execute, required=args.execute)
+        ], stage="06_small_llm_publication_annotation", logs=logs, records=command_records, execute=args.execute, required=False)
 
     annot_out = out / "sdrf_annotation"
     if active:
@@ -670,18 +703,16 @@ def main() -> int:
             cmd += ["--resolved-sdrf-dir", str(args.resolved_sdrf_dir)]
         if args.force:
             cmd += ["--force"]
-        run_command(cmd, stage="07_sdrf_annotate", logs=logs, records=command_records, execute=args.execute, required=args.execute)
+        sdrf_annotate_ok = run_command(
+            cmd, stage="07_sdrf_annotate", logs=logs, records=command_records,
+            execute=args.execute, required=False,
+        )
 
         results = annot_out / "sdrf_annotation_results.tsv"
-        if args.execute:
-            if not results.is_file():
-                raise RuntimeError("07_sdrf_annotate returned success but did not write sdrf_annotation_results.tsv")
-            result_counts = annotation_result_counts(results)
-            if result_counts["rows"] == 0 or result_counts["success"] == 0:
-                raise RuntimeError(
-                    "07_sdrf_annotate produced no successful accession rows: "
-                    + json.dumps(result_counts, sort_keys=True)
-                )
+        if args.execute and results.is_file():
+            annotation_result_summary = annotation_result_counts(results)
+        elif args.execute:
+            annotation_result_summary = {"rows": 0, "success": 0, "errors": 0, "locally_valid": 0}
         triage = out / "postrun_triage"
         if not args.execute or results.is_file():
             cmd = [
@@ -715,6 +746,12 @@ def main() -> int:
         "gt_runtime_truth_used": False,
         "network_policy": "bounded public evidence retrieval only; online failures fail closed",
         "llm_policy": "semantic reader only; unsupported identity/mapping remains unresolved",
+        "service_status": {
+            "publication_annotation_ok": annotation_ok,
+            "sdrf_annotation_ok": sdrf_annotate_ok,
+            "sdrf_annotation_results": annotation_result_summary,
+            "partial_evidence_is_retained": True,
+        },
         "outputs": {
             "plan": str(out / "evidence_escalation_plan.tsv"),
             "command_plan": str(out / "command_plan.json"),

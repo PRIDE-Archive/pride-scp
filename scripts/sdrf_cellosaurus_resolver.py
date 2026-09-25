@@ -127,33 +127,42 @@ def resolve_file(candidate: Path, output: Path, report: Path, endpoint: str, tim
     line_idx, acc_idx = detect_columns(headers)
     if line_idx is None:
         shutil.copy2(candidate, output)
-        result = {"status":"no_cell_line_column", "changed":False, "input_sha256":sha256_file(candidate), "output_sha256":sha256_file(output), "resolutions":[]}
-        report.write_text(json.dumps(result, indent=2)+"\n", encoding="utf-8")
+        result = {
+            "schema_version": "pride-scp-cellosaurus-exact-resolver-v2",
+            "status": "no_cell_line_column",
+            "changed": False,
+            "input": str(candidate),
+            "output": str(output),
+            "input_sha256": sha256_file(candidate),
+            "output_sha256": sha256_file(output),
+            "resolutions": [],
+        }
+        report.write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")
         return result
+
     changed = False
-    if acc_idx is None:
-        headers.append("characteristics[cellosaurus accession]")
-        acc_idx = len(headers)-1
-        for row in rows:
-            row.append("")
-        changed = True
-    elif headers[acc_idx].strip().lower() == "characteristics[cell line accession]":
-        # Canonicalize the historical/nonstandard alias without changing row values.
+    # Renaming a populated legacy alias is representation-only and preserves all
+    # existing accession values.  A missing canonical column, however, is created
+    # lazily only after at least one exact ontology resolution succeeds; adding an
+    # empty column must not consume a closure pass.
+    if acc_idx is not None and headers[acc_idx].strip().lower() == "characteristics[cell line accession]":
         headers[acc_idx] = "characteristics[cellosaurus accession]"
         changed = True
+
     fixture_obj = json.loads(fixture.read_text()) if fixture and fixture.is_file() else None
     cache: dict[str, dict[str, str] | None] = {}
     resolutions: list[dict[str, Any]] = []
+
     for row_no, row in enumerate(rows, start=2):
         while len(row) < len(headers):
             row.append("")
         term = row[line_idx].strip()
-        current = row[acc_idx].strip()
+        current = row[acc_idx].strip() if acc_idx is not None and acc_idx < len(row) else ""
         if norm(term) in PLACEHOLDERS or re.fullmatch(r"CVCL_[A-Z0-9]+", current, re.I):
             continue
         # Composite cell-line identity is a row-mapping problem, not an ontology lookup.
         if ";" in term or "|" in term:
-            resolutions.append({"row":row_no,"query":term,"status":"composite_unresolved"})
+            resolutions.append({"row": row_no, "query": term, "status": "composite_unresolved"})
             continue
         if term not in cache:
             if fixture_obj is not None:
@@ -162,34 +171,45 @@ def resolve_file(candidate: Path, output: Path, report: Path, endpoint: str, tim
                 try:
                     recs = api_query(term, endpoint, timeout)
                 except Exception as exc:
-                    resolutions.append({"row":row_no,"query":term,"status":"api_error","detail":repr(exc)})
+                    resolutions.append({"row": row_no, "query": term, "status": "api_error", "detail": repr(exc)})
                     cache[term] = None
                     continue
             cache[term] = unique_exact(term, recs)
         hit = cache[term]
         if hit is None:
-            resolutions.append({"row":row_no,"query":term,"status":"not_unique_exact"})
+            resolutions.append({"row": row_no, "query": term, "status": "not_unique_exact"})
             continue
+        if acc_idx is None:
+            headers.append("characteristics[cellosaurus accession]")
+            acc_idx = len(headers) - 1
+            for existing in rows:
+                while len(existing) < len(headers):
+                    existing.append("")
         row[acc_idx] = hit["accession"]
         changed = True
-        resolutions.append({"row":row_no,"query":term,"status":"resolved",**hit})
-    output.parent.mkdir(parents=True, exist_ok=True)
-    with output.open("w", newline="", encoding="utf-8") as fh:
-        w = csv.writer(fh, delimiter="\t", lineterminator="\n")
-        w.writerow(headers)
-        w.writerows(rows)
+        resolutions.append({"row": row_no, "query": term, "status": "resolved", **hit})
+
+    if changed:
+        with output.open("w", newline="", encoding="utf-8") as fh:
+            w = csv.writer(fh, delimiter="\t", lineterminator="\n")
+            w.writerow(headers)
+            w.writerows(rows)
+    else:
+        shutil.copy2(candidate, output)
+
     result = {
-        "schema_version":"pride-scp-cellosaurus-exact-resolver-v1",
-        "status":"changed" if changed else "unchanged",
-        "changed":changed,
-        "input":str(candidate),
-        "output":str(output),
-        "input_sha256":sha256_file(candidate),
-        "output_sha256":sha256_file(output),
-        "resolutions":resolutions,
+        "schema_version": "pride-scp-cellosaurus-exact-resolver-v2",
+        "status": "changed" if changed else "unchanged",
+        "changed": changed,
+        "input": str(candidate),
+        "output": str(output),
+        "input_sha256": sha256_file(candidate),
+        "output_sha256": sha256_file(output),
+        "resolutions": resolutions,
+        "composite_unresolved": sum(x.get("status") == "composite_unresolved" for x in resolutions),
+        "exact_resolved": sum(x.get("status") == "resolved" for x in resolutions),
     }
-    report.parent.mkdir(parents=True, exist_ok=True)
-    report.write_text(json.dumps(result, indent=2)+"\n", encoding="utf-8")
+    report.write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")
     return result
 
 
@@ -218,6 +238,14 @@ def self_test() -> None:
         assert "characteristics[cellosaurus accession]" in legacy_text
         assert "characteristics[cell line accession]" not in legacy_text
         assert "CVCL_9999" in legacy_text
+
+        composite = root/"composite.tsv"; composite_out=root/"composite_out.tsv"; composite_rep=root/"composite_report.json"
+        composite.write_text("source name\tcharacteristics[cell line]\nS1\tHeLa; A549\n", encoding="utf-8")
+        composite_res=resolve_file(composite,composite_out,composite_rep,API,5,fixture)
+        assert composite_res["changed"] is False
+        assert composite_out.read_bytes() == composite.read_bytes()
+        assert "characteristics[cellosaurus accession]" not in composite_out.read_text()
+        assert composite_res["composite_unresolved"] == 1
     print("sdrf_cellosaurus_resolver self-test: PASS")
 
 
