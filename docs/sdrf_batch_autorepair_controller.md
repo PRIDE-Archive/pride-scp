@@ -206,3 +206,10 @@ singularity exec <readiness.sif> <readiness-python> <readiness-script> ...
 ```
 
 It must never propagate a host-side Python wrapper into the frozen readiness image. This separation prevents nested-dispatch/runtime lookup failures while leaving the scientific and readiness policies unchanged.
+
+## Closure-engine contract
+
+Bridge-v2 remains a bounded repair/classification component. It does not own downstream closure of
+`row_mapping_required`, `ontology_mapping_required`, or `needs_independent_review`. Those states are
+consumed by `sdrf_batch_closure.py`, which now provides class-level deterministic/evidence/review
+resolvers. Do not add accession-specific repair rules to bridge-v2 merely to increase ready counts.

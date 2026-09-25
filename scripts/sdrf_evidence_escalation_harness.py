@@ -163,6 +163,14 @@ def classify_lane(state: str, blockers: list[str], warnings: list[str]) -> str:
     text = " ".join([state_l, *blockers, *warnings]).lower()
     if state_l in VALID_STATES_NO_ESCALATION:
         return "closed"
+    # Closure-controller terminal states are evidence-routing inputs here, not final
+    # scientific outcomes.  Row-mapping cases require supplementary/structured mapping
+    # evidence, while ontology cases may benefit from publication/source enrichment after
+    # the exact deterministic ontology resolver has had its bounded attempt.
+    if state_l == "ontology_mapping_required":
+        return "required_metadata"
+    if state_l == "row_mapping_required" or "mapping_unresolved" in text:
+        return "mapping"
     if "validator" in text or "skills" in text or "ontology" in text:
         # Mapping/metadata/semantic evidence takes precedence over tool drift.
         if not any(k in text for k in ("mapping", "metadata", "semantic", "candidate")):
@@ -448,6 +456,16 @@ def self_test() -> None:
         assert p2.lane == "mapping" and p2.online_requested and p2.external_analysis_requested
         assert p3.lane == "closed" and not p3.model_requested
         assert p4.lane == "validator_compatibility" and not p4.online_requested and not p4.model_requested
+        # Closure bridge states must route into generic evidence classes rather than
+        # being treated as opaque general-evidence terminals.
+        p5 = CasePlan(
+            accession="PXD900005", state="row_mapping_required", lane="mapping",
+            blockers=["row_scoped_metadata_mapping_unresolved"], warnings=[],
+            evidence_needs=list(LANE_NEEDS["mapping"]), local=LocalEvidence(),
+            online_requested=True, external_analysis_requested=True, model_requested=True,
+        )
+        assert classify_lane(p5.state, p5.blockers, []) == "mapping"
+        assert classify_lane("ontology_mapping_required", ["cell_line_ontology_mapping_unresolved"], []) == "required_metadata"
         assert content_missing_accessions(pub, ["PXD900001", "PXD900002"]) == ["PXD900002"]
         assert snapshot_missing_inputs(snap, ["PXD900001"] ) == {"projects": [], "files": []}
         assert absolute_without_symlink_resolution(Path("relative/path")).is_absolute()

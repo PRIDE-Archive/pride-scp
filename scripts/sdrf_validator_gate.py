@@ -63,6 +63,7 @@ def run_gate(
     ontology_mode: str,
     timeout: int,
     runtime_sha256: str = "",
+    validator_version_override: str = "",
 ) -> dict[str, Any]:
     if not candidate.is_file():
         raise FileNotFoundError(f"candidate not found: {candidate}")
@@ -83,7 +84,7 @@ def run_gate(
         "validator_gate": gate,
         "validator_available": available,
         "validator_passed": passed,
-        "validator_version": validator_version(),
+        "validator_version": validator_version_override or validator_version(),
         "runtime_sha256": runtime_sha256 or sha256_file(readiness_script),
         "readiness_script": str(readiness_script),
         "parse_sdrf_command": parse_sdrf,
@@ -129,10 +130,12 @@ def command_dict(x):
             parse_sdrf="parse_sdrf",
             ontology_mode="skip",
             timeout=5,
+            validator_version_override="0.1.6",
         )
         assert receipt["validator_gate"] == "green"
         assert receipt["candidate_sha256"] == sha256_file(candidate)
         assert receipt["templates"] == ["single-cell", "ms-proteomics"]
+        assert receipt["validator_version"] == "0.1.6"
     print("sdrf_validator_gate self-test: PASS")
 
 
@@ -148,6 +151,7 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--ontology-mode", choices=["skip", "online"], default="skip")
     p.add_argument("--timeout", type=int, default=180)
     p.add_argument("--runtime-sha256", default="")
+    p.add_argument("--validator-version", default="", help="Version reported by the actual validator runtime; overrides host package metadata.")
     p.add_argument("--fail-on-red", action="store_true")
     return p
 
@@ -168,6 +172,7 @@ def main() -> int:
         ontology_mode=args.ontology_mode,
         timeout=args.timeout,
         runtime_sha256=args.runtime_sha256,
+        validator_version_override=args.validator_version,
     )
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(receipt, indent=2) + "\n", encoding="utf-8")

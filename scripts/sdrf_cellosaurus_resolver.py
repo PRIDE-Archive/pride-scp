@@ -108,11 +108,16 @@ def unique_exact(term: str, records: list[dict[str, Any]]) -> dict[str, str] | N
 def detect_columns(headers: list[str]) -> tuple[int | None, int | None]:
     lower = [h.strip().lower() for h in headers]
     line = next((i for i, h in enumerate(lower) if h == "characteristics[cell line]"), None)
-    acc = next((i for i, h in enumerate(lower) if "cellosaurus" in h or h == "characteristics[cell line accession]"), None)
-    return line, acc
+    canonical = next((i for i, h in enumerate(lower) if h == "characteristics[cellosaurus accession]"), None)
+    if canonical is not None:
+        return line, canonical
+    legacy = next((i for i, h in enumerate(lower) if h == "characteristics[cell line accession]"), None)
+    return line, legacy
 
 
 def resolve_file(candidate: Path, output: Path, report: Path, endpoint: str, timeout: int, fixture: Path | None) -> dict[str, Any]:
+    output.parent.mkdir(parents=True, exist_ok=True)
+    report.parent.mkdir(parents=True, exist_ok=True)
     with candidate.open(newline="", encoding="utf-8-sig", errors="replace") as fh:
         matrix = list(csv.reader(fh, delimiter="\t"))
     if not matrix:
@@ -125,15 +130,20 @@ def resolve_file(candidate: Path, output: Path, report: Path, endpoint: str, tim
         result = {"status":"no_cell_line_column", "changed":False, "input_sha256":sha256_file(candidate), "output_sha256":sha256_file(output), "resolutions":[]}
         report.write_text(json.dumps(result, indent=2)+"\n", encoding="utf-8")
         return result
+    changed = False
     if acc_idx is None:
-        headers.append("characteristics[cell line accession]")
+        headers.append("characteristics[cellosaurus accession]")
         acc_idx = len(headers)-1
         for row in rows:
             row.append("")
+        changed = True
+    elif headers[acc_idx].strip().lower() == "characteristics[cell line accession]":
+        # Canonicalize the historical/nonstandard alias without changing row values.
+        headers[acc_idx] = "characteristics[cellosaurus accession]"
+        changed = True
     fixture_obj = json.loads(fixture.read_text()) if fixture and fixture.is_file() else None
     cache: dict[str, dict[str, str] | None] = {}
     resolutions: list[dict[str, Any]] = []
-    changed = False
     for row_no, row in enumerate(rows, start=2):
         while len(row) < len(headers):
             row.append("")
@@ -192,7 +202,22 @@ def self_test() -> None:
         fixture.write_text(json.dumps({"HeLa":[{"id":"HeLa","ac":"CVCL_0030","sy":["He-La"]}]}),encoding="utf-8")
         res=resolve_file(src,out,rep,API,5,fixture)
         assert res["changed"] is True
-        assert "CVCL_0030" in out.read_text()
+        rendered = out.read_text()
+        assert "CVCL_0030" in rendered
+        assert "characteristics[cellosaurus accession]" in rendered
+        assert "characteristics[cell line accession]" not in rendered
+
+        legacy = root/"legacy.tsv"; legacy_out=root/"legacy_out.tsv"; legacy_rep=root/"legacy_report.json"
+        legacy.write_text(
+            "source name\tcharacteristics[cell line]\tcharacteristics[cell line accession]\n"
+            "S1\tUnknownLine\tCVCL_9999\n", encoding="utf-8"
+        )
+        legacy_res=resolve_file(legacy,legacy_out,legacy_rep,API,5,root/"missing_fixture.json")
+        assert legacy_res["changed"] is True
+        legacy_text=legacy_out.read_text()
+        assert "characteristics[cellosaurus accession]" in legacy_text
+        assert "characteristics[cell line accession]" not in legacy_text
+        assert "CVCL_9999" in legacy_text
     print("sdrf_cellosaurus_resolver self-test: PASS")
 
 

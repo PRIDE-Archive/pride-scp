@@ -80,11 +80,17 @@ def review(accession:str,projected:Path,readiness:dict[str,Any],validator:dict[s
     if fixture and fixture.is_file():
         decision=read_json(fixture)
     else:
+        allowed_refs = sorted(evidence_refs(evidence))
         prompt=(
             "You are a non-editing independent SDRF reviewer. Return one JSON object only. "
             "Allowed status values: approved, held, insufficient_evidence. Do not propose edits. "
-            "Approve only if the supplied exact candidate, readiness diagnostics and evidence support the projection.\n\n"
+            "The JSON must contain status, reason, and evidence_refs. evidence_refs must be a non-empty "
+            "list chosen only from the allowed evidence reference IDs supplied below whenever status is approved. "
+            "Approve only if the supplied exact projected bytes, readiness diagnostics, validator receipt, and "
+            "source evidence support the projection without unresolved scientific contradiction. If the evidence "
+            "does not establish that, return held or insufficient_evidence rather than guessing.\n\n"
             f"accession={accession}\nsha256={digest}\n"
+            f"allowed_evidence_refs={json.dumps(allowed_refs)}\n"
             f"readiness={json.dumps(readiness,sort_keys=True)}\n"
             f"validator={json.dumps(validator,sort_keys=True)}\n"
             f"evidence={json.dumps(evidence,sort_keys=True)}\n"
