@@ -43,3 +43,15 @@ The current specialized3 acceptance cohort is intentionally format-diverse:
 
 The adapter is reusable for later hard-tail accessions with the same source
 formats.  No accession-specific scientific values are embedded in the code.
+
+## Runtime robustness (v1.1)
+
+- `.xlsx` parsing prefers `openpyxl` when available, but has a standard-library
+  ZIP/XML fallback so the immutable production SIF does not require `openpyxl`.
+- If the requested `--base-sdrf` has zero data rows and the structured source
+  directory contains exactly one non-empty `*.sdrf.tsv`, that deposited source
+  SDRF is selected as the effective base. A substantive requested base is never
+  replaced automatically.
+- If an exact annotation pass applies zero values, the candidate is copied
+  byte-for-byte from the effective base; formatting/newline reserialization is
+  never counted as scientific progress.

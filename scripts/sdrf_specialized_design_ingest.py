@@ -21,11 +21,12 @@ import shutil
 import sys
 import tempfile
 import xml.etree.ElementTree as ET
+import zipfile
 from collections import defaultdict
 from pathlib import Path
 from typing import Any, Iterable
 
-SCHEMA = "pride-scp-specialized-design-ingest-v1"
+SCHEMA = "pride-scp-specialized-design-ingest-v1.1"
 PLACEHOLDERS = {"", "not available", "not applicable", "na", "n/a", "unknown"}
 
 
@@ -161,34 +162,131 @@ def parse_annotation_tables(source_root: Path) -> tuple[list[dict[str, Any]], di
     }
 
 
+def _xlsx_col_index(cell_ref: str) -> int:
+    letters = "".join(ch for ch in cell_ref if ch.isalpha()).upper()
+    value = 0
+    for ch in letters:
+        value = value * 26 + (ord(ch) - ord("A") + 1)
+    return max(value - 1, 0)
+
+
+def _xlsx_shared_strings(zf: zipfile.ZipFile) -> list[str]:
+    name = "xl/sharedStrings.xml"
+    if name not in zf.namelist():
+        return []
+    root = ET.fromstring(zf.read(name))
+    ns = {"m": "http://schemas.openxmlformats.org/spreadsheetml/2006/main"}
+    out = []
+    for si in root.findall("m:si", ns):
+        parts = [t.text or "" for t in si.findall(".//m:t", ns)]
+        out.append("".join(parts))
+    return out
+
+
+def _xlsx_sheet_rows_stdlib(path: Path) -> list[tuple[str, list[list[str]]]]:
+    """Read XLSX worksheet values using only the Python standard library.
+
+    This deliberately supports the simple scalar/shared-string cell forms used by
+    deposited experimental-design workbooks. Formula results are read from cached
+    <v> values when present. Legacy binary .xls is intentionally unsupported here.
+    """
+    ns_main = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+    ns_rel = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+    ns_pkg_rel = "http://schemas.openxmlformats.org/package/2006/relationships"
+    with zipfile.ZipFile(path) as zf:
+        shared = _xlsx_shared_strings(zf)
+        workbook = ET.fromstring(zf.read("xl/workbook.xml"))
+        relroot = ET.fromstring(zf.read("xl/_rels/workbook.xml.rels"))
+        rels = {
+            r.attrib.get("Id", ""): r.attrib.get("Target", "")
+            for r in relroot.findall(f"{{{ns_pkg_rel}}}Relationship")
+        }
+        sheets: list[tuple[str, str]] = []
+        for sheet in workbook.findall(f".//{{{ns_main}}}sheet"):
+            title = sheet.attrib.get("name", "Sheet")
+            rid = sheet.attrib.get(f"{{{ns_rel}}}id", "")
+            target = rels.get(rid, "")
+            if not target:
+                continue
+            if target.startswith("/"):
+                xml_name = target.lstrip("/")
+            elif target.startswith("xl/"):
+                xml_name = target
+            else:
+                xml_name = "xl/" + target.lstrip("./")
+            sheets.append((title, xml_name))
+
+        result: list[tuple[str, list[list[str]]]] = []
+        for title, xml_name in sheets:
+            root = ET.fromstring(zf.read(xml_name))
+            rows: list[list[str]] = []
+            for row in root.findall(f".//{{{ns_main}}}sheetData/{{{ns_main}}}row"):
+                values: dict[int, str] = {}
+                max_idx = -1
+                for cell in row.findall(f"{{{ns_main}}}c"):
+                    ref = cell.attrib.get("r", "A1")
+                    idx = _xlsx_col_index(ref)
+                    max_idx = max(max_idx, idx)
+                    ctype = cell.attrib.get("t", "")
+                    value = ""
+                    if ctype == "inlineStr":
+                        texts = [x.text or "" for x in cell.findall(f".//{{{ns_main}}}t")]
+                        value = "".join(texts)
+                    else:
+                        v = cell.find(f"{{{ns_main}}}v")
+                        raw = v.text if v is not None and v.text is not None else ""
+                        if ctype == "s" and raw:
+                            try:
+                                value = shared[int(raw)]
+                            except (ValueError, IndexError):
+                                value = raw
+                        elif ctype == "b":
+                            value = "TRUE" if raw == "1" else "FALSE"
+                        else:
+                            value = raw
+                    values[idx] = value
+                if max_idx >= 0:
+                    rows.append([values.get(i, "") for i in range(max_idx + 1)])
+            result.append((title, rows))
+        return result
+
+
 def parse_xlsx_design(source_root: Path) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     paths = sorted([p for p in source_root.iterdir() if p.suffix.lower() in {".xlsx", ".xls"}])
     if not paths:
         return [], {"adapter": "xlsx_design", "files": 0, "rows": 0}
-    try:
-        from openpyxl import load_workbook
-    except Exception as exc:  # pragma: no cover
-        raise RuntimeError("openpyxl is required for XLSX ingestion") from exc
 
     records: list[dict[str, Any]] = []
     meta: list[dict[str, Any]] = []
     for path in paths:
-        wb = load_workbook(path, read_only=True, data_only=True)
-        for ws in wb.worksheets:
+        if path.suffix.lower() == ".xls":
+            raise RuntimeError("legacy binary .xls ingestion is not supported without an external reader")
+        try:
+            from openpyxl import load_workbook
+        except Exception:
+            sheet_rows = _xlsx_sheet_rows_stdlib(path)
+            backend = "stdlib_zip_xml"
+        else:
+            wb = load_workbook(path, read_only=True, data_only=True)
+            sheet_rows = [
+                (ws.title, [[norm(v) for v in row] for row in ws.iter_rows(values_only=True)])
+                for ws in wb.worksheets
+            ]
+            backend = "openpyxl"
+
+        for sheet_title, rows in sheet_rows:
             section = ""
             data_rows = 0
-            for rownum, values in enumerate(ws.iter_rows(values_only=True), 1):
+            for rownum, values in enumerate(rows, 1):
                 cells = [norm(v) for v in values]
                 first = cells[0] if cells else ""
                 second = cells[1] if len(cells) > 1 else ""
                 third = cells[2] if len(cells) > 2 else ""
                 if not any(cells):
                     continue
-                # Section headers are one non-empty cell and are not run identifiers.
                 if first and not second and not third and not re.search(r"\d{4}-\d{2}-\d{2}", first):
                     section = first
                     continue
-                # Project-level metadata is retained but not promoted into row mappings.
                 if first in {"Publication/Project", "Authors (Full name)", "Correspondance"}:
                     continue
                 if not first:
@@ -201,12 +299,11 @@ def parse_xlsx_design(source_root: Path) -> tuple[list[dict[str, Any]], dict[str
                         "description": second,
                         "detail": third,
                     },
-                    "evidence": {"file": path.name, "sheet": ws.title, "row": rownum, "adapter": "xlsx_design"},
+                    "evidence": {"file": path.name, "sheet": sheet_title, "row": rownum, "adapter": "xlsx_design"},
                 })
                 data_rows += 1
-            meta.append({"file": path.name, "sheet": ws.title, "rows": data_rows})
+            meta.append({"file": path.name, "sheet": sheet_title, "rows": data_rows, "backend": backend})
     return records, {"adapter": "xlsx_design", "files": len(paths), "sheets": meta, "rows": len(records)}
-
 
 def parse_pdstudy(source_root: Path) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     paths = sorted([p for p in source_root.iterdir() if p.suffix.lower() == ".pdstudy"])
@@ -259,6 +356,49 @@ def read_sdrf(path: Path) -> tuple[list[str], list[dict[str, str]]]:
         if reader.fieldnames is None:
             raise RuntimeError(f"missing SDRF header: {path}")
         return list(reader.fieldnames), [{k: norm(v) for k, v in row.items()} for row in reader]
+
+
+def _sdrf_data_rows(path: Path) -> int:
+    if not path.is_file():
+        return 0
+    try:
+        _, rows = read_sdrf(path)
+    except Exception:
+        return 0
+    return len(rows)
+
+
+def select_effective_base(requested: Path | None, source_root: Path) -> tuple[Path | None, dict[str, Any]]:
+    """Prefer a unique deposited source SDRF only when the requested base is empty/header-only.
+
+    This avoids silently replacing a substantive base candidate.  A source SDRF is
+    eligible only when exactly one *.sdrf.tsv exists in source_root and it contains
+    at least one data row.
+    """
+    info: dict[str, Any] = {
+        "requested": str(requested) if requested is not None else None,
+        "selected": str(requested) if requested is not None else None,
+        "reason": "requested_base",
+    }
+    requested_rows = _sdrf_data_rows(requested) if requested is not None else 0
+    source_sdrfs = sorted(p for p in source_root.glob("*.sdrf.tsv") if _sdrf_data_rows(p) > 0)
+    if requested is not None and requested_rows > 0:
+        info["requested_rows"] = requested_rows
+        return requested, info
+    if len(source_sdrfs) == 1:
+        selected = source_sdrfs[0]
+        info.update({
+            "selected": str(selected),
+            "reason": "unique_source_sdrf_fallback",
+            "requested_rows": requested_rows,
+            "selected_rows": _sdrf_data_rows(selected),
+        })
+        return selected, info
+    info.update({
+        "requested_rows": requested_rows,
+        "source_sdrf_candidates": [str(p) for p in source_sdrfs],
+    })
+    return requested, info
 
 
 def write_sdrf(path: Path, headers: list[str], rows: list[dict[str, str]]) -> None:
@@ -346,8 +486,17 @@ def apply_exact_annotations(base: Path, records: list[dict[str, Any]], out: Path
             row["comment[label]"] = "TMT" + chans[0]
             applied += 1
 
-    write_sdrf(out, headers, rows)
-    return {"matched_rows": matched, "applied_values": applied, "conflicts": conflicts, "ambiguous_join_keys": len(ambiguous)}
+    if applied == 0:
+        shutil.copy2(base, out)
+    else:
+        write_sdrf(out, headers, rows)
+    return {
+        "matched_rows": matched,
+        "applied_values": applied,
+        "conflicts": conflicts,
+        "ambiguous_join_keys": len(ambiguous),
+        "copied_base_unchanged": applied == 0,
+    }
 
 
 def correlate_design_with_base(base: Path, records: list[dict[str, Any]]) -> dict[str, Any]:
@@ -443,10 +592,11 @@ def run(args: argparse.Namespace) -> int:
     accession = args.accession
     source_root = Path(args.source_root)
     output_root = Path(args.output_root)
-    base = Path(args.base_sdrf) if args.base_sdrf else None
+    requested_base = Path(args.base_sdrf) if args.base_sdrf else None
     if not source_root.is_dir():
         raise SystemExit(f"source root not found: {source_root}")
     output_root.mkdir(parents=True, exist_ok=True)
+    base, base_selection = select_effective_base(requested_base, source_root)
 
     records: list[dict[str, Any]] = []
     summaries: list[dict[str, Any]] = []
@@ -462,6 +612,7 @@ def run(args: argparse.Namespace) -> int:
     if not records:
         raise SystemExit("no supported structured-design records found")
 
+    correlations["base_selection"] = base_selection
     if base is not None:
         if not base.is_file():
             raise SystemExit(f"base SDRF not found: {base}")
@@ -512,6 +663,26 @@ def self_test() -> int:
         assert rows[1]["characteristics[cell type]"] == "THP1"
         summary = json.loads((out / "PXDTEST.ingest_summary.json").read_text())
         assert summary["correlations"]["annotation_candidate"]["matched_rows"] == 2
+
+        # No-op annotation must preserve base bytes exactly.
+        noopsrc = root / "noop"; noopsrc.mkdir()
+        (noopsrc / "sampleAnnotations.csv").write_text(
+            "run;channel;cell_type;cell_number;sample_type;batch\nOTHER;126C;X;1;SC;B1\n",
+            encoding="utf-8",
+        )
+        noopout = root / "noopout"
+        run(argparse.Namespace(accession="PXDNOOP", source_root=str(noopsrc), base_sdrf=str(base), output_root=str(noopout)))
+        assert (noopout / "PXDNOOP.specialized_candidate.sdrf.tsv").read_bytes() == base.read_bytes()
+
+        # A unique deposited SDRF replaces a header-only requested base, fail-closed.
+        fallbacksrc = root / "fallback"; fallbacksrc.mkdir()
+        shutil.copy2(src / "sampleAnnotations.csv", fallbacksrc / "sampleAnnotations.csv")
+        deposited = fallbacksrc / "sample_to_data.sdrf.tsv"
+        shutil.copy2(base, deposited)
+        header_only = root / "header_only.tsv"
+        header_only.write_text("source name\tassay name\tcomment[data file]\tcomment[label]\n", encoding="utf-8")
+        chosen, meta = select_effective_base(header_only, fallbacksrc)
+        assert chosen == deposited and meta["reason"] == "unique_source_sdrf_fallback"
 
         # pdStudy minimal exact topology
         pdsrc = root / "pd"; pdsrc.mkdir()
