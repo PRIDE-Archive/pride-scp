@@ -33,6 +33,8 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Iterable
 
+from sdrf_external_artifact_acquisition import classify_external_source, europe_pmc_supplement_url
+
 SCRIPT_DIR = Path(__file__).resolve().parent
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
@@ -511,29 +513,68 @@ def acquire(row: RepoFile, dest: Path, max_bytes: int, reuse_roots: list[Path]) 
         return None, f"download_error:{type(exc).__name__}:{exc}"
 
 
-def _row_evidence(accession: str, file_name: str, location: str, cells: list[str]) -> StructuredEvidence | None:
-    text = " | ".join(norm(x) for x in cells if norm(x))
-    if not text: return None
-    raws = sorted(set(m.group(1) for m in RAW_TOKEN_RE.finditer(text)))
+def _row_evidence(
+    accession: str, file_name: str, location: str, cells: list[str], schema_fields: list[str] | None = None,
+) -> StructuredEvidence | None:
+    fields = [norm(x) for x in (schema_fields or [])]
+    named = bool(fields and len(fields) == len(cells))
+    if named:
+        text = " | ".join(
+            f"{fields[i]}={norm(value)}" for i, value in enumerate(cells)
+            if fields[i] and norm(value)
+        )
+    else:
+        text = " | ".join(norm(x) for x in cells if norm(x))
+    if not text:
+        return None
+    value_text = " | ".join(norm(x) for x in cells if norm(x))
+    raws = sorted(set(m.group(1) for m in RAW_TOKEN_RE.finditer(value_text)))
     channels = channels_in(text) if re.search(r"(?i)(?:TMT|reporter|channel|abundance|intensity|S/?N)", text) else []
     samples = []
-    for c in cells:
-        if re.search(r"(?i)(?:sample|cell|zygote|neuron|replicate|well|carrier|blank)", c) and len(c) <= 180:
-            samples.append(norm(c))
-    if not (raws or channels or samples): return None
+    for i, cell in enumerate(cells):
+        c = norm(cell)
+        key = fields[i] if named else ""
+        if (
+            re.search(r"(?i)(?:sample|cell|zygote|neuron|replicate|well|carrier|blank)", c)
+            or re.search(r"(?i)(?:sample|cell|well|replicate|source|assay)", key)
+        ) and len(c) <= 180:
+            samples.append(c)
+    if not (raws or channels or samples):
+        return None
     et = "row_mapping" if raws and (channels or samples) else "channel_schema" if channels else "sample_schema"
-    return StructuredEvidence(accession, file_name, location, et, raws, channels, samples[:12], [], "", text[:1200])
+    return StructuredEvidence(
+        accession, file_name, location, et, raws, channels, samples[:12], fields if named else [], "",
+        text[:1200],
+    )
 
 
 def parse_tabular_structured(accession: str, path: Path, max_rows: int = 80) -> list[StructuredEvidence]:
     out: list[StructuredEvidence] = []
     suffix = path.suffix.lower()
     if suffix == ".xlsx":
-        try: rows = parse_support_file(path)
-        except Exception: return []
+        try:
+            rows = parse_support_file(path)
+        except Exception:
+            return []
+        by_sheet: dict[str, list[Any]] = defaultdict(list)
         for row in rows[:max_rows * 5]:
-            ev = _row_evidence(accession, path.name, f"{row.sheet}:row{row.row_number}", row.cells)
-            if ev: out.append(ev)
+            by_sheet[row.sheet].append(row)
+        for sheet, sheet_rows in by_sheet.items():
+            headers: list[str] = []
+            header_row_number = -1
+            for row in sheet_rows[:12]:
+                score = sum(bool(SCHEMA_SIGNAL_RE.search(norm(cell))) for cell in row.cells)
+                if score >= 2:
+                    headers = [norm(x) for x in row.cells]
+                    header_row_number = row.row_number
+                    break
+            for row in sheet_rows:
+                fields = headers if headers and row.row_number > header_row_number and len(headers) == len(row.cells) else []
+                ev = _row_evidence(
+                    accession, path.name, f"{sheet}:row{row.row_number}", row.cells, fields
+                )
+                if ev:
+                    out.append(ev)
         # Quantitative summary from workbook headers + numeric columns is intentionally conservative;
         # detailed role validation is emitted only where a recognizable reporter header is found.
         return out[:max_rows]
@@ -570,9 +611,11 @@ def parse_tabular_structured(accession: str, path: Path, max_rows: int = 80) -> 
         base = statistics.median([x for x in med.values() if x > 0]) if any(x > 0 for x in med.values()) else 0.0
         summary = ";".join(f"{ch}:median={med[ch]:.6g},ratio={med[ch]/base:.3g}" for ch in sorted(med) if base > 0)
         out.append(StructuredEvidence(accession, path.name, "header", "quantitative_reporter_columns", [], [ch for _, ch in reporter_cols], [], header, summary, " | ".join(header)[:1200]))
-    for i, row in enumerate(rows[:max_rows], start=1):
-        ev = _row_evidence(accession, path.name, f"row{i}", row)
-        if ev: out.append(ev)
+    for i, row in enumerate(rows[1:max_rows], start=2):
+        fields = header if len(header) == len(row) else []
+        ev = _row_evidence(accession, path.name, f"row{i}", row, fields)
+        if ev:
+            out.append(ev)
     return out[:max_rows]
 
 
@@ -605,9 +648,10 @@ def parse_sqlite_structured(accession: str, path: Path, max_tables: int = 30) ->
             try:
                 for ridx, row in enumerate(con.execute(q), start=1):
                     cells = [norm(x) for x in row]
-                    ev = _row_evidence(accession, path.name, f"sqlite:{t}:row{ridx}", cells)
+                    ev = _row_evidence(
+                        accession, path.name, f"sqlite:{t}:row{ridx}", cells, selected
+                    )
                     if ev:
-                        ev.schema_fields = selected
                         ev.evidence_type = "sqlite_structured_row"
                         out.append(ev)
             except Exception:
@@ -628,10 +672,11 @@ def parse_skyline(accession: str, path: Path) -> list[StructuredEvidence]:
         if not attrs: continue
         joined = " | ".join(f"{k}={v}" for k, v in attrs.items())
         if any(x in tag for x in ("replicate", "sample", "file", "result")) or RAW_TOKEN_RE.search(joined):
-            ev = _row_evidence(accession, path.name, f"xml:{tag}", list(attrs.values()))
+            ev = _row_evidence(
+                accession, path.name, f"xml:{tag}", list(attrs.values()), list(attrs)
+            )
             if ev:
                 ev.evidence_type = "skyline_structured"
-                ev.schema_fields = list(attrs)
                 out.append(ev)
     return out[:200]
 
@@ -664,11 +709,12 @@ def extract_external_sources(accession: str, source_ref: str, text: str) -> list
             url = "https://" + url.replace("www.", "", 1)
         elif url.lower().startswith("doi.org/"):
             url = "https://" + url
-        low = url.lower()
-        typ = "github" if "github.com/" in low else "zenodo" if "zenodo." in low else "mendeley" if "mendeley" in low else "other"
-        if typ == "other": continue
+        typ = classify_external_source(url)
+        if typ == "other":
+            continue
         if url not in seen:
-            seen.add(url); out.append(ExternalSource(accession, typ, url, source_ref, "high"))
+            seen.add(url)
+            out.append(ExternalSource(accession, typ, url, source_ref, "high"))
     return out
 
 
@@ -724,11 +770,36 @@ def supplementary_sources(path: Path, wanted: set[str]) -> list[ExternalSource]:
     out: list[ExternalSource] = []
     for row in read_tsv(path):
         acc = (row.get("accession") or "").strip().upper()
-        if acc not in wanted: continue
+        if acc not in wanted:
+            continue
         link = (row.get("link") or "").strip()
-        low = link.lower()
-        typ = "github" if "github.com/" in low else "zenodo" if "zenodo." in low else "mendeley" if "mendeley" in low else "supplementary" if row.get("link_type") == "media" else "other"
-        if typ != "other": out.append(ExternalSource(acc, typ, link, "v0.5.0 publication supplementary link", "high"))
+        link_type = (row.get("link_type") or "").strip()
+        pmcid = (row.get("publication_pmcid") or "").strip()
+        typ = classify_external_source(link, link_type)
+        source_ref = "publication_supplementary_link"
+        if pmcid:
+            source_ref += f";pmcid={pmcid}"
+        if link_type:
+            source_ref += f";link_type={link_type}"
+        if typ != "other" and link:
+            out.append(ExternalSource(acc, typ, link, source_ref, "high"))
+
+        # PMC/Europe PMC supplementary bundles are authoritative article-associated deposited
+        # material.  Add one generic bundle source when the JATS inventory identifies a media or
+        # supplementary-material link.  Downstream deduplication collapses repeated rows for the
+        # same accession/PMCID.
+        bundle_candidate = bool(
+            pmcid
+            and (
+                typ == "supplementary_media"
+                or (link and not link.startswith(("http://", "https://")))
+                or "supp" in link.lower()
+            )
+        )
+        if bundle_candidate:
+            bundle = europe_pmc_supplement_url(pmcid)
+            if bundle:
+                out.append(ExternalSource(acc, "europe_pmc_supplement", bundle, source_ref, "high"))
     return out
 
 
@@ -870,6 +941,10 @@ def self_test() -> None:
         sev = parse_sqlite_structured("PXDTEST", dbp)
         assert any(e.evidence_type == "sqlite_schema" and "ChannelName" in e.schema_fields for e in sev)
         assert any("A.raw" in e.raw_files for e in sev)
+        assert any(
+            "SampleName=cell1" in e.text and "ChannelName=TMT126" in e.text and "RawFile=A.raw" in e.text
+            for e in sev if e.evidence_type == "sqlite_structured_row"
+        )
 
         skyp = td / "test.sky"
         skyp.write_text("<srm_settings><measured_results><replicate name='cell1'><sample_file file_path='A.raw'/></replicate></measured_results></srm_settings>")

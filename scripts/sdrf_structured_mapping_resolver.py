@@ -70,7 +70,11 @@ FIELD_ALIASES: dict[str, tuple[str, ...]] = {
     "characteristics[organism part]": ("characteristics[organism part]", "organism part", "organism_part", "tissue"),
     "characteristics[sample type]": ("characteristics[sample type]", "sample type", "sample_type"),
     "characteristics[individual]": ("characteristics[individual]", "individual", "donor identifier", "donor_identifier", "subject identifier", "subject_identifier"),
-    "comment[label]": ("comment[label]", "label", "channel", "reporter channel", "reporter_channel", "tmt channel", "tmt_channel"),
+    "comment[label]": (
+        "comment[label]", "label", "channel", "channel name", "channel_name", "channelname",
+        "reporter channel", "reporter_channel", "reporter channel name", "reporter_channel_name",
+        "tmt channel", "tmt_channel", "quan channel", "quan_channel",
+    ),
 }
 
 RAW_ALIASES = (
@@ -740,6 +744,27 @@ def self_test() -> None:
         assert r6["applied_edge_count"] == 0
         assert "HeLa; Jurkat" not in out6.read_text()
         assert out6.read_bytes() == src6.read_bytes()
+
+        # Generalized graph join rows from structured SQLite evidence preserve source column names
+        # as field=value assertions.  The resolver may project them only through its normal alias and
+        # uniqueness rules; high-level join status alone is never treated as a value.
+        src8 = root / "join_bridge.tsv"
+        ev8 = root / "join_evidence.tsv"
+        out8 = root / "join_bridge_out.tsv"
+        rep8 = root / "join_bridge_report.json"
+        src8.write_text(
+            "source name\tcomment[data file]\tcomment[label]\n"
+            "not available\tm.raw\tnot available\n"
+        )
+        ev8.write_text(
+            "accession\trepository_raw\tjoin_confidence\tevidence_text\n"
+            "PXD900001\tm.raw\thigh\tRawFile=m.raw | SampleName=cell-A | ChannelName=TMT126\n"
+        )
+        r8 = resolve(src8, out8, rep8, [ev8], "PXD900001")
+        assert r8["changed"] is True
+        rows8 = list(csv.DictReader(out8.open(), delimiter="\t"))
+        assert rows8[0]["source name"] == "cell-A"
+        assert rows8[0]["comment[label]"] == "TMT126"
 
         noev = root / "noev.tsv"; noev_out = root / "noev_out.tsv"; noev_rep = root / "noev.json"
         noev.write_bytes(b"source name\tcomment[data file]\r\nS1\ta.raw\r\n")

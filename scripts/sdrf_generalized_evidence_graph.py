@@ -31,6 +31,8 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
+from sdrf_external_artifact_acquisition import acquire_external_artifacts  # noqa: E402
+
 from sdrf_multiplex_evidence_graph import (  # noqa: E402
     DesignContract,
     ExternalSource,
@@ -86,9 +88,12 @@ METHODDEV_RE = re.compile(r"(?i)\b(?:method(?:dev|development|test)|optimization
 
 # High-value analysis repository paths.  These are schema/semantic classes and therefore reusable.
 EXTERNAL_PATH_RE = re.compile(
-    r"(?i)(?:cell|sample|input|design|metadata|annotation|characteristic|cellenone|channel|reporter|tmt|raw|run|plex|batch|well|manifest|mapping|sorted|unsorted)"
+    r"(?i)(?:cell|sample|input|design|metadata|annotation|characteristic|cellenone|channel|reporter|tmt|raw|run|plex|batch|well|manifest|mapping|sorted|unsorted|table|supp)"
 )
-EXTERNAL_EXTS = {".txt", ".tsv", ".csv", ".xlsx", ".xls", ".json", ".xml", ".sky", ".r", ".py", ".zip", ".7z"}
+EXTERNAL_EXTS = {
+    ".txt", ".tsv", ".csv", ".xlsx", ".xls", ".json", ".xml", ".sky", ".pdresult",
+    ".pdstudy", ".msf", ".r", ".py", ".zip", ".7z",
+}
 
 
 @dataclass(frozen=True)
@@ -173,13 +178,18 @@ class JoinEvidence:
 @dataclass
 class ExternalFetch:
     accession: str
+    source_type: str
+    source_ref: str
     source_url: str
+    resolved_url: str
     repository_path: str
     local_path: str
     archive_member: str
     size_bytes: int
     sha256: str
     parse_status: str
+    parser: str
+    structural_hits: int
 
 
 @dataclass
@@ -614,41 +624,121 @@ def parse_join_evidence(accession: str, source_file: str, source_location: str, 
 def fetch_external_sources(
     sources: list[ExternalSource], output: Path, max_files: int, max_bytes: int, max_archive_bytes: int,
     reuse_roots: list[Path], snapshot: Path,
-) -> tuple[list[ExternalFetch], list[JoinEvidence]]:
+) -> tuple[list[ExternalFetch], list[JoinEvidence], list[StructuredEvidence]]:
     inventory: list[ExternalFetch] = []
     joins: list[JoinEvidence] = []
+    structured: list[StructuredEvidence] = []
     seen_repo: dict[str, list[Path]] = {}
-    for src in sources:
-        if src.source_type != "github": continue
-        key = src.url.rstrip("/")
-        files = seen_repo.get(key)
-        if files is None:
-            files = []
-            # Reuse already downloaded analysis files first.
-            owner_repo = github_repo_parts(src.url)
-            if owner_repo:
-                owner, repo = owner_repo
-                for root in reuse_roots:
-                    p = root / owner / repo
-                    if p.is_dir():
-                        files.extend(x for x in p.rglob("*") if x.is_file() and x.suffix.lower() in EXTERNAL_EXTS and EXTERNAL_PATH_RE.search(str(x.relative_to(p))))
-            if not files:
-                files = fetch_github_high_value(src, output, max_files, max_bytes)
-            seen_repo[key] = files[:max_files]
+
+    def record_path(src: ExternalSource, path: Path, *, resolved_url: str, repository_path: str,
+                    parse_status: str, archive_member: str = "") -> None:
+        parser = ""
+        ev: list[StructuredEvidence] = []
+        try:
+            data = path.read_bytes()
+            sha = hashlib.sha256(data).hexdigest()
+            size = len(data)
+        except OSError:
+            return
+        try:
+            parser, ev = parse_artifact(src.accession, path)
+        except Exception as exc:
+            parser = f"parse_error:{type(exc).__name__}"
+            ev = []
+        structured.extend(ev)
         repo_raws = raw_files(snapshot, src.accession)
-        for path in files[:max_files]:
-            sha = hashlib.sha256(path.read_bytes()).hexdigest()
-            inventory.append(ExternalFetch(src.accession, src.url, path.name, str(path), "", path.stat().st_size, sha, "selected"))
-            try:
-                data = path.read_bytes()
-            except OSError:
+        joins.extend(parse_join_evidence(src.accession, path.name, str(path), data, repo_raws))
+        inventory.append(ExternalFetch(
+            src.accession, src.source_type, src.source_ref, src.url, resolved_url, repository_path,
+            str(path), archive_member, size, sha, parse_status, parser, len(ev),
+        ))
+
+    def record_archive(src: ExternalSource, path: Path, *, resolved_url: str) -> None:
+        if path.suffix.lower() not in {".zip", ".7z"} or path.stat().st_size > max_archive_bytes:
+            return
+        repo_raws = raw_files(snapshot, src.accession)
+        member_root = output / "_archive_members" / src.accession / hashlib.sha256(str(path).encode()).hexdigest()[:12]
+        for member, blob in _parse_archive(path, max_archive_bytes):
+            if len(blob) > max_bytes:
+                inventory.append(ExternalFetch(
+                    src.accession, src.source_type, src.source_ref, src.url, resolved_url, path.name,
+                    str(path), member, len(blob), hashlib.sha256(blob).hexdigest(),
+                    f"archive_member_too_large:{len(blob)}", "", 0,
+                ))
                 continue
-            joins.extend(parse_join_evidence(src.accession, path.name, str(path), data, repo_raws))
-            if path.suffix.lower() in {".zip", ".7z"} and path.stat().st_size <= max_archive_bytes:
-                for member, blob in _parse_archive(path, max_archive_bytes):
-                    inventory.append(ExternalFetch(src.accession, src.url, path.name, str(path), member, len(blob), hashlib.sha256(blob).hexdigest(), "archive_member"))
-                    joins.extend(parse_join_evidence(src.accession, Path(member).name, f"{path}!{member}", blob, repo_raws))
-    return inventory, joins
+            safe = re.sub(r"[^A-Za-z0-9._-]+", "_", Path(member).name) or "archive_member"
+            member_path = member_root / safe
+            member_path.parent.mkdir(parents=True, exist_ok=True)
+            member_path.write_bytes(blob)
+            parser = ""
+            ev: list[StructuredEvidence] = []
+            try:
+                parser, ev = parse_artifact(src.accession, member_path)
+            except Exception as exc:
+                parser = f"parse_error:{type(exc).__name__}"
+            structured.extend(ev)
+            joins.extend(parse_join_evidence(
+                src.accession, Path(member).name, f"{path}!{member}", blob, repo_raws
+            ))
+            inventory.append(ExternalFetch(
+                src.accession, src.source_type, src.source_ref, src.url, resolved_url, path.name,
+                str(member_path), member, len(blob), hashlib.sha256(blob).hexdigest(),
+                "archive_member", parser, len(ev),
+            ))
+
+    for src in sources:
+        if src.source_type == "github":
+            key = src.url.rstrip("/")
+            files = seen_repo.get(key)
+            if files is None:
+                files = []
+                # Reuse already downloaded analysis files first.
+                owner_repo = github_repo_parts(src.url)
+                if owner_repo:
+                    owner, repo = owner_repo
+                    for root in reuse_roots:
+                        p = root / owner / repo
+                        if p.is_dir():
+                            files.extend(
+                                x for x in p.rglob("*")
+                                if x.is_file() and x.suffix.lower() in EXTERNAL_EXTS
+                                and EXTERNAL_PATH_RE.search(str(x.relative_to(p)))
+                            )
+                if not files:
+                    files = fetch_github_high_value(src, output, max_files, max_bytes)
+                seen_repo[key] = files[:max_files]
+            repo_raws = raw_files(snapshot, src.accession)
+            for path in files[:max_files]:
+                record_path(
+                    src, path, resolved_url=src.url, repository_path=path.name, parse_status="selected",
+                )
+                record_archive(src, path, resolved_url=src.url)
+            continue
+
+        source_key = hashlib.sha256(src.url.encode("utf-8", errors="replace")).hexdigest()[:12]
+        provider_dest = output / src.accession / source_key
+        acquired = acquire_external_artifacts(
+            source_type=src.source_type,
+            source_url=src.url,
+            dest=provider_dest,
+            max_files=max_files,
+            max_bytes=max_bytes,
+            max_archive_bytes=max_archive_bytes,
+        )
+        for art in acquired:
+            if art.local_path:
+                path = Path(art.local_path)
+                record_path(
+                    src, path, resolved_url=art.resolved_url, repository_path=art.remote_name,
+                    parse_status=art.status,
+                )
+                record_archive(src, path, resolved_url=art.resolved_url)
+            else:
+                inventory.append(ExternalFetch(
+                    src.accession, src.source_type, src.source_ref, src.url, art.resolved_url,
+                    art.remote_name, "", "", art.size_bytes, art.sha256, art.status, "", 0,
+                ))
+    return inventory, joins, structured
 
 
 def project_announce(snapshot: Path, accession: str) -> str:
@@ -774,8 +864,13 @@ def run(args: argparse.Namespace) -> int:
     # Generic external analysis repository acquisition/join resolution.
     ext_inventory: list[ExternalFetch] = []
     joins: list[JoinEvidence] = []
+    external_structured: list[StructuredEvidence] = []
     if args.fetch_external_analysis:
-        ext_inventory, joins = fetch_external_sources(external, out / "external_analysis", args.max_external_files, args.max_external_bytes, args.max_archive_bytes, args.reuse_external_root, args.snapshot)
+        ext_inventory, joins, external_structured = fetch_external_sources(
+            external, out / "external_analysis", args.max_external_files, args.max_external_bytes,
+            args.max_archive_bytes, args.reuse_external_root, args.snapshot
+        )
+        structured.extend(external_structured)
 
     # Structured evidence may include exact RAW/channel rows too; convert them into generic joins.
     raw_sets = {acc: raw_files(args.snapshot, acc) for acc in accessions}
@@ -835,7 +930,11 @@ def run(args: argparse.Namespace) -> int:
         "branch_resolution_counts": dict(sorted(Counter(r["resolved_status"] for r in branch_rows).items())),
         "accession_status_counts": dict(sorted(Counter(r["accession_status"] for r in accession_rows).items())),
         "external_analysis_sources": len(external),
-        "external_files": len(ext_inventory),
+        "external_source_types": dict(sorted(Counter(e.source_type for e in external).items())),
+        "external_files": sum(bool(x.local_path) for x in ext_inventory),
+        "external_fetch_inventory_rows": len(ext_inventory),
+        "external_structured_evidence_rows": len(external_structured),
+        "external_structured_parsers": dict(sorted(Counter(x.parser for x in ext_inventory if x.parser).items())),
         "join_evidence_rows": len(joins),
         "relation_assessments": len(relations),
         "runtime_accession_specific_rules": False,
