@@ -6504,7 +6504,26 @@ fn concrete_proposal_value(value: &str) -> Option<String> {
         return None;
     }
     let v = value.trim();
-    (!v.is_empty()).then(|| v.to_string())
+    let internal = matches!(
+        v.to_ascii_lowercase().as_str(),
+        "blocked_set"
+            | "blocked"
+            | "unsupported_or_exhausted"
+            | "row_mapping_required"
+            | "bridge_gap"
+            | "template_gap"
+            | "provenance_conflict"
+            | "no_substantive_candidate"
+    );
+    (!v.is_empty() && !internal).then(|| v.to_string())
+}
+
+fn serialized_instrument_value(value: &str) -> String {
+    let v = value.trim();
+    if v.eq_ignore_ascii_case("NT=quadrupole orbitrap astral instrument;AC=MS:1003771") {
+        return "NT=quadrupole orbitrap astral;AC=MS:1003771".into();
+    }
+    v.to_string()
 }
 
 fn append_header(headers: &mut Vec<String>, rows: &mut [Vec<String>], name: &str) -> usize {
@@ -6558,6 +6577,7 @@ fn enrich_existing_sdrf_rows(
         bail!("existing SDRF normalization requires at least one data row");
     }
     let original_header_count = headers.len();
+    let original_headers = headers.iter().cloned().collect::<BTreeSet<_>>();
 
     for required in [
         "source name",
@@ -6645,11 +6665,6 @@ fn enrich_existing_sdrf_rows(
         );
         set_missing(
             row,
-            idx("characteristics[cell type]"),
-            concrete_proposal_value(&proposal.cell_type),
-        );
-        set_missing(
-            row,
             idx("comment[proteomics data acquisition method]"),
             concrete_proposal_value(&proposal.proteomics_data_acquisition_method),
         );
@@ -6657,11 +6672,6 @@ fn enrich_existing_sdrf_rows(
             row,
             idx("comment[label]"),
             concrete_proposal_value(&proposal.label),
-        );
-        set_missing(
-            row,
-            idx("comment[instrument]"),
-            concrete_proposal_value(&proposal.instrument),
         );
         set_missing(
             row,
@@ -6694,16 +6704,6 @@ fn enrich_existing_sdrf_rows(
         }
         set_missing(
             row,
-            idx(SC_INDIVIDUAL),
-            concrete_proposal_value(&proposal.individual),
-        );
-        set_missing(
-            row,
-            idx(SC_PREP_BATCH),
-            concrete_proposal_value(&proposal.sample_preparation_batch),
-        );
-        set_missing(
-            row,
             idx(SC_CARRIER_CHANNEL),
             concrete_proposal_value(&proposal.carrier_channel),
         );
@@ -6712,6 +6712,22 @@ fn enrich_existing_sdrf_rows(
             idx(SC_REFERENCE_CHANNEL),
             concrete_proposal_value(&proposal.reference_channel),
         );
+
+        // Existing row-level biological/provenance fields are preservation-first. A project-level
+        // proposal must not be broadcast into heterogeneous rows. Missing values use a reserved
+        // word; concrete source values remain untouched.
+        for header in [
+            SC_INDIVIDUAL,
+            "characteristics[cell type]",
+            "comment[instrument]",
+            SC_PREP_BATCH,
+        ] {
+            if let Some(j) = idx(header) {
+                if row[j].trim().is_empty() {
+                    row[j] = "not available".into();
+                }
+            }
+        }
 
         // Recommended single-cell metadata must never remain blank. This is reserved-word
         // normalization only: no batch or channel identity is invented. Non-isobaric labels do not
@@ -6866,7 +6882,11 @@ fn enrich_existing_sdrf_rows(
             row[j] = SDRF_SPEC_VERSION.into();
         }
         if let Some(j) = idx("comment[sdrf annotation tool]") {
-            row[j] = sdrf_annotation_tool_value();
+            if !original_headers.contains("comment[sdrf annotation tool]")
+                && row[j].trim().is_empty()
+            {
+                row[j] = sdrf_annotation_tool_value();
+            }
         }
         if let Some(j) = sc_template_idx {
             row[j] = format!("single-cell v{SINGLE_CELL_TEMPLATE_VERSION}");
@@ -6879,6 +6899,8 @@ fn enrich_existing_sdrf_rows(
             if is_missing_cell_value(&row[uri_j]) {
                 if let Some(uri) = raw_uri.get(&file).filter(|x| !x.is_empty()) {
                     row[uri_j] = uri.clone();
+                } else {
+                    row[uri_j] = "not available".into();
                 }
             }
         }
@@ -6978,7 +7000,7 @@ fn draft_rows_from_explicit_mappings(
         set(
             &mut row,
             "comment[instrument]",
-            reserved_or(&proposal.instrument, "not available"),
+            serialized_instrument_value(&reserved_or(&proposal.instrument, "not available")),
         );
         set(
             &mut row,
@@ -7038,7 +7060,8 @@ fn draft_rows_from_explicit_mappings(
             &mut row,
             SC_PREP_BATCH,
             if single_cell_row {
-                reserved_or(&proposal.sample_preparation_batch, "not available")
+                concrete_proposal_value(&proposal.sample_preparation_batch)
+                    .unwrap_or_else(|| "not available".into())
             } else {
                 "not applicable".to_string()
             },
@@ -7186,7 +7209,7 @@ fn draft_rows_with_explicit_mappings(
         set(
             &mut row,
             "comment[instrument]",
-            reserved_or(&proposal.instrument, "not available"),
+            serialized_instrument_value(&reserved_or(&proposal.instrument, "not available")),
         );
         set(
             &mut row,
@@ -7297,7 +7320,8 @@ fn draft_rows_with_explicit_mappings(
         set(
             &mut row,
             SC_PREP_BATCH,
-            reserved_or(&proposal.sample_preparation_batch, "not available"),
+            concrete_proposal_value(&proposal.sample_preparation_batch)
+                .unwrap_or_else(|| "not available".into()),
         );
         set(&mut row, SC_CELLS_PER_WELL, cells_per_well);
         set(
@@ -10479,6 +10503,66 @@ mod tests {
         assert_eq!(rows[0][cell], "cell_A");
         assert_eq!(rows[0][iso], "cellenONE");
         assert_eq!(rows[0][frac], "1");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn existing_sdrf_merge_is_preservation_first_for_issue_999_fields() {
+        let root = tmp();
+        fs::create_dir_all(&root).unwrap();
+        let existing = root.join("issue999-existing.sdrf.tsv");
+        fs::write(
+            &existing,
+            "source name\tcharacteristics[organism]\tcharacteristics[cell type]\tassay name\ttechnology type\tcomment[proteomics data acquisition method]\tcomment[label]\tcomment[instrument]\tcomment[cleavage agent details]\tcomment[fraction identifier]\tcomment[technical replicate]\tcomment[data file]\tcomment[sdrf annotation tool]\nhela\tHomo sapiens\tepithelial cell\thela\tproteomic profiling by mass spectrometry\tData-dependent acquisition\tlabel free sample\tOrbitrap\tNT=Trypsin;AC=MS:1001251\t1\t1\thela.raw\tmanual curation\nk562\tHomo sapiens\t\tk562\tproteomic profiling by mass spectrometry\tData-dependent acquisition\tlabel free sample\t\tNT=Trypsin;AC=MS:1001251\t1\t1\tk562.raw\tmanual curation\n",
+        )
+        .unwrap();
+        let evidence = DatasetEvidence {
+            accession: "PXD999999".into(),
+            project_json_path: String::new(),
+            files_json_path: String::new(),
+            existing_sdrf_path: existing.display().to_string(),
+            raw_files: vec![RawFile {
+                file_name: "hela.raw".into(),
+                file_uri: "ftp://x/hela.raw".into(),
+                category: "RAW".into(),
+            }],
+            study_design: StudyDesignScaffold::default(),
+            metadata_scaffold: DeterministicMetadataScaffold::default(),
+            evidence: vec![],
+            manuscript_sources: vec![],
+            annotation_sources: vec![],
+        };
+        let proposal = SdrfProposal {
+            relation_mode: "one_cell_per_data_file".into(),
+            cell_type: "epithelial cell".into(),
+            instrument: "NT=quadrupole orbitrap astral instrument;AC=MS:1003771".into(),
+            individual: "donor1".into(),
+            sample_preparation_batch: "blocked_set".into(),
+            ..Default::default()
+        };
+        let (headers, rows, _) = merge_existing_sdrf(&proposal, &evidence).unwrap();
+        let at = |name: &str| header_first_index(&headers, name).unwrap();
+        assert_eq!(rows[0][at("characteristics[cell type]")], "epithelial cell");
+        assert_eq!(rows[1][at("characteristics[cell type]")], "not available");
+        assert_eq!(rows[1][at("comment[instrument]")], "not available");
+        assert_eq!(
+            rows[0][at("comment[sdrf annotation tool]")],
+            "manual curation"
+        );
+        assert_eq!(
+            rows[1][at("comment[sdrf annotation tool]")],
+            "manual curation"
+        );
+        assert_eq!(rows[0][at(SC_INDIVIDUAL)], "not available");
+        assert_eq!(rows[0][at(SC_PREP_BATCH)], "not available");
+        assert_eq!(rows[0][at("comment[file uri]")], "ftp://x/hela.raw");
+        assert_eq!(rows[1][at("comment[file uri]")], "not available");
+        assert_ne!(rows[0][at(SC_PREP_BATCH)], "blocked_set");
+        assert_eq!(
+            serialized_instrument_value("NT=quadrupole orbitrap astral instrument;AC=MS:1003771"),
+            "NT=quadrupole orbitrap astral;AC=MS:1003771"
+        );
+        assert!(concrete_proposal_value("blocked_set").is_none());
         let _ = fs::remove_dir_all(root);
     }
 
