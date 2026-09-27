@@ -16,6 +16,7 @@ use pride_scp_sdrf::{
     SdrfAnnotateOptions, SdrfAuditOptions, SdrfResolveOptions, SdrfScientificAgentOptions,
     DEFAULT_OLLAMA_URL as DEFAULT_SDRF_OLLAMA_URL,
 };
+use pride_scp_transfer::{transfer, SlurmOptions, TransferOptions};
 use std::path::PathBuf;
 use std::time::Instant;
 
@@ -23,7 +24,7 @@ use std::time::Instant;
 #[command(
     name = "pride-scp",
     version,
-    about = "Recall-first PRIDE single-cell proteomics discovery and audit tooling"
+    about = "PRIDE single-cell proteomics discovery, annotation, audit, and transfer tooling"
 )]
 struct Cli {
     /// Disable interactive progress bars/spinners. Final summaries still print to stdout.
@@ -41,6 +42,122 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Plan or transfer files from HTTP(S), FTP(S), or a list of dataset roots.
+    /// Supports byte-accurate dry runs, resumable direct downloads, and size-balanced Slurm shards.
+    Transfer {
+        /// Single HTTP(S)/FTP(S) file or directory URL. Use --source-list for multiple dataset roots.
+        #[arg(long, conflicts_with = "source_list")]
+        source: Option<String>,
+        /// Text file containing one HTTP(S)/FTP(S) source or MassIVE dataset root per line.
+        /// Blank lines and lines beginning with '#' are ignored. Alias: --dataset-list.
+        #[arg(long, visible_alias = "dataset-list", conflicts_with = "source")]
+        source_list: Option<PathBuf>,
+        /// Local destination root. The source directory hierarchy is preserved below this path.
+        #[arg(long)]
+        destination: PathBuf,
+        /// Concurrent direct-download workers. Ignored for Slurm execution.
+        #[arg(long, default_value_t = 4)]
+        jobs: usize,
+        /// Concurrent HEAD/range probes used to calculate remote sizes.
+        #[arg(long, default_value_t = 16)]
+        metadata_jobs: usize,
+        /// Timeout for directory-listing and size-probe requests. Large file bodies are not subject to this timeout.
+        #[arg(long, default_value_t = 120)]
+        metadata_timeout: u64,
+        /// Number of retries after the initial HTTP attempt.
+        #[arg(long, default_value_t = 4)]
+        retries: usize,
+        #[arg(long, default_value = "PRIDE-SCP-transfer/0.1.12")]
+        user_agent: String,
+        /// Maximum recursive directory depth below the source root. Omit for unlimited recursion.
+        #[arg(long)]
+        max_depth: Option<usize>,
+        /// Keep only relative file paths matching at least one regex. Repeat as needed.
+        #[arg(long = "include-regex")]
+        include_regex: Vec<String>,
+        /// Exclude relative file/directory paths matching any regex. Repeat as needed.
+        #[arg(long = "exclude-regex")]
+        exclude_regex: Vec<String>,
+        /// Limit the selected file set after filtering. Zero means unlimited.
+        #[arg(long, default_value_t = 0)]
+        limit: usize,
+        /// Report discovered files and transfer size without downloading or creating Slurm scripts.
+        #[arg(long, conflicts_with_all = ["generate_slurm", "submit_slurm"])]
+        dry_run: bool,
+        /// Do not resume partially present files; replace them from byte zero.
+        #[arg(long)]
+        no_resume: bool,
+        /// Replace local files that are larger than their remote counterpart.
+        #[arg(long)]
+        force: bool,
+        /// Optional JSON (extension `.json`) or TSV transfer manifest.
+        #[arg(long)]
+        manifest_out: Option<PathBuf>,
+        /// Generate size-balanced Slurm transfer scripts but do not submit them.
+        #[arg(long, conflicts_with = "submit_slurm")]
+        generate_slurm: bool,
+        /// Generate and submit size-balanced Slurm transfer jobs with `sbatch`.
+        #[arg(long, conflicts_with = "generate_slurm")]
+        submit_slurm: bool,
+        /// Maximum number of independent Slurm transfer shards.
+        #[arg(long, default_value_t = 8)]
+        slurm_jobs: usize,
+        /// Directory for generated Slurm scripts, logs, and the transfer manifest.
+        #[arg(long)]
+        slurm_script_dir: Option<PathBuf>,
+        #[arg(long, default_value = "pride-scp-transfer")]
+        slurm_job_name: String,
+        #[arg(long, default_value = "12:00:00")]
+        slurm_time: String,
+        #[arg(long, default_value = "4G")]
+        slurm_mem: String,
+        #[arg(long, default_value_t = 1)]
+        slurm_cpus_per_task: usize,
+        #[arg(long)]
+        slurm_partition: Option<String>,
+        #[arg(long)]
+        slurm_account: Option<String>,
+        #[arg(long)]
+        slurm_qos: Option<String>,
+        #[arg(long)]
+        slurm_constraint: Option<String>,
+        /// Extra argument passed directly to every `sbatch` invocation. Repeat as needed.
+        #[arg(long = "sbatch-arg", allow_hyphen_values = true)]
+        sbatch_args: Vec<String>,
+        /// sbatch executable used for --submit-slurm. Useful when Slurm is exposed at a non-default path.
+        #[arg(long, default_value = "sbatch")]
+        sbatch_binary: String,
+        /// Curl executable used for FTP(S) discovery/direct downloads and generated Slurm workers.
+        #[arg(long, default_value = "curl")]
+        curl_binary: String,
+        /// FTP TLS policy: auto, required, or off. Auto requires explicit TLS for MassIVE.
+        #[arg(long, default_value = "auto", value_parser = ["auto", "required", "off"])]
+        ftp_tls: String,
+        /// Disable FTP(S) TLS certificate verification. Use only as an explicit compatibility workaround.
+        #[arg(long, conflicts_with = "ftp_ca_cert")]
+        ftp_insecure_tls: bool,
+        /// CA certificate bundle/file passed to curl for FTP(S) certificate verification.
+        #[arg(long, value_name = "PATH", conflicts_with = "ftp_insecure_tls")]
+        ftp_ca_cert: Option<PathBuf>,
+        /// Force IPv4 for FTP(S). MassIVE does this automatically.
+        #[arg(long)]
+        ftp_ipv4: bool,
+        /// Disable EPSV and use PASV for FTP(S). MassIVE does this automatically.
+        #[arg(long)]
+        ftp_disable_epsv: bool,
+        /// FTP directory-listing strategy. Auto prefers MLSD for MassIVE and falls back to LIST only for non-transient protocol/parse failures.
+        #[arg(long, default_value = "auto", value_parser = ["auto", "mlsd", "list"])]
+        ftp_listing: String,
+        /// Maximum concurrent FTP directory-listing sessions. Kept separate from --metadata-jobs to avoid overwhelming FTP servers.
+        #[arg(long, default_value_t = 1)]
+        ftp_listing_jobs: usize,
+        /// Minimum milliseconds between new FTP directory-listing connection attempts.
+        #[arg(long, default_value_t = 750)]
+        ftp_listing_interval_ms: u64,
+        /// Base seconds for exponential backoff after transient FTP listing failures (curl 7/28/56).
+        #[arg(long, default_value_t = 5)]
+        ftp_retry_backoff_seconds: u64,
+    },
     /// Snapshot PRIDE project metadata, file manifests, and SDRF where available.
     Snapshot {
         #[arg(long, default_value = "data/snapshot")]
@@ -380,6 +497,114 @@ async fn main() -> Result<()> {
     let started = Instant::now();
 
     match command {
+        Command::Transfer {
+            source,
+            source_list,
+            destination,
+            jobs,
+            metadata_jobs,
+            metadata_timeout,
+            retries,
+            user_agent,
+            max_depth,
+            include_regex,
+            exclude_regex,
+            limit,
+            dry_run,
+            no_resume,
+            force,
+            manifest_out,
+            generate_slurm,
+            submit_slurm,
+            slurm_jobs,
+            slurm_script_dir,
+            slurm_job_name,
+            slurm_time,
+            slurm_mem,
+            slurm_cpus_per_task,
+            slurm_partition,
+            slurm_account,
+            slurm_qos,
+            slurm_constraint,
+            sbatch_args,
+            sbatch_binary,
+            curl_binary,
+            ftp_tls,
+            ftp_insecure_tls,
+            ftp_ca_cert,
+            ftp_ipv4,
+            ftp_disable_epsv,
+            ftp_listing,
+            ftp_listing_jobs,
+            ftp_listing_interval_ms,
+            ftp_retry_backoff_seconds,
+        } => {
+            let source_label = source
+                .as_deref()
+                .map(str::to_owned)
+                .or_else(|| {
+                    source_list
+                        .as_ref()
+                        .map(|path| format!("@{}", path.display()))
+                })
+                .unwrap_or_else(|| "<missing>".to_owned());
+            log::info!(
+                "command=transfer source={} destination={} dry_run={} generate_slurm={} submit_slurm={}",
+                source_label,
+                destination.display(),
+                dry_run,
+                generate_slurm,
+                submit_slurm
+            );
+            let slurm = (generate_slurm || submit_slurm).then(|| SlurmOptions {
+                submit: submit_slurm,
+                jobs: slurm_jobs,
+                script_dir: slurm_script_dir,
+                job_name: slurm_job_name,
+                time: slurm_time,
+                mem: slurm_mem,
+                cpus_per_task: slurm_cpus_per_task,
+                partition: slurm_partition,
+                account: slurm_account,
+                qos: slurm_qos,
+                constraint: slurm_constraint,
+                sbatch_args,
+                sbatch_binary,
+                curl_binary: curl_binary.clone(),
+            });
+            let summary = transfer(TransferOptions {
+                source,
+                source_list,
+                destination_dir: destination,
+                jobs,
+                metadata_jobs,
+                metadata_timeout_seconds: metadata_timeout,
+                retries,
+                user_agent,
+                max_depth,
+                include_regex,
+                exclude_regex,
+                limit,
+                resume: !no_resume,
+                force,
+                dry_run,
+                manifest_out,
+                curl_binary: curl_binary.clone(),
+                ftp_tls_mode: ftp_tls,
+                ftp_insecure_tls,
+                ftp_ca_cert,
+                ftp_force_ipv4: ftp_ipv4,
+                ftp_disable_epsv,
+                ftp_listing_mode: ftp_listing,
+                ftp_listing_jobs,
+                ftp_listing_interval_ms,
+                ftp_retry_backoff_seconds,
+                slurm,
+                progress,
+            })
+            .await?;
+            println!("{}", serde_json::to_string_pretty(&summary)?);
+        }
         Command::Snapshot {
             output,
             api_base,

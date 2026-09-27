@@ -1,4 +1,29 @@
 
+## 2026-09-21 transfer v0.5 MassIVE connection pacing and backoff
+
+- Separate FTP recursive-directory concurrency from general metadata concurrency with `--ftp-listing-jobs` (default 1).
+- Add a global minimum spacing between FTP directory-list connection attempts with `--ftp-listing-interval-ms` (default 750 ms).
+- Replace curl-internal listing retry bursts with Rust-managed exponential backoff plus deterministic jitter for transient curl exits 7, 28, and 56.
+- Add `--ftp-retry-backoff-seconds` (default 5 s) for tuning the transient-listing backoff base.
+- In `--ftp-listing auto`, do not immediately fall back from MLSD to LIST after exhausted transient network failures; LIST cannot repair a refused/throttled control connection and would only double the connection burst.
+- Keep actual file-transfer parallelism (`--jobs` / Slurm shards) independent from conservative FTP discovery pacing.
+- Bump transfer plan schema to `pride-scp-transfer-plan-v5`.
+## 2026-09-21 transfer v0.4 MassIVE recursive listing hardening
+
+- Prefer RFC 3659 `MLSD` for MassIVE FTPS directory enumeration, with classic `LIST` fallback.
+- Add `--ftp-listing auto|mlsd|list` for explicit control.
+- Add curl `--retry-all-errors` and a retry delay to FTP directory enumeration so transient data-channel receive failures such as curl `(56)` are retried.
+- Run recursive FTP directory listings with bounded `--metadata-jobs` concurrency instead of enumerating large MassIVE trees serially.
+- Fix MLSD parsing so `type=` and `size=` facts may appear in any RFC-valid order.
+- Preserve strict dry-run accounting: if all configured listing methods fail for any directory, planning fails instead of silently undercounting bytes.
+# Unreleased — transfer tooling
+
+- Harden MassIVE transfer transport for its current SFTPGo endpoint: `--ftp-tls auto` now requires explicit FTP-over-TLS for `massive-ftp.ucsd.edu`, and MassIVE curl operations automatically use IPv4 plus PASV compatibility. Add `--ftp-ca-cert`, explicit opt-in `--ftp-insecure-tls`, `--ftp-ipv4`, and `--ftp-disable-epsv`; propagate the same transport policy into discovery, size probes, direct downloads, and generated Slurm workers. Improve TLS-required/certificate failures so they are reported as actionable FTPS diagnostics instead of opaque curl timeouts.
+- Add `pride-scp transfer` for recursive HTTP/HTTPS staging with resume-aware dry-run byte accounting, bounded direct concurrency, manifests, regex/depth filtering, and safe path normalization.
+- Add dataset-root list input (`--source-list` / `--dataset-list`) and recursive FTP/FTPS discovery so one MassIVE FTP root represents an entire dataset rather than requiring one manifest line per file. Preserve the dataset root name (for example `MSV000098940`) as the local top-level path and use FTP listing sizes directly in the dry-run plan.
+- Recognize MassIVE ProteoSAFe dataset pages when they expose a direct FTP root, fail closed on unrecognized FTP listing formats/symbolic links, and use curl for FTP/FTPS resume-capable direct transfers.
+- Add size-balanced Slurm script generation and optional parallel `sbatch` submission, with worker-side curl resume/retry and final byte-size verification when the remote size is known.
+
 ## GT196 v19-shadow-2.5 sample-unit normalization
 
 - Preserve the accepted v19-shadow-2.4 decision policy while expanding literal biological-cell unit recognition.

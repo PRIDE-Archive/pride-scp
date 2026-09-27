@@ -795,6 +795,7 @@ dependencies = [
  "pride-scp-discovery",
  "pride-scp-index",
  "pride-scp-sdrf",
+ "pride-scp-transfer",
  "serde_json",
  "tokio",
 ]
@@ -849,6 +850,21 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
+]
+
+[[package]]
+name = "pride-scp-transfer"
+version = "0.1.12"
+dependencies = [
+ "anyhow",
+ "log",
+ "percent-encoding",
+ "regex",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tokio",
+ "url",
 ]
 
 [[package]]
