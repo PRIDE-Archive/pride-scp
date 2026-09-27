@@ -1094,39 +1094,32 @@ def normalize_bigbio_projection(
     if dia_value_changes:
         info.actions.append(f"normalized_dia_acquisition_validator_serialization:{dia_value_changes}_cells")
 
-    # Preserve every existing non-redundant template declaration.  Projection may normalize
-    # its serialization and add missing derived leaves, but it must not silently delete
-    # organism/clinical contracts already declared by the source SDRF.
+    # Existing template declarations are provenance-bearing source metadata. Preserve their
+    # columns, order, multiplicity, values, and serialization exactly. Template selection for
+    # validation is carried separately in `templates`; projection therefore has no reason to
+    # rebuild valid source declarations (Issue #999). Only append a derived leaf that is genuinely
+    # absent from every existing template cell.
     existing_template_names: set[str] = set()
-    existing_template_versions: dict[str, str] = {}
     for value in row_values_all(headers, rows, "comment[sdrf template]"):
         low = value.lower()
-        version_match = re.search(r"(?:^|;)\s*vv\s*=\s*v?(\d+\.\d+\.\d+(?:-[\w.]+)?)", value, re.I)
-        if not version_match:
-            version_match = re.search(r"\bv(\d+\.\d+\.\d+(?:-[\w.]+)?)\b", value, re.I)
         for name in KNOWN_TEMPLATE_NAMES:
             if re.search(rf"(?<![a-z0-9-]){re.escape(name)}(?![a-z0-9-])", low):
                 existing_template_names.add(name)
-                if version_match:
-                    existing_template_versions.setdefault(name, version_match.group(1))
-    desired_templates = list(dict.fromkeys([*existing_template_names, *_declared_leaf_templates(templates)]))
-    selected = set(desired_templates)
-    redundant_parents = {parent for child, parent in TEMPLATE_PARENT.items() if child in selected}
-    desired_templates = [t for t in desired_templates if t not in redundant_parents]
-    removed_templates = _remove_columns(headers, rows, "comment[sdrf template]")
-    if removed_templates:
-        info.actions.append(f"normalized_comment_sdrf_template_columns:{removed_templates}")
-    serialized_templates: list[str] = []
-    for template in desired_templates:
-        version = existing_template_versions.get(template) or TEMPLATE_VERSION_HINTS.get(template)
+
+    added_templates: list[str] = []
+    for template in _declared_leaf_templates(templates):
+        if template in existing_template_names:
+            continue
+        version = TEMPLATE_VERSION_HINTS.get(template)
         if not version:
             info.warnings.append(f"template_version_unavailable_preservation_block:{template}")
-            info.blockers.append(f"existing_template_version_unavailable:{template}")
+            info.blockers.append(f"derived_template_version_unavailable:{template}")
             continue
         _add_uniform_column(headers, rows, "comment[sdrf template]", f"{template} v{version}")
-        serialized_templates.append(template)
-    if serialized_templates:
-        info.actions.append("declared_bigbio_leaf_templates:" + ",".join(serialized_templates))
+        existing_template_names.add(template)
+        added_templates.append(template)
+    if added_templates:
+        info.actions.append("added_missing_bigbio_leaf_templates:" + ",".join(added_templates))
 
     # Human required demographics explicitly allow 'not available'. Adding that sentinel documents
     # absence of source metadata; it does not invent a biological value.
@@ -1881,11 +1874,11 @@ def self_test() -> None:
         assert projected_headers[-1].startswith("factor value[")
         assert set(row_values(projected_headers, projected_rows, "comment[sdrf version]")) == {"v1.1.0"}
         template_values = row_values_all(projected_headers, projected_rows, "comment[sdrf template]")
-        assert template_values and all(re.fullmatch(r"[\w-]+ v\d+\.\d+\.\d+(?:-[\w.]+)?", x) for x in template_values)
-        # single-cell extends ms-proteomics, so file-level metadata declares only the selected leaves.
+        # Existing template metadata is preserved verbatim; missing derived leaves are appended.
+        assert template_values.count("pride-scp-sdrf-v0.3.6") == 2
         assert "single-cell v1.0.0" in template_values
         assert "human v1.1.0" in template_values
-        assert "ms-proteomics v1.1.0" not in template_values
+        assert not any(value.startswith("ms-proteomics ") for value in template_values)
         annotation_values = row_values_all(projected_headers, projected_rows, "comment[sdrf annotation tool]")
         assert annotation_values == ["pride-scp-sdrf v0.3.6", "pride-scp-sdrf v0.3.6"]
         assert not any("pride-scp-sdrf-v" in x for x in annotation_values)
@@ -1997,11 +1990,36 @@ def self_test() -> None:
         tph, tpr, _ = normalize_bigbio_projection(
             template_source, template_projected, ["ms-proteomics", "single-cell", "vertebrates"]
         )
-        preserved_templates = set(row_values_all(tph, tpr, "comment[sdrf template]"))
-        assert "vertebrates v1.1.0" in preserved_templates
-        assert "clinical-metadata v1.1.0" in preserved_templates
-        assert "single-cell v1.0.0" in preserved_templates
-        assert not any(value.startswith("ms-proteomics ") for value in preserved_templates)
+        preserved_template_columns = column_indices(tph, "comment[sdrf template]")
+        assert len(preserved_template_columns) == 3
+        assert [tpr[0][i] for i in preserved_template_columns[:2]] == [
+            "vertebrates v1.1.0", "clinical-metadata v1.1.0"
+        ]
+        assert tpr[0][preserved_template_columns[2]] == "single-cell v1.0.0"
+
+        # Issue #999 exact regression: repeated valid NT/VV template columns, including an
+        # explicitly declared parent, must survive projection byte-for-value and position-relative
+        # to one another. No redundant-parent deletion or serialization rewrite is permitted.
+        issue999_template_source = root / "issue999_template_source.tsv"
+        issue999_template_projected = root / "issue999_template_projected.tsv"
+        issue999_values = [
+            "NT=ms-proteomics;VV=v1.1.0",
+            "NT=human;VV=v1.1.0",
+            "NT=single-cell;VV=v1.0.0",
+        ]
+        _write_sdrf(
+            issue999_template_source,
+            ["source name", "comment[sdrf template]", "comment[sdrf template]", "comment[sdrf template]"],
+            [["sample", *issue999_values]],
+        )
+        i9h, i9r, i9i = normalize_bigbio_projection(
+            issue999_template_source, issue999_template_projected,
+            ["ms-proteomics", "single-cell", "human"],
+        )
+        i9idx = column_indices(i9h, "comment[sdrf template]")
+        assert len(i9idx) == 3
+        assert [i9r[0][i] for i in i9idx] == issue999_values
+        assert not any(action.startswith("added_missing_bigbio_leaf_templates:") for action in i9i.actions)
 
         # Keep the normative source contract encoded even though the publication projection uses the
         # bare DIA superclass while the pinned validator carries issue #345.
