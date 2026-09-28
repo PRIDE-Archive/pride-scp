@@ -123,6 +123,122 @@ class SkillsCompatibilityTests(unittest.TestCase):
         self.assertIn("comment_label_pride", check.compatibility_reason)
         self.assertIn("unimod199", check.compatibility_reason)
 
+    def test_historical_hcd_pride_wrong_ontology_is_known_drift(self):
+        check = readiness.apply_known_skills_drift_override(
+            failed_check(),
+            {
+                "is_clean": False,
+                "hallucinated": [],
+                "mismatched": [],
+                "wrong_ontology": [
+                    {
+                        "column": "comment[dissociation method]",
+                        "accession": "PRIDE:0000590",
+                        "label": "HCD",
+                        "expected_ontologies": ["MS"],
+                        "actual_ontology": "PRIDE",
+                    }
+                ],
+                "unimod_swaps": [],
+            },
+        )
+        self.assertTrue(check.passed)
+        self.assertIn("historical_hcd_pride", check.compatibility_reason)
+
+    def test_astral_stale_ols_label_is_known_exact_drift(self):
+        check = readiness.apply_known_skills_drift_override(
+            failed_check(),
+            {
+                "is_clean": False,
+                "hallucinated": [],
+                "mismatched": [
+                    {
+                        "column": "comment[instrument]",
+                        "accession": "MS:1003771",
+                        "actual_label": "quadrupole orbitrap astral instrument",
+                        "expected_label": "quadrupole orbitrap astral",
+                        "message": "Label mismatch",
+                    }
+                ],
+                "wrong_ontology": [],
+                "unimod_swaps": [],
+            },
+        )
+        self.assertTrue(check.passed)
+        self.assertIn("ms1003771", check.compatibility_reason)
+
+    def test_astral_reverse_direction_is_never_waived(self):
+        check = readiness.apply_known_skills_drift_override(
+            failed_check(),
+            {
+                "is_clean": False,
+                "hallucinated": [],
+                "mismatched": [
+                    {
+                        "column": "comment[instrument]",
+                        "accession": "MS:1003771",
+                        "actual_label": "quadrupole orbitrap astral",
+                        "expected_label": "quadrupole orbitrap astral instrument",
+                    }
+                ],
+                "wrong_ontology": [],
+                "unimod_swaps": [],
+            },
+        )
+        self.assertFalse(check.passed)
+        self.assertFalse(check.compatibility_override)
+
+    def test_unknown_label_mismatch_is_never_waived(self):
+        check = readiness.apply_known_skills_drift_override(
+            failed_check(),
+            {
+                "is_clean": False,
+                "hallucinated": [],
+                "mismatched": [
+                    {
+                        "column": "comment[instrument]",
+                        "accession": "MS:9999999",
+                        "actual_label": "wrong",
+                        "expected_label": "right",
+                    }
+                ],
+                "wrong_ontology": [],
+                "unimod_swaps": [],
+            },
+        )
+        self.assertFalse(check.passed)
+        self.assertFalse(check.compatibility_override)
+
+    def test_bigbio2_combined_known_issues_are_waived_only_together(self):
+        check = readiness.apply_known_skills_drift_override(
+            failed_check(),
+            {
+                "is_clean": False,
+                "hallucinated": [],
+                "mismatched": [
+                    {
+                        "column": "comment[instrument]",
+                        "accession": "MS:1003771",
+                        "actual_label": "quadrupole orbitrap astral instrument",
+                        "expected_label": "quadrupole orbitrap astral",
+                    }
+                ],
+                "wrong_ontology": [
+                    {
+                        "column": "comment[dissociation method]",
+                        "accession": "PRIDE:0000590",
+                        "label": "HCD",
+                        "expected_ontologies": ["MS"],
+                        "actual_ontology": "PRIDE",
+                    }
+                ],
+                "unimod_swaps": [],
+            },
+        )
+        self.assertTrue(check.passed)
+        self.assertIn("ms1003771", check.compatibility_reason)
+        self.assertIn("historical_hcd_pride", check.compatibility_reason)
+
     def test_hallucination_is_never_waived(self):
         check = readiness.apply_known_skills_drift_override(
             failed_check(),
