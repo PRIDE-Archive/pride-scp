@@ -522,12 +522,28 @@ def parse_tabular_rows(data: bytes, name: str) -> tuple[list[str], list[dict[str
         dialect = csv.Sniffer().sniff(sample, delimiters="\t,;")
     except Exception:
         dialect = csv.excel_tab if "\t" in sample else csv.excel
-    reader = csv.DictReader(io.StringIO(text), dialect=dialect)
-    fields = [norm(x) for x in (reader.fieldnames or []) if norm(x)]
-    rows: list[dict[str, str]] = []
-    for i, row in enumerate(reader):
-        if i >= 5000: break
-        rows.append({norm(k): norm(v) for k, v in row.items() if k is not None})
+
+    # CSV inputs recovered from public repositories and supplementary archives may use bare CR
+    # line endings.  StringIO's default newline handling can make Python's csv reader treat those
+    # records as embedded newlines and raise ``_csv.Error``.  Preserve physical line endings just
+    # as ``open(..., newline="")`` does for a normal CSV file.  Any remaining malformed tabular
+    # input fails closed for join extraction: it contributes no row/sample/channel mapping rather
+    # than aborting the entire accession cohort.
+    try:
+        reader = csv.DictReader(io.StringIO(text, newline=""), dialect=dialect)
+        fields = [norm(x) for x in (reader.fieldnames or []) if norm(x)]
+        rows: list[dict[str, str]] = []
+        for i, row in enumerate(reader):
+            if i >= 5000:
+                break
+            rows.append({norm(k): norm(v) for k, v in row.items() if k is not None})
+    except csv.Error as exc:
+        print(
+            f"WARNING: skipping malformed external tabular join source {name!r}: "
+            f"{type(exc).__name__}: {exc}",
+            file=sys.stderr,
+        )
+        return [], []
     return fields, rows
 
 
@@ -978,6 +994,13 @@ def self_test() -> None:
     joins = parse_join_evidence(a,"input.tsv","fixture",data,["run_A.raw","run-B.RAW"])
     assert {j.repository_raw for j in joins} == {"run_A.raw","run-B.RAW"}
     assert all(j.join_confidence == "high" for j in joins)
+
+    # Public/supplementary tabular files may use bare carriage-return line endings.  These must be
+    # parsed as records rather than crashing the full evidence-graph cohort.
+    cr_data = b"Raw file\tChannel\tCell\rrun_C.raw\tTMT128N\tcell_3\r"
+    cr_joins = parse_join_evidence(a,"legacy-cr.tsv","fixture",cr_data,["run_C.raw"])
+    assert len(cr_joins) == 1 and cr_joins[0].repository_raw == "run_C.raw", cr_joins
+    assert cr_joins[0].channels == ["128N"], cr_joins
 
     # Branch membership depends on evidence features, not accession identity.
     b = next(x for x in branches if x.modality.startswith("reporter_multiplexed"))

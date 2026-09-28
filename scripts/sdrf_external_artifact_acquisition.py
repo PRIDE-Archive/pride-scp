@@ -157,6 +157,43 @@ def _stream_download(session: Any, url: str, target: Path, max_bytes: int, timeo
         return False, url, 0, f"download_error:{type(exc).__name__}:{exc}"
 
 
+def _cached_artifacts(
+    provider: str, source_url: str, dest: Path, max_files: int, max_bytes: int,
+) -> list[AcquiredArtifact]:
+    """Reuse previously materialized bytes for this source-specific destination.
+
+    The generalized evidence graph creates ``dest`` from a hash of the discovered source URL, so
+    files below ``dest/provider`` are scoped to that exact external source.  Reusing them makes
+    failed cohort runs resumable without changing evidence provenance or performing new inference.
+    """
+    root = dest / provider
+    if not root.is_dir():
+        return []
+    ranked: list[tuple[int, int, str, Path]] = []
+    for path in root.rglob("*"):
+        if not path.is_file():
+            continue
+        try:
+            size = path.stat().st_size
+        except OSError:
+            continue
+        score, _ = _score_name(path.name)
+        if score <= 0 or size <= 0 or size > max_bytes:
+            continue
+        ranked.append((score, size, str(path.relative_to(root)).lower(), path))
+    ranked.sort(key=lambda x: (-x[0], x[1], x[2]))
+    out: list[AcquiredArtifact] = []
+    for _, size, _, path in ranked[:max_files]:
+        try:
+            sha = hashlib.sha256(path.read_bytes()).hexdigest()
+        except OSError:
+            continue
+        out.append(AcquiredArtifact(
+            provider, source_url, source_url, path.name, str(path), size, sha, "cached",
+        ))
+    return out
+
+
 def _download_selected(
     *, provider: str, source_url: str, rows: list[dict[str, Any]], dest: Path, max_files: int,
     max_bytes: int, session: Any,
@@ -340,6 +377,9 @@ def acquire_external_artifacts(
     max_archive_bytes: int, session: Any | None = None,
 ) -> list[AcquiredArtifact]:
     """Materialize parser-relevant artifacts for one already-discovered public source."""
+    cached = _cached_artifacts(source_type, source_url, dest, max_files, max_bytes)
+    if cached:
+        return cached
     if session is None:
         import requests
         session = requests.Session()
@@ -410,6 +450,21 @@ def self_test() -> None:
         def iter_content(self, chunk_size: int) -> Iterable[bytes]:
             if self.content:
                 yield self.content
+
+    # Source-scoped cached bytes are reused without touching the network.
+    class NoNetworkSession:
+        def get(self, *args: Any, **kwargs: Any) -> Any:
+            raise AssertionError("network should not be used for cached external artifacts")
+    with tempfile.TemporaryDirectory() as td:
+        cached = Path(td) / "zenodo" / "sample_design.tsv"
+        cached.parent.mkdir(parents=True)
+        cached.write_bytes(b"sample\tchannel\nA\t126\n")
+        got = acquire_external_artifacts(
+            source_type="zenodo", source_url="https://zenodo.org/records/998877",
+            dest=Path(td), max_files=4, max_bytes=100000, max_archive_bytes=100000,
+            session=NoNetworkSession(),
+        )
+        assert len(got) == 1 and got[0].status == "cached" and got[0].sha256
 
     class ProviderSession:
         def get(self, url: str, *args: Any, **kwargs: Any) -> JsonResponse:
