@@ -672,20 +672,13 @@ def _is_dia_acquisition(value: str) -> bool:
 
 
 def _normalize_dia_acquisition_value(value: str) -> str:
-    """Return the publication-compatible serialization for an already explicit DIA method.
+    """Preserve an existing explicit DIA serialization verbatim apart from whitespace.
 
-    The pinned dia-acquisition template in sdrf-pipelines 0.1.5/0.1.6 accepts only the bare
-    ``Data-independent acquisition`` literal (issue #345). The source candidate is immutable, so the
-    compatibility derivative may safely collapse known DIA spellings to that accepted superclass
-    representation without inventing acquisition mode. DDA/PRM/other methods are never converted.
+    Rich ``NT=...;AC=...`` source annotations must not be collapsed merely to satisfy a
+    validator compatibility gap.  The readiness runner already has a bounded issue-#345
+    compatibility override for valid DIA terms, so information preservation wins here.
     """
-    text = norm_value(value)
-    key = _contract_key(text)
-    if key == "nt=data-independent acquisition;ac=pride:0000628":
-        return DIA_VALIDATOR_COMPATIBLE_VALUE
-    if key in DIA_SPEC_ALLOWED_VALUES:
-        return DIA_VALIDATOR_COMPATIBLE_VALUE
-    return text
+    return norm_value(value)
 
 
 def _normalize_sample_type_validator_value(value: str) -> str:
@@ -723,16 +716,11 @@ def _normalize_reserved_word(value: str) -> str:
 
 
 def _normalize_dissociation_method_value(value: str) -> str:
+    """Preserve ontology-bearing dissociation terms; normalize only bare HCD synonyms."""
     text = norm_value(value)
-    low = text.lower()
-    if low in HCD_KNOWN_LABELS:
-        return "HCD"
-    match = re.fullmatch(r"nt\s*=\s*(?P<name>[^;]+);\s*ac\s*=\s*(?P<accession>[^;]+)", text, re.I)
-    if not match:
+    if ";" in text or "AC=" in text.upper():
         return text
-    name = norm_value(match.group("name")).lower()
-    accession = norm_value(match.group("accession")).lower()
-    if name in HCD_KNOWN_LABELS and accession in HCD_KNOWN_ACCESSIONS:
+    if text.lower() in HCD_KNOWN_LABELS:
         return "HCD"
     return text
 
@@ -1106,19 +1094,32 @@ def normalize_bigbio_projection(
     if dia_value_changes:
         info.actions.append(f"normalized_dia_acquisition_validator_serialization:{dia_value_changes}_cells")
 
-    # Replace stale PRIDE_SCP/internal template metadata with valid BigBio template declarations.
-    removed_templates = _remove_columns(headers, rows, "comment[sdrf template]")
-    if removed_templates:
-        info.actions.append(f"replaced_legacy_comment_sdrf_template_columns:{removed_templates}")
-    declared_templates = _declared_leaf_templates(templates)
-    for template in declared_templates:
+    # Existing template declarations are provenance-bearing source metadata. Preserve their
+    # columns, order, multiplicity, values, and serialization exactly. Template selection for
+    # validation is carried separately in `templates`; projection therefore has no reason to
+    # rebuild valid source declarations (Issue #999). Only append a derived leaf that is genuinely
+    # absent from every existing template cell.
+    existing_template_names: set[str] = set()
+    for value in row_values_all(headers, rows, "comment[sdrf template]"):
+        low = value.lower()
+        for name in KNOWN_TEMPLATE_NAMES:
+            if re.search(rf"(?<![a-z0-9-]){re.escape(name)}(?![a-z0-9-])", low):
+                existing_template_names.add(name)
+
+    added_templates: list[str] = []
+    for template in _declared_leaf_templates(templates):
+        if template in existing_template_names:
+            continue
         version = TEMPLATE_VERSION_HINTS.get(template)
         if not version:
-            info.warnings.append(f"template_version_hint_unavailable:{template}")
+            info.warnings.append(f"template_version_unavailable_preservation_block:{template}")
+            info.blockers.append(f"derived_template_version_unavailable:{template}")
             continue
         _add_uniform_column(headers, rows, "comment[sdrf template]", f"{template} v{version}")
-    if declared_templates:
-        info.actions.append("declared_bigbio_leaf_templates:" + ",".join(declared_templates))
+        existing_template_names.add(template)
+        added_templates.append(template)
+    if added_templates:
+        info.actions.append("added_missing_bigbio_leaf_templates:" + ",".join(added_templates))
 
     # Human required demographics explicitly allow 'not available'. Adding that sentinel documents
     # absence of source metadata; it does not invent a biological value.
@@ -1335,9 +1336,6 @@ def _known_skills_mismatch(issue: dict[str, Any]) -> str | None:
     actual = str(issue.get("actual_label", "")).strip().lower()
     expected = str(issue.get("expected_label", "")).strip().lower()
 
-    # PSI-MS MS:1003771 is canonically "quadrupole orbitrap astral" in the
-    # maintained SDRF. Frozen OLS state used by sdrf-skills returns the older
-    # "... instrument" label. Waive only this exact directional mismatch.
     if (
         column == "comment[instrument]"
         and accession == "MS:1003771"
@@ -1370,8 +1368,8 @@ def apply_known_skills_drift_override(
 ) -> CommandResult:
     """Waive only exact, standards-backed sdrf-skills checker defects.
 
-    This function never mutates SDRF bytes and never waives hallucinations or unknown label mismatches.
-    Every reported mismatch, wrong-ontology, or UNIMOD-swap issue must match a documented generic signature.
+    This function never mutates SDRF bytes and never waives hallucinations or true label mismatches.
+    Every reported wrong-ontology or UNIMOD-swap issue must match a documented generic signature.
     """
     if check.passed or not diagnostic:
         return check
@@ -1919,11 +1917,11 @@ def self_test() -> None:
         assert projected_headers[-1].startswith("factor value[")
         assert set(row_values(projected_headers, projected_rows, "comment[sdrf version]")) == {"v1.1.0"}
         template_values = row_values_all(projected_headers, projected_rows, "comment[sdrf template]")
-        assert template_values and all(re.fullmatch(r"[\w-]+ v\d+\.\d+\.\d+(?:-[\w.]+)?", x) for x in template_values)
-        # single-cell extends ms-proteomics, so file-level metadata declares only the selected leaves.
+        # Existing template metadata is preserved verbatim; missing derived leaves are appended.
+        assert template_values.count("pride-scp-sdrf-v0.3.6") == 2
         assert "single-cell v1.0.0" in template_values
         assert "human v1.1.0" in template_values
-        assert "ms-proteomics v1.1.0" not in template_values
+        assert not any(value.startswith("ms-proteomics ") for value in template_values)
         annotation_values = row_values_all(projected_headers, projected_rows, "comment[sdrf annotation tool]")
         assert annotation_values == ["pride-scp-sdrf v0.3.6", "pride-scp-sdrf v0.3.6"]
         assert not any("pride-scp-sdrf-v" in x for x in annotation_values)
@@ -2014,15 +2012,57 @@ def self_test() -> None:
         assert "dia-acquisition" in derive_templates(mixed_acquisition_headers, mixed_acquisition_rows, ["dia-acquisition"])
         assert (
             _normalize_dia_acquisition_value("NT=Data-independent acquisition;AC=PRIDE:0000628")
-            == "Data-independent acquisition"
+            == "NT=Data-independent acquisition;AC=PRIDE:0000628"
         )
         assert (
             _normalize_dia_acquisition_value("NT=Data-independent acquisition;AC=PRIDE:0000450")
-            == "Data-independent acquisition"
+            == "NT=Data-independent acquisition;AC=PRIDE:0000450"
         )
-        assert _normalize_dia_acquisition_value("NT=diaPASEF;AC=PRIDE:0000650") == "Data-independent acquisition"
-        assert _normalize_dia_acquisition_value("NT=SWATH MS;AC=PRIDE:0000447") == "Data-independent acquisition"
+        assert _normalize_dia_acquisition_value("NT=diaPASEF;AC=PRIDE:0000650") == "NT=diaPASEF;AC=PRIDE:0000650"
+        assert _normalize_dia_acquisition_value("NT=SWATH MS;AC=PRIDE:0000447") == "NT=SWATH MS;AC=PRIDE:0000447"
         assert _normalize_dia_acquisition_value("Data-dependent acquisition") == "Data-dependent acquisition"
+
+        # Issue #999: preservation projection must retain independent organism/clinical templates.
+        template_source = root / "template_preservation_source.tsv"
+        template_projected = root / "template_preservation_projected.tsv"
+        _write_sdrf(
+            template_source,
+            ["source name", "comment[sdrf template]", "comment[sdrf template]"],
+            [["sample", "vertebrates v1.1.0", "clinical-metadata v1.1.0"]],
+        )
+        tph, tpr, _ = normalize_bigbio_projection(
+            template_source, template_projected, ["ms-proteomics", "single-cell", "vertebrates"]
+        )
+        preserved_template_columns = column_indices(tph, "comment[sdrf template]")
+        assert len(preserved_template_columns) == 3
+        assert [tpr[0][i] for i in preserved_template_columns[:2]] == [
+            "vertebrates v1.1.0", "clinical-metadata v1.1.0"
+        ]
+        assert tpr[0][preserved_template_columns[2]] == "single-cell v1.0.0"
+
+        # Issue #999 exact regression: repeated valid NT/VV template columns, including an
+        # explicitly declared parent, must survive projection byte-for-value and position-relative
+        # to one another. No redundant-parent deletion or serialization rewrite is permitted.
+        issue999_template_source = root / "issue999_template_source.tsv"
+        issue999_template_projected = root / "issue999_template_projected.tsv"
+        issue999_values = [
+            "NT=ms-proteomics;VV=v1.1.0",
+            "NT=human;VV=v1.1.0",
+            "NT=single-cell;VV=v1.0.0",
+        ]
+        _write_sdrf(
+            issue999_template_source,
+            ["source name", "comment[sdrf template]", "comment[sdrf template]", "comment[sdrf template]"],
+            [["sample", *issue999_values]],
+        )
+        i9h, i9r, i9i = normalize_bigbio_projection(
+            issue999_template_source, issue999_template_projected,
+            ["ms-proteomics", "single-cell", "human"],
+        )
+        i9idx = column_indices(i9h, "comment[sdrf template]")
+        assert len(i9idx) == 3
+        assert [i9r[0][i] for i in i9idx] == issue999_values
+        assert not any(action.startswith("added_missing_bigbio_leaf_templates:") for action in i9i.actions)
 
         # Keep the normative source contract encoded even though the publication projection uses the
         # bare DIA superclass while the pinned validator carries issue #345.
@@ -2093,21 +2133,21 @@ def self_test() -> None:
             ["ms-proteomics", "single-cell", "dia-acquisition", "human"],
         )
         cidx = {name: i for i, name in enumerate(ch)}
-        assert all(row[cidx["comment[proteomics data acquisition method]"]] == "Data-independent acquisition" for row in cr)
+        assert all(row[cidx["comment[proteomics data acquisition method]"]] == "NT=Data-independent acquisition;AC=PRIDE:0000450" for row in cr)
         assert cr[0][cidx["characteristics[individual]"]] == "not applicable"
         assert cr[0][cidx["characteristics[cell type]"]] == "not applicable"
         assert cr[0][cidx["characteristics[cell line]"]] == "not applicable"
         assert cr[0][cidx["characteristics[material type]"]] == "not applicable"
         assert cr[0][cidx["characteristics[organism part]"]] == "pancreas"
         assert cr[1][cidx["characteristics[sample type]"]] == "not available"
-        assert any(x.startswith("normalized_dia_acquisition_validator_serialization:2") for x in ci.actions)
+        assert not any(x.startswith("normalized_dia_acquisition_validator_serialization:") for x in ci.actions)
 
         # Stable representation-only normalizations directly encoded by SDRF 1.1.
         assert _normalize_reserved_word("Not Available") == "not available"
         assert _normalize_reserved_word("Tumor") == "Tumor"
         assert _normalize_dissociation_method_value("higher energy beam-type collision-induced dissociation") == "HCD"
-        assert _normalize_dissociation_method_value("NT=beam-type collision-induced dissociation;AC=MS:1000422") == "HCD"
-        assert _normalize_dissociation_method_value("NT=HCD;AC=PRIDE:0000590") == "HCD"
+        assert _normalize_dissociation_method_value("NT=beam-type collision-induced dissociation;AC=MS:1000422") == "NT=beam-type collision-induced dissociation;AC=MS:1000422"
+        assert _normalize_dissociation_method_value("NT=HCD;AC=PRIDE:0000590") == "NT=HCD;AC=PRIDE:0000590"
         assert _normalize_dissociation_method_value("ETD") == "ETD"
 
         # Multiple non-identical candidates are fail-closed.
