@@ -12,9 +12,10 @@ use pride_scp_index::{
     DEFAULT_PROJECT_PAGE_SIZE, DEFAULT_PROTEOMECENTRAL_PROXI_API, DEFAULT_REGISTRY_PAGE_SIZE,
 };
 use pride_scp_sdrf::{
-    annotate_sdrf, audit_sdrf_sources, resolve_sdrf_sources, run_scientific_sdrf_agent,
-    SdrfAnnotateOptions, SdrfAuditOptions, SdrfResolveOptions, SdrfScientificAgentOptions,
-    DEFAULT_OLLAMA_URL as DEFAULT_SDRF_OLLAMA_URL,
+    acquire_sdrf_evidence, annotate_sdrf, audit_sdrf_sources, resolve_sdrf_sources,
+    run_scientific_sdrf_agent, SdrfAcquireEvidenceOptions, SdrfAnnotateOptions, SdrfAuditOptions,
+    SdrfResolveOptions, SdrfScientificAgentOptions, DEFAULT_OLLAMA_URL as DEFAULT_SDRF_OLLAMA_URL,
+    DEFAULT_PRIDE_V2_API as DEFAULT_SDRF_PRIDE_V2_API,
 };
 use pride_scp_transfer::{transfer, SlurmOptions, TransferOptions};
 use std::path::PathBuf;
@@ -358,6 +359,30 @@ enum Command {
         #[arg(long)]
         force: bool,
     },
+    /// Execute blocker-directed PRIDE evidence acquisition tasks from the SDRF harness.
+    /// Community-annotated SDRFs are recorded separately and are never promoted to depositor evidence.
+    SdrfAcquireEvidence {
+        /// `evidence_acquisition_plan.tsv` produced by the SDRF annotation harness.
+        #[arg(long)]
+        acquisition_plan: PathBuf,
+        /// Output directory for acquisition attempts, provenance manifest, and downloaded candidates.
+        #[arg(long, default_value = "data/sdrf_evidence_acquisition")]
+        output: PathBuf,
+        /// PRIDE Archive v2 API base used for project file inventories.
+        #[arg(long, default_value = DEFAULT_SDRF_PRIDE_V2_API)]
+        api_base: String,
+        /// Request timeout in seconds.
+        #[arg(long, default_value_t = 120)]
+        timeout: u64,
+        /// Maximum non-community SDRF candidates downloaded for one accession.
+        #[arg(long, default_value_t = 4)]
+        max_candidates_per_accession: usize,
+        /// Re-download already materialized provider artifacts.
+        #[arg(long)]
+        force: bool,
+    },
+    /// Execute blocker-directed PRIDE evidence acquisition tasks from the SDRF harness.
+    /// Community-annotated SDRFs are recorded separately and are never promoted to depositor evidence.
     /// Deterministically audit already-resolved SDRFs without invoking Ollama.
     /// Reports validator errors/warnings and target fields that would still need enrichment.
     SdrfAudit {
@@ -542,7 +567,11 @@ async fn main() -> Result<()> {
             let source_label = source
                 .as_deref()
                 .map(str::to_owned)
-                .or_else(|| source_list.as_ref().map(|path| format!("@{}", path.display())))
+                .or_else(|| {
+                    source_list
+                        .as_ref()
+                        .map(|path| format!("@{}", path.display()))
+                })
                 .unwrap_or_else(|| "<missing>".to_owned());
             log::info!(
                 "command=transfer source={} destination={} dry_run={} generate_slurm={} submit_slurm={}",
@@ -820,6 +849,32 @@ async fn main() -> Result<()> {
                 accessions,
                 accessions_file,
                 timeout_seconds: timeout,
+                force,
+                progress,
+            })
+            .await?;
+            println!("{}", serde_json::to_string_pretty(&summary)?);
+        }
+        Command::SdrfAcquireEvidence {
+            acquisition_plan,
+            output,
+            api_base,
+            timeout,
+            max_candidates_per_accession,
+            force,
+        } => {
+            log::info!(
+                "command=sdrf-acquire-evidence plan={} output={} api={}",
+                acquisition_plan.display(),
+                output.display(),
+                api_base
+            );
+            let summary = acquire_sdrf_evidence(SdrfAcquireEvidenceOptions {
+                acquisition_plan,
+                output_dir: output,
+                api_base,
+                timeout_seconds: timeout,
+                max_candidates_per_accession,
                 force,
                 progress,
             })

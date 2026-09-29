@@ -150,7 +150,10 @@ pub async fn transfer(options: TransferOptions) -> Result<TransferSummary> {
         .context("build HTTP transfer client")?;
 
     if options.progress {
-        log::info!("discovering transfer source {}", transfer_source_label(&options));
+        log::info!(
+            "discovering transfer source {}",
+            transfer_source_label(&options)
+        );
     }
     let (discovered_count, mut files) = discover_files(&client, &options).await?;
     files.sort_by(|a, b| a.relative_path.cmp(&b.relative_path));
@@ -166,7 +169,8 @@ pub async fn transfer(options: TransferOptions) -> Result<TransferSummary> {
         );
     }
     let mut plan = build_plan(&client, &options, files).await?;
-    plan.files.sort_by(|a, b| a.relative_path.cmp(&b.relative_path));
+    plan.files
+        .sort_by(|a, b| a.relative_path.cmp(&b.relative_path));
 
     if !options.dry_run && !options.force {
         if let Some(item) = plan.files.iter().find(|item| {
@@ -217,7 +221,11 @@ pub async fn transfer(options: TransferOptions) -> Result<TransferSummary> {
     }
 
     let known_remote_bytes = plan.files.iter().filter_map(|f| f.remote_bytes).sum();
-    let unknown_remote_size_files = plan.files.iter().filter(|f| f.remote_bytes.is_none()).count();
+    let unknown_remote_size_files = plan
+        .files
+        .iter()
+        .filter(|f| f.remote_bytes.is_none())
+        .count();
     let existing_local_bytes = plan.files.iter().map(|f| f.local_bytes).sum();
     let known_bytes_to_transfer = plan.files.iter().filter_map(|f| f.bytes_remaining).sum();
     let already_complete_files = plan.files.iter().filter(|f| f.complete).count();
@@ -322,7 +330,8 @@ fn validate_options(options: &TransferOptions) -> Result<()> {
 }
 
 fn validate_source_url(source: &str) -> Result<Url> {
-    let parsed = Url::parse(source).with_context(|| format!("invalid transfer source URL: {source}"))?;
+    let parsed =
+        Url::parse(source).with_context(|| format!("invalid transfer source URL: {source}"))?;
     if !matches!(parsed.scheme(), "http" | "https" | "ftp" | "ftps") {
         bail!("transfer sources support http://, https://, ftp:// and ftps:// URLs");
     }
@@ -354,9 +363,7 @@ async fn discover_files(
     for source_text in sources {
         let source = validate_source_url(&source_text)?;
         let (source_count, source_files) = match source.scheme() {
-            "ftp" | "ftps" => {
-                discover_ftp_files(options, source, &include, &exclude).await?
-            }
+            "ftp" | "ftps" => discover_ftp_files(options, source, &include, &exclude).await?,
             "http" | "https" if is_massive_dataset_page(&source) => {
                 let ftp_root = resolve_massive_ftp_root(
                     client,
@@ -372,7 +379,8 @@ async fn discover_files(
             }
             "http" | "https" => {
                 let prefix = prefix_http_sources.then(|| source_prefix_from_url(&source));
-                discover_http_files(client, options, source_text, prefix, &include, &exclude).await?
+                discover_http_files(client, options, source_text, prefix, &include, &exclude)
+                    .await?
             }
             _ => unreachable!("source scheme validated above"),
         };
@@ -409,14 +417,22 @@ async fn load_sources(options: &TransferOptions) -> Result<Vec<String>> {
         if source.is_empty() || source.starts_with('#') {
             continue;
         }
-        validate_source_url(source)
-            .with_context(|| format!("invalid source-list entry at {}:{}", path.display(), index + 1))?;
+        validate_source_url(source).with_context(|| {
+            format!(
+                "invalid source-list entry at {}:{}",
+                path.display(),
+                index + 1
+            )
+        })?;
         if seen.insert(source.to_owned()) {
             sources.push(source.to_owned());
         }
     }
     if sources.is_empty() {
-        bail!("source list {} contains no transfer sources", path.display());
+        bail!(
+            "source list {} contains no transfer sources",
+            path.display()
+        );
     }
     Ok(sources)
 }
@@ -425,7 +441,12 @@ fn transfer_source_label(options: &TransferOptions) -> String {
     options
         .source
         .clone()
-        .or_else(|| options.source_list.as_ref().map(|path| format!("@{}", path.display())))
+        .or_else(|| {
+            options
+                .source_list
+                .as_ref()
+                .map(|path| format!("@{}", path.display()))
+        })
         .unwrap_or_else(|| "<missing>".to_owned())
 }
 
@@ -446,7 +467,8 @@ async fn discover_http_files(
     .await?;
 
     if !source.path().ends_with('/') {
-        let relative_path = prefixed_path(relative_prefix.as_deref(), &file_name_from_url(&source)?);
+        let relative_path =
+            prefixed_path(relative_prefix.as_deref(), &file_name_from_url(&source)?);
         if selected(&relative_path, include, exclude) {
             return Ok((
                 1,
@@ -513,7 +535,10 @@ async fn discover_http_files(
                     continue;
                 }
                 let next_depth = depth + 1;
-                if options.max_depth.map_or(true, |max_depth| next_depth <= max_depth) {
+                if options
+                    .max_depth
+                    .map_or(true, |max_depth| next_depth <= max_depth)
+                {
                     queue.push_back((link, next_depth));
                 }
                 continue;
@@ -551,10 +576,8 @@ async fn resolve_massive_ftp_root(
     let html = get_text_with_retry(client, dataset_page.clone(), timeout_seconds, retries)
         .await
         .with_context(|| format!("read MassIVE dataset page {dataset_page}"))?;
-    let ftp_re = Regex::new(
-        r#"(?i)ftps?://massive-ftp\.ucsd\.edu/[A-Za-z0-9._~%/+-]*/MSV\d{9}/?"#,
-    )
-    .expect("MassIVE FTP URL regex");
+    let ftp_re = Regex::new(r#"(?i)ftps?://massive-ftp\.ucsd\.edu/[A-Za-z0-9._~%/+-]*/MSV\d{9}/?"#)
+        .expect("MassIVE FTP URL regex");
     if let Some(found) = ftp_re.find(&html) {
         let mut text = found.as_str().to_owned();
         if !text.ends_with('/') {
@@ -877,9 +900,8 @@ async fn ftp_list_directory(
             let listing = match String::from_utf8(output.stdout) {
                 Ok(listing) => listing,
                 Err(error) => {
-                    method_failure = Some(format!(
-                        "{method}: directory listing is not UTF-8: {error}"
-                    ));
+                    method_failure =
+                        Some(format!("{method}: directory listing is not UTF-8: {error}"));
                     break;
                 }
             };
@@ -950,12 +972,9 @@ fn ftp_listing_retry_delay(
 }
 
 fn parse_ftp_listing(listing: &str) -> Result<Vec<FtpEntry>> {
-    let unix_re = Regex::new(
-        r"^([bcdlps-]\S*)\s+\d+\s+\S+\s+\S+\s+(\d+)\s+\S+\s+\S+\s+\S+\s+(.+)$",
-    )?;
-    let dos_re = Regex::new(
-        r"^\d{2}-\d{2}-\d{2,4}\s+\d{2}:\d{2}(?:AM|PM)\s+(<DIR>|\d+)\s+(.+)$",
-    )?;
+    let unix_re =
+        Regex::new(r"^([bcdlps-]\S*)\s+\d+\s+\S+\s+\S+\s+(\d+)\s+\S+\s+\S+\s+\S+\s+(.+)$")?;
+    let dos_re = Regex::new(r"^\d{2}-\d{2}-\d{2,4}\s+\d{2}:\d{2}(?:AM|PM)\s+(<DIR>|\d+)\s+(.+)$")?;
     let mut entries = Vec::new();
     let mut unparsed = Vec::new();
 
@@ -982,8 +1001,16 @@ fn parse_ftp_listing(listing: &str) -> Result<Vec<FtpEntry>> {
                 }
                 if let Some(kind) = kind.as_deref() {
                     match kind {
-                        "dir" => entries.push(FtpEntry { name, is_dir: true, size: None }),
-                        "file" => entries.push(FtpEntry { name, is_dir: false, size }),
+                        "dir" => entries.push(FtpEntry {
+                            name,
+                            is_dir: true,
+                            size: None,
+                        }),
+                        "file" => entries.push(FtpEntry {
+                            name,
+                            is_dir: false,
+                            size,
+                        }),
                         "cdir" | "pdir" => {}
                         _ => {}
                     }
@@ -1000,7 +1027,11 @@ fn parse_ftp_listing(listing: &str) -> Result<Vec<FtpEntry>> {
             if !mode.starts_with('d') && !mode.starts_with('-') {
                 bail!("unsupported FTP directory-entry type: {line:?}");
             }
-            let name = caps.get(3).map(|m| m.as_str()).unwrap_or_default().to_owned();
+            let name = caps
+                .get(3)
+                .map(|m| m.as_str())
+                .unwrap_or_default()
+                .to_owned();
             let is_dir = mode.starts_with('d');
             let size = if is_dir {
                 None
@@ -1013,9 +1044,17 @@ fn parse_ftp_listing(listing: &str) -> Result<Vec<FtpEntry>> {
 
         if let Some(caps) = dos_re.captures(line) {
             let marker = caps.get(1).map(|m| m.as_str()).unwrap_or_default();
-            let name = caps.get(2).map(|m| m.as_str()).unwrap_or_default().to_owned();
+            let name = caps
+                .get(2)
+                .map(|m| m.as_str())
+                .unwrap_or_default()
+                .to_owned();
             let is_dir = marker.eq_ignore_ascii_case("<DIR>");
-            let size = if is_dir { None } else { marker.parse::<u64>().ok() };
+            let size = if is_dir {
+                None
+            } else {
+                marker.parse::<u64>().ok()
+            };
             entries.push(FtpEntry { name, is_dir, size });
             continue;
         }
@@ -1222,7 +1261,9 @@ async fn build_plan(
         tasks.spawn(async move {
             let remote_bytes = match file.remote_bytes_hint {
                 Some(bytes) => Some(bytes),
-                None => remote_size(&client, &transfer_options, &file.url, timeout, retries).await?,
+                None => {
+                    remote_size(&client, &transfer_options, &file.url, timeout, retries).await?
+                }
             };
             let target = safe_destination(&destination, &file.relative_path)?;
             let local_bytes = match fs::metadata(&target).await {
@@ -1303,7 +1344,8 @@ async fn remote_size(
             .await
         {
             Ok(response) if response.status().is_success() => {
-                if let Some(total) = total_from_content_range(response.headers().get(CONTENT_RANGE)) {
+                if let Some(total) = total_from_content_range(response.headers().get(CONTENT_RANGE))
+                {
                     return Ok(Some(total));
                 }
                 if let Some(size) = header_u64(response.headers().get(CONTENT_LENGTH)) {
@@ -1409,7 +1451,10 @@ async fn write_manifest(path: &Path, plan: &TransferPlan) -> Result<()> {
             .await
             .with_context(|| format!("create manifest directory {}", parent.display()))?;
     }
-    let extension = path.extension().and_then(|x| x.to_str()).unwrap_or_default();
+    let extension = path
+        .extension()
+        .and_then(|x| x.to_str())
+        .unwrap_or_default();
     if extension.eq_ignore_ascii_case("json") {
         let bytes = serde_json::to_vec_pretty(plan)?;
         fs::write(path, bytes)
@@ -1418,7 +1463,8 @@ async fn write_manifest(path: &Path, plan: &TransferPlan) -> Result<()> {
         return Ok(());
     }
 
-    let mut text = String::from("url\trelative_path\tremote_bytes\tlocal_bytes\tbytes_remaining\tcomplete\n");
+    let mut text =
+        String::from("url\trelative_path\tremote_bytes\tlocal_bytes\tbytes_remaining\tcomplete\n");
     for item in &plan.files {
         text.push_str(&format!(
             "{}\t{}\t{}\t{}\t{}\t{}\n",
@@ -1426,7 +1472,9 @@ async fn write_manifest(path: &Path, plan: &TransferPlan) -> Result<()> {
             sanitize_tsv(&item.relative_path),
             item.remote_bytes.map(|x| x.to_string()).unwrap_or_default(),
             item.local_bytes,
-            item.bytes_remaining.map(|x| x.to_string()).unwrap_or_default(),
+            item.bytes_remaining
+                .map(|x| x.to_string())
+                .unwrap_or_default(),
             item.complete
         ));
     }
@@ -1439,7 +1487,13 @@ async fn write_manifest(path: &Path, plan: &TransferPlan) -> Result<()> {
 fn sanitize_tsv(value: &str) -> String {
     value
         .chars()
-        .map(|c| if matches!(c, '\t' | '\n' | '\r') { ' ' } else { c })
+        .map(|c| {
+            if matches!(c, '\t' | '\n' | '\r') {
+                ' '
+            } else {
+                c
+            }
+        })
         .collect()
 }
 
@@ -1528,7 +1582,8 @@ async fn download_one(
     let mut last_error = None;
     for attempt in 0..=retries {
         let current = fs::metadata(&target).await.map(|m| m.len()).unwrap_or(0);
-        let can_resume = resume && current > 0 && item.remote_bytes.map_or(true, |remote| current < remote);
+        let can_resume =
+            resume && current > 0 && item.remote_bytes.map_or(true, |remote| current < remote);
         let mut request = client.get(url.clone());
         if can_resume {
             request = request.header(RANGE, format!("bytes={current}-"));
@@ -1555,8 +1610,12 @@ async fn download_one(
 
                 let mut response = response;
                 let write_result: Result<()> = async {
-                    while let Some(chunk) = response.chunk().await.context("read HTTP body chunk")? {
-                        file.write_all(&chunk).await.context("write transfer chunk")?;
+                    while let Some(chunk) =
+                        response.chunk().await.context("read HTTP body chunk")?
+                    {
+                        file.write_all(&chunk)
+                            .await
+                            .context("write transfer chunk")?;
                     }
                     file.flush().await.context("flush transfer file")?;
                     Ok(())
@@ -1567,7 +1626,9 @@ async fn download_one(
                     Ok(()) => {
                         let after = fs::metadata(&target)
                             .await
-                            .with_context(|| format!("stat completed transfer {}", target.display()))?
+                            .with_context(|| {
+                                format!("stat completed transfer {}", target.display())
+                            })?
                             .len();
                         if let Some(remote) = item.remote_bytes {
                             if after != remote {
@@ -1578,10 +1639,18 @@ async fn download_one(
                                     remote
                                 ));
                             } else {
-                                return Ok(if append { after.saturating_sub(before) } else { after });
+                                return Ok(if append {
+                                    after.saturating_sub(before)
+                                } else {
+                                    after
+                                });
                             }
                         } else {
-                            return Ok(if append { after.saturating_sub(before) } else { after });
+                            return Ok(if append {
+                                after.saturating_sub(before)
+                            } else {
+                                after
+                            });
                         }
                     }
                     Err(error) => last_error = Some(error),
@@ -1639,19 +1708,9 @@ async fn download_one_curl(
     }
 
     let current = fs::metadata(&target).await.map(|m| m.len()).unwrap_or(0);
-    let can_resume = resume
-        && current > 0
-        && item
-            .remote_bytes
-            .map_or(true, |remote| current < remote);
-    let first = run_curl_download(
-        options,
-        &item.url,
-        &target,
-        retries,
-        can_resume,
-    )
-    .await;
+    let can_resume =
+        resume && current > 0 && item.remote_bytes.map_or(true, |remote| current < remote);
+    let first = run_curl_download(options, &item.url, &target, retries, can_resume).await;
     let resumed_successfully = if first.is_err() && can_resume {
         log::warn!(
             "resume failed for {}; retrying from byte zero",
@@ -1760,7 +1819,12 @@ async fn prepare_slurm(
     let manifest = script_dir.join("transfer-plan.tsv");
     write_manifest(&manifest, plan).await?;
 
-    let pending: Vec<_> = plan.files.iter().filter(|item| !item.complete).cloned().collect();
+    let pending: Vec<_> = plan
+        .files
+        .iter()
+        .filter(|item| !item.complete)
+        .cloned()
+        .collect();
     if pending.is_empty() {
         return Ok(SlurmPreparation {
             manifest,
@@ -1819,7 +1883,10 @@ async fn prepare_slurm(
 
 fn balance_shards(mut items: Vec<TransferItem>, shard_count: usize) -> Vec<Vec<TransferItem>> {
     let known_sum: u64 = items.iter().filter_map(|item| item.bytes_remaining).sum();
-    let known_count = items.iter().filter(|item| item.bytes_remaining.is_some()).count() as u64;
+    let known_count = items
+        .iter()
+        .filter(|item| item.bytes_remaining.is_some())
+        .count() as u64;
     let unknown_weight = if known_count > 0 {
         (known_sum / known_count).max(1)
     } else {
@@ -1835,7 +1902,8 @@ fn balance_shards(mut items: Vec<TransferItem>, shard_count: usize) -> Vec<Vec<T
             .enumerate()
             .min_by_key(|(_, weight)| **weight)
             .expect("at least one shard");
-        weights[index] = weights[index].saturating_add(item.bytes_remaining.unwrap_or(unknown_weight));
+        weights[index] =
+            weights[index].saturating_add(item.bytes_remaining.unwrap_or(unknown_weight));
         shards[index].push(item);
     }
     shards
@@ -1851,10 +1919,16 @@ fn render_slurm_script(
     let stdout_path = script_dir.join(format!("{}-shard-{index:03}-%j.out", slurm.job_name));
     let stderr_path = script_dir.join(format!("{}-shard-{index:03}-%j.err", slurm.job_name));
     let mut text = String::from("#!/usr/bin/env bash\n");
-    text.push_str(&format!("#SBATCH --job-name={}-{:03}\n", slurm.job_name, index));
+    text.push_str(&format!(
+        "#SBATCH --job-name={}-{:03}\n",
+        slurm.job_name, index
+    ));
     text.push_str(&format!("#SBATCH --time={}\n", slurm.time));
     text.push_str(&format!("#SBATCH --mem={}\n", slurm.mem));
-    text.push_str(&format!("#SBATCH --cpus-per-task={}\n", slurm.cpus_per_task));
+    text.push_str(&format!(
+        "#SBATCH --cpus-per-task={}\n",
+        slurm.cpus_per_task
+    ));
     text.push_str(&format!("#SBATCH --output={}\n", stdout_path.display()));
     text.push_str(&format!("#SBATCH --error={}\n", stderr_path.display()));
     if let Some(partition) = slurm.partition.as_ref() {
@@ -1871,7 +1945,9 @@ fn render_slurm_script(
     }
     text.push('\n');
     text.push_str("FAILED=0\n");
-    text.push_str("echo \"transfer shard started: $(date -Is) host=$(hostname) job=${SLURM_JOB_ID:-none}\"\n");
+    text.push_str(
+        "echo \"transfer shard started: $(date -Is) host=$(hostname) job=${SLURM_JOB_ID:-none}\"\n",
+    );
 
     for item in items {
         let target = safe_destination(&options.destination_dir, &item.relative_path)?;
@@ -1907,7 +1983,9 @@ fn render_slurm_script(
         }
         text.push('\n');
     }
-    text.push_str("echo \"transfer shard finished: $(date -Is) failed=$FAILED\"\nexit \"$FAILED\"\n");
+    text.push_str(
+        "echo \"transfer shard finished: $(date -Is) failed=$FAILED\"\nexit \"$FAILED\"\n",
+    );
     Ok(text)
 }
 
@@ -2078,7 +2156,10 @@ mod tests {
         assert_eq!(source_prefix_from_url(&root), "MSV000098940");
         let raw = join_url_path_segment(&root, "raw", true).unwrap();
         let file = join_url_path_segment(&raw, "sample 01.d", false).unwrap();
-        assert_eq!(relative_path_from_url(&root, &file).unwrap(), "raw/sample 01.d");
+        assert_eq!(
+            relative_path_from_url(&root, &file).unwrap(),
+            "raw/sample 01.d"
+        );
         assert_eq!(
             prefixed_path(Some(&source_prefix_from_url(&root)), "raw/sample 01.d"),
             "MSV000098940/raw/sample 01.d"
@@ -2093,5 +2174,4 @@ mod tests {
         .unwrap();
         assert!(is_massive_dataset_page(&url));
     }
-
 }
