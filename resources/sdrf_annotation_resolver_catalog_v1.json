@@ -1,0 +1,50 @@
+{
+  "schema_version": "pride-scp-sdrf-resolver-catalog-v1",
+  "resolvers": [
+    {
+      "resolver_id": "structured_mapping_v2",
+      "version": "pride-scp-structured-row-mapping-resolver-v2",
+      "supported_fields": [
+        "source name",
+        "assay name",
+        "characteristics[cell identifier]",
+        "characteristics[biological replicate]",
+        "characteristics[cell line]",
+        "characteristics[cellosaurus accession]",
+        "characteristics[organism]",
+        "characteristics[organism part]",
+        "characteristics[sample type]",
+        "characteristics[individual]",
+        "comment[label]"
+      ],
+      "supported_families": ["row_mapping"],
+      "accepted_trust_classes": [
+        "trusted_independent",
+        "trusted_deposited",
+        "trusted_local_deposited_sdrf",
+        "trusted_publication_supplement"
+      ],
+      "requires_independent_evidence": true,
+      "can_fill_placeholder": true,
+      "can_narrow_composite": true,
+      "can_expand_multiplex": true,
+      "overwrite_policy": "never_conflicting_concrete"
+    },
+    {
+      "resolver_id": "cellosaurus_exact_v1",
+      "version": "pride-scp-cellosaurus-resolver-v1",
+      "supported_fields": ["characteristics[cellosaurus accession]"],
+      "supported_families": ["cellosaurus_accession"],
+      "accepted_trust_classes": [
+        "trusted_independent",
+        "trusted_deposited",
+        "trusted_local_deposited_sdrf"
+      ],
+      "requires_independent_evidence": true,
+      "can_fill_placeholder": true,
+      "can_narrow_composite": false,
+      "can_expand_multiplex": false,
+      "overwrite_policy": "never_conflicting_concrete"
+    }
+  ]
+}
