@@ -26,30 +26,32 @@ from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Any
 
-from sdrf_evidence_registry import build_registry as build_evidence_registry
-
-from sdrf_evidence_acquisition_planner import (
-    acquisition_stage_key,
-    load_attempts as load_acquisition_attempts,
-    load_catalog as load_source_catalog,
-    plan_acquisition_for_case,
-)
-
 from sdrf_annotation_state import (
     AttemptRecord,
     EvidenceRecord,
     ResolverCapability,
     apply_generic_implementation_gate,
-    builtin_resolver_catalog,
-    canonical_sha256,
     blocker_key,
+    builtin_resolver_catalog,
     decide_case,
     normalize_field_name,
     sha256_file,
     stage_key,
 )
+from sdrf_evidence_acquisition_planner import (
+    load_attempts as load_acquisition_attempts,
+)
+from sdrf_evidence_acquisition_planner import (
+    load_catalog as load_source_catalog,
+)
+from sdrf_evidence_acquisition_planner import (
+    plan_acquisition_for_case,
+)
+from sdrf_evidence_registry import build_registry as build_evidence_registry
+from sdrf_publication_evidence import build_publication_source_rows
+from sdrf_publication_evidence import write_tsv as write_publication_source_tsv
 
-VERSION = "pride-scp-sdrf-annotation-harness-v2.2.0"
+VERSION = "pride-scp-sdrf-annotation-harness-v2.3.0"
 RUN_SPEC_VERSION = "pride-scp-sdrf-annotation-run-spec-v1"
 
 
@@ -87,7 +89,7 @@ def resolve_path(base: Path, value: str | None) -> Path | None:
 def load_json(path: Path) -> dict[str, Any]:
     obj = json.loads(path.read_text(encoding="utf-8"))
     if not isinstance(obj, dict):
-        raise ValueError(f"expected JSON object: {path}")
+        raise TypeError(f"expected JSON object: {path}")
     return obj
 
 
@@ -101,7 +103,7 @@ def split_fields(value: str) -> list[str]:
             parsed = json.loads(raw.replace("'", '"'))
             if isinstance(parsed, list):
                 return [normalize_field_name(x) for x in parsed if normalize_field_name(x)]
-        except Exception:
+        except json.JSONDecodeError:
             pass
     return [normalize_field_name(x) for x in raw.split(";") if normalize_field_name(x)]
 
@@ -210,7 +212,7 @@ def load_resolvers(path: Path | None) -> list[ResolverCapability]:
     obj = load_json(path)
     rows = obj.get("resolvers") or []
     if not isinstance(rows, list):
-        raise ValueError("resolver catalog must contain a list named 'resolvers'")
+        raise TypeError("resolver catalog must contain a list named 'resolvers'")
     return [ResolverCapability.from_dict(x) for x in rows]
 
 
@@ -241,7 +243,8 @@ def verify_run_spec(spec_path: Path, spec: dict[str, Any]) -> dict[str, str]:
 
 EVIDENCE_REGISTRY_FIELDS = [
     "accession", "artifact_sha256", "declared_sha256", "sha_verified", "blocker_field",
-    "source_kind", "source_provider", "source_locator", "retrieved_at", "retrieval_method",
+    "source_kind", "source_provider", "source_locator", "source_identity", "publication_doi",
+    "publication_pmid", "publication_pmcid", "publication_identity_status", "retrieved_at", "retrieval_method",
     "original_filename", "media_type", "local_path", "byte_size", "parent_artifact_sha256",
     "derivation_operation", "trust_class", "independence_class", "is_independent",
     "provenance_status", "candidate_hash_equal", "manifest_path",
@@ -273,6 +276,44 @@ def ingest_provider_manifest_and_replan(
         "evidence_registry_summary": str(registry_summary_path),
         "records": registry_summary["records"],
         "accessions": registry_summary["accessions"],
+    }
+    (output / "run_manifest.json").write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
+    return summary
+
+
+def ingest_publication_manifests_and_replan(
+    spec_path: Path, publication_manifests: list[Path], output: Path
+) -> dict[str, Any]:
+    """Register trusted cached publication artifacts, then replan without claiming field support."""
+    spec = load_json(spec_path)
+    base = spec_path.parent
+    inputs = spec.get("inputs") or {}
+    evidence_registry = resolve_path(base, inputs.get("evidence_registry"))
+    if evidence_registry is None:
+        raise ValueError("run spec inputs.evidence_registry is required for publication ingestion")
+    candidate_manifest = resolve_path(base, inputs.get("candidate_manifest"))
+
+    publication_rows, publication_summary = build_publication_source_rows(publication_manifests)
+    output.mkdir(parents=True, exist_ok=True)
+    source_manifest = output / "cached_publication_source_manifest.tsv"
+    write_publication_source_tsv(source_manifest, publication_rows)
+
+    manifests = [source_manifest]
+    if evidence_registry.is_file():
+        manifests.insert(0, evidence_registry)
+    rows, registry_summary = build_evidence_registry(manifests, candidate_manifest)
+    write_tsv(evidence_registry, rows, EVIDENCE_REGISTRY_FIELDS)
+    registry_summary_path = evidence_registry.with_name("evidence_registry_summary.json")
+    registry_summary_path.write_text(json.dumps(registry_summary, indent=2) + "\n", encoding="utf-8")
+
+    summary = plan(spec_path, output)
+    summary["publication_ingestion"] = {
+        **publication_summary,
+        "source_manifest": str(source_manifest),
+        "evidence_registry": str(evidence_registry),
+        "evidence_registry_summary": str(registry_summary_path),
+        "registry_records": registry_summary["records"],
+        "registry_independent_records": registry_summary["independent_records"],
     }
     (output / "run_manifest.json").write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
     return summary
@@ -669,6 +710,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--run-spec", type=Path)
     p.add_argument("--output", type=Path)
     p.add_argument("--ingest-source-manifest", type=Path, help="Provider source_manifest.tsv to ingest before automatically replanning")
+    p.add_argument("--ingest-publication-manifest", action="append", type=Path, default=[], help="Cached publication manifest to register before automatically replanning; repeatable")
     p.add_argument("--self-test", action="store_true")
     return p
 
@@ -680,9 +722,15 @@ def main() -> int:
         return 0
     if args.run_spec is None or args.output is None:
         raise SystemExit("--run-spec and --output are required unless --self-test")
+    if args.ingest_source_manifest is not None and args.ingest_publication_manifest:
+        raise SystemExit("choose provider ingestion or publication ingestion in one invocation")
     if args.ingest_source_manifest is not None:
         summary = ingest_provider_manifest_and_replan(
             args.run_spec, args.ingest_source_manifest.resolve(), args.output
+        )
+    elif args.ingest_publication_manifest:
+        summary = ingest_publication_manifests_and_replan(
+            args.run_spec, [path.resolve() for path in args.ingest_publication_manifest], args.output
         )
     else:
         summary = plan(args.run_spec, args.output)

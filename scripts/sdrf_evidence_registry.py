@@ -16,9 +16,10 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
-from sdrf_annotation_state import VERSION as STATE_VERSION, sha256_file
+from sdrf_annotation_state import VERSION as STATE_VERSION
+from sdrf_annotation_state import sha256_file
 
-VERSION = "pride-scp-sdrf-evidence-registry-v2.2.0"
+VERSION = "pride-scp-sdrf-evidence-registry-v2.3.0"
 
 PATH_KEYS = ("local_path", "path", "source_path", "artifact_path", "file_path")
 ACCESSION_KEYS = ("accession", "project_accession", "pxd")
@@ -42,6 +43,11 @@ RETRIEVAL_METHOD_KEYS = ("retrieval_method", "fetch_method", "download_method")
 ORIGINAL_FILENAME_KEYS = ("original_filename", "source_filename", "remote_filename")
 MEDIA_TYPE_KEYS = ("media_type", "mime_type", "content_type")
 SIZE_KEYS = ("artifact_size_bytes", "byte_size", "size_bytes")
+SOURCE_IDENTITY_KEYS = ("source_identity", "publication_identity")
+PUBLICATION_DOI_KEYS = ("publication_doi", "doi")
+PUBLICATION_PMID_KEYS = ("publication_pmid", "pmid")
+PUBLICATION_PMCID_KEYS = ("publication_pmcid", "pmcid")
+PUBLICATION_IDENTITY_STATUS_KEYS = ("publication_identity_status", "identity_status")
 
 TRUSTED_EXTERNAL_CLASSES = {"trusted_independent"}
 TRUSTED_DEPOSITED_CLASSES = {"trusted_deposited", "trusted_local_deposited_sdrf"}
@@ -213,6 +219,11 @@ def build_registry(
             retrieval_method = first(row, RETRIEVAL_METHOD_KEYS)
             original_filename = first(row, ORIGINAL_FILENAME_KEYS) or (path.name if path else "")
             media_type = _media_type(row, path)
+            source_identity = first(row, SOURCE_IDENTITY_KEYS)
+            publication_doi = first(row, PUBLICATION_DOI_KEYS)
+            publication_pmid = first(row, PUBLICATION_PMID_KEYS)
+            publication_pmcid = first(row, PUBLICATION_PMCID_KEYS)
+            publication_identity_status = first(row, PUBLICATION_IDENTITY_STATUS_KEYS)
 
             key = (acc, artifact_sha, field_name)
             item = {
@@ -224,6 +235,11 @@ def build_registry(
                 "source_kind": kind,
                 "source_provider": provider,
                 "source_locator": locator,
+                "source_identity": source_identity,
+                "publication_doi": publication_doi,
+                "publication_pmid": publication_pmid,
+                "publication_pmcid": publication_pmcid,
+                "publication_identity_status": publication_identity_status,
                 "retrieved_at": retrieved_at,
                 "retrieval_method": retrieval_method,
                 "original_filename": original_filename,

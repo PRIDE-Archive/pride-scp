@@ -1,14 +1,14 @@
 from __future__ import annotations
-import json
 
 import csv
+import json
 import sys
 from pathlib import Path
 
 SCRIPTS = Path(__file__).resolve().parents[1] / "scripts"
 sys.path.insert(0, str(SCRIPTS))
 
-from sdrf_annotation_state import (  # noqa: E402
+from sdrf_annotation_state import (
     AttemptRecord,
     EvidenceRecord,
     ResolverCapability,
@@ -33,13 +33,13 @@ def evidence(acc: str, field: str, sha: str = "a" * 64) -> EvidenceRecord:
 
 def test_stage_key_changes_with_candidate_and_evidence() -> None:
     bkey = blocker_key("cell_identifier", ["characteristics[cell identifier]"])
-    base = dict(
-        accession="PXD900001",
-        resolver_id="r",
-        resolver_version="1",
-        policy_version="p",
-        blocker_key_value=bkey,
-    )
+    base = {
+        "accession": "PXD900001",
+        "resolver_id": "r",
+        "resolver_version": "1",
+        "policy_version": "p",
+        "blocker_key_value": bkey,
+    }
     k1 = stage_key(candidate_sha256="1" * 64, evidence_set_sha256_value="a" * 64, **base)
     k2 = stage_key(candidate_sha256="2" * 64, evidence_set_sha256_value="a" * 64, **base)
     k3 = stage_key(candidate_sha256="1" * 64, evidence_set_sha256_value="b" * 64, **base)
@@ -296,7 +296,8 @@ def test_evidence_set_hash_changes_with_provenance_identity() -> None:
 
 
 def test_provenance_registry_preserves_external_copy_and_parent_lineage(tmp_path: Path) -> None:
-    from sdrf_evidence_registry import build_registry, sha256_file as registry_sha
+    from sdrf_evidence_registry import build_registry
+    from sdrf_evidence_registry import sha256_file as registry_sha
 
     parent = tmp_path / "source.tsv"
     parent.write_text("raw\tvalue\na.raw\tx\n", encoding="utf-8")
@@ -320,7 +321,8 @@ def test_provenance_registry_preserves_external_copy_and_parent_lineage(tmp_path
 
 
 def test_provenance_registry_candidate_parent_fails_closed(tmp_path: Path) -> None:
-    from sdrf_evidence_registry import build_registry, sha256_file as registry_sha
+    from sdrf_evidence_registry import build_registry
+    from sdrf_evidence_registry import sha256_file as registry_sha
 
     candidate = tmp_path / "candidate.tsv"
     candidate.write_text("raw\tvalue\na.raw\tx\n", encoding="utf-8")
@@ -373,17 +375,17 @@ def test_acquisition_planner_prioritizes_deposited_source_and_caches_exhaustion(
         SourceStrategy("publication_supplement", 40, ("single_cell_isolation",), (), "pub", "supp", "trusted_publication_supplement"),
         SourceStrategy("deposited_sdrf", 10, ("single_cell_isolation",), (), "PRIDE", "deposited", "trusted_deposited"),
     ]
-    kwargs = dict(
-        accession="PXD930001",
-        blocker_family="single_cell_isolation",
-        blocker_fields=["characteristics[single cell isolation protocol]"],
-        blocker_key="b" * 64,
-        evidence_set_sha256="e" * 64,
-        policy_version="p",
-        strategies=strategies,
-        strategy_version="v1",
-        max_source_classes=2,
-    )
+    kwargs = {
+        "accession": "PXD930001",
+        "blocker_family": "single_cell_isolation",
+        "blocker_fields": ["characteristics[single cell isolation protocol]"],
+        "blocker_key": "b" * 64,
+        "evidence_set_sha256": "e" * 64,
+        "policy_version": "p",
+        "strategies": strategies,
+        "strategy_version": "v1",
+        "max_source_classes": 2,
+    }
     rows = plan_acquisition_for_case(attempts=[], **kwargs)
     assert [r["source_class"] for r in rows] == ["deposited_sdrf"]
     exhausted = AcquisitionAttempt(
@@ -397,6 +399,7 @@ def test_acquisition_planner_prioritizes_deposited_source_and_caches_exhaustion(
 
 def test_harness_acquisition_mode_turns_evidence_limited_into_acquire_evidence(tmp_path: Path) -> None:
     import json
+
     from sdrf_annotation_harness import plan, write_tsv
 
     (tmp_path / "accessions.txt").write_text("PXD930001\n", encoding="utf-8")
@@ -452,7 +455,10 @@ def test_harness_acquisition_mode_turns_evidence_limited_into_acquire_evidence(t
 
 
 def test_candidate_missing_can_plan_structured_source_discovery() -> None:
-    from sdrf_evidence_acquisition_planner import SourceStrategy, plan_acquisition_for_case
+    from sdrf_evidence_acquisition_planner import (
+        SourceStrategy,
+        plan_acquisition_for_case,
+    )
 
     strategy = SourceStrategy(
         "deposited_sdrf", 10, ("candidate_missing",), (), "PRIDE", "deposited", "trusted_deposited"
@@ -475,6 +481,7 @@ def test_candidate_missing_can_plan_structured_source_discovery() -> None:
 
 def test_harness_returns_to_evidence_limited_when_acquisition_source_is_exhausted(tmp_path: Path) -> None:
     import json
+
     from sdrf_annotation_harness import plan, write_tsv
 
     (tmp_path / "accessions.txt").write_text("PXD940001\n", encoding="utf-8")
@@ -511,7 +518,12 @@ def test_harness_returns_to_evidence_limited_when_acquisition_source_is_exhauste
     spec_path.write_text(json.dumps(spec), encoding="utf-8")
     first = plan(spec_path, tmp_path / "out1")
     assert first["decision_counts"] == {"ACQUIRE_EVIDENCE": 1}
-    planned = list(csv.DictReader((tmp_path / "out1" / "evidence_acquisition_plan.tsv").open(), delimiter="\t"))[0]
+    planned = next(
+        csv.DictReader(
+            (tmp_path / "out1" / "evidence_acquisition_plan.tsv").open(),
+            delimiter="\t",
+        )
+    )
     write_tsv(
         tmp_path / "acq_attempts.tsv",
         [{
@@ -652,3 +664,104 @@ def test_provider_ingestion_rewrites_registry_and_replans_with_new_evidence_sha(
     registry_rows = list(csv.DictReader((tmp_path / "evidence.tsv").open(), delimiter="\t"))
     assert registry_rows[0]["artifact_sha256"] == sha
     assert registry_rows[0]["is_independent"] == "false"
+
+
+def test_cached_publication_ingestion_collapses_same_publication_identity(tmp_path: Path) -> None:
+    from sdrf_publication_evidence import build_publication_source_rows
+
+    short = tmp_path / "short.txt"
+    long = tmp_path / "long.txt"
+    short.write_text("same paper short extraction\n", encoding="utf-8")
+    long.write_text("same paper longer extraction with references\n", encoding="utf-8")
+    manifest = tmp_path / "publications.tsv"
+    manifest.write_text(
+        "accession\tpublication_doi\tpublication_pmid\tpublication_pmcid\tpublication_status\t"
+        "publication_content_status\tpublication_content_source\tpublication_content_text_path\t"
+        "external_recovery_status\n"
+        f"PXD023366\t10.1016/j.mcpro.2022.100267\t35809850\tPMC9396076\tpublication_found\t"
+        f"available\teurope_pmc_fullTextXML\t{short}\taccepted\n"
+        f"PXD023366\t10.1016/j.mcpro.2022.100267\t35809850\tPMC9396076\tpublication_found\t"
+        f"available\teurope_pmc_fullTextXML_verified_residual_recovery\t{long}\taccepted\n",
+        encoding="utf-8",
+    )
+    rows, summary = build_publication_source_rows([manifest])
+    assert len(rows) == 1
+    assert summary["duplicate_materializations_collapsed"] == 1
+    assert rows[0]["source_identity"] == "doi:10.1016/j.mcpro.2022.100267"
+    assert rows[0]["local_path"] == str(long)
+    assert rows[0]["trust_class"] == "trusted_independent"
+    assert rows[0]["blocker_field"] == ""
+
+
+def test_cached_publication_ingestion_rejects_unverified_mapping(tmp_path: Path) -> None:
+    from sdrf_publication_evidence import build_publication_source_rows
+
+    text = tmp_path / "paper.txt"
+    text.write_text("paper\n", encoding="utf-8")
+    manifest = tmp_path / "publications.tsv"
+    manifest.write_text(
+        "accession\tpublication_doi\tpublication_content_text_path\texternal_recovery_status\n"
+        f"PXD058457\t10.1016/j.mcpro.2025.101018\t{text}\treview\n",
+        encoding="utf-8",
+    )
+    rows, summary = build_publication_source_rows([manifest])
+    assert rows == []
+    assert summary["skipped_unverified_identity"] == 1
+
+
+def test_cached_publication_ingestion_registers_identity_but_not_blocker_claim(tmp_path: Path) -> None:
+    from sdrf_annotation_harness import (
+        ingest_publication_manifests_and_replan,
+        write_tsv,
+    )
+
+    (tmp_path / "accessions.txt").write_text("PXD058457\n", encoding="utf-8")
+    write_tsv(
+        tmp_path / "candidates.tsv",
+        [{"accession": "PXD058457", "candidate_sha256": "5" * 64}],
+        ["accession", "candidate_sha256"],
+    )
+    write_tsv(
+        tmp_path / "blockers.tsv",
+        [{
+            "accession": "PXD058457",
+            "state": "blocked_metadata_incomplete",
+            "reason_code": "cell_identifier_invalid_or_unresolved",
+            "blocker_fields": "characteristics[cell identifier]",
+        }],
+        ["accession", "state", "reason_code", "blocker_fields"],
+    )
+    (tmp_path / "evidence.tsv").write_text("accession\tartifact_sha256\n", encoding="utf-8")
+    spec = {
+        "schema_version": "pride-scp-sdrf-annotation-run-spec-v1",
+        "run_id": "publication-ingest-test",
+        "provenance": {"policy_version": "p"},
+        "inputs": {
+            "accessions_file": "accessions.txt",
+            "candidate_manifest": "candidates.tsv",
+            "blocker_manifest": "blockers.tsv",
+            "evidence_registry": "evidence.tsv",
+        },
+    }
+    spec_path = tmp_path / "run_spec.json"
+    spec_path.write_text(json.dumps(spec), encoding="utf-8")
+    paper = tmp_path / "paper.txt"
+    paper.write_text("independent manuscript text\n", encoding="utf-8")
+    manifest = tmp_path / "publications.tsv"
+    manifest.write_text(
+        "accession\tpublication_doi\tpublication_pmid\tpublication_pmcid\tpublication_status\t"
+        "publication_content_status\tpublication_content_source\tpublication_content_text_path\t"
+        "external_recovery_status\n"
+        f"PXD058457\t10.1016/j.mcpro.2025.101018\t40544993\tPMC12301781\tpublication_found\t"
+        f"available\teurope_pmc_fullTextXML_verified_residual_recovery\t{paper}\taccepted\n",
+        encoding="utf-8",
+    )
+    summary = ingest_publication_manifests_and_replan(spec_path, [manifest], tmp_path / "out")
+    registry = list(csv.DictReader((tmp_path / "evidence.tsv").open(), delimiter="\t"))
+    assert len(registry) == 1
+    assert registry[0]["source_identity"] == "doi:10.1016/j.mcpro.2025.101018"
+    assert registry[0]["is_independent"] == "true"
+    assert registry[0]["blocker_field"] == ""
+    assert summary["publication_ingestion"]["field_claims_emitted"] == 0
+    # Publication discovery changes evidence identity but cannot itself authorize a field resolver.
+    assert summary["decision_counts"] != {"RUN_RESOLVER": 1}
