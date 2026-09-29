@@ -1,9 +1,9 @@
 {
   "schema_version": "pride-scp-sdrf-evidence-source-catalog-v1",
-  "catalog_revision": "pride-scp-sdrf-evidence-source-catalog-v1.0.0",
+  "catalog_revision": "pride-scp-sdrf-evidence-source-catalog-v1.1.0",
   "strategies": [
     {
-      "source_class": "deposited_sdrf",
+      "source_class": "depositor_sdrf",
       "priority": 10,
       "families": [
         "single_cell_isolation",
@@ -21,7 +21,7 @@
       "fields": [],
       "provider": "PRIDE_or_registered_repository",
       "acquisition_method": "deposited_structured_metadata",
-      "expected_trust_class": "trusted_deposited",
+      "expected_trust_class": "provenance_gated_depositor_candidate",
       "requires_external_locator": true
     },
     {

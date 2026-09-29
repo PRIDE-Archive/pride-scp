@@ -318,3 +318,54 @@ harness is rerun with the updated evidence/attempt ledger. This allows it to sto
 cheap trusted source closes the blocker instead of downloading lower-priority sources unnecessarily.
 `max_source_classes_per_accession` is the total distinct source-class budget for the blocker/catalog
 version, not the number of concurrent fetches.
+
+
+## Production PRIDE evidence provider integration (v2.3 provider slice)
+
+The blocker-directed planner is connected to a first-class Rust CLI provider:
+
+```text
+pride-scp sdrf-acquire-evidence \
+  --acquisition-plan <run>/evidence_acquisition_plan.tsv \
+  --output <run>/provider
+```
+
+This command is generic and cohort-independent. It consumes the harness acquisition plan, queries
+PRIDE Archive project-file inventories, and materializes only bounded non-community SDRF candidates.
+It writes `evidence_acquisition_attempts.tsv`, `source_manifest.tsv`, and
+`evidence_acquisition_summary.json` for subsequent provenance registration and replanning.
+
+### PRIDE SDRF source taxonomy
+
+PRIDE-hosted SDRF-like files are not all equivalent evidence:
+
+```text
+pride_community_annotated_sdrf
+  PXD*_community_annotated.sdrf.tsv
+  community-curated; never promoted to depositor evidence solely because PRIDE hosts it
+
+depositor_sdrf_candidate
+  non-community SDRF-like TSV/TXT in the PRIDE project-file inventory
+  provenance-gated; downloaded for registration but not automatically trusted as independent
+```
+
+The same classifier is used by `sdrf-resolve`; a PRIDE community-annotated SDRF is no longer
+labelled `repository_submitted` and cannot be selected through the repository-submitted precedence
+path.
+
+Provider attempt statuses include:
+
+```text
+found_new_provenance_gated_artifact
+found_untrusted_community_annotation
+source_not_found
+fetch_failed
+```
+
+A downloaded `depositor_sdrf_candidate` is deliberately emitted with
+`trust_class=untrusted_or_unknown`. The provenance/evidence registry must establish its independence
+before any deterministic resolver can consume it as trusted blocker evidence.
+
+This provider does not mutate SDRFs and does not confer submission readiness. The next orchestration
+slice connects provider output -> evidence registry -> replan -> deterministic resolver -> validation
+-> readiness under the existing bounded state machine.

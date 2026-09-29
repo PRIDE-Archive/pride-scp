@@ -46,6 +46,8 @@ const MANUSCRIPT_EVIDENCE_MAX_RESERVED_CHARS: usize = 12_000;
 pub const SDRF_SOURCE_RESOLVER_VERSION: &str = "pride-scp-sdrf-source-resolver-v0.1";
 pub const SDRF_AUDITOR_VERSION: &str = "pride-scp-sdrf-auditor-v0.3";
 pub const DEFAULT_OLLAMA_URL: &str = "http://localhost:11434/api/generate";
+pub const SDRF_EVIDENCE_PROVIDER_VERSION: &str = "pride-scp-sdrf-evidence-provider-v0.1";
+pub const DEFAULT_PRIDE_V2_API: &str = "https://www.ebi.ac.uk/pride/ws/archive/v2";
 
 // The linked single-cell template is work-in-progress. Generated drafts pin the
 // column profile shown by the current rendered specification/GitHub view on
@@ -85,6 +87,29 @@ pub struct SdrfResolveSummary {
     pub unresolved: usize,
     pub selected_sources_tsv: String,
     pub resolved_dir: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct SdrfAcquireEvidenceOptions {
+    pub acquisition_plan: PathBuf,
+    pub output_dir: PathBuf,
+    pub api_base: String,
+    pub timeout_seconds: u64,
+    pub max_candidates_per_accession: usize,
+    pub force: bool,
+    pub progress: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SdrfAcquireEvidenceSummary {
+    pub provider_version: String,
+    pub tasks_requested: usize,
+    pub depositor_sdrf_downloaded: usize,
+    pub community_annotation_only: usize,
+    pub source_not_found: usize,
+    pub fetch_failed: usize,
+    pub acquisition_attempts_tsv: String,
+    pub source_manifest_tsv: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1044,6 +1069,17 @@ fn fnv1a64_hex(bytes: &[u8]) -> String {
     format!("fnv1a64:{hash:016x}")
 }
 
+fn classify_repository_sdrf_name(name: &str) -> &'static str {
+    let lower = name.trim().to_ascii_lowercase();
+    if lower.contains("community_annotated") && lower.contains("sdrf") {
+        "pride_community_annotated_sdrf"
+    } else if lower.contains("sdrf") && (lower.ends_with(".tsv") || lower.ends_with(".txt")) {
+        "depositor_sdrf_candidate"
+    } else {
+        "not_sdrf"
+    }
+}
+
 fn extract_sdrf_file_candidates(value: &Value) -> Vec<(String, String)> {
     fn walk(value: &Value, out: &mut BTreeMap<String, String>) {
         match value {
@@ -1215,7 +1251,7 @@ fn select_sdrf_source_candidate(
 ) -> Option<&SdrfSourceCandidateAudit> {
     [
         "curated_bigbio",
-        "repository_submitted",
+        "depositor_sdrf_candidate",
         "snapshot_pride_sdrf_api",
     ]
     .iter()
@@ -1291,11 +1327,10 @@ async fn resolve_sdrf_one(
                     });
                     continue;
                 }
+                let source_kind = classify_repository_sdrf_name(&name);
                 let path = cache_dir.join(format!("repository_{:02}.sdrf.tsv", idx + 1));
-                candidates.push(
-                    fetch_sdrf_candidate(client, "repository_submitted", &uri, &path, opts.force)
-                        .await,
-                );
+                candidates
+                    .push(fetch_sdrf_candidate(client, source_kind, &uri, &path, opts.force).await);
             }
         }
     }
@@ -1348,7 +1383,7 @@ async fn resolve_sdrf_one(
 
     let repository_usable_count = candidates
         .iter()
-        .filter(|c| c.source_kind == "repository_submitted" && c.usable)
+        .filter(|c| c.source_kind == "depositor_sdrf_candidate" && c.usable)
         .count();
     let audit = SdrfSourceAudit {
         accession: accession.into(),
@@ -1440,7 +1475,7 @@ pub async fn resolve_sdrf_sources(opts: SdrfResolveOptions) -> Result<SdrfResolv
             .count(),
         repository_submitted_usable: rows
             .iter()
-            .filter(|r| r.selected_source_kind == "repository_submitted")
+            .filter(|r| r.selected_source_kind == "depositor_sdrf_candidate")
             .count(),
         snapshot_usable: rows
             .iter()
@@ -1452,6 +1487,368 @@ pub async fn resolve_sdrf_sources(opts: SdrfResolveOptions) -> Result<SdrfResolv
     };
     fs::write(
         opts.output_dir.join("sdrf_source_resolution_summary.json"),
+        serde_json::to_string_pretty(&summary)?,
+    )?;
+    Ok(summary)
+}
+
+#[derive(Debug, Deserialize)]
+struct AcquisitionPlanRow {
+    stage_key: String,
+    accession: String,
+    source_class: String,
+    #[serde(default, rename = "blocker_family")]
+    _blocker_family: String,
+    #[serde(default)]
+    blocker_fields: String,
+    #[serde(default)]
+    blocker_key: String,
+    #[serde(default)]
+    evidence_set_sha256: String,
+    #[serde(default)]
+    policy_version: String,
+    #[serde(default)]
+    strategy_version: String,
+}
+
+#[derive(Debug, Serialize)]
+struct AcquisitionAttemptRow {
+    stage_key: String,
+    accession: String,
+    source_class: String,
+    status: String,
+    evidence_set_sha256: String,
+    policy_version: String,
+    blocker_key: String,
+    strategy_version: String,
+    note: String,
+}
+
+#[derive(Debug, Serialize)]
+struct ProviderSourceManifestRow {
+    accession: String,
+    source_kind: String,
+    source_provider: String,
+    source_locator: String,
+    retrieval_method: String,
+    original_filename: String,
+    local_path: String,
+    trust_class: String,
+    blocker_field: String,
+    derivation_operation: String,
+    file_accession: String,
+    api_record_fingerprint: String,
+}
+
+fn collect_pride_file_objects(value: &Value, out: &mut Vec<Map<String, Value>>) {
+    match value {
+        Value::Object(map) => {
+            if !object_file_name(map).is_empty() {
+                out.push(map.clone());
+                return;
+            }
+            for child in map.values() {
+                collect_pride_file_objects(child, out);
+            }
+        }
+        Value::Array(items) => {
+            for child in items {
+                collect_pride_file_objects(child, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn pride_total_pages(value: &Value) -> Option<usize> {
+    value
+        .get("page")
+        .and_then(Value::as_object)
+        .and_then(|p| p.get("totalPages"))
+        .and_then(Value::as_u64)
+        .map(|x| x as usize)
+        .or_else(|| {
+            value
+                .get("totalPages")
+                .and_then(Value::as_u64)
+                .map(|x| x as usize)
+        })
+}
+
+fn object_file_accession(map: &Map<String, Value>) -> String {
+    map.get("accession")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim()
+        .to_string()
+}
+
+async fn pride_project_files(
+    client: &Client,
+    api_base: &str,
+    accession: &str,
+) -> Result<Vec<Map<String, Value>>> {
+    let mut out = Vec::new();
+    let page_size = 100usize;
+    let mut page = 0usize;
+    loop {
+        let url = format!(
+            "{}/projects/{}/files?pageSize={}&page={}",
+            api_base.trim_end_matches('/'),
+            accession,
+            page_size,
+            page
+        );
+        let response = client
+            .get(&url)
+            .send()
+            .await
+            .with_context(|| format!("query PRIDE project files for {accession}"))?
+            .error_for_status()
+            .with_context(|| format!("PRIDE project files HTTP error for {accession}"))?;
+        let value: Value = response.json().await?;
+        let mut current = Vec::new();
+        collect_pride_file_objects(&value, &mut current);
+        let current_len = current.len();
+        out.extend(current);
+        let total_pages = pride_total_pages(&value);
+        page += 1;
+        if total_pages
+            .map(|n| page >= n)
+            .unwrap_or(current_len < page_size)
+        {
+            break;
+        }
+        if page >= 1000 {
+            bail!("PRIDE project-files pagination safety stop for {accession}");
+        }
+    }
+    Ok(out)
+}
+
+async fn download_provider_artifact(
+    client: &Client,
+    uri: &str,
+    path: &Path,
+    force: bool,
+) -> Result<()> {
+    if path.is_file() && !force {
+        return Ok(());
+    }
+    let url =
+        normalize_download_url(uri).ok_or_else(|| anyhow!("unsupported public file URL: {uri}"))?;
+    let bytes = client
+        .get(&url)
+        .send()
+        .await?
+        .error_for_status()?
+        .bytes()
+        .await?;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(path, bytes)?;
+    Ok(())
+}
+
+pub async fn acquire_sdrf_evidence(
+    opts: SdrfAcquireEvidenceOptions,
+) -> Result<SdrfAcquireEvidenceSummary> {
+    fs::create_dir_all(&opts.output_dir)?;
+    let mut rdr = ReaderBuilder::new()
+        .delimiter(b'\t')
+        .from_path(&opts.acquisition_plan)
+        .with_context(|| format!("read acquisition plan {}", opts.acquisition_plan.display()))?;
+    let mut tasks = Vec::new();
+    for row in rdr.deserialize::<AcquisitionPlanRow>() {
+        let row = row?;
+        if row.source_class == "deposited_sdrf" || row.source_class == "depositor_sdrf" {
+            tasks.push(row);
+        }
+    }
+    let client = Client::builder()
+        .timeout(Duration::from_secs(opts.timeout_seconds))
+        .user_agent("PRIDE-SCP-SDRF-evidence-provider/0.1")
+        .build()?;
+    let mut attempts = Vec::new();
+    let mut manifest = Vec::new();
+    let mut downloaded = 0usize;
+    let mut community_only = 0usize;
+    let mut not_found = 0usize;
+    let mut failed = 0usize;
+
+    for (idx, task) in tasks.iter().enumerate() {
+        if opts.progress {
+            eprintln!(
+                "[{}/{}] {} {}",
+                idx + 1,
+                tasks.len(),
+                task.accession,
+                task.source_class
+            );
+        }
+        let files = match pride_project_files(&client, &opts.api_base, &task.accession).await {
+            Ok(v) => v,
+            Err(err) => {
+                failed += 1;
+                attempts.push(AcquisitionAttemptRow {
+                    stage_key: task.stage_key.clone(),
+                    accession: task.accession.clone(),
+                    source_class: task.source_class.clone(),
+                    status: "fetch_failed".into(),
+                    evidence_set_sha256: task.evidence_set_sha256.clone(),
+                    policy_version: task.policy_version.clone(),
+                    blocker_key: task.blocker_key.clone(),
+                    strategy_version: task.strategy_version.clone(),
+                    note: err.to_string(),
+                });
+                continue;
+            }
+        };
+        let mut depositor = Vec::new();
+        let mut community = Vec::new();
+        for file in files {
+            let name = object_file_name(&file);
+            match classify_repository_sdrf_name(&name) {
+                "depositor_sdrf_candidate" => depositor.push(file),
+                "pride_community_annotated_sdrf" => community.push(file),
+                _ => {}
+            }
+        }
+        depositor.sort_by_key(object_file_name);
+        community.sort_by_key(object_file_name);
+
+        if depositor.is_empty() {
+            if !community.is_empty() {
+                community_only += 1;
+                for file in community.iter().take(opts.max_candidates_per_accession) {
+                    manifest.push(ProviderSourceManifestRow {
+                        accession: task.accession.clone(),
+                        source_kind: "pride_community_annotated_sdrf".into(),
+                        source_provider: "PRIDE Archive".into(),
+                        source_locator: file_uri(file),
+                        retrieval_method: "pride_project_files_metadata".into(),
+                        original_filename: object_file_name(file),
+                        local_path: String::new(),
+                        trust_class: "community_curated_untrusted_for_independence".into(),
+                        blocker_field: task.blocker_fields.clone(),
+                        derivation_operation: String::new(),
+                        file_accession: object_file_accession(file),
+                        api_record_fingerprint: fnv1a64_hex(serde_json::to_vec(file)?.as_slice()),
+                    });
+                }
+                attempts.push(AcquisitionAttemptRow {
+                    stage_key: task.stage_key.clone(), accession: task.accession.clone(), source_class: task.source_class.clone(),
+                    status: "found_untrusted_community_annotation".into(), evidence_set_sha256: task.evidence_set_sha256.clone(), policy_version: task.policy_version.clone(),
+                    blocker_key: task.blocker_key.clone(), strategy_version: task.strategy_version.clone(), note: "PRIDE exposes community-annotated SDRF but no provenance-verified depositor SDRF candidate".into(),
+                });
+            } else {
+                not_found += 1;
+                attempts.push(AcquisitionAttemptRow {
+                    stage_key: task.stage_key.clone(),
+                    accession: task.accession.clone(),
+                    source_class: task.source_class.clone(),
+                    status: "source_not_found".into(),
+                    evidence_set_sha256: task.evidence_set_sha256.clone(),
+                    policy_version: task.policy_version.clone(),
+                    blocker_key: task.blocker_key.clone(),
+                    strategy_version: task.strategy_version.clone(),
+                    note: "no non-community SDRF-like PRIDE project file found".into(),
+                });
+            }
+            continue;
+        }
+
+        let mut any_downloaded = false;
+        for file in depositor.iter().take(opts.max_candidates_per_accession) {
+            let name = object_file_name(file);
+            let uri = file_uri(file);
+            if uri.trim().is_empty() {
+                continue;
+            }
+            let local_path = opts
+                .output_dir
+                .join("artifacts")
+                .join(&task.accession)
+                .join(&name);
+            match download_provider_artifact(&client, &uri, &local_path, opts.force).await {
+                Ok(()) => {
+                    any_downloaded = true;
+                    manifest.push(ProviderSourceManifestRow {
+                        accession: task.accession.clone(),
+                        source_kind: "depositor_sdrf_candidate".into(),
+                        source_provider: "PRIDE Archive".into(),
+                        source_locator: uri,
+                        retrieval_method: "pride_project_file_download".into(),
+                        original_filename: name,
+                        local_path: local_path.display().to_string(),
+                        // Filename/category alone is insufficient to prove depositor independence.
+                        trust_class: "untrusted_or_unknown".into(),
+                        blocker_field: task.blocker_fields.clone(),
+                        derivation_operation: "download_copy".into(),
+                        file_accession: object_file_accession(file),
+                        api_record_fingerprint: fnv1a64_hex(serde_json::to_vec(file)?.as_slice()),
+                    });
+                }
+                Err(err) => {
+                    if opts.progress {
+                        eprintln!("  -> candidate download failed: {err:#}");
+                    }
+                }
+            }
+        }
+        if any_downloaded {
+            downloaded += 1;
+            attempts.push(AcquisitionAttemptRow {
+                stage_key: task.stage_key.clone(), accession: task.accession.clone(), source_class: task.source_class.clone(),
+                status: "found_new_provenance_gated_artifact".into(), evidence_set_sha256: task.evidence_set_sha256.clone(), policy_version: task.policy_version.clone(),
+                blocker_key: task.blocker_key.clone(), strategy_version: task.strategy_version.clone(), note: "downloaded non-community SDRF candidate; trust/independence must be established separately".into(),
+            });
+        } else {
+            failed += 1;
+            attempts.push(AcquisitionAttemptRow {
+                stage_key: task.stage_key.clone(),
+                accession: task.accession.clone(),
+                source_class: task.source_class.clone(),
+                status: "fetch_failed".into(),
+                evidence_set_sha256: task.evidence_set_sha256.clone(),
+                policy_version: task.policy_version.clone(),
+                blocker_key: task.blocker_key.clone(),
+                strategy_version: task.strategy_version.clone(),
+                note: "candidate metadata found but no artifact download succeeded".into(),
+            });
+        }
+    }
+
+    let attempts_path = opts.output_dir.join("evidence_acquisition_attempts.tsv");
+    let mut w = WriterBuilder::new()
+        .delimiter(b'\t')
+        .from_path(&attempts_path)?;
+    for row in &attempts {
+        w.serialize(row)?;
+    }
+    w.flush()?;
+    let manifest_path = opts.output_dir.join("source_manifest.tsv");
+    let mut w = WriterBuilder::new()
+        .delimiter(b'\t')
+        .from_path(&manifest_path)?;
+    for row in &manifest {
+        w.serialize(row)?;
+    }
+    w.flush()?;
+
+    let summary = SdrfAcquireEvidenceSummary {
+        provider_version: SDRF_EVIDENCE_PROVIDER_VERSION.into(),
+        tasks_requested: tasks.len(),
+        depositor_sdrf_downloaded: downloaded,
+        community_annotation_only: community_only,
+        source_not_found: not_found,
+        fetch_failed: failed,
+        acquisition_attempts_tsv: attempts_path.display().to_string(),
+        source_manifest_tsv: manifest_path.display().to_string(),
+    };
+    fs::write(
+        opts.output_dir.join("evidence_acquisition_summary.json"),
         serde_json::to_string_pretty(&summary)?,
     )?;
     Ok(summary)
@@ -10942,7 +11339,7 @@ mod tests {
         };
         let candidates = vec![
             mk("snapshot_pride_sdrf_api", true),
-            mk("repository_submitted", true),
+            mk("depositor_sdrf_candidate", true),
             mk("curated_bigbio", true),
         ];
         assert_eq!(
@@ -10953,13 +11350,13 @@ mod tests {
         );
         let candidates = vec![
             mk("snapshot_pride_sdrf_api", true),
-            mk("repository_submitted", true),
+            mk("depositor_sdrf_candidate", true),
         ];
         assert_eq!(
             select_sdrf_source_candidate(&candidates)
                 .unwrap()
                 .source_kind,
-            "repository_submitted"
+            "depositor_sdrf_candidate"
         );
     }
 
@@ -14109,6 +14506,56 @@ mod tests {
         assert_eq!(
             deterministic_validator_repair_terminal_status(&tasks, &issues, &assessment, 1, &[],),
             "evidence_exhausted"
+        );
+    }
+
+    #[test]
+    fn repository_sdrf_taxonomy_separates_community_annotations() {
+        assert_eq!(
+            classify_repository_sdrf_name("PXD023366_community_annotated.sdrf.tsv"),
+            "pride_community_annotated_sdrf"
+        );
+        assert_eq!(
+            classify_repository_sdrf_name("study_design.sdrf.tsv"),
+            "depositor_sdrf_candidate"
+        );
+        assert_eq!(
+            classify_repository_sdrf_name("MARSPRE_SDRF_sample_to_data_file_format.txt"),
+            "depositor_sdrf_candidate"
+        );
+        assert_eq!(classify_repository_sdrf_name("samples.csv"), "not_sdrf");
+    }
+
+    #[test]
+    fn source_selection_never_promotes_pride_community_annotation() {
+        let community = SdrfSourceCandidateAudit {
+            source_kind: "pride_community_annotated_sdrf".into(),
+            source_url: "https://example/PXD000001_community_annotated.sdrf.tsv".into(),
+            status: "usable".into(),
+            usable: true,
+            local_path: "/tmp/community.tsv".into(),
+            content_fingerprint: "fnv1a64:1".into(),
+            bytes: 10,
+            note: String::new(),
+        };
+        assert!(select_sdrf_source_candidate(&[community]).is_none());
+    }
+
+    #[test]
+    fn source_selection_accepts_provenance_gated_depositor_candidate() {
+        let depositor = SdrfSourceCandidateAudit {
+            source_kind: "depositor_sdrf_candidate".into(),
+            source_url: "https://example/study.sdrf.tsv".into(),
+            status: "usable".into(),
+            usable: true,
+            local_path: "/tmp/depositor.tsv".into(),
+            content_fingerprint: "fnv1a64:2".into(),
+            bytes: 10,
+            note: String::new(),
+        };
+        assert_eq!(
+            select_sdrf_source_candidate(&[depositor]).map(|x| x.source_kind.as_str()),
+            Some("depositor_sdrf_candidate")
         );
     }
 }

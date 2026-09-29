@@ -1,4 +1,5 @@
 from __future__ import annotations
+import json
 
 import csv
 import sys
@@ -530,3 +531,12 @@ def test_harness_returns_to_evidence_limited_when_acquisition_source_is_exhauste
     second = plan(spec_path, tmp_path / "out2")
     assert second["decision_counts"] == {"EVIDENCE_LIMITED": 1}
     assert second["evidence_acquisition_plan_count"] == 0
+
+
+def test_production_source_catalog_keeps_depositor_sdrf_provenance_gated() -> None:
+    catalog_path = Path(__file__).resolve().parents[1] / "resources" / "sdrf_evidence_source_catalog_v1.json"
+    catalog = json.loads(catalog_path.read_text(encoding="utf-8"))
+    first = min(catalog["strategies"], key=lambda row: int(row["priority"]))
+    assert first["source_class"] == "depositor_sdrf"
+    assert first["expected_trust_class"] == "provenance_gated_depositor_candidate"
+    assert first["expected_trust_class"] != "trusted_deposited"
