@@ -542,11 +542,7 @@ async fn main() -> Result<()> {
             let source_label = source
                 .as_deref()
                 .map(str::to_owned)
-                .or_else(|| {
-                    source_list
-                        .as_ref()
-                        .map(|path| format!("@{}", path.display()))
-                })
+                .or_else(|| source_list.as_ref().map(|path| format!("@{}", path.display())))
                 .unwrap_or_else(|| "<missing>".to_owned());
             log::info!(
                 "command=transfer source={} destination={} dry_run={} generate_slurm={} submit_slurm={}",
