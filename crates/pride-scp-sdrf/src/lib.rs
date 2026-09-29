@@ -8,6 +8,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use csv::{ReaderBuilder, WriterBuilder};
 use regex::Regex;
 use reqwest::Client;
+use ring::digest::{digest, SHA256};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -46,7 +47,7 @@ const MANUSCRIPT_EVIDENCE_MAX_RESERVED_CHARS: usize = 12_000;
 pub const SDRF_SOURCE_RESOLVER_VERSION: &str = "pride-scp-sdrf-source-resolver-v0.1";
 pub const SDRF_AUDITOR_VERSION: &str = "pride-scp-sdrf-auditor-v0.3";
 pub const DEFAULT_OLLAMA_URL: &str = "http://localhost:11434/api/generate";
-pub const SDRF_EVIDENCE_PROVIDER_VERSION: &str = "pride-scp-sdrf-evidence-provider-v0.1";
+pub const SDRF_EVIDENCE_PROVIDER_VERSION: &str = "pride-scp-sdrf-evidence-provider-v0.2";
 pub const DEFAULT_PRIDE_V2_API: &str = "https://www.ebi.ac.uk/pride/ws/archive/v2";
 
 // The linked single-cell template is work-in-progress. Generated drafts pin the
@@ -1538,6 +1539,8 @@ struct ProviderSourceManifestRow {
     derivation_operation: String,
     file_accession: String,
     api_record_fingerprint: String,
+    artifact_sha256: String,
+    artifact_size_bytes: u64,
 }
 
 fn collect_pride_file_objects(value: &Value, out: &mut Vec<Map<String, Value>>) {
@@ -1651,6 +1654,18 @@ async fn download_provider_artifact(
     Ok(())
 }
 
+fn provider_artifact_identity(path: &Path) -> Result<(String, u64)> {
+    let bytes =
+        fs::read(path).with_context(|| format!("read provider artifact {}", path.display()))?;
+    let hash = digest(&SHA256, &bytes);
+    let sha256 = hash
+        .as_ref()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    Ok((sha256, bytes.len() as u64))
+}
+
 pub async fn acquire_sdrf_evidence(
     opts: SdrfAcquireEvidenceOptions,
 ) -> Result<SdrfAcquireEvidenceSummary> {
@@ -1735,6 +1750,8 @@ pub async fn acquire_sdrf_evidence(
                         derivation_operation: String::new(),
                         file_accession: object_file_accession(file),
                         api_record_fingerprint: fnv1a64_hex(serde_json::to_vec(file)?.as_slice()),
+                        artifact_sha256: String::new(),
+                        artifact_size_bytes: 0,
                     });
                 }
                 attempts.push(AcquisitionAttemptRow {
@@ -1773,6 +1790,8 @@ pub async fn acquire_sdrf_evidence(
                 .join(&name);
             match download_provider_artifact(&client, &uri, &local_path, opts.force).await {
                 Ok(()) => {
+                    let (artifact_sha256, artifact_size_bytes) =
+                        provider_artifact_identity(&local_path)?;
                     any_downloaded = true;
                     manifest.push(ProviderSourceManifestRow {
                         accession: task.accession.clone(),
@@ -1788,6 +1807,8 @@ pub async fn acquire_sdrf_evidence(
                         derivation_operation: "download_copy".into(),
                         file_accession: object_file_accession(file),
                         api_record_fingerprint: fnv1a64_hex(serde_json::to_vec(file)?.as_slice()),
+                        artifact_sha256,
+                        artifact_size_bytes,
                     });
                 }
                 Err(err) => {
@@ -14557,5 +14578,43 @@ mod tests {
             select_sdrf_source_candidate(&[depositor]).map(|x| x.source_kind.as_str()),
             Some("depositor_sdrf_candidate")
         );
+    }
+    #[test]
+    fn provider_artifact_identity_hashes_exact_materialized_bytes() {
+        let root =
+            std::env::temp_dir().join(format!("pride-scp-provider-hash-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("artifact.sdrf.tsv");
+        fs::write(&path, b"source name\tcomment[data file]\na\ta.raw\n").unwrap();
+        let (sha, size) = provider_artifact_identity(&path).unwrap();
+        assert_eq!(
+            sha,
+            "48f76f746d229d3a4cad74b5e76ebb55b0e9a5c6abc1326cda2558daa6ee979e"
+        );
+        assert_eq!(size, fs::read(&path).unwrap().len() as u64);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn provider_artifact_identity_is_stable_for_identical_bytes_and_changes_with_content() {
+        let root = std::env::temp_dir().join(format!(
+            "pride-scp-provider-identity-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let a = root.join("a.tsv");
+        let b = root.join("b.tsv");
+        fs::write(&a, b"same bytes\n").unwrap();
+        fs::write(&b, b"same bytes\n").unwrap();
+        assert_eq!(
+            provider_artifact_identity(&a).unwrap(),
+            provider_artifact_identity(&b).unwrap()
+        );
+        let old = provider_artifact_identity(&a).unwrap();
+        fs::write(&a, b"changed bytes\n").unwrap();
+        assert_ne!(old, provider_artifact_identity(&a).unwrap());
+        let _ = fs::remove_dir_all(root);
     }
 }

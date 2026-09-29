@@ -41,6 +41,7 @@ RETRIEVED_AT_KEYS = ("retrieved_at", "retrieval_time", "downloaded_at")
 RETRIEVAL_METHOD_KEYS = ("retrieval_method", "fetch_method", "download_method")
 ORIGINAL_FILENAME_KEYS = ("original_filename", "source_filename", "remote_filename")
 MEDIA_TYPE_KEYS = ("media_type", "mime_type", "content_type")
+SIZE_KEYS = ("artifact_size_bytes", "byte_size", "size_bytes")
 
 TRUSTED_EXTERNAL_CLASSES = {"trusted_independent"}
 TRUSTED_DEPOSITED_CLASSES = {"trusted_deposited", "trusted_local_deposited_sdrf"}
@@ -182,12 +183,18 @@ def build_registry(
                 local_path = str(path)
             actual_sha = ""
             byte_size: int | str = ""
+            declared_size_raw = first(row, SIZE_KEYS)
+            declared_size = int(declared_size_raw) if declared_size_raw else None
             if path and path.is_file():
                 actual_sha = sha256_file(path)
                 byte_size = path.stat().st_size
                 if declared_sha and declared_sha != actual_sha:
                     raise ValueError(
                         f"declared SHA mismatch for {path}: {declared_sha} != {actual_sha}"
+                    )
+                if declared_size is not None and declared_size != byte_size:
+                    raise ValueError(
+                        f"declared size mismatch for {path}: {declared_size} != {byte_size}"
                     )
             elif local_path:
                 missing_files += 1

@@ -540,3 +540,115 @@ def test_production_source_catalog_keeps_depositor_sdrf_provenance_gated() -> No
     assert first["source_class"] == "depositor_sdrf"
     assert first["expected_trust_class"] == "provenance_gated_depositor_candidate"
     assert first["expected_trust_class"] != "trusted_deposited"
+
+
+def test_provider_manifest_identity_dedup_and_changed_bytes(tmp_path: Path) -> None:
+    from sdrf_evidence_registry import build_registry
+    from sdrf_evidence_registry import sha256_file as registry_sha
+
+    artifact = tmp_path / "depositor.sdrf.tsv"
+    artifact.write_text("source name\tcomment[data file]\na\ta.raw\n", encoding="utf-8")
+    sha1 = registry_sha(artifact)
+    size1 = artifact.stat().st_size
+    manifest = tmp_path / "source_manifest.tsv"
+    header = (
+        "accession\tsource_kind\tsource_provider\tsource_locator\tretrieval_method\t"
+        "original_filename\tlocal_path\ttrust_class\tblocker_field\tderivation_operation\t"
+        "artifact_sha256\tartifact_size_bytes\n"
+    )
+    row = (
+        f"PXD930001\tdepositor_sdrf_candidate\tPRIDE Archive\thttps://example.org/a.tsv\t"
+        f"pride_project_file_download\tdepositor.sdrf.tsv\t{artifact}\tuntrusted_or_unknown\t"
+        f"characteristics[cell identifier]\tdownload_copy\t{sha1}\t{size1}\n"
+    )
+    manifest.write_text(header + row + row, encoding="utf-8")
+    rows, summary = build_registry([manifest], None)
+    assert len(rows) == 1
+    assert summary["records"] == 1
+    assert rows[0]["artifact_sha256"] == sha1
+    assert rows[0]["sha_verified"] == "true"
+    assert rows[0]["is_independent"] == "false"
+    assert rows[0]["provenance_status"] == "locator_present_but_trust_unproven"
+
+    artifact.write_text("source name\tcomment[data file]\nb\tb.raw\n", encoding="utf-8")
+    sha2 = registry_sha(artifact)
+    assert sha2 != sha1
+    try:
+        build_registry([manifest], None)
+    except ValueError as exc:
+        assert "declared SHA mismatch" in str(exc)
+    else:
+        raise AssertionError("changed bytes reused an old provider identity")
+
+
+def test_provider_community_metadata_is_not_registered_as_independent_evidence(tmp_path: Path) -> None:
+    from sdrf_evidence_registry import build_registry
+
+    manifest = tmp_path / "source_manifest.tsv"
+    manifest.write_text(
+        "accession\tsource_kind\tsource_provider\tsource_locator\tlocal_path\ttrust_class\tartifact_sha256\tartifact_size_bytes\n"
+        "PXD930001\tpride_community_annotated_sdrf\tPRIDE Archive\thttps://example.org/community.tsv\t\t"
+        "community_curated_untrusted_for_independence\t\t0\n",
+        encoding="utf-8",
+    )
+    rows, summary = build_registry([manifest], None)
+    assert rows == []
+    assert summary["independent_records"] == 0
+
+
+def test_provider_ingestion_rewrites_registry_and_replans_with_new_evidence_sha(tmp_path: Path) -> None:
+    from sdrf_annotation_harness import ingest_provider_manifest_and_replan, write_tsv
+    from sdrf_evidence_registry import sha256_file as registry_sha
+
+    (tmp_path / "accessions.txt").write_text("PXD930001\n", encoding="utf-8")
+    write_tsv(
+        tmp_path / "candidates.tsv",
+        [{"accession": "PXD930001", "candidate_sha256": "1" * 64}],
+        ["accession", "candidate_sha256"],
+    )
+    write_tsv(
+        tmp_path / "blockers.tsv",
+        [{
+            "accession": "PXD930001",
+            "state": "blocked_metadata_incomplete",
+            "reason_code": "cell_identifier_invalid_or_unresolved",
+            "blocker_fields": "characteristics[cell identifier]",
+        }],
+        ["accession", "state", "reason_code", "blocker_fields"],
+    )
+    (tmp_path / "evidence.tsv").write_text("accession\tartifact_sha256\n", encoding="utf-8")
+    spec = {
+        "schema_version": "pride-scp-sdrf-annotation-run-spec-v1",
+        "run_id": "provider-ingest-test",
+        "provenance": {"policy_version": "p"},
+        "inputs": {
+            "accessions_file": "accessions.txt",
+            "candidate_manifest": "candidates.tsv",
+            "blocker_manifest": "blockers.tsv",
+            "evidence_registry": "evidence.tsv",
+        },
+    }
+    spec_path = tmp_path / "run_spec.json"
+    spec_path.write_text(json.dumps(spec), encoding="utf-8")
+
+    __import__("sdrf_annotation_harness").plan(spec_path, tmp_path / "before")
+    before_row = next(csv.DictReader((tmp_path / "before" / "state_ledger.tsv").open(), delimiter="\t"))
+
+    artifact = tmp_path / "provider.tsv"
+    artifact.write_text("raw\tcell\na.raw\tcell-1\n", encoding="utf-8")
+    sha = registry_sha(artifact)
+    provider = tmp_path / "source_manifest.tsv"
+    provider.write_text(
+        "accession\tsource_kind\tsource_provider\tsource_locator\tlocal_path\ttrust_class\tblocker_field\t"
+        "derivation_operation\tartifact_sha256\tartifact_size_bytes\n"
+        f"PXD930001\tdepositor_sdrf_candidate\tPRIDE Archive\thttps://example.org/provider.tsv\t{artifact}\t"
+        f"untrusted_or_unknown\tcharacteristics[cell identifier]\tdownload_copy\t{sha}\t{artifact.stat().st_size}\n",
+        encoding="utf-8",
+    )
+    after = ingest_provider_manifest_and_replan(spec_path, provider, tmp_path / "after")
+    after_row = next(csv.DictReader((tmp_path / "after" / "state_ledger.tsv").open(), delimiter="\t"))
+    assert before_row["evidence_set_sha256"] != after_row["evidence_set_sha256"]
+    assert after["provider_ingestion"]["records"] == 1
+    registry_rows = list(csv.DictReader((tmp_path / "evidence.tsv").open(), delimiter="\t"))
+    assert registry_rows[0]["artifact_sha256"] == sha
+    assert registry_rows[0]["is_independent"] == "false"

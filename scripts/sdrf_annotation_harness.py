@@ -26,6 +26,8 @@ from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Any
 
+from sdrf_evidence_registry import build_registry as build_evidence_registry
+
 from sdrf_evidence_acquisition_planner import (
     acquisition_stage_key,
     load_attempts as load_acquisition_attempts,
@@ -235,6 +237,45 @@ def verify_run_spec(spec_path: Path, spec: dict[str, Any]) -> dict[str, str]:
         "git_sha": str(provenance.get("git_sha") or ""),
         "policy_version": str(provenance.get("policy_version") or "unknown"),
     }
+
+
+EVIDENCE_REGISTRY_FIELDS = [
+    "accession", "artifact_sha256", "declared_sha256", "sha_verified", "blocker_field",
+    "source_kind", "source_provider", "source_locator", "retrieved_at", "retrieval_method",
+    "original_filename", "media_type", "local_path", "byte_size", "parent_artifact_sha256",
+    "derivation_operation", "trust_class", "independence_class", "is_independent",
+    "provenance_status", "candidate_hash_equal", "manifest_path",
+]
+
+
+def ingest_provider_manifest_and_replan(
+    spec_path: Path, provider_source_manifest: Path, output: Path
+) -> dict[str, Any]:
+    """Merge provider evidence by content identity, rewrite the configured registry, then replan."""
+    spec = load_json(spec_path)
+    base = spec_path.parent
+    inputs = spec.get("inputs") or {}
+    evidence_registry = resolve_path(base, inputs.get("evidence_registry"))
+    if evidence_registry is None:
+        raise ValueError("run spec inputs.evidence_registry is required for provider ingestion")
+    candidate_manifest = resolve_path(base, inputs.get("candidate_manifest"))
+    manifests = [provider_source_manifest]
+    if evidence_registry.is_file():
+        manifests.insert(0, evidence_registry)
+    rows, registry_summary = build_evidence_registry(manifests, candidate_manifest)
+    write_tsv(evidence_registry, rows, EVIDENCE_REGISTRY_FIELDS)
+    registry_summary_path = evidence_registry.with_name("evidence_registry_summary.json")
+    registry_summary_path.write_text(json.dumps(registry_summary, indent=2) + "\n", encoding="utf-8")
+    summary = plan(spec_path, output)
+    summary["provider_ingestion"] = {
+        "source_manifest": str(provider_source_manifest),
+        "evidence_registry": str(evidence_registry),
+        "evidence_registry_summary": str(registry_summary_path),
+        "records": registry_summary["records"],
+        "accessions": registry_summary["accessions"],
+    }
+    (output / "run_manifest.json").write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
+    return summary
 
 
 def plan(spec_path: Path, output: Path) -> dict[str, Any]:
@@ -627,6 +668,7 @@ def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--run-spec", type=Path)
     p.add_argument("--output", type=Path)
+    p.add_argument("--ingest-source-manifest", type=Path, help="Provider source_manifest.tsv to ingest before automatically replanning")
     p.add_argument("--self-test", action="store_true")
     return p
 
@@ -638,7 +680,12 @@ def main() -> int:
         return 0
     if args.run_spec is None or args.output is None:
         raise SystemExit("--run-spec and --output are required unless --self-test")
-    summary = plan(args.run_spec, args.output)
+    if args.ingest_source_manifest is not None:
+        summary = ingest_provider_manifest_and_replan(
+            args.run_spec, args.ingest_source_manifest.resolve(), args.output
+        )
+    else:
+        summary = plan(args.run_spec, args.output)
     print(json.dumps(summary, indent=2))
     return 0
 

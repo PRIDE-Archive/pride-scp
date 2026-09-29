@@ -847,6 +847,7 @@ dependencies = [
  "log",
  "regex",
  "reqwest",
+ "ring",
  "serde",
  "serde_json",
  "tokio",
