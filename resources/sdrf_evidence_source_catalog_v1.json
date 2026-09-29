@@ -1,0 +1,121 @@
+{
+  "schema_version": "pride-scp-sdrf-evidence-source-catalog-v1",
+  "catalog_revision": "pride-scp-sdrf-evidence-source-catalog-v1.0.0",
+  "strategies": [
+    {
+      "source_class": "deposited_sdrf",
+      "priority": 10,
+      "families": [
+        "single_cell_isolation",
+        "cell_identifier",
+        "cell_line_composite",
+        "cellosaurus_accession",
+        "dissociation_method",
+        "label",
+        "row_mapping",
+        "material_ontology",
+        "required_integer",
+        "metadata_incomplete",
+        "candidate_missing"
+      ],
+      "fields": [],
+      "provider": "PRIDE_or_registered_repository",
+      "acquisition_method": "deposited_structured_metadata",
+      "expected_trust_class": "trusted_deposited",
+      "requires_external_locator": true
+    },
+    {
+      "source_class": "repository_structured_sidecars",
+      "priority": 15,
+      "families": [
+        "candidate_missing",
+        "parser_gap",
+        "row_mapping",
+        "cell_identifier",
+        "label",
+        "required_integer"
+      ],
+      "fields": [],
+      "provider": "PRIDE_or_registered_repository",
+      "acquisition_method": "repository_file_inventory_structured_sidecars",
+      "expected_trust_class": "trusted_independent",
+      "requires_external_locator": true
+    },
+    {
+      "source_class": "sample_annotation_table",
+      "priority": 20,
+      "families": [
+        "single_cell_isolation",
+        "cell_identifier",
+        "cell_line_composite",
+        "cellosaurus_accession",
+        "dissociation_method",
+        "label",
+        "row_mapping",
+        "material_ontology",
+        "required_integer",
+        "metadata_incomplete",
+        "candidate_missing"
+      ],
+      "fields": [],
+      "provider": "PRIDE_or_public_supplement",
+      "acquisition_method": "structured_sidecar_discovery",
+      "expected_trust_class": "trusted_independent",
+      "requires_external_locator": true
+    },
+    {
+      "source_class": "experimental_design_table",
+      "priority": 30,
+      "families": [
+        "cell_identifier",
+        "label",
+        "row_mapping",
+        "required_integer"
+      ],
+      "fields": [],
+      "provider": "PRIDE_or_public_supplement",
+      "acquisition_method": "csv_tsv_xlsx_design_discovery",
+      "expected_trust_class": "trusted_independent",
+      "requires_external_locator": true
+    },
+    {
+      "source_class": "publication_supplement",
+      "priority": 40,
+      "families": [
+        "single_cell_isolation",
+        "cell_identifier",
+        "cell_line_composite",
+        "cellosaurus_accession",
+        "dissociation_method",
+        "label",
+        "row_mapping",
+        "material_ontology",
+        "required_integer",
+        "metadata_incomplete",
+        "candidate_missing"
+      ],
+      "fields": [],
+      "provider": "publication_supplement",
+      "acquisition_method": "supplementary_file_discovery",
+      "expected_trust_class": "trusted_publication_supplement",
+      "requires_external_locator": true
+    },
+    {
+      "source_class": "publication_full_text",
+      "priority": 50,
+      "families": [
+        "single_cell_isolation",
+        "cell_line_composite",
+        "cellosaurus_accession",
+        "dissociation_method",
+        "material_ontology",
+        "metadata_incomplete"
+      ],
+      "fields": [],
+      "provider": "publication",
+      "acquisition_method": "bounded_structured_claim_extraction",
+      "expected_trust_class": "publication_context",
+      "requires_external_locator": true
+    }
+  ]
+}

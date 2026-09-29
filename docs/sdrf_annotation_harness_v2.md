@@ -177,3 +177,144 @@ replays automatically.
 The repository ships `resources/sdrf_annotation_resolver_catalog_v1.json` so the resolver
 capability contract can be reviewed and versioned independently of the planner implementation.  The
 built-in catalog is an equivalent fallback used by self-tests and minimal deployments.
+
+## v2.2 — provenance hardening and blocker-directed evidence acquisition
+
+Version 2.2 adds the first submission-yield mechanism on top of the v2.1 control plane.
+It still does not fetch data itself and it does not weaken scientific acceptance rules. Instead,
+it produces a content-addressed acquisition queue for the existing/future provider adapters.
+
+### Provenance lineage
+
+Evidence registry rows now preserve:
+
+```text
+artifact_sha256
+accession
+source_kind
+source_provider
+source_locator
+retrieved_at
+retrieval_method
+original_filename
+media_type
+byte_size
+parent_artifact_sha256
+derivation_operation
+trust_class
+independence_class
+```
+
+`independence_class` is deterministic and may be:
+
+```text
+independent_external
+deposited_repository
+publication_supplement
+derived_from_trusted_source
+candidate_derived
+provenance_unknown
+```
+
+A local workspace path is never sufficient to establish independence. Candidate ancestry fails
+closed even after copying/parsing. A parser/materialization derivative may retain independence only
+when its parent artifact is registered as independently sourced and the derivation operation is an
+approved non-generative transformation.
+
+The evidence-set content hash now includes source locator/provider, independence class, provenance
+status, parent SHA and derivation operation. Changing provenance therefore invalidates old resolver
+or acquisition stage keys instead of silently reusing stale no-progress state.
+
+### Evidence acquisition section in the run spec
+
+Acquisition is opt-in so historical deterministic replays remain byte-stable:
+
+```json
+{
+  "evidence_acquisition": {
+    "enabled": true,
+    "source_catalog": "resources/sdrf_evidence_source_catalog_v1.json",
+    "attempt_ledger": "evidence_acquisition_attempts.tsv",
+    "max_source_classes_per_accession": 4
+  }
+}
+```
+
+When acquisition is disabled, a case with no applicable independent evidence remains
+`EVIDENCE_LIMITED`, exactly as in v2.1.
+
+When enabled, an evidence-limited case is compared against the blocker-directed source catalog. If
+an unexhausted strategy exists, its state becomes:
+
+```text
+next_action=ACQUIRE_EVIDENCE
+terminal_state=<blank>
+```
+
+and the exact work is written to:
+
+```text
+evidence_acquisition_plan.tsv
+```
+
+### Source-class priority
+
+The shipped catalog prefers structured/high-trust sources before text extraction:
+
+```text
+10  deposited_sdrf
+15  repository_structured_sidecars
+20  sample_annotation_table
+30  experimental_design_table
+40  publication_supplement
+50  publication_full_text
+```
+
+Strategies are blocker-specific. For example, cell identifiers and row mapping can use design
+spreadsheets, while cell-line/Cellosaurus blockers prefer deposited/sample annotation evidence.
+Candidate-missing cases first search for deposited SDRFs and repository structured sidecars.
+
+Publication full text is an evidence-discovery source, not directly projectable row evidence. Any
+claim extracted from it must still enter the provenance registry and pass normal deterministic
+scope/mapping rules before it can affect a candidate.
+
+### Acquisition no-progress cache
+
+Each source-class attempt has its own content-addressed key:
+
+```text
+SHA256(
+  accession
+  + source_class
+  + evidence_set_sha256
+  + policy_version
+  + blocker_key
+  + source_catalog_version
+)
+```
+
+No-progress statuses are:
+
+```text
+source_not_found
+no_new_artifact
+source_exhausted
+unsupported_source
+provenance_invalid
+```
+
+An exhausted source class is skipped for identical inputs. A changed evidence set, policy, blocker
+or source strategy version creates a new key and may legally reopen acquisition.
+
+### v2.2 boundaries
+
+v2.2 plans acquisition only. Provider-specific network fetchers, structured parsing execution,
+candidate generation and readiness iteration remain existing components or follow-on v2.2c work.
+This separation keeps source discovery from becoming an implicit scientific mutation path.
+
+The source-class budget is sequential, not parallel. One planning cycle schedules only the
+highest-priority unexhausted source class for an accession. After that acquisition attempt, the
+harness is rerun with the updated evidence/attempt ledger. This allows it to stop immediately when a
+cheap trusted source closes the blocker instead of downloading lower-priority sources unnecessarily.
+`max_source_classes_per_accession` is the total distinct source-class budget for the blocker/catalog
+version, not the number of concurrent fetches.

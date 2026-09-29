@@ -1,23 +1,24 @@
 #!/usr/bin/env python3
-"""Build a content-addressed provenance registry for PRIDE-SCP SDRF evidence artifacts.
+"""Build provenance-hardened evidence records for the PRIDE-SCP SDRF harness.
 
-The registry is deliberately conservative.  A local file path or generalized-graph copy does
-not establish source independence.  Positive independence requires an explicit trusted source
-class/locator from the supplied manifests, while exact equality to a candidate is recorded as a
-circularity warning.
+v2.2 keeps immutable source lineage when evidence is copied, parsed or materialized.
+Presence in a workspace never upgrades trust. Candidate-derived ancestry fails closed, while
+safe derivatives of independently sourced artifacts retain independence through parent SHA
+lineage.
 """
 from __future__ import annotations
 
 import argparse
 import csv
 import json
+import mimetypes
 import tempfile
 from pathlib import Path
 from typing import Any
 
-from sdrf_annotation_state import EvidenceRecord, VERSION as STATE_VERSION, sha256_file
+from sdrf_annotation_state import VERSION as STATE_VERSION, sha256_file
 
-VERSION = "pride-scp-sdrf-evidence-registry-v2.1.0"
+VERSION = "pride-scp-sdrf-evidence-registry-v2.2.0"
 
 PATH_KEYS = ("local_path", "path", "source_path", "artifact_path", "file_path")
 ACCESSION_KEYS = ("accession", "project_accession", "pxd")
@@ -36,12 +37,27 @@ TRUST_KEYS = ("trust_class", "trusted_source", "source_trust")
 BLOCKER_FIELD_KEYS = ("blocker_field", "field", "target_field", "sdrf_field")
 PARENT_SHA_KEYS = ("parent_artifact_sha256", "parent_sha256")
 DERIVATION_KEYS = ("derivation_operation", "operation", "producer_stage")
+RETRIEVED_AT_KEYS = ("retrieved_at", "retrieval_time", "downloaded_at")
+RETRIEVAL_METHOD_KEYS = ("retrieval_method", "fetch_method", "download_method")
+ORIGINAL_FILENAME_KEYS = ("original_filename", "source_filename", "remote_filename")
+MEDIA_TYPE_KEYS = ("media_type", "mime_type", "content_type")
 
-TRUSTED_CLASSES = {
-    "trusted_independent",
-    "trusted_deposited",
-    "trusted_local_deposited_sdrf",
-    "trusted_publication_supplement",
+TRUSTED_EXTERNAL_CLASSES = {"trusted_independent"}
+TRUSTED_DEPOSITED_CLASSES = {"trusted_deposited", "trusted_local_deposited_sdrf"}
+TRUSTED_SUPPLEMENT_CLASSES = {"trusted_publication_supplement"}
+TRUSTED_CLASSES = TRUSTED_EXTERNAL_CLASSES | TRUSTED_DEPOSITED_CLASSES | TRUSTED_SUPPLEMENT_CLASSES
+
+# These operations preserve the scientific source identity; they do not themselves invent values.
+SAFE_DERIVATIONS = {
+    "copy",
+    "materialize",
+    "download_copy",
+    "archive_member",
+    "decompress",
+    "parse",
+    "parse_table",
+    "extract_table",
+    "normalize_schema",
 }
 
 
@@ -76,15 +92,75 @@ def candidate_sha_index(path: Path | None) -> dict[str, set[str]]:
     return out
 
 
-def infer_independence(row: dict[str, str], trust: str, locator: str) -> bool:
-    explicit = str(row.get("is_independent") or "").strip().lower()
-    if explicit in {"true", "1", "yes"}:
-        return True
-    if explicit in {"false", "0", "no"}:
-        return False
-    if trust in TRUSTED_CLASSES and locator:
-        return True
-    return False
+def _primary_independence_class(trust: str, locator: str) -> str:
+    if not locator:
+        return ""
+    if trust in TRUSTED_DEPOSITED_CLASSES:
+        return "deposited_repository"
+    if trust in TRUSTED_SUPPLEMENT_CLASSES:
+        return "publication_supplement"
+    if trust in TRUSTED_EXTERNAL_CLASSES:
+        return "independent_external"
+    return ""
+
+
+def _media_type(row: dict[str, str], path: Path | None) -> str:
+    explicit = first(row, MEDIA_TYPE_KEYS)
+    if explicit:
+        return explicit
+    if path:
+        guessed, _ = mimetypes.guess_type(str(path))
+        return guessed or ""
+    return ""
+
+
+def _resolve_parent_class(
+    record: dict[str, Any],
+    by_sha: dict[tuple[str, str], dict[str, Any]],
+    candidate_shas: dict[str, set[str]],
+    stack: set[tuple[str, str]],
+) -> tuple[str, bool, str]:
+    """Return (independence_class, independent, provenance_status)."""
+    acc = record["accession"]
+    artifact_sha = record["artifact_sha256"]
+    trust = record["trust_class"]
+    locator = record["source_locator"]
+    parent_sha = record["parent_artifact_sha256"]
+    derivation = record["derivation_operation"]
+    candidate_equal = artifact_sha in candidate_shas.get(acc, set())
+
+    primary = _primary_independence_class(trust, locator)
+    if primary:
+        return primary, True, "independent_source_provenance_present"
+
+    if parent_sha:
+        if parent_sha in candidate_shas.get(acc, set()):
+            return "candidate_derived", False, "candidate_derived_ancestry"
+        key = (acc, parent_sha)
+        if key in stack:
+            return "provenance_unknown", False, "lineage_cycle_detected"
+        parent = by_sha.get(key)
+        if parent is None:
+            return "provenance_unknown", False, "parent_artifact_not_registered"
+        parent_class, parent_independent, _ = _resolve_parent_class(
+            parent,
+            by_sha,
+            candidate_shas,
+            stack | {key},
+        )
+        if parent_class == "candidate_derived":
+            return "candidate_derived", False, "candidate_derived_ancestry"
+        if parent_independent and derivation in SAFE_DERIVATIONS:
+            return "derived_from_trusted_source", True, "independent_parent_lineage_preserved"
+        if parent_independent:
+            return "provenance_unknown", False, "unapproved_derivation_from_independent_parent"
+        return "provenance_unknown", False, "parent_provenance_not_independent"
+
+    if candidate_equal:
+        return "candidate_derived", False, "circular_or_unproven_self_evidence"
+    if locator:
+        return "provenance_unknown", False, "locator_present_but_trust_unproven"
+    return "provenance_unknown", False, "source_provenance_unknown"
 
 
 def build_registry(
@@ -125,21 +201,13 @@ def build_registry(
             trust = first(row, TRUST_KEYS) or "untrusted_or_unknown"
             field_name = first(row, BLOCKER_FIELD_KEYS)
             parent_sha = first(row, PARENT_SHA_KEYS).lower()
-            derivation = first(row, DERIVATION_KEYS)
-            independent = infer_independence(row, trust, locator)
-
-            candidate_equal = artifact_sha in candidate_shas.get(acc, set())
-            if candidate_equal and not independent:
-                provenance_status = "circular_or_unproven_self_evidence"
-            elif independent:
-                provenance_status = "independent_source_provenance_present"
-            elif locator:
-                provenance_status = "locator_present_but_trust_unproven"
-            else:
-                provenance_status = "source_provenance_unknown"
+            derivation = first(row, DERIVATION_KEYS).lower()
+            retrieved_at = first(row, RETRIEVED_AT_KEYS)
+            retrieval_method = first(row, RETRIEVAL_METHOD_KEYS)
+            original_filename = first(row, ORIGINAL_FILENAME_KEYS) or (path.name if path else "")
+            media_type = _media_type(row, path)
 
             key = (acc, artifact_sha, field_name)
-            existing = records.get(key)
             item = {
                 "accession": acc,
                 "artifact_sha256": artifact_sha,
@@ -149,21 +217,57 @@ def build_registry(
                 "source_kind": kind,
                 "source_provider": provider,
                 "source_locator": locator,
+                "retrieved_at": retrieved_at,
+                "retrieval_method": retrieval_method,
+                "original_filename": original_filename,
+                "media_type": media_type,
                 "local_path": local_path,
                 "byte_size": byte_size,
                 "parent_artifact_sha256": parent_sha,
                 "derivation_operation": derivation,
                 "trust_class": trust,
-                "is_independent": str(independent).lower(),
-                "provenance_status": provenance_status,
-                "candidate_hash_equal": str(candidate_equal).lower(),
+                "independence_class": "",
+                "is_independent": "false",
+                "provenance_status": "unclassified",
+                "candidate_hash_equal": str(artifact_sha in candidate_shas.get(acc, set())).lower(),
                 "manifest_path": str(manifest),
             }
-            # Prefer the row carrying stronger provenance if duplicate content appears.
-            if existing is None or (independent and existing["is_independent"] != "true"):
+            existing = records.get(key)
+            # Prefer a duplicate row carrying an immutable locator or explicit parent lineage.
+            score = int(bool(locator)) * 4 + int(bool(parent_sha)) * 2 + int(trust in TRUSTED_CLASSES)
+            old_score = -1
+            if existing:
+                old_score = (
+                    int(bool(existing["source_locator"])) * 4
+                    + int(bool(existing["parent_artifact_sha256"])) * 2
+                    + int(existing["trust_class"] in TRUSTED_CLASSES)
+                )
+            if existing is None or score > old_score:
                 records[key] = item
 
+    # Parent lookup is content-addressed and ignores blocker field because parentage is artifact-level.
+    by_sha: dict[tuple[str, str], dict[str, Any]] = {}
+    for item in records.values():
+        key = (item["accession"], item["artifact_sha256"])
+        current = by_sha.get(key)
+        if current is None or item["source_locator"]:
+            by_sha[key] = item
+
+    for item in records.values():
+        cls, independent, status = _resolve_parent_class(
+            item,
+            by_sha,
+            candidate_shas,
+            {(item["accession"], item["artifact_sha256"])},
+        )
+        item["independence_class"] = cls
+        item["is_independent"] = str(independent).lower()
+        item["provenance_status"] = status
+
     rows = sorted(records.values(), key=lambda r: (r["accession"], r["artifact_sha256"], r["blocker_field"]))
+    class_counts: dict[str, int] = {}
+    for row in rows:
+        class_counts[row["independence_class"]] = class_counts.get(row["independence_class"], 0) + 1
     summary = {
         "version": VERSION,
         "state_primitives_version": STATE_VERSION,
@@ -173,6 +277,8 @@ def build_registry(
         "accessions": len({r["accession"] for r in rows}),
         "independent_records": sum(r["is_independent"] == "true" for r in rows),
         "candidate_hash_equal_records": sum(r["candidate_hash_equal"] == "true" for r in rows),
+        "candidate_derived_records": sum(r["independence_class"] == "candidate_derived" for r in rows),
+        "independence_class_counts": dict(sorted(class_counts.items())),
         "missing_local_files": missing_files,
     }
     return rows, summary
@@ -189,34 +295,54 @@ def write_tsv(path: Path, rows: list[dict[str, Any]], fields: list[str]) -> None
 def self_test() -> None:
     with tempfile.TemporaryDirectory() as td:
         root = Path(td)
-        artifact = root / "PXD900001.sdrf.tsv"
-        artifact.write_text("source name\tcomment[data file]\na\ta.raw\n", encoding="utf-8")
-        sha = sha256_file(artifact)
+        candidate = root / "candidate.sdrf.tsv"
+        candidate.write_text("source name\tcomment[data file]\na\ta.raw\n", encoding="utf-8")
+        candidate_sha = sha256_file(candidate)
         candidates = root / "candidates.tsv"
         candidates.write_text(
-            "accession\tcandidate_sha256\nPXD900001\t" + sha + "\n",
+            "accession\tcandidate_sha256\nPXD900001\t" + candidate_sha + "\n",
             encoding="utf-8",
         )
-        manifest = root / "sources.tsv"
-        manifest.write_text(
-            "accession\tlocal_path\ttrust_class\tsource_locator\n"
-            f"PXD900001\t{artifact}\tuntrusted_or_unknown\t\n",
-            encoding="utf-8",
-        )
-        rows, summary = build_registry([manifest], candidates)
-        assert summary["records"] == 1
-        assert rows[0]["candidate_hash_equal"] == "true"
-        assert rows[0]["is_independent"] == "false"
-        assert rows[0]["provenance_status"] == "circular_or_unproven_self_evidence"
 
-        manifest.write_text(
+        # Candidate bytes without external provenance must fail closed.
+        m1 = root / "m1.tsv"
+        m1.write_text(
             "accession\tlocal_path\ttrust_class\tsource_locator\n"
-            f"PXD900001\t{artifact}\ttrusted_deposited\thttps://example.org/source.tsv\n",
+            f"PXD900001\t{candidate}\tuntrusted_or_unknown\t\n",
             encoding="utf-8",
         )
-        rows, _ = build_registry([manifest], candidates)
+        rows, _ = build_registry([m1], candidates)
+        assert rows[0]["independence_class"] == "candidate_derived"
+        assert rows[0]["is_independent"] == "false"
+
+        # An independently fetched deposited artifact may happen to have identical bytes.
+        m1.write_text(
+            "accession\tlocal_path\ttrust_class\tsource_locator\tsource_provider\n"
+            f"PXD900001\t{candidate}\ttrusted_deposited\thttps://example.org/source.tsv\tPRIDE\n",
+            encoding="utf-8",
+        )
+        rows, _ = build_registry([m1], candidates)
+        assert rows[0]["independence_class"] == "deposited_repository"
         assert rows[0]["is_independent"] == "true"
-        assert rows[0]["provenance_status"] == "independent_source_provenance_present"
+
+        # A parser derivative preserves independence through parent SHA lineage.
+        parent = root / "parent.tsv"
+        parent.write_text("raw\tvalue\na.raw\tx\n", encoding="utf-8")
+        child = root / "child.tsv"
+        child.write_text("raw\tvalue\tnormalized\na.raw\tx\t1\n", encoding="utf-8")
+        psha = sha256_file(parent)
+        m2 = root / "m2.tsv"
+        m2.write_text(
+            "accession\tlocal_path\ttrust_class\tsource_locator\tparent_artifact_sha256\tderivation_operation\n"
+            f"PXD900002\t{parent}\ttrusted_independent\thttps://example.org/parent.tsv\t\t\n"
+            f"PXD900002\t{child}\ttrusted_independent\t\t{psha}\tparse_table\n",
+            encoding="utf-8",
+        )
+        rows, summary = build_registry([m2], None)
+        child_row = next(r for r in rows if r["local_path"] == str(child))
+        assert child_row["independence_class"] == "derived_from_trusted_source"
+        assert child_row["is_independent"] == "true"
+        assert summary["independent_records"] == 2
     print("sdrf_evidence_registry self-test: PASS")
 
 
@@ -239,10 +365,11 @@ def main() -> int:
     rows, summary = build_registry(args.source_manifest, args.candidate_manifest)
     args.output.mkdir(parents=True, exist_ok=True)
     fields = [
-        "accession", "artifact_sha256", "declared_sha256", "sha_verified", "blocker_field", "source_kind", "source_provider",
-        "source_locator", "local_path", "byte_size", "parent_artifact_sha256",
-        "derivation_operation", "trust_class", "is_independent", "provenance_status",
-        "candidate_hash_equal", "manifest_path",
+        "accession", "artifact_sha256", "declared_sha256", "sha_verified", "blocker_field",
+        "source_kind", "source_provider", "source_locator", "retrieved_at", "retrieval_method",
+        "original_filename", "media_type", "local_path", "byte_size", "parent_artifact_sha256",
+        "derivation_operation", "trust_class", "independence_class", "is_independent",
+        "provenance_status", "candidate_hash_equal", "manifest_path",
     ]
     write_tsv(args.output / "evidence_registry.tsv", rows, fields)
     (args.output / "evidence_registry_summary.json").write_text(

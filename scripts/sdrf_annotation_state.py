@@ -15,7 +15,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Iterable
 
-VERSION = "pride-scp-sdrf-annotation-state-v2.1.0"
+VERSION = "pride-scp-sdrf-annotation-state-v2.2.0"
 
 TERMINAL_STATES = {
     "SUBMISSION_READY",
@@ -106,10 +106,15 @@ class EvidenceRecord:
     source_locator: str = ""
     local_path: str = ""
     trust_class: str = "untrusted_or_unknown"
+    independence_class: str = "provenance_unknown"
     provenance_status: str = "unknown"
     is_independent: bool = False
     parent_artifact_sha256: str = ""
     derivation_operation: str = ""
+    retrieved_at: str = ""
+    retrieval_method: str = ""
+    original_filename: str = ""
+    media_type: str = ""
 
 
 @dataclass(frozen=True)
@@ -196,9 +201,14 @@ def evidence_set_sha256(records: Iterable[EvidenceRecord]) -> str:
                 r.accession.upper(),
                 r.artifact_sha256.lower(),
                 normalize_field_name(r.blocker_field),
+                r.source_provider,
+                r.source_locator,
                 r.trust_class,
+                r.independence_class,
                 r.provenance_status,
                 bool(r.is_independent),
+                r.parent_artifact_sha256.lower(),
+                r.derivation_operation,
             )
             for r in records
             if r.artifact_sha256

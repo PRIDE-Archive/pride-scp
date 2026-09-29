@@ -6,6 +6,7 @@ machine-readable artifacts, normalizes accession state, prevents repeated no-pro
 and emits the next deterministic queue:
 
   RUN_RESOLVER
+  ACQUIRE_EVIDENCE
   SUBMISSION_READY
   HUMAN_REVIEW_ACTIONABLE
   IMPLEMENTATION_CANDIDATE
@@ -25,6 +26,13 @@ from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Any
 
+from sdrf_evidence_acquisition_planner import (
+    acquisition_stage_key,
+    load_attempts as load_acquisition_attempts,
+    load_catalog as load_source_catalog,
+    plan_acquisition_for_case,
+)
+
 from sdrf_annotation_state import (
     AttemptRecord,
     EvidenceRecord,
@@ -39,7 +47,7 @@ from sdrf_annotation_state import (
     stage_key,
 )
 
-VERSION = "pride-scp-sdrf-annotation-harness-v2.1.0"
+VERSION = "pride-scp-sdrf-annotation-harness-v2.2.0"
 RUN_SPEC_VERSION = "pride-scp-sdrf-annotation-run-spec-v1"
 
 
@@ -160,10 +168,15 @@ def load_evidence(path: Path | None) -> list[EvidenceRecord]:
                 source_locator=row.get("source_locator", ""),
                 local_path=row.get("local_path", ""),
                 trust_class=row.get("trust_class", "untrusted_or_unknown"),
+                independence_class=row.get("independence_class", "provenance_unknown"),
                 provenance_status=row.get("provenance_status", "unknown"),
                 is_independent=independent,
                 parent_artifact_sha256=row.get("parent_artifact_sha256", ""),
                 derivation_operation=row.get("derivation_operation", ""),
+                retrieved_at=row.get("retrieved_at", ""),
+                retrieval_method=row.get("retrieval_method", ""),
+                original_filename=row.get("original_filename", ""),
+                media_type=row.get("media_type", ""),
             )
         )
     return out
@@ -239,6 +252,11 @@ def plan(spec_path: Path, output: Path) -> dict[str, Any]:
     evidence_registry = resolve_path(base, inputs.get("evidence_registry"))
     attempt_ledger = resolve_path(base, inputs.get("attempt_ledger"))
     resolver_catalog = resolve_path(base, inputs.get("resolver_catalog"))
+    acquisition_cfg = spec.get("evidence_acquisition") or {}
+    acquisition_enabled = bool(acquisition_cfg.get("enabled", False))
+    source_catalog_path = resolve_path(base, acquisition_cfg.get("source_catalog"))
+    source_attempt_ledger_path = resolve_path(base, acquisition_cfg.get("attempt_ledger"))
+    max_source_classes = int(acquisition_cfg.get("max_source_classes_per_accession") or 4)
 
     candidates = load_candidates(candidate_manifest)
     blockers = load_blockers(blocker_manifest)
@@ -246,6 +264,14 @@ def plan(spec_path: Path, output: Path) -> dict[str, Any]:
     attempts = load_attempts(attempt_ledger)
     resolvers = load_resolvers(resolver_catalog)
     policy_version = verified["policy_version"]
+    source_catalog_version = ""
+    source_strategies = []
+    acquisition_attempts = []
+    if acquisition_enabled:
+        if source_catalog_path is None or not source_catalog_path.is_file():
+            raise FileNotFoundError("evidence_acquisition.source_catalog is required when acquisition is enabled")
+        source_catalog_version, source_strategies = load_source_catalog(source_catalog_path)
+        acquisition_attempts = load_acquisition_attempts(source_attempt_ledger_path)
 
     evidence_by_acc: dict[str, list[EvidenceRecord]] = defaultdict(list)
     for row in evidence:
@@ -283,6 +309,33 @@ def plan(spec_path: Path, output: Path) -> dict[str, Any]:
     threshold = int(spec.get("generic_implementation_threshold") or 3)
     implementation_candidates = apply_generic_implementation_gate(decisions, threshold=threshold)
 
+    acquisition_plan_rows = []
+    if acquisition_enabled:
+        acquisition_attempts_by_acc: dict[str, list[Any]] = defaultdict(list)
+        for attempt in acquisition_attempts:
+            acquisition_attempts_by_acc[attempt.accession.upper()].append(attempt)
+        for decision in decisions:
+            if decision.terminal_state != "EVIDENCE_LIMITED":
+                continue
+            bkey = blocker_key(decision.blocker_family, decision.blocker_fields)
+            planned = plan_acquisition_for_case(
+                accession=decision.accession,
+                blocker_family=decision.blocker_family,
+                blocker_fields=decision.blocker_fields,
+                blocker_key=bkey,
+                evidence_set_sha256=decision.evidence_set_sha256,
+                policy_version=policy_version,
+                strategies=source_strategies,
+                attempts=acquisition_attempts_by_acc.get(decision.accession, []),
+                strategy_version=source_catalog_version,
+                max_source_classes=max_source_classes,
+            )
+            if planned:
+                acquisition_plan_rows.extend(planned)
+                decision.terminal_state = ""
+                decision.next_action = "ACQUIRE_EVIDENCE"
+                decision.decision_reason = "blocker_directed_source_strategy_available"
+
     output.mkdir(parents=True, exist_ok=True)
     decision_rows = [d.as_dict() for d in decisions]
     for row in decision_rows:
@@ -313,11 +366,6 @@ def plan(spec_path: Path, output: Path) -> dict[str, Any]:
         "independent_evidence_fields", "applicable_resolvers", "cached_no_progress_resolvers", "next_action",
         "terminal_state", "decision_reason",
     ]
-    write_tsv(output / "state_ledger.tsv", decision_rows, state_fields)
-
-    action_rows = [r for r in decision_rows if r["next_action"]]
-    write_tsv(output / "action_queue.tsv", action_rows, state_fields)
-
     resolver_by_id = {x.resolver_id: x for x in resolvers}
     resolver_plan_rows = []
     for decision in decisions:
@@ -356,6 +404,34 @@ def plan(spec_path: Path, output: Path) -> dict[str, Any]:
             "evidence_set_sha256", "status",
         ],
     )
+    write_tsv(
+        output / "evidence_acquisition_plan.tsv",
+        acquisition_plan_rows,
+        [
+            "stage_key", "accession", "source_class", "priority", "provider",
+            "acquisition_method", "expected_trust_class", "requires_external_locator",
+            "blocker_family", "blocker_fields", "blocker_key", "evidence_set_sha256",
+            "policy_version", "strategy_version", "status",
+        ],
+    )
+    write_tsv(
+        output / "evidence_acquisition_attempts.tsv",
+        [vars(x) for x in acquisition_attempts],
+        [
+            "stage_key", "accession", "source_class", "status", "evidence_set_sha256",
+            "policy_version", "blocker_key", "strategy_version",
+        ],
+    )
+    # Refresh rows after acquisition planning mutates terminal/action classification.
+    decision_rows = [d.as_dict() for d in decisions]
+    for row in decision_rows:
+        row["blocker_fields"] = ";".join(row["blocker_fields"])
+        row["independent_evidence_fields"] = ";".join(row["independent_evidence_fields"])
+        row["applicable_resolvers"] = ";".join(row["applicable_resolvers"])
+        row["cached_no_progress_resolvers"] = ";".join(row["cached_no_progress_resolvers"])
+    write_tsv(output / "state_ledger.tsv", decision_rows, state_fields)
+    action_rows = [r for r in decision_rows if r["next_action"]]
+    write_tsv(output / "action_queue.tsv", action_rows, state_fields)
     human_rows = [r for r in decision_rows if r["terminal_state"] == "HUMAN_REVIEW_ACTIONABLE"]
     write_tsv(output / "human_review_queue.tsv", human_rows, state_fields)
     limited_rows = [r for r in decision_rows if r["terminal_state"] == "EVIDENCE_LIMITED"]
@@ -396,6 +472,10 @@ def plan(spec_path: Path, output: Path) -> dict[str, Any]:
         "evidence_records": len(evidence),
         "attempt_records": len(attempts),
         "resolver_count": len(resolvers),
+        "evidence_acquisition_enabled": acquisition_enabled,
+        "evidence_source_catalog_version": source_catalog_version,
+        "evidence_acquisition_plan_count": len(acquisition_plan_rows),
+        "evidence_acquisition_attempt_count": len(acquisition_attempts),
         "generic_implementation_threshold": threshold,
         "generic_implementation_candidates": implementation_candidates,
         "decision_counts": dict(sorted(counts.items())),
@@ -405,6 +485,8 @@ def plan(spec_path: Path, output: Path) -> dict[str, Any]:
             "resolver_attempts": str(output / "resolver_attempts.tsv"),
             "action_queue": str(output / "action_queue.tsv"),
             "resolver_plan": str(output / "resolver_plan.tsv"),
+            "evidence_acquisition_plan": str(output / "evidence_acquisition_plan.tsv"),
+            "evidence_acquisition_attempts": str(output / "evidence_acquisition_attempts.tsv"),
             "human_review_queue": str(output / "human_review_queue.tsv"),
             "implementation_candidates": str(output / "implementation_candidates.tsv"),
             "evidence_limited": str(output / "evidence_limited.tsv"),
@@ -436,7 +518,7 @@ def plan(spec_path: Path, output: Path) -> dict[str, Any]:
         "",
         "## Operator surfaces",
         "",
-        "Inspect `action_queue.tsv`, `resolver_plan.tsv`, `human_review_queue.tsv`, `implementation_candidates.tsv`, and `submission_ready.tsv`.",
+        "Inspect `action_queue.tsv`, `resolver_plan.tsv`, `evidence_acquisition_plan.tsv`, `human_review_queue.tsv`, `implementation_candidates.tsv`, and `submission_ready.tsv`.",
         "The harness does not mutate SDRFs and does not itself confer submission readiness.",
         "",
     ])
