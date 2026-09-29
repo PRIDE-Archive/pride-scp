@@ -765,3 +765,70 @@ def test_cached_publication_ingestion_registers_identity_but_not_blocker_claim(t
     assert summary["publication_ingestion"]["field_claims_emitted"] == 0
     # Publication discovery changes evidence identity but cannot itself authorize a field resolver.
     assert summary["decision_counts"] != {"RUN_RESOLVER": 1}
+
+
+def test_empty_blocker_fields_do_not_align_unscoped_independent_evidence() -> None:
+    acc = "PXD058457"
+    cap = ResolverCapability(
+        resolver_id="structured_mapping_v2",
+        version="1",
+        supported_families=("row_mapping",),
+        accepted_trust_classes=("trusted_independent",),
+    )
+    d = decide_case(
+        accession=acc,
+        input_state="hard_tail40_terminal_state_unmapped_in_uploaded_bundle",
+        reason_code="row_mapping_required",
+        blocker_fields=[],
+        candidate_sha256="0" * 64,
+        evidence=[evidence(acc, "")],
+        resolvers=[cap],
+        attempts=[],
+        policy_version="p",
+    )
+    assert d.blocker_family == "row_mapping"
+    assert d.independent_evidence_count == 0
+    assert d.independent_evidence_fields == []
+    assert d.applicable_resolvers == []
+    assert d.next_action == ""
+    assert d.terminal_state == "EVIDENCE_LIMITED"
+    assert d.decision_reason == "no_exact_blocker_field_and_no_applicable_independent_evidence"
+
+
+def test_configured_scientific_manifest_missing_fails_closed(tmp_path: Path) -> None:
+    from sdrf_annotation_harness import plan
+
+    (tmp_path / "accessions.txt").write_text("PXD900001\n", encoding="utf-8")
+    (tmp_path / "candidates.tsv").write_text(
+        "accession\tcandidate_sha256\nPXD900001\t" + "1" * 64 + "\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "blockers.tsv").write_text(
+        "accession\tstate\treason_code\tblocker_fields\n"
+        "PXD900001\tblocked_metadata_incomplete\tcell_identifier_invalid_or_unresolved\t"
+        "characteristics[cell identifier]\n",
+        encoding="utf-8",
+    )
+
+    for missing_key in ("candidate_manifest", "blocker_manifest"):
+        inputs = {
+            "accessions_file": "accessions.txt",
+            "candidate_manifest": "candidates.tsv",
+            "blocker_manifest": "blockers.tsv",
+        }
+        inputs[missing_key] = f"missing-{missing_key}.tsv"
+        spec = {
+            "schema_version": "pride-scp-sdrf-annotation-run-spec-v1",
+            "run_id": f"missing-{missing_key}",
+            "provenance": {"policy_version": "p"},
+            "inputs": inputs,
+        }
+        spec_path = tmp_path / f"{missing_key}.json"
+        spec_path.write_text(json.dumps(spec), encoding="utf-8")
+
+        try:
+            plan(spec_path, tmp_path / f"out-{missing_key}")
+        except FileNotFoundError as exc:
+            assert f"configured inputs.{missing_key} missing" in str(exc)
+        else:
+            raise AssertionError(f"missing configured {missing_key} did not fail closed")

@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """State, hashing and decision primitives for the PRIDE-SCP SDRF annotation harness.
 
 This module is intentionally orchestration-only.  It does not mutate SDRFs and it does
@@ -11,11 +10,12 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+from collections.abc import Iterable
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any
 
-VERSION = "pride-scp-sdrf-annotation-state-v2.2.0"
+VERSION = "pride-scp-sdrf-annotation-state-v2.2.1"
 
 TERMINAL_STATES = {
     "SUBMISSION_READY",
@@ -81,7 +81,7 @@ class ResolverCapability:
     overwrite_policy: str = "never_conflicting_concrete"
 
     @classmethod
-    def from_dict(cls, obj: dict[str, Any]) -> "ResolverCapability":
+    def from_dict(cls, obj: dict[str, Any]) -> ResolverCapability:
         return cls(
             resolver_id=str(obj["resolver_id"]),
             version=str(obj.get("version") or "unknown"),
@@ -256,6 +256,12 @@ def trusted_independent_evidence(
     accepted_trust_classes: Iterable[str] | None = None,
 ) -> list[EvidenceRecord]:
     fields = {normalize_field_name(x) for x in blocker_fields if normalize_field_name(x)}
+    # Evidence is blocker-aligned only when the blocker identifies at least one exact
+    # SDRF field.  An empty blocker field set must fail closed: otherwise an unscoped
+    # independent source (for example a publication full text) could authorize a
+    # family-level resolver such as row_mapping without any field-specific claim.
+    if not fields:
+        return []
     accepted = set(accepted_trust_classes or ())
     out: list[EvidenceRecord] = []
     for record in evidence:

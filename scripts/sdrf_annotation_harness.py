@@ -51,7 +51,7 @@ from sdrf_evidence_registry import build_registry as build_evidence_registry
 from sdrf_publication_evidence import build_publication_source_rows
 from sdrf_publication_evidence import write_tsv as write_publication_source_tsv
 
-VERSION = "pride-scp-sdrf-annotation-harness-v2.3.0"
+VERSION = "pride-scp-sdrf-annotation-harness-v2.3.1"
 RUN_SPEC_VERSION = "pride-scp-sdrf-annotation-run-spec-v1"
 
 
@@ -222,6 +222,15 @@ def verify_run_spec(spec_path: Path, spec: dict[str, Any]) -> dict[str, str]:
             f"unsupported run spec schema {spec.get('schema_version')!r}; expected {RUN_SPEC_VERSION!r}"
         )
     base = spec_path.parent
+    inputs = spec.get("inputs") or {}
+    for key in ("candidate_manifest", "blocker_manifest"):
+        configured = inputs.get(key)
+        if not configured:
+            continue
+        configured_path = resolve_path(base, configured)
+        if configured_path is None or not configured_path.is_file():
+            raise FileNotFoundError(f"configured inputs.{key} missing: {configured_path}")
+
     provenance = spec.get("provenance") or {}
     sif_path = resolve_path(base, provenance.get("sif_path"))
     expected_sif_sha = str(provenance.get("sif_sha256") or "").lower()
