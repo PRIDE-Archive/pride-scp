@@ -32,8 +32,8 @@ try:
 except ImportError:  # pragma: no cover - only for standalone source-only bundles
     annotation_state = None
 
-VERSION = "pride-scp-sdrf-llm-completion-v0.2.0"
-BUNDLE_SCHEMA_VERSION = "pride-scp-sdrf-escalation-bundle-v2"
+VERSION = "pride-scp-sdrf-llm-completion-v0.3.0"
+BUNDLE_SCHEMA_VERSION = "pride-scp-sdrf-escalation-bundle-v3"
 PATCH_SCHEMA_VERSION = "pride-scp-sdrf-external-patch-v2"
 
 
@@ -46,6 +46,8 @@ class CompletionDecision:
     current_value_model_assessment: str
     current_value_audit: str
     current_value_evidence_refs: tuple[str, ...]
+    evidence_reference_status: str
+    current_value_evidence_reference_status: str
     model_decision: str
     proposed_value: str
     canonical_value: str
@@ -56,7 +58,8 @@ class CompletionDecision:
     confident_patch_status: str
     local_draft_status: str
     escalation_reason: str
-    evidence_refs: tuple[str, ...]
+    model_evidence_refs: tuple[str, ...]
+    candidate_evidence_refs: tuple[str, ...]
     rationale: str
     prompt_sha256: str
     field_contract_sha256: str
@@ -444,6 +447,9 @@ def current_value_audit_status(
             return "current_value_supported_by_supplied_evidence"
         return "current_value_conflicts_with_supplied_evidence"
 
+    if adjudication.get("current_value_evidence_reference_status") != "valid":
+        return "current_value_unverified_by_supplied_evidence"
+
     model_assessment = str(adjudication.get("current_value_assessment") or "not_assessed")
     if model_assessment == "supported":
         return "current_value_model_supported_but_semantic_value_unresolved"
@@ -503,6 +509,8 @@ def escalation_reason_for(
         return "no_matching_evidence_for_target_field"
     if policy == "invalid_evidence_reference":
         return "invalid_local_evidence_reference"
+    if policy == "missing_evidence_reference":
+        return "missing_local_evidence_reference"
     if policy == "missing_proposed_value":
         return "missing_local_proposed_value"
     if current_value_audit in {
@@ -621,6 +629,8 @@ def run_completion(
                     else "current_value_unverified_by_supplied_evidence"
                 ),
                 current_value_evidence_refs=(),
+                evidence_reference_status="missing",
+                current_value_evidence_reference_status="missing",
                 model_decision="insufficient_evidence",
                 proposed_value="",
                 canonical_value="",
@@ -631,7 +641,8 @@ def run_completion(
                 confident_patch_status="not_applied",
                 local_draft_status="not_applied",
                 escalation_reason="unsupported_field_contract",
-                evidence_refs=(),
+                model_evidence_refs=(),
+                candidate_evidence_refs=(),
                 rationale="No deterministic field-semantics contract is registered.",
                 prompt_sha256="",
                 field_contract_sha256="",
@@ -820,6 +831,12 @@ def run_completion(
                 str(ref)
                 for ref in adjudication.get("current_value_evidence_refs") or []
             ),
+            evidence_reference_status=str(
+                adjudication.get("evidence_reference_status") or "missing"
+            ),
+            current_value_evidence_reference_status=str(
+                adjudication.get("current_value_evidence_reference_status") or "missing"
+            ),
             model_decision=str(adjudication.get("decision") or ""),
             proposed_value=proposed,
             canonical_value=canonical,
@@ -830,7 +847,12 @@ def run_completion(
             confident_patch_status=confident_status,
             local_draft_status=draft_status,
             escalation_reason=escalation_reason,
-            evidence_refs=tuple(str(ref) for ref in adjudication.get("evidence_refs") or []),
+            model_evidence_refs=tuple(
+                str(ref) for ref in adjudication.get("evidence_refs") or []
+            ),
+            candidate_evidence_refs=tuple(
+                str(ref) for ref in adjudication.get("candidate_evidence_refs") or []
+            ),
             rationale=str(adjudication.get("rationale") or ""),
             prompt_sha256=str(adjudication.get("prompt_sha256") or ""),
             field_contract_sha256=contract.contract_sha256,
@@ -855,6 +877,22 @@ def run_completion(
                     ),
                     "original_value_sha256": candidate_value_sha256(current_values),
                     "escalation_reason": escalation_reason,
+                    "candidate_evidence_refs": list(
+                        adjudication.get("candidate_evidence_refs") or []
+                    ),
+                    "local_model_evidence_refs": list(
+                        adjudication.get("evidence_refs") or []
+                    ),
+                    "local_model_current_value_evidence_refs": list(
+                        adjudication.get("current_value_evidence_refs") or []
+                    ),
+                    "evidence_reference_status": str(
+                        adjudication.get("evidence_reference_status") or "missing"
+                    ),
+                    "current_value_evidence_reference_status": str(
+                        adjudication.get("current_value_evidence_reference_status")
+                        or "missing"
+                    ),
                     "field_contract": {
                         "field": field,
                         "semantic_definition": contract.semantic_definition,
@@ -914,7 +952,10 @@ def run_completion(
         "confident_patch_status",
         "local_draft_status",
         "escalation_reason",
-        "evidence_refs",
+        "model_evidence_refs",
+        "candidate_evidence_refs",
+        "evidence_reference_status",
+        "current_value_evidence_reference_status",
         "rationale",
         "prompt_sha256",
         "field_contract_sha256",
@@ -925,7 +966,12 @@ def run_completion(
             {
                 **row,
                 "current_values": ";".join(row.get("current_values") or []),
-                "evidence_refs": ";".join(row.get("evidence_refs") or []),
+                "model_evidence_refs": ";".join(
+                    row.get("model_evidence_refs") or []
+                ),
+                "candidate_evidence_refs": ";".join(
+                    row.get("candidate_evidence_refs") or []
+                ),
                 "current_value_evidence_refs": ";".join(
                     row.get("current_value_evidence_refs") or []
                 ),
@@ -1002,6 +1048,12 @@ def run_completion(
             for decision in decisions
             if decision.current_value_audit
             == "current_value_conflicts_with_supplied_evidence"
+        ),
+        "missing_model_evidence_reference_items": sum(
+            1 for decision in decisions if decision.evidence_reference_status == "missing"
+        ),
+        "invalid_model_evidence_reference_items": sum(
+            1 for decision in decisions if decision.evidence_reference_status == "invalid"
         ),
         "outputs": provenance["outputs"],
         "provenance": str(provenance_path),

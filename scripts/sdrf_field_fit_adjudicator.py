@@ -16,8 +16,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-VERSION = "pride-scp-sdrf-field-fit-adjudicator-v0.3.0"
-OUTPUT_SCHEMA_VERSION = "pride-scp-sdrf-field-fit-adjudication-v3"
+VERSION = "pride-scp-sdrf-field-fit-adjudicator-v0.4.0"
+OUTPUT_SCHEMA_VERSION = "pride-scp-sdrf-field-fit-adjudication-v4"
 DEFAULT_MODEL = "qwen3.6:27b"
 DEFAULT_OLLAMA_URL = "http://127.0.0.1:11434"
 
@@ -304,10 +304,18 @@ def apply_deterministic_policy(
     normalized = normalize_model_response(model_response)
     cited = set(normalized["evidence_refs"])
     current_cited = set(normalized["current_value_evidence_refs"])
-    invalid_refs = sorted((cited | current_cited) - allowed_evidence_refs)
-    missing_refs = not cited
+    invalid_semantic_refs = sorted(cited - allowed_evidence_refs)
+    invalid_current_refs = sorted(current_cited - allowed_evidence_refs)
+    invalid_refs = sorted(set(invalid_semantic_refs) | set(invalid_current_refs))
+    evidence_reference_status = (
+        "invalid" if invalid_semantic_refs else "valid" if cited else "missing"
+    )
+    current_value_evidence_reference_status = (
+        "invalid" if invalid_current_refs else "valid" if current_cited else "missing"
+    )
+    candidate_evidence_refs = sorted(allowed_evidence_refs)
 
-    if invalid_refs or missing_refs:
+    if invalid_refs:
         return {
             **normalized,
             "decision": "insufficient_evidence",
@@ -316,9 +324,27 @@ def apply_deterministic_policy(
             "policy_status": "invalid_evidence_reference",
             "requires_human_review": True,
             "invalid_evidence_refs": invalid_refs,
+            "evidence_reference_status": evidence_reference_status,
+            "current_value_evidence_reference_status": current_value_evidence_reference_status,
+            "candidate_evidence_refs": candidate_evidence_refs,
         }
 
     decision = normalized["decision"]
+    decisions_requiring_semantic_refs = {"fits", "does_not_fit", "conflicting_evidence"}
+    if not cited and decision in decisions_requiring_semantic_refs:
+        return {
+            **normalized,
+            "decision": "insufficient_evidence",
+            "canonical_value": "",
+            "vocabulary_status": "missing",
+            "policy_status": "missing_evidence_reference",
+            "requires_human_review": True,
+            "invalid_evidence_refs": [],
+            "evidence_reference_status": "missing",
+            "current_value_evidence_reference_status": current_value_evidence_reference_status,
+            "candidate_evidence_refs": candidate_evidence_refs,
+        }
+
     proposed_value = normalized["proposed_value"]
     canonical_value, vocabulary_status = canonicalize_value(contract, proposed_value)
 
@@ -331,6 +357,9 @@ def apply_deterministic_policy(
             "policy_status": "missing_proposed_value",
             "requires_human_review": True,
             "invalid_evidence_refs": [],
+            "evidence_reference_status": evidence_reference_status,
+            "current_value_evidence_reference_status": current_value_evidence_reference_status,
+            "candidate_evidence_refs": candidate_evidence_refs,
         }
 
     if decision == "fits" and vocabulary_status == "supported":
@@ -368,6 +397,9 @@ def apply_deterministic_policy(
         "policy_status": policy_status,
         "requires_human_review": requires_human_review,
         "invalid_evidence_refs": [],
+        "evidence_reference_status": evidence_reference_status,
+        "current_value_evidence_reference_status": current_value_evidence_reference_status,
+        "candidate_evidence_refs": candidate_evidence_refs,
     }
 
 

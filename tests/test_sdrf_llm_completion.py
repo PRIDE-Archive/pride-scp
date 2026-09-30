@@ -700,3 +700,154 @@ def test_short_fragmentation_abbreviation_requires_token_boundary() -> None:
         max_windows=2,
     )
     assert windows == []
+
+
+def test_abstention_packet_separates_candidate_and_model_evidence_refs(tmp_path: Path) -> None:
+    candidate, blocker, registry, accession = fixture_inputs(tmp_path)
+    headers, rows = mod.read_tsv(candidate)
+    for row in rows:
+        row["comment[dissociation method]"] = "NT=CID;AC=MS:1000133"
+    mod.write_tsv(candidate, headers, rows)
+
+    output = tmp_path / "out"
+    summary = mod.run_completion(
+        accession=accession,
+        candidate_sdrf=candidate,
+        blocker_manifest=blocker,
+        evidence_registry=registry,
+        semantics=SEMANTICS,
+        output=output,
+        model="fixture",
+        ollama_url="http://unused",
+        timeout_seconds=1.0,
+        response_fixtures={
+            "comment[dissociation method]": {
+                "decision": "insufficient_evidence",
+                "proposed_value": "",
+                "application_scope": "unknown",
+                "evidence_refs": [],
+                "current_value_assessment": "unsupported",
+                "current_value_evidence_refs": [],
+                "rationale": "The supplied evidence does not explicitly verify CID.",
+            }
+        },
+        window_chars=200,
+        max_publication_windows=2,
+    )
+
+    assert summary["missing_model_evidence_reference_items"] == 1
+    assert summary["invalid_model_evidence_reference_items"] == 0
+
+    packet = json.loads(
+        (output / "evidence_packet.jsonl").read_text(encoding="utf-8").splitlines()[0]
+    )
+    assert packet["escalation_reason"] == "current_value_unverified_by_supplied_evidence"
+    assert packet["current_value_audit"] == "current_value_unverified_by_supplied_evidence"
+    assert packet["evidence_reference_status"] == "missing"
+    assert packet["current_value_evidence_reference_status"] == "missing"
+    assert packet["local_model_evidence_refs"] == []
+    assert packet["local_model_current_value_evidence_refs"] == []
+    assert packet["candidate_evidence_refs"]
+    assert "claim:" + "a" * 64 in packet["candidate_evidence_refs"]
+    assert packet["local_adjudication"]["policy_status"] == "insufficient_evidence"
+
+    review = read_tsv(output / "review_overlay.tsv")[0]
+    assert review["model_evidence_refs"] == ""
+    assert "claim:" + "a" * 64 in review["candidate_evidence_refs"]
+    assert review["evidence_reference_status"] == "missing"
+
+
+def test_isolation_abstention_without_refs_keeps_scientific_escalation_reason(
+    tmp_path: Path,
+) -> None:
+    accession = "PXD023366"
+    candidate = tmp_path / "candidate.sdrf.tsv"
+    blocker = tmp_path / "blockers.tsv"
+    registry = tmp_path / "registry.tsv"
+    write_tsv(
+        candidate,
+        ["source name", "characteristics[single cell isolation protocol]"],
+        [
+            {
+                "source name": "oocyte-1",
+                "characteristics[single cell isolation protocol]": "not applicable",
+            }
+        ],
+    )
+    write_tsv(
+        blocker,
+        ["accession", "blocker_family", "blocker_fields"],
+        [
+            {
+                "accession": accession,
+                "blocker_family": "single_cell_isolation",
+                "blocker_fields": "characteristics[single cell isolation protocol]",
+            }
+        ],
+    )
+    write_tsv(
+        registry,
+        [
+            "accession",
+            "source_kind",
+            "source_identity",
+            "artifact_sha256",
+            "parent_artifact_sha256",
+            "local_path",
+            "blocker_field",
+            "claim_text",
+            "claim_value",
+            "claim_status",
+            "row_scope",
+        ],
+        [
+            {
+                "accession": accession,
+                "source_kind": "publication_field_claim",
+                "source_identity": "doi:test",
+                "artifact_sha256": "b" * 64,
+                "parent_artifact_sha256": "c" * 64,
+                "local_path": "",
+                "blocker_field": "characteristics[single cell isolation protocol]",
+                "claim_text": "The oocytes were obtained by transvaginal puncture.",
+                "claim_value": "transvaginal puncture",
+                "claim_status": "unsupported_vocabulary",
+                "row_scope": "unknown",
+            }
+        ],
+    )
+
+    output = tmp_path / "out"
+    mod.run_completion(
+        accession=accession,
+        candidate_sdrf=candidate,
+        blocker_manifest=blocker,
+        evidence_registry=registry,
+        semantics=SEMANTICS,
+        output=output,
+        model="fixture",
+        ollama_url="http://unused",
+        timeout_seconds=1.0,
+        response_fixtures={
+            "characteristics[single cell isolation protocol]": {
+                "decision": "insufficient_evidence",
+                "proposed_value": "",
+                "application_scope": "unknown",
+                "evidence_refs": [],
+                "current_value_assessment": "unsupported",
+                "current_value_evidence_refs": [],
+                "rationale": "Retrieval is explicit, but proteomic isolation is not established.",
+            }
+        },
+        window_chars=200,
+        max_publication_windows=2,
+    )
+
+    packet = json.loads(
+        (output / "evidence_packet.jsonl").read_text(encoding="utf-8").splitlines()[0]
+    )
+    assert packet["current_value_audit"] == "no_substantive_current_value"
+    assert packet["escalation_reason"] == "insufficient_local_evidence"
+    assert packet["evidence_reference_status"] == "missing"
+    assert packet["local_model_evidence_refs"] == []
+    assert "claim:" + "b" * 64 in packet["candidate_evidence_refs"]

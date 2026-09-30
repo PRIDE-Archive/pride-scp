@@ -226,3 +226,52 @@ def test_current_value_evidence_reference_is_validated() -> None:
     )
     assert result["policy_status"] == "invalid_evidence_reference"
     assert result["invalid_evidence_refs"] == ["claim:not-present"]
+
+
+def test_abstention_without_evidence_refs_is_missing_not_invalid() -> None:
+    contract = mod.load_field_contract(SEMANTICS, "comment[dissociation method]")
+    result = mod.adjudicate(
+        accession="PXDTEST",
+        contract=contract,
+        current_values=["CID"],
+        evidence_items=[evidence("claim:valid", "The supplied text does not state fragmentation.")],
+        model="fixture",
+        model_response={
+            "decision": "insufficient_evidence",
+            "proposed_value": "",
+            "application_scope": "unknown",
+            "evidence_refs": [],
+            "current_value_assessment": "unsupported",
+            "current_value_evidence_refs": [],
+            "rationale": "No explicit fragmentation method is stated.",
+        },
+    )
+    assert result["policy_status"] == "insufficient_evidence"
+    assert result["decision"] == "insufficient_evidence"
+    assert result["evidence_reference_status"] == "missing"
+    assert result["current_value_evidence_reference_status"] == "missing"
+    assert result["invalid_evidence_refs"] == []
+    assert result["candidate_evidence_refs"] == ["claim:valid"]
+
+
+def test_positive_fit_without_evidence_refs_fails_closed_as_missing_reference() -> None:
+    contract = mod.load_field_contract(SEMANTICS, "comment[dissociation method]")
+    result = mod.adjudicate(
+        accession="PXDTEST",
+        contract=contract,
+        current_values=[],
+        evidence_items=[evidence("claim:hcd", "HCD was used.")],
+        model="fixture",
+        model_response={
+            "decision": "fits",
+            "proposed_value": "HCD",
+            "application_scope": "all_rows",
+            "evidence_refs": [],
+            "rationale": "HCD is explicit but the fixture omitted its citation.",
+        },
+    )
+    assert result["decision"] == "insufficient_evidence"
+    assert result["policy_status"] == "missing_evidence_reference"
+    assert result["evidence_reference_status"] == "missing"
+    assert result["invalid_evidence_refs"] == []
+    assert result["candidate_evidence_refs"] == ["claim:hcd"]
