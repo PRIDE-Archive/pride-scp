@@ -97,6 +97,12 @@ struct AgentRelation {
     reason: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq, PartialOrd, Ord)]
+struct AgentRowSelector {
+    field: String,
+    value: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 struct AgentBranch {
     id: String,
@@ -106,6 +112,8 @@ struct AgentBranch {
     evidence_refs: Vec<String>,
     #[serde(default)]
     linked_raw_files: Vec<String>,
+    #[serde(default)]
+    row_selectors: Vec<AgentRowSelector>,
     linkage_status: String,
     notes: String,
 }
@@ -436,6 +444,8 @@ struct FactorRegimeProposal {
     input_or_cell_count_regime: String,
     #[serde(default)]
     evidence_refs: Vec<String>,
+    #[serde(default)]
+    row_selectors: Vec<AgentRowSelector>,
     notes: String,
 }
 
@@ -511,6 +521,8 @@ struct AcceptedFactorRegime {
     input_or_cell_count_regime: String,
     #[serde(default)]
     evidence_refs: Vec<String>,
+    #[serde(default)]
+    row_selectors: Vec<AgentRowSelector>,
     notes: String,
 }
 
@@ -991,6 +1003,7 @@ fn scientific_agent_schema(
             "status":{"type":"string","enum":["supported","hypothesis","rejected"]},
             "evidence_refs":{"type":"array","items":{"type":"string","pattern":"^E[0-9]{4}$"},"minItems":1,"maxItems":16},
             "linked_raw_files":{"type":"array","items":{"type":"string","maxLength":300},"maxItems":128,"description":"Only exact RAW basenames explicitly linked by trusted source evidence. Use [] when linkage is unresolved."},
+            "row_selectors":{"type":"array","maxItems":8,"description":"Optional source-grounded exact selectors for existing/structured SDRF rows when exact RAW linkage is unavailable. Selectors are conjunctive and may use only approved biological SDRF context columns; never use source name, assay name, row number, or data-file/filename semantics.","items":{"type":"object","properties":{"field":{"type":"string","enum":["characteristics[organism]","characteristics[organism part]","characteristics[cell type]","characteristics[cell line]","characteristics[sample type]","characteristics[disease]","characteristics[sex]","characteristics[cell identifier]","characteristics[biological replicate]"]},"value":{"type":"string","minLength":1,"maxLength":300}},"required":["field","value"],"additionalProperties":false}},
             "linkage_status":{"type":"string","enum":["supported","partial","unresolved"],"description":"Use unresolved when the conceptual branch is supported but exact RAW linkage is absent."},
             "notes":{"type":"string","maxLength":700}
         },
@@ -1764,6 +1777,7 @@ SCIENTIFIC OBSERVATION -> RUST CANONICALIZATION CONTRACT:\n\
 STUDY-STRUCTURE CONTRACT:\n\
 - task:study_structure comes first. Establish source-grounded biological/experimental branches, acquisition cardinality, and scope before field repair. Use edit_study_structure to create the supported conceptual branches. Conceptual branches may be supported while linked_raw_files remains empty and linkage_status is unresolved; unresolved RAW linkage is NOT a reason to avoid creating the branch.\n\
 - linked_raw_files require trusted source evidence explicitly linking exact RAW basenames. Filename words are search hints/contradiction detectors, never biological identity.\n\
+- row_selectors are an optional fallback for existing/structured SDRF rows when exact RAW linkage is unavailable. Each selector must be an exact approved biological SDRF column/value pair explicitly supported by the cited branch evidence. Selectors are conjunctive. Never select by row number, source/assay name, RAW filename, or fuzzy/semantic similarity. Use row_selectors=[] when the branch cannot be addressed safely.\n\
 - Never collapse multiple organisms, cell populations, isolation regimes, or acquisition regimes into one project observation.\n\n\
 HARD SAFETY CONTRACT:\n\
 1. Never use GT labels or hidden benchmark truth.\n\
@@ -2432,6 +2446,29 @@ fn factor_graph_stage1_schema() -> Value {
             "isolation_or_loading_method":{"type":"string","maxLength":800},
             "input_or_cell_count_regime":{"type":"string","maxLength":500},
             "evidence_refs":evidence_refs(),
+            "row_selectors":{
+                "type":"array",
+                "maxItems":8,
+                "items":{
+                    "type":"object",
+                    "properties":{
+                        "field":{"type":"string","enum":[
+                            "characteristics[organism]",
+                            "characteristics[organism part]",
+                            "characteristics[cell type]",
+                            "characteristics[cell line]",
+                            "characteristics[sample type]",
+                            "characteristics[disease]",
+                            "characteristics[sex]",
+                            "characteristics[cell identifier]",
+                            "characteristics[biological replicate]"
+                        ]},
+                        "value":{"type":"string","minLength":1,"maxLength":300}
+                    },
+                    "required":["field","value"],
+                    "additionalProperties":false
+                }
+            },
             "notes":{"type":"string","maxLength":1000}
         },
         "required":["local_id","label","experimental_role","isolation_or_loading_method","input_or_cell_count_regime","evidence_refs","notes"],
@@ -2511,6 +2548,7 @@ EXPERIMENTAL REGIME NODES (R#):\n\
 - Represent distinct experimental roles, isolation/loading/sampling operations, or input/cell-count regimes.\n\
 - If trusted evidence distinguishes single-cell manual/hydrodynamic loading from low-number spray-voltage injection, they MUST be separate regime nodes even if both use HeLa and the same CE-MS/MS acquisition.\n\
 - A named source-defined isolation technology such as evDISCO/tDISCO or capillary microsampling is a valid regime description.\n\n\
+- row_selectors are OPTIONAL exact applicability selectors for existing/structured SDRF rows when exact RAW linkage is unavailable. Use only approved biological characteristics fields and exact values explicitly supported by the regime's cited E#### evidence. Multiple selectors are conjunctive. Never use row number, source name, assay name, RAW/data-file name, filename wording, or fuzzy/model-inferred semantics as a selector. Omit row_selectors when applicability cannot be stated exactly from trusted evidence.\n\n\
 ACQUISITION NODES (A#):\n\
 - Represent distinct mass-spectrometry acquisition/platform workflows when source-supported.\n\n\
 RELATIONS:\n\
@@ -2718,6 +2756,7 @@ fn accept_factor_graph_stage1(
             normalize_study_graph_text(&node.input_or_cell_count_regime);
         node.notes = normalize_study_graph_text(&node.notes);
         let refs = valid_evidence_refs(evidence, &node.evidence_refs);
+        node.row_selectors = normalize_row_selectors(evidence, &refs, node.row_selectors);
         if !factor_local_id_has_prefix(&node.local_id, 'R')
             || node.label.is_empty()
             || node.experimental_role.is_empty()
@@ -2740,12 +2779,14 @@ fn accept_factor_graph_stage1(
             });
             continue;
         }
+        let selector_key = serde_json::to_string(&node.row_selectors).unwrap_or_default();
         let key = format!(
-            "{}|{}|{}|{}",
+            "{}|{}|{}|{}|{}",
             node.label.to_ascii_lowercase(),
             node.experimental_role.to_ascii_lowercase(),
             node.isolation_or_loading_method.to_ascii_lowercase(),
             node.input_or_cell_count_regime.to_ascii_lowercase(),
+            selector_key,
         );
         if !seen_regimes.insert(key.clone()) {
             rejected_items.push(FactorGraphRejectedItem {
@@ -2770,6 +2811,7 @@ fn accept_factor_graph_stage1(
             isolation_or_loading_method: node.isolation_or_loading_method,
             input_or_cell_count_regime: node.input_or_cell_count_regime,
             evidence_refs: refs,
+            row_selectors: node.row_selectors,
             notes: node.notes,
         });
     }
@@ -3564,7 +3606,7 @@ fn accept_factor_phase_b_observations(
 
 fn factor_graph_as_agent_branches(graph: &StudyFactorGraphAcceptance) -> Vec<AgentBranch> {
     let mut result = Vec::new();
-    let mut add = |id: &str, label: &str, refs: &[String]| {
+    let mut add = |id: &str, label: &str, refs: &[String], row_selectors: &[AgentRowSelector]| {
         let mut raw_files = graph
             .raw_links
             .iter()
@@ -3579,6 +3621,7 @@ fn factor_graph_as_agent_branches(graph: &StudyFactorGraphAcceptance) -> Vec<Age
             status: "supported".into(),
             evidence_refs: refs.to_vec(),
             linked_raw_files: raw_files.clone(),
+            row_selectors: row_selectors.to_vec(),
             linkage_status: if raw_files.is_empty() {
                 "unresolved".into()
             } else {
@@ -3588,13 +3631,18 @@ fn factor_graph_as_agent_branches(graph: &StudyFactorGraphAcceptance) -> Vec<Age
         });
     };
     for node in &graph.materials {
-        add(&node.id, &node.label, &node.evidence_refs);
+        add(&node.id, &node.label, &node.evidence_refs, &[]);
     }
     for node in &graph.regimes {
-        add(&node.id, &node.label, &node.evidence_refs);
+        add(
+            &node.id,
+            &node.label,
+            &node.evidence_refs,
+            &node.row_selectors,
+        );
     }
     for node in &graph.acquisitions {
-        add(&node.id, &node.label, &node.evidence_refs);
+        add(&node.id, &node.label, &node.evidence_refs, &[]);
     }
     result
 }
@@ -6557,6 +6605,111 @@ fn set_task_search_blocked(state: &mut ScientificWorkspaceState, task_id: &str, 
     }
 }
 
+fn canonical_branch_row_selector_field(value: &str) -> Option<&'static str> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "characteristics[organism]" => Some("characteristics[organism]"),
+        "characteristics[organism part]" => Some("characteristics[organism part]"),
+        "characteristics[cell type]" => Some("characteristics[cell type]"),
+        "characteristics[cell line]" => Some("characteristics[cell line]"),
+        "characteristics[sample type]" => Some("characteristics[sample type]"),
+        "characteristics[disease]" => Some("characteristics[disease]"),
+        "characteristics[sex]" => Some("characteristics[sex]"),
+        "characteristics[cell identifier]" => Some("characteristics[cell identifier]"),
+        "characteristics[biological replicate]" => Some("characteristics[biological replicate]"),
+        _ => None,
+    }
+}
+
+fn source_text_contains_selector_value(text: &str, value: &str) -> bool {
+    let hay = text.to_ascii_lowercase();
+    let needle = value.trim().to_ascii_lowercase();
+    if needle.is_empty() {
+        return false;
+    }
+    let needs_left_boundary = needle.chars().next().is_some_and(|ch| ch.is_alphanumeric());
+    let needs_right_boundary = needle
+        .chars()
+        .next_back()
+        .is_some_and(|ch| ch.is_alphanumeric());
+    hay.match_indices(&needle).any(|(start, matched)| {
+        let left_ok = !needs_left_boundary
+            || hay[..start]
+                .chars()
+                .next_back()
+                .map(|ch| !ch.is_alphanumeric())
+                .unwrap_or(true);
+        let end = start + matched.len();
+        let right_ok = !needs_right_boundary
+            || hay[end..]
+                .chars()
+                .next()
+                .map(|ch| !ch.is_alphanumeric())
+                .unwrap_or(true);
+        left_ok && right_ok
+    })
+}
+
+fn branch_row_selector_is_source_grounded(
+    evidence: &DatasetEvidence,
+    evidence_refs: &[String],
+    selector: &AgentRowSelector,
+) -> bool {
+    let needle = selector.value.trim().to_ascii_lowercase();
+    if needle.is_empty() || canonical_reserved_alias(&needle).is_some() {
+        return false;
+    }
+    evidence_refs.iter().any(|id| {
+        evidence
+            .evidence
+            .iter()
+            .find(|item| item.id == *id)
+            .map(|item| source_text_contains_selector_value(&item.text, &needle))
+            .unwrap_or(false)
+    })
+}
+
+fn normalize_row_selectors(
+    evidence: &DatasetEvidence,
+    evidence_refs: &[String],
+    selectors: Vec<AgentRowSelector>,
+) -> Vec<AgentRowSelector> {
+    let mut normalized = Vec::new();
+    for selector in selectors {
+        let Some(field) = canonical_branch_row_selector_field(&selector.field) else {
+            continue;
+        };
+        let selector = AgentRowSelector {
+            field: field.into(),
+            value: selector.value.trim().to_string(),
+        };
+        if branch_row_selector_is_source_grounded(evidence, evidence_refs, &selector) {
+            normalized.push(selector);
+        }
+    }
+    normalized.sort();
+    normalized.dedup();
+
+    let mut field_values: BTreeMap<&str, BTreeSet<String>> = BTreeMap::new();
+    for selector in &normalized {
+        field_values
+            .entry(selector.field.as_str())
+            .or_default()
+            .insert(selector.value.to_ascii_lowercase());
+    }
+    if field_values.values().any(|values| values.len() > 1) {
+        return Vec::new();
+    }
+    normalized
+}
+
+fn normalize_branch_row_selectors(evidence: &DatasetEvidence, branch: &mut AgentBranch) {
+    branch.row_selectors = normalize_row_selectors(
+        evidence,
+        &branch.evidence_refs,
+        std::mem::take(&mut branch.row_selectors),
+    );
+}
+
 fn normalize_workspace_branches(evidence: &DatasetEvidence, branches: &mut Vec<AgentBranch>) {
     let raw_names = evidence
         .raw_files
@@ -6592,6 +6745,7 @@ fn normalize_workspace_branches(evidence: &DatasetEvidence, branches: &mut Vec<A
         linked.sort();
         linked.dedup();
         branch.linked_raw_files = linked;
+        normalize_branch_row_selectors(evidence, &mut branch);
         branch.linkage_status = if branch.linked_raw_files.is_empty() {
             "unresolved".into()
         } else if branch.status == "supported" {
@@ -6610,6 +6764,8 @@ fn normalize_workspace_branches(evidence: &DatasetEvidence, branches: &mut Vec<A
                 existing.linked_raw_files.extend(branch.linked_raw_files);
                 existing.linked_raw_files.sort();
                 existing.linked_raw_files.dedup();
+                existing.row_selectors.extend(branch.row_selectors);
+                normalize_branch_row_selectors(evidence, existing);
                 if status_rank(&branch.status) > status_rank(&existing.status) {
                     existing.status = branch.status;
                 }
@@ -8627,6 +8783,144 @@ fn unresolved_de_novo_multiplex_mapping(
             .ends_with("mapping_unresolved")
 }
 
+fn branch_row_matches_selectors(
+    row: &[String],
+    header_index: &HashMap<String, usize>,
+    selectors: &[AgentRowSelector],
+) -> bool {
+    !selectors.is_empty()
+        && selectors.iter().all(|selector| {
+            header_index
+                .get(&selector.field.to_ascii_lowercase())
+                .and_then(|idx| row.get(*idx))
+                .map(|value| value.trim().eq_ignore_ascii_case(selector.value.trim()))
+                .unwrap_or(false)
+        })
+}
+
+fn apply_branch_row_selector_isolation_projection(
+    headers: &[String],
+    rows: &mut [Vec<String>],
+    evidence: &DatasetEvidence,
+    state: &ScientificWorkspaceState,
+    explicit_mappings: &[ExplicitRowMapping],
+    trusted_partial_mapping_applied: bool,
+) -> Vec<ValidationIssue> {
+    if state.harness_version != SCIENTIFIC_AGENT_FACTOR_ROW_ROLE_HARDENED_VERSION
+        || (evidence.existing_sdrf_path.is_empty()
+            && explicit_mappings.is_empty()
+            && !trusted_partial_mapping_applied)
+    {
+        return Vec::new();
+    }
+
+    let header_index = headers
+        .iter()
+        .enumerate()
+        .map(|(index, header)| (header.to_ascii_lowercase(), index))
+        .collect::<HashMap<_, _>>();
+    let Some(&sample_type_idx) = header_index.get(&SC_SAMPLE_TYPE.to_ascii_lowercase()) else {
+        return Vec::new();
+    };
+    let Some(&isolation_idx) = header_index.get(&SC_ISOLATION_METHOD.to_ascii_lowercase()) else {
+        return Vec::new();
+    };
+
+    let mut candidates = Vec::new();
+    for branch in &state.branches {
+        if branch.status != "supported" || branch.row_selectors.is_empty() {
+            continue;
+        }
+        let selectors = normalize_row_selectors(
+            evidence,
+            &branch.evidence_refs,
+            branch.row_selectors.clone(),
+        );
+        if selectors.is_empty() {
+            continue;
+        }
+        for claim in state.claims.iter().filter(|claim| {
+            claim.status == "supported"
+                && claim.scope == "branch"
+                && claim.branch_id == branch.id
+                && claim.concept_type == "isolation_method"
+        }) {
+            let Some((value, refs)) = canonical_workspace_claim_value(evidence, state, claim) else {
+                continue;
+            };
+            candidates.push((branch.id.clone(), selectors.clone(), value, refs));
+        }
+    }
+    if candidates.is_empty() {
+        return Vec::new();
+    }
+
+    let mut issues = Vec::new();
+    for (row_idx, row) in rows.iter_mut().enumerate() {
+        if sample_type_idx >= row.len() || isolation_idx >= row.len() {
+            continue;
+        }
+        if !row[sample_type_idx].trim().eq_ignore_ascii_case("single cell")
+            || !row_value_is_unresolved(&row[isolation_idx])
+        {
+            continue;
+        }
+
+        let matched = candidates
+            .iter()
+            .filter(|(_, selectors, _, _)| {
+                branch_row_matches_selectors(row, &header_index, selectors)
+            })
+            .collect::<Vec<_>>();
+        if matched.is_empty() {
+            continue;
+        }
+        let distinct_values = matched
+            .iter()
+            .map(|(_, _, value, _)| value.trim().to_ascii_lowercase())
+            .collect::<BTreeSet<_>>();
+        if distinct_values.len() != 1 {
+            issues.push(ValidationIssue {
+                level: "warning".into(),
+                code: "scientific_agent_branch_row_selector_conflict".into(),
+                row: row_idx + 1,
+                column: SC_ISOLATION_METHOD.into(),
+                message: format!(
+                    "row matched multiple source-grounded branch selectors with conflicting canonical isolation values {:?}; left unresolved",
+                    distinct_values
+                ),
+            });
+            continue;
+        }
+
+        let value = matched[0].2.clone();
+        let mut branch_ids = matched
+            .iter()
+            .map(|(branch_id, _, _, _)| branch_id.clone())
+            .collect::<Vec<_>>();
+        branch_ids.sort();
+        branch_ids.dedup();
+        let mut refs = matched
+            .iter()
+            .flat_map(|(_, _, _, refs)| refs.clone())
+            .collect::<Vec<_>>();
+        refs.sort();
+        refs.dedup();
+        row[isolation_idx] = value.clone();
+        issues.push(ValidationIssue {
+            level: "warning".into(),
+            code: "scientific_agent_branch_row_selector_isolation_projected".into(),
+            row: row_idx + 1,
+            column: SC_ISOLATION_METHOD.into(),
+            message: format!(
+                "projected canonical isolation '{}' from source-grounded branch selector(s) {:?}; refs={:?}",
+                value, branch_ids, refs
+            ),
+        });
+    }
+    issues
+}
+
 fn consensus_canonical_isolation_for_single_cell_regimes(
     evidence: &DatasetEvidence,
     state: &ScientificWorkspaceState,
@@ -8999,6 +9293,15 @@ fn compile_workspace_with_trusted_partial_sdrf(
             }
         }
     }
+
+    issues.extend(apply_branch_row_selector_isolation_projection(
+        &headers,
+        &mut rows,
+        evidence,
+        state,
+        explicit_mappings,
+        trusted_partial_mapping_applied,
+    ));
 
     issues.extend(apply_consensus_single_cell_isolation_projection(
         &headers,
@@ -10866,6 +11169,7 @@ mod tests {
                 status: "supported".into(),
                 evidence_refs: vec!["E0001".into()],
                 linked_raw_files: Vec::new(),
+                row_selectors: Vec::new(),
                 linkage_status: "unresolved".into(),
                 notes: "conceptual branch only".into(),
             }],
@@ -11106,6 +11410,7 @@ mod tests {
                 status: "supported".into(),
                 evidence_refs: vec!["E0001".into()],
                 linked_raw_files: Vec::new(),
+                row_selectors: Vec::new(),
                 linkage_status: "unresolved".into(),
                 notes: "conceptual branch; no source-grounded RAW mapping".into(),
             }],
@@ -12011,6 +12316,298 @@ mod tests {
         result
     }
 
+    fn selector_branch(
+        id: &str,
+        evidence_ref: &str,
+        field: &str,
+        value: &str,
+    ) -> AgentBranch {
+        AgentBranch {
+            id: id.into(),
+            label: id.into(),
+            status: "supported".into(),
+            evidence_refs: vec![evidence_ref.into()],
+            linked_raw_files: Vec::new(),
+            row_selectors: vec![AgentRowSelector {
+                field: field.into(),
+                value: value.into(),
+            }],
+            linkage_status: "unresolved".into(),
+            notes: "test row selector".into(),
+        }
+    }
+
+    #[test]
+    fn v2_laser_capture_microdissection_is_not_shadowed_by_manual_picking() {
+        let evidence = evidence_with(
+            vec![EvidenceItem {
+                id: "E0001".into(),
+                source_kind: "manuscript_semantic_evidence".into(),
+                source_label: "paper.txt".into(),
+                text: "Spinal cord neurons were isolated by laser capture microdissection.".into(),
+            }],
+            vec!["neuron.raw"],
+        );
+        let state = row_role_state_with_claims(Vec::new());
+        let claim = branch_claim_with_ref(
+            "isolation_method",
+            "laser capture microdissection",
+            "R001",
+            "E0001",
+        );
+
+        assert!(matches!(
+            adjudicate_workspace_claim(&evidence, &state, &claim),
+            ClaimAdjudication::Canonical { ref value, .. }
+                if value == "laser capture microdissection"
+        ));
+    }
+
+    #[test]
+    fn v2_branch_row_selectors_project_distinct_isolation_methods_to_distinct_rows() {
+        let mut evidence = evidence_with(
+            vec![
+                EvidenceItem {
+                    id: "E0001".into(),
+                    source_kind: "manuscript_semantic_evidence".into(),
+                    source_label: "paper.txt".into(),
+                    text: "HeLa single cells were isolated by manual picking.".into(),
+                },
+                EvidenceItem {
+                    id: "E0002".into(),
+                    source_kind: "manuscript_semantic_evidence".into(),
+                    source_label: "paper.txt".into(),
+                    text: "Spinal cord neurons were isolated by laser capture microdissection.".into(),
+                },
+            ],
+            vec!["hela.raw", "neuron.raw", "control.raw"],
+        );
+        evidence.existing_sdrf_path = "/tmp/existing.sdrf.tsv".into();
+        let mut state = row_role_state_with_claims(vec![
+            branch_claim_with_ref("sample_type", "single cell", "R001", "E0001"),
+            branch_claim_with_ref("sample_type", "single cell", "R002", "E0002"),
+            branch_claim_with_ref("isolation_method", "manual picking", "R001", "E0001"),
+            branch_claim_with_ref(
+                "isolation_method",
+                "laser capture microdissection",
+                "R002",
+                "E0002",
+            ),
+        ]);
+        state.branches = vec![
+            selector_branch("R001", "E0001", "characteristics[cell line]", "HeLa"),
+            selector_branch(
+                "R002",
+                "E0002",
+                "characteristics[organism part]",
+                "spinal cord",
+            ),
+        ];
+        normalize_workspace_branches(&evidence, &mut state.branches);
+
+        let headers = vec![
+            "comment[data file]".into(),
+            "characteristics[cell line]".into(),
+            "characteristics[organism part]".into(),
+            SC_SAMPLE_TYPE.into(),
+            SC_ISOLATION_METHOD.into(),
+        ];
+        let mut rows = vec![
+            vec![
+                "hela.raw".into(),
+                "HeLa".into(),
+                "not applicable".into(),
+                "single cell".into(),
+                "not available".into(),
+            ],
+            vec![
+                "neuron.raw".into(),
+                "not applicable".into(),
+                "spinal cord".into(),
+                "single cell".into(),
+                "not available".into(),
+            ],
+            vec![
+                "control.raw".into(),
+                "not applicable".into(),
+                "not applicable".into(),
+                "bulk control".into(),
+                "not applicable".into(),
+            ],
+        ];
+
+        let issues = apply_branch_row_selector_isolation_projection(
+            &headers,
+            &mut rows,
+            &evidence,
+            &state,
+            &[],
+            false,
+        );
+
+        assert_eq!(rows[0][4], "manual picking");
+        assert_eq!(rows[1][4], "laser capture microdissection");
+        assert_eq!(rows[2][4], "not applicable");
+        assert_eq!(issues.len(), 2);
+    }
+
+    #[test]
+    fn v2_branch_row_selectors_leave_unmatched_and_concrete_rows_unchanged() {
+        let mut evidence = evidence_with(
+            vec![EvidenceItem {
+                id: "E0001".into(),
+                source_kind: "manuscript_semantic_evidence".into(),
+                source_label: "paper.txt".into(),
+                text: "HeLa single cells were isolated by manual picking.".into(),
+            }],
+            vec!["hela.raw"],
+        );
+        evidence.existing_sdrf_path = "/tmp/existing.sdrf.tsv".into();
+        let mut state = row_role_state_with_claims(vec![branch_claim_with_ref(
+            "isolation_method",
+            "manual picking",
+            "R001",
+            "E0001",
+        )]);
+        state.branches = vec![selector_branch(
+            "R001",
+            "E0001",
+            "characteristics[cell line]",
+            "HeLa",
+        )];
+        normalize_workspace_branches(&evidence, &mut state.branches);
+        let headers = vec![
+            "characteristics[cell line]".into(),
+            SC_SAMPLE_TYPE.into(),
+            SC_ISOLATION_METHOD.into(),
+        ];
+        let mut rows = vec![
+            vec!["K562".into(), "single cell".into(), "not available".into()],
+            vec!["HeLa".into(), "single cell".into(), "FACS".into()],
+        ];
+        let before = rows.clone();
+
+        let issues = apply_branch_row_selector_isolation_projection(
+            &headers,
+            &mut rows,
+            &evidence,
+            &state,
+            &[],
+            false,
+        );
+
+        assert_eq!(rows, before);
+        assert!(issues.is_empty());
+    }
+
+    #[test]
+    fn v2_branch_row_selectors_reject_filename_and_ungrounded_selectors() {
+        let mut evidence = evidence_with(
+            vec![EvidenceItem {
+                id: "E0001".into(),
+                source_kind: "manuscript_semantic_evidence".into(),
+                source_label: "paper.txt".into(),
+                text: "HeLa single cells were isolated by manual picking.".into(),
+            }],
+            vec!["HeLa_1.raw"],
+        );
+        evidence.existing_sdrf_path = "/tmp/existing.sdrf.tsv".into();
+        let mut branches = vec![
+            selector_branch("R001", "E0001", "comment[data file]", "HeLa_1.raw"),
+            selector_branch("R002", "E0001", "characteristics[cell line]", "K562"),
+        ];
+        normalize_workspace_branches(&evidence, &mut branches);
+        assert!(branches[0].row_selectors.is_empty());
+        assert!(branches[1].row_selectors.is_empty());
+    }
+
+    #[test]
+    fn v2_branch_row_selectors_fail_closed_on_overlapping_conflicting_branches() {
+        let mut evidence = evidence_with(
+            vec![
+                EvidenceItem {
+                    id: "E0001".into(),
+                    source_kind: "manuscript_semantic_evidence".into(),
+                    source_label: "paper.txt".into(),
+                    text: "HeLa single cells were isolated by manual picking.".into(),
+                },
+                EvidenceItem {
+                    id: "E0002".into(),
+                    source_kind: "manuscript_semantic_evidence".into(),
+                    source_label: "paper.txt".into(),
+                    text: "HeLa single cells were isolated by FACS sorting.".into(),
+                },
+            ],
+            vec!["hela.raw"],
+        );
+        evidence.existing_sdrf_path = "/tmp/existing.sdrf.tsv".into();
+        let mut state = row_role_state_with_claims(vec![
+            branch_claim_with_ref("isolation_method", "manual picking", "R001", "E0001"),
+            branch_claim_with_ref("isolation_method", "FACS sorting", "R002", "E0002"),
+        ]);
+        state.branches = vec![
+            selector_branch("R001", "E0001", "characteristics[cell line]", "HeLa"),
+            selector_branch("R002", "E0002", "characteristics[cell line]", "HeLa"),
+        ];
+        normalize_workspace_branches(&evidence, &mut state.branches);
+        let headers = vec![
+            "characteristics[cell line]".into(),
+            SC_SAMPLE_TYPE.into(),
+            SC_ISOLATION_METHOD.into(),
+        ];
+        let mut rows = vec![vec![
+            "HeLa".into(),
+            "single cell".into(),
+            "not available".into(),
+        ]];
+
+        let issues = apply_branch_row_selector_isolation_projection(
+            &headers,
+            &mut rows,
+            &evidence,
+            &state,
+            &[],
+            false,
+        );
+
+        assert_eq!(rows[0][2], "not available");
+        assert!(issues
+            .iter()
+            .any(|issue| issue.code == "scientific_agent_branch_row_selector_conflict"));
+    }
+
+    #[test]
+    fn v2_branch_row_selectors_do_not_apply_without_source_grounded_row_context() {
+        let evidence = consensus_projection_evidence();
+        let mut state = row_role_state_with_claims(vec![branch_claim_with_ref(
+            "isolation_method",
+            "manual picking",
+            "R001",
+            "E0002",
+        )]);
+        state.branches = vec![selector_branch(
+            "R001",
+            "E0002",
+            "characteristics[sample type]",
+            "single cell",
+        )];
+        normalize_workspace_branches(&evidence, &mut state.branches);
+        let headers = vec![SC_SAMPLE_TYPE.into(), SC_ISOLATION_METHOD.into()];
+        let mut rows = vec![vec!["single cell".into(), "not available".into()]];
+
+        let issues = apply_branch_row_selector_isolation_projection(
+            &headers,
+            &mut rows,
+            &evidence,
+            &state,
+            &[],
+            false,
+        );
+
+        assert_eq!(rows[0][1], "not available");
+        assert!(issues.is_empty());
+    }
+
     #[test]
     fn trusted_partial_mapping_disables_global_multiplex_mapping_error() {
         let mut evidence = evidence_with(Vec::new(), vec!["plex.raw"]);
@@ -12666,6 +13263,7 @@ mod tests {
                     isolation_or_loading_method: "manual loading by hydrodynamic pressure".into(),
                     input_or_cell_count_regime: "single cell".into(),
                     evidence_refs: vec!["E0001".into()],
+                    row_selectors: Vec::new(),
                     notes: String::new(),
                 },
                 FactorRegimeProposal {
@@ -12675,6 +13273,7 @@ mod tests {
                     isolation_or_loading_method: "spray voltage injection".into(),
                     input_or_cell_count_regime: "low-number cells".into(),
                     evidence_refs: vec!["E0001".into()],
+                    row_selectors: Vec::new(),
                     notes: String::new(),
                 },
             ],
@@ -12737,6 +13336,147 @@ mod tests {
     }
 
     #[test]
+    fn v2_factor_stage1_preserves_source_grounded_row_selectors() {
+        let evidence = evidence_with(
+            vec![
+                EvidenceItem {
+                    id: "E0001".into(),
+                    source_kind: "manuscript_semantic_evidence".into(),
+                    source_label: "methods".into(),
+                    text: "HeLa single cells were isolated by manual picking.".into(),
+                },
+                EvidenceItem {
+                    id: "E0002".into(),
+                    source_kind: "manuscript_semantic_evidence".into(),
+                    source_label: "methods".into(),
+                    text: "Spinal cord neurons were isolated by laser capture microdissection.".into(),
+                },
+            ],
+            vec!["hela.raw", "neuron.raw"],
+        );
+        let proposal = StudyFactorGraphProposal {
+            decision: "propose_graph".into(),
+            materials: vec![FactorMaterialProposal {
+                local_id: "M1".into(),
+                label: "single-cell material".into(),
+                organism: "Homo sapiens".into(),
+                biological_material: "single cells".into(),
+                experimental_role: "single-cell material".into(),
+                evidence_refs: vec!["E0001".into()],
+                notes: String::new(),
+            }],
+            regimes: vec![
+                FactorRegimeProposal {
+                    local_id: "R1".into(),
+                    label: "HeLa isolation".into(),
+                    experimental_role: "single-cell proteomics".into(),
+                    isolation_or_loading_method: "manual picking".into(),
+                    input_or_cell_count_regime: "single cell".into(),
+                    evidence_refs: vec!["E0001".into()],
+                    row_selectors: vec![AgentRowSelector {
+                        field: "characteristics[cell line]".into(),
+                        value: "HeLa".into(),
+                    }],
+                    notes: String::new(),
+                },
+                FactorRegimeProposal {
+                    local_id: "R2".into(),
+                    label: "spinal-neuron isolation".into(),
+                    experimental_role: "single-cell proteomics".into(),
+                    isolation_or_loading_method: "laser capture microdissection".into(),
+                    input_or_cell_count_regime: "single cell".into(),
+                    evidence_refs: vec!["E0002".into()],
+                    row_selectors: vec![AgentRowSelector {
+                        field: "characteristics[organism part]".into(),
+                        value: "spinal cord".into(),
+                    }],
+                    notes: String::new(),
+                },
+            ],
+            acquisitions: Vec::new(),
+            relations: Vec::new(),
+            raw_links: Vec::new(),
+            open_questions: Vec::new(),
+            reason: "two source-grounded isolation regimes".into(),
+        };
+
+        let accepted = accept_factor_graph_stage1(&evidence, &proposal);
+        assert_eq!(accepted.status, "accepted");
+        assert_eq!(accepted.regimes.len(), 2);
+        assert_eq!(accepted.regimes[0].row_selectors.len(), 1);
+        assert_eq!(accepted.regimes[1].row_selectors.len(), 1);
+
+        let branches = factor_graph_as_agent_branches(&accepted);
+        let selector_values = branches
+            .iter()
+            .filter(|branch| branch.id.starts_with('R'))
+            .flat_map(|branch| branch.row_selectors.iter().map(|selector| selector.value.clone()))
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            selector_values,
+            BTreeSet::from(["HeLa".to_string(), "spinal cord".to_string()])
+        );
+    }
+
+    #[test]
+    fn v2_factor_stage1_strips_ungrounded_or_disallowed_row_selectors() {
+        let evidence = evidence_with(
+            vec![EvidenceItem {
+                id: "E0001".into(),
+                source_kind: "manuscript_semantic_evidence".into(),
+                source_label: "methods".into(),
+                text: "Female HeLa single cells were isolated by manual picking.".into(),
+            }],
+            vec!["HeLa_1.raw"],
+        );
+        let proposal = StudyFactorGraphProposal {
+            decision: "propose_graph".into(),
+            materials: vec![FactorMaterialProposal {
+                local_id: "M1".into(),
+                label: "HeLa".into(),
+                organism: "Homo sapiens".into(),
+                biological_material: "HeLa cells".into(),
+                experimental_role: "single-cell material".into(),
+                evidence_refs: vec!["E0001".into()],
+                notes: String::new(),
+            }],
+            regimes: vec![FactorRegimeProposal {
+                local_id: "R1".into(),
+                label: "HeLa isolation".into(),
+                experimental_role: "single-cell proteomics".into(),
+                isolation_or_loading_method: "manual picking".into(),
+                input_or_cell_count_regime: "single cell".into(),
+                evidence_refs: vec!["E0001".into()],
+                row_selectors: vec![
+                    AgentRowSelector {
+                        field: "comment[data file]".into(),
+                        value: "HeLa_1.raw".into(),
+                    },
+                    AgentRowSelector {
+                        field: "characteristics[cell line]".into(),
+                        value: "K562".into(),
+                    },
+                    AgentRowSelector {
+                        field: "characteristics[sex]".into(),
+                        value: "male".into(),
+                    },
+                ],
+                notes: String::new(),
+            }],
+            acquisitions: Vec::new(),
+            relations: Vec::new(),
+            raw_links: Vec::new(),
+            open_questions: Vec::new(),
+            reason: String::new(),
+        };
+
+        let accepted = accept_factor_graph_stage1(&evidence, &proposal);
+        assert_eq!(accepted.status, "accepted");
+        assert_eq!(accepted.regimes.len(), 1);
+        assert!(accepted.regimes[0].row_selectors.is_empty());
+    }
+
+    #[test]
     fn v2_factor_stage1_preserves_distinct_explicit_organisms_as_material_nodes() {
         let evidence = evidence_with(
             vec![EvidenceItem {
@@ -12776,6 +13516,7 @@ mod tests {
                 isolation_or_loading_method: "picked single-cell transferred into microwell".into(),
                 input_or_cell_count_regime: "single cell".into(),
                 evidence_refs: vec!["E0001".into()],
+                row_selectors: Vec::new(),
                 notes: String::new(),
             }],
             acquisitions: Vec::new(),
@@ -12826,6 +13567,7 @@ mod tests {
                 isolation_or_loading_method: "capillary aspiration".into(),
                 input_or_cell_count_regime: "single cell".into(),
                 evidence_refs: vec!["E0001".into()],
+                row_selectors: Vec::new(),
                 notes: String::new(),
             }],
             acquisitions: Vec::new(),
@@ -12875,6 +13617,7 @@ mod tests {
                 isolation_or_loading_method: String::new(),
                 input_or_cell_count_regime: "single cell".into(),
                 evidence_refs: vec!["E0001".into()],
+                row_selectors: Vec::new(),
                 notes: String::new(),
             }],
             acquisitions: Vec::new(),
@@ -12943,6 +13686,7 @@ mod tests {
                     isolation_or_loading_method: "manual hydrodynamic loading".into(),
                     input_or_cell_count_regime: "single cell".into(),
                     evidence_refs: vec!["E0001".into()],
+                    row_selectors: Vec::new(),
                     notes: String::new(),
                 },
                 AcceptedFactorRegime {
@@ -12952,6 +13696,7 @@ mod tests {
                     isolation_or_loading_method: "spray voltage injection".into(),
                     input_or_cell_count_regime: "few cells".into(),
                     evidence_refs: vec!["E0001".into()],
+                    row_selectors: Vec::new(),
                     notes: String::new(),
                 },
             ],
@@ -13205,6 +13950,7 @@ mod tests {
             isolation_or_loading_method: "Standard loading of commercial digest".into(),
             input_or_cell_count_regime: "Commercial digest input".into(),
             evidence_refs: vec!["E0001".into()],
+            row_selectors: Vec::new(),
             notes: String::new(),
         }];
         let accepted = derive_factor_graph_observations(&evidence, &graph);
