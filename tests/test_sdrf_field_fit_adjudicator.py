@@ -182,3 +182,47 @@ def test_claim_to_evidence_binds_exact_artifact_sha(tmp_path: Path) -> None:
     assert item["evidence_ref"] == f"claim:{mod.sha256_bytes(path.read_bytes())}"
     assert item["source_identity"] == "doi:test"
     assert item["parent_artifact_sha256"] == "2" * 64
+
+
+def test_prompt_keeps_semantic_fit_independent_from_vocabulary() -> None:
+    contract = mod.load_field_contract(
+        SEMANTICS,
+        "characteristics[single cell isolation protocol]",
+    )
+    prompt = mod.build_prompt(
+        accession="PXD023366",
+        contract=contract,
+        current_values=["not applicable"],
+        evidence_items=[
+            evidence(
+                "claim:iso",
+                "The oocytes were obtained by transvaginal puncture with an 18-gauge needle.",
+            )
+        ],
+    )
+    assert "accepted_values" not in prompt
+    assert "known_explicit_but_unsupported" not in prompt
+    assert "accepted SDRF vocabulary is intentionally withheld" in prompt
+    assert "transvaginal puncture" in prompt
+
+
+def test_current_value_evidence_reference_is_validated() -> None:
+    contract = mod.load_field_contract(SEMANTICS, "comment[dissociation method]")
+    result = mod.adjudicate(
+        accession="PXDTEST",
+        contract=contract,
+        current_values=["CID"],
+        evidence_items=[evidence("claim:hcd", "HCD was used.")],
+        model="fixture",
+        model_response={
+            "decision": "fits",
+            "proposed_value": "HCD",
+            "application_scope": "all_rows",
+            "evidence_refs": ["claim:hcd"],
+            "current_value_assessment": "conflicts",
+            "current_value_evidence_refs": ["claim:not-present"],
+            "rationale": "The supplied evidence supports HCD, not CID.",
+        },
+    )
+    assert result["policy_status"] == "invalid_evidence_reference"
+    assert result["invalid_evidence_refs"] == ["claim:not-present"]

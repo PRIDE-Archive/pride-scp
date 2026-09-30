@@ -20,22 +20,32 @@ import argparse
 import csv
 import hashlib
 import json
+import re
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
 import sdrf_field_fit_adjudicator as field_fit
 
-VERSION = "pride-scp-sdrf-llm-completion-v0.1.0"
-BUNDLE_SCHEMA_VERSION = "pride-scp-sdrf-escalation-bundle-v1"
-PATCH_SCHEMA_VERSION = "pride-scp-sdrf-external-patch-v1"
+try:
+    import sdrf_annotation_state as annotation_state
+except ImportError:  # pragma: no cover - only for standalone source-only bundles
+    annotation_state = None
+
+VERSION = "pride-scp-sdrf-llm-completion-v0.2.0"
+BUNDLE_SCHEMA_VERSION = "pride-scp-sdrf-escalation-bundle-v2"
+PATCH_SCHEMA_VERSION = "pride-scp-sdrf-external-patch-v2"
 
 
 @dataclass(frozen=True)
 class CompletionDecision:
     accession: str
+    blocker_family: str
     field: str
     current_values: tuple[str, ...]
+    current_value_model_assessment: str
+    current_value_audit: str
+    current_value_evidence_refs: tuple[str, ...]
     model_decision: str
     proposed_value: str
     canonical_value: str
@@ -103,16 +113,54 @@ def write_jsonl(path: Path, rows: list[dict[str, Any]]) -> None:
             handle.write(json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n")
 
 
-def parse_blocker_fields(blocker_manifest: Path, accession: str) -> tuple[str, list[str]]:
+def parse_blocker_context(
+    blocker_manifest: Path,
+    accession: str,
+) -> tuple[str, list[str], str, str]:
     _, rows = read_tsv(blocker_manifest)
     matches = [row for row in rows if str(row.get("accession") or "") == accession]
     if not matches:
         raise KeyError(f"accession missing from blocker manifest: {accession}")
     row = matches[0]
-    blocker_family = str(row.get("blocker_family") or "")
     raw = str(row.get("blocker_fields") or row.get("blocker_field") or "")
     fields = [normalize_text(item) for item in raw.split(";") if normalize_text(item)]
+    state = str(
+        row.get("state")
+        or row.get("baseline_terminal_state")
+        or row.get("final_state")
+        or ""
+    )
+    reason = str(row.get("reason_code") or row.get("baseline_reason_code") or "")
+    blocker_family = str(row.get("blocker_family") or "").strip()
+    if not blocker_family and annotation_state is not None:
+        blocker_family = annotation_state.normalize_blocker_family(state, reason, fields)
+    if not blocker_family:
+        blocker_family = "unknown"
+    return blocker_family, fields, state, reason
+
+
+def parse_blocker_fields(blocker_manifest: Path, accession: str) -> tuple[str, list[str]]:
+    blocker_family, fields, _, _ = parse_blocker_context(blocker_manifest, accession)
     return blocker_family, fields
+
+
+NON_SUBSTANTIVE_VALUES = {
+    "",
+    "na",
+    "n/a",
+    "not applicable",
+    "not available",
+    "unknown",
+}
+
+ROW_CONTEXT_COLUMNS = (
+    "source name",
+    "assay name",
+    "characteristics[cell identifier]",
+    "characteristics[sample type]",
+    "comment[data file]",
+    "comment[label]",
+)
 
 
 def distinct_current_values(rows: list[dict[str, str]], field: str) -> list[str]:
@@ -124,6 +172,77 @@ def distinct_current_values(rows: list[dict[str, str]], field: str) -> list[str]
     return sorted(values)
 
 
+def is_non_substantive_value(value: str) -> bool:
+    return normalize_text(value).casefold() in NON_SUBSTANTIVE_VALUES
+
+
+def extract_nt_value(value: str) -> str:
+    match = re.search(r"(?:^|;)\s*NT=([^;]+)", value, flags=re.IGNORECASE)
+    if match:
+        return normalize_text(match.group(1))
+    return normalize_text(value)
+
+
+def canonicalize_existing_value(
+    contract: field_fit.FieldContract,
+    value: str,
+) -> tuple[str, str]:
+    if is_non_substantive_value(value):
+        return "", "non_substantive"
+    return field_fit.canonicalize_value(contract, extract_nt_value(value))
+
+
+def current_value_search_terms(
+    contract: field_fit.FieldContract,
+    current_values: list[str],
+) -> tuple[str, ...]:
+    terms: list[str] = []
+    for value in current_values:
+        token = extract_nt_value(value)
+        if not token or is_non_substantive_value(token):
+            continue
+        canonical, _ = field_fit.canonicalize_value(contract, token)
+        if canonical:
+            terms.append(canonical)
+            for alias, target in contract.aliases.items():
+                if normalize_text(target).casefold() == normalize_text(canonical).casefold():
+                    terms.append(alias)
+        terms.append(token)
+    terms.extend(contract.evidence_search_terms)
+    seen: set[str] = set()
+    ordered: list[str] = []
+    for term in terms:
+        normalized = normalize_text(term)
+        key = normalized.casefold()
+        if normalized and key not in seen:
+            seen.add(key)
+            ordered.append(normalized)
+    return tuple(ordered)
+
+
+def representative_row_context(
+    rows: list[dict[str, str]],
+    field: str,
+    *,
+    max_rows: int = 8,
+) -> list[dict[str, Any]]:
+    selected: list[dict[str, Any]] = []
+    seen: set[tuple[tuple[str, str], ...]] = set()
+    for index, row in enumerate(rows, start=1):
+        payload: dict[str, str] = {}
+        for column in (*ROW_CONTEXT_COLUMNS, field):
+            if column in row:
+                payload[column] = str(row.get(column) or "")
+        signature = tuple(sorted(payload.items()))
+        if signature in seen:
+            continue
+        seen.add(signature)
+        selected.append({"row_index": index, "values": payload})
+        if len(selected) >= max_rows:
+            break
+    return selected
+
+
 def find_text_windows(
     *,
     text: str,
@@ -132,31 +251,48 @@ def find_text_windows(
     max_windows: int,
 ) -> list[tuple[int, int, str]]:
     lowered = text.casefold()
-    candidates: list[tuple[int, int]] = []
+    candidates: list[tuple[int, int, int]] = []
     half = max(100, window_chars // 2)
-    for term in terms:
+    for priority, term in enumerate(terms):
         needle = term.casefold()
         if not needle:
             continue
-        start = 0
-        while len(candidates) < max_windows * max(2, len(terms)):
-            idx = lowered.find(needle, start)
-            if idx < 0:
-                break
+        positions: list[int] = []
+        if re.fullmatch(r"[A-Za-z0-9]+", term) and len(term) <= 6:
+            pattern = re.compile(
+                rf"(?<![A-Za-z0-9]){re.escape(term)}(?![A-Za-z0-9])",
+                flags=re.IGNORECASE,
+            )
+            positions = [match.start() for match in pattern.finditer(text)]
+        else:
+            start = 0
+            while True:
+                idx = lowered.find(needle, start)
+                if idx < 0:
+                    break
+                positions.append(idx)
+                start = idx + max(1, len(needle))
+
+        for idx in positions[:max_windows]:
             left = max(0, idx - half)
             right = min(len(text), idx + len(term) + half)
-            candidates.append((left, right))
-            start = idx + max(1, len(needle))
+            candidates.append((priority, left, right))
 
-    candidates.sort()
+    # Preserve field-specific term priority instead of allowing early generic text to crowd out
+    # a later decisive HCD/CID/etc. occurrence. Position breaks ties deterministically.
+    candidates.sort(key=lambda item: (item[0], item[1], item[2]))
     chosen: list[tuple[int, int]] = []
-    for left, right in candidates:
-        overlap = any(not (right <= prev_left or left >= prev_right) for prev_left, prev_right in chosen)
+    for _, left, right in candidates:
+        overlap = any(
+            not (right <= prev_left or left >= prev_right)
+            for prev_left, prev_right in chosen
+        )
         if overlap:
             continue
         chosen.append((left, right))
         if len(chosen) >= max_windows:
             break
+    chosen.sort()
     return [(left, right, text[left:right]) for left, right in chosen]
 
 
@@ -166,6 +302,7 @@ def registry_evidence_for_field(
     accession: str,
     field: str,
     contract: field_fit.FieldContract,
+    current_values: list[str],
     window_chars: int,
     max_publication_windows: int,
 ) -> list[dict[str, Any]]:
@@ -203,7 +340,7 @@ def registry_evidence_for_field(
         artifact_sha = str(row.get("artifact_sha256") or sha256_file(local_path))
         for left, right, snippet in find_text_windows(
             text=text,
-            terms=contract.evidence_search_terms,
+            terms=current_value_search_terms(contract, current_values),
             window_chars=window_chars,
             max_windows=max_publication_windows,
         ):
@@ -260,11 +397,61 @@ def deterministic_scope_supported(
     return False
 
 
-def current_values_compatible(current_values: list[str], value: str) -> bool:
-    if not current_values:
+def substantive_current_values(current_values: list[str]) -> list[str]:
+    return [value for value in current_values if not is_non_substantive_value(value)]
+
+
+def normalized_existing_values(
+    contract: field_fit.FieldContract,
+    current_values: list[str],
+) -> list[str]:
+    normalized: list[str] = []
+    for value in substantive_current_values(current_values):
+        canonical, _ = canonicalize_existing_value(contract, value)
+        normalized.append(canonical or extract_nt_value(value))
+    return normalized
+
+
+def current_values_compatible(
+    contract: field_fit.FieldContract,
+    current_values: list[str],
+    value: str,
+) -> bool:
+    substantive = normalized_existing_values(contract, current_values)
+    if not substantive:
         return True
-    normalized = normalize_text(value).casefold()
-    return all(normalize_text(item).casefold() == normalized for item in current_values)
+    canonical, _ = field_fit.canonicalize_value(contract, value)
+    target = normalize_text(canonical or value).casefold()
+    return all(normalize_text(item).casefold() == target for item in substantive)
+
+
+def current_value_audit_status(
+    *,
+    contract: field_fit.FieldContract,
+    current_values: list[str],
+    adjudication: dict[str, Any],
+) -> str:
+    substantive = normalized_existing_values(contract, current_values)
+    if not substantive:
+        return "no_substantive_current_value"
+
+    decision = str(adjudication.get("decision") or "")
+    proposed = str(adjudication.get("canonical_value") or adjudication.get("proposed_value") or "")
+    if decision == "fits" and proposed:
+        proposed_canonical, _ = field_fit.canonicalize_value(contract, proposed)
+        target = normalize_text(proposed_canonical or proposed).casefold()
+        if all(normalize_text(value).casefold() == target for value in substantive):
+            return "current_value_supported_by_supplied_evidence"
+        return "current_value_conflicts_with_supplied_evidence"
+
+    model_assessment = str(adjudication.get("current_value_assessment") or "not_assessed")
+    if model_assessment == "supported":
+        return "current_value_model_supported_but_semantic_value_unresolved"
+    if model_assessment == "conflicts":
+        return "current_value_conflicts_with_supplied_evidence"
+    if model_assessment == "unsupported":
+        return "current_value_not_supported_by_supplied_evidence"
+    return "current_value_unverified_by_supplied_evidence"
 
 
 def ensure_field(headers: list[str], rows: list[dict[str, str]], field: str) -> None:
@@ -275,10 +462,15 @@ def ensure_field(headers: list[str], rows: list[dict[str, str]], field: str) -> 
         row[field] = ""
 
 
-def fill_blank_cells(rows: list[dict[str, str]], field: str, value: str) -> int:
+def fill_blank_or_placeholder_cells(
+    rows: list[dict[str, str]],
+    field: str,
+    value: str,
+) -> int:
     changed = 0
     for row in rows:
-        if normalize_text(str(row.get(field) or "")):
+        current = normalize_text(str(row.get(field) or ""))
+        if current and not is_non_substantive_value(current):
             continue
         row[field] = value
         changed += 1
@@ -290,7 +482,10 @@ def escalation_reason_for(
     adjudication: dict[str, Any],
     scope_supported: bool,
     values_compatible: bool,
+    current_value_audit: str,
 ) -> str:
+    if current_value_audit == "current_value_conflicts_with_supplied_evidence":
+        return "current_value_conflicts_with_evidence"
     policy = str(adjudication.get("policy_status") or "")
     if policy == "supported_field_fit" and not values_compatible:
         return "conflicts_with_existing_candidate_values"
@@ -310,6 +505,12 @@ def escalation_reason_for(
         return "invalid_local_evidence_reference"
     if policy == "missing_proposed_value":
         return "missing_local_proposed_value"
+    if current_value_audit in {
+        "current_value_not_supported_by_supplied_evidence",
+        "current_value_unverified_by_supplied_evidence",
+        "current_value_model_supported_but_semantic_value_unresolved",
+    }:
+        return "current_value_unverified_by_supplied_evidence"
     return "insufficient_local_evidence"
 
 
@@ -323,9 +524,11 @@ def external_patch_schema() -> dict[str, Any]:
             "accession",
             "field",
             "original_value_sha256",
+            "action",
             "proposed_value",
             "evidence_refs",
             "semantic_fit",
+            "current_value_assessment",
             "vocabulary_status",
             "rationale",
             "abstain",
@@ -334,11 +537,25 @@ def external_patch_schema() -> dict[str, Any]:
             "accession": {"type": "string"},
             "field": {"type": "string"},
             "original_value_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+            "action": {
+                "type": "string",
+                "enum": ["keep", "set", "replace", "clear", "abstain"],
+            },
             "proposed_value": {"type": "string"},
             "evidence_refs": {"type": "array", "items": {"type": "string"}},
             "semantic_fit": {
                 "type": "string",
                 "enum": sorted(field_fit.ALLOWED_DECISIONS),
+            },
+            "current_value_assessment": {
+                "type": "string",
+                "enum": [
+                    "supported",
+                    "unsupported",
+                    "conflicts",
+                    "insufficient_evidence",
+                    "not_present",
+                ],
             },
             "vocabulary_status": {
                 "type": "string",
@@ -369,7 +586,9 @@ def run_completion(
     window_chars: int,
     max_publication_windows: int,
 ) -> dict[str, Any]:
-    blocker_family, blocker_fields = parse_blocker_fields(blocker_manifest, accession)
+    blocker_family, blocker_fields, blocker_state, blocker_reason = parse_blocker_context(
+        blocker_manifest, accession
+    )
     headers, candidate_rows = read_tsv(candidate_sdrf)
     registry_headers, registry_rows = read_tsv(evidence_registry)
     del registry_headers
@@ -392,8 +611,16 @@ def run_completion(
             current_values = distinct_current_values(candidate_rows, field)
             decision = CompletionDecision(
                 accession=accession,
+                blocker_family=blocker_family,
                 field=field,
                 current_values=tuple(current_values),
+                current_value_model_assessment="not_assessed",
+                current_value_audit=(
+                    "no_substantive_current_value"
+                    if not substantive_current_values(current_values)
+                    else "current_value_unverified_by_supplied_evidence"
+                ),
+                current_value_evidence_refs=(),
                 model_decision="insufficient_evidence",
                 proposed_value="",
                 canonical_value="",
@@ -416,8 +643,14 @@ def run_completion(
                     "schema_version": BUNDLE_SCHEMA_VERSION,
                     "accession": accession,
                     "blocker_family": blocker_family,
+                    "blocker_state": blocker_state,
+                    "blocker_reason": blocker_reason,
                     "field": field,
                     "current_distinct_values": current_values,
+                    "candidate_row_count": len(candidate_rows),
+                    "representative_row_context": representative_row_context(
+                        candidate_rows, field
+                    ),
                     "escalation_reason": decision.escalation_reason,
                     "field_contract": None,
                     "evidence": [],
@@ -432,6 +665,7 @@ def run_completion(
             accession=accession,
             field=field,
             contract=contract,
+            current_values=current_values,
             window_chars=window_chars,
             max_publication_windows=max_publication_windows,
         )
@@ -456,6 +690,8 @@ def run_completion(
                 "proposed_value": "",
                 "application_scope": "unknown",
                 "evidence_refs": [],
+                "current_value_assessment": "not_assessed",
+                "current_value_evidence_refs": [],
                 "rationale": "No field-scoped or publication evidence was available.",
             }
 
@@ -476,6 +712,8 @@ def run_completion(
                 "proposed_value": "",
                 "application_scope": "unknown",
                 "evidence_refs": [],
+                "current_value_assessment": "not_assessed",
+                "current_value_evidence_refs": [],
                 "rationale": "No field-scoped or publication evidence was available.",
                 "canonical_value": "",
                 "vocabulary_status": "missing",
@@ -493,6 +731,24 @@ def run_completion(
                 model_response=model_response,
             )
 
+        scope_supported = deterministic_scope_supported(
+            adjudication=adjudication,
+            evidence_items=evidence_items,
+        )
+        canonical = str(adjudication.get("canonical_value") or "")
+        proposed = str(adjudication.get("proposed_value") or "")
+        values_compatible = current_values_compatible(
+            contract, current_values, canonical or proposed
+        )
+        current_audit = current_value_audit_status(
+            contract=contract,
+            current_values=current_values,
+            adjudication=adjudication,
+        )
+        adjudication = {
+            **adjudication,
+            "deterministic_current_value_audit": current_audit,
+        }
         adjudication_records.append(
             {
                 "field": field,
@@ -500,14 +756,6 @@ def run_completion(
                 "adjudication": adjudication,
             }
         )
-
-        scope_supported = deterministic_scope_supported(
-            adjudication=adjudication,
-            evidence_items=evidence_items,
-        )
-        canonical = str(adjudication.get("canonical_value") or "")
-        proposed = str(adjudication.get("proposed_value") or "")
-        values_compatible = current_values_compatible(current_values, canonical or proposed)
 
         accepted = (
             adjudication.get("policy_status") == "supported_field_fit"
@@ -527,14 +775,14 @@ def run_completion(
 
         if accepted:
             ensure_field(confident_headers, confident_rows, field)
-            changed = fill_blank_cells(confident_rows, field, canonical)
+            changed = fill_blank_or_placeholder_cells(confident_rows, field, canonical)
             confident_status = f"applied_to_{changed}_blank_rows"
             accepted_patches.append(
                 {
                     "schema_version": "pride-scp-sdrf-accepted-patch-v1",
                     "accession": accession,
                     "field": field,
-                    "row_selector": {"type": "all_blank_rows"},
+                    "row_selector": {"type": "all_blank_or_placeholder_rows"},
                     "original_value_sha256": candidate_value_sha256(current_values),
                     "proposed_value": canonical,
                     "evidence_refs": list(adjudication.get("evidence_refs") or []),
@@ -548,7 +796,7 @@ def run_completion(
         if draft_applicable:
             draft_value = canonical if adjudication.get("vocabulary_status") == "supported" else proposed
             ensure_field(draft_headers, draft_rows, field)
-            changed = fill_blank_cells(draft_rows, field, draft_value)
+            changed = fill_blank_or_placeholder_cells(draft_rows, field, draft_value)
             draft_status = f"review_only_applied_to_{changed}_blank_rows"
 
         if not accepted:
@@ -556,12 +804,22 @@ def run_completion(
                 adjudication=adjudication,
                 scope_supported=scope_supported,
                 values_compatible=values_compatible,
+                current_value_audit=current_audit,
             )
 
         decision = CompletionDecision(
             accession=accession,
+            blocker_family=blocker_family,
             field=field,
             current_values=tuple(current_values),
+            current_value_model_assessment=str(
+                adjudication.get("current_value_assessment") or "not_assessed"
+            ),
+            current_value_audit=current_audit,
+            current_value_evidence_refs=tuple(
+                str(ref)
+                for ref in adjudication.get("current_value_evidence_refs") or []
+            ),
             model_decision=str(adjudication.get("decision") or ""),
             proposed_value=proposed,
             canonical_value=canonical,
@@ -586,8 +844,15 @@ def run_completion(
                     "schema_version": BUNDLE_SCHEMA_VERSION,
                     "accession": accession,
                     "blocker_family": blocker_family,
+                    "blocker_state": blocker_state,
+                    "blocker_reason": blocker_reason,
                     "field": field,
                     "current_distinct_values": current_values,
+                    "current_value_audit": current_audit,
+                    "candidate_row_count": len(candidate_rows),
+                    "representative_row_context": representative_row_context(
+                        candidate_rows, field
+                    ),
                     "original_value_sha256": candidate_value_sha256(current_values),
                     "escalation_reason": escalation_reason,
                     "field_contract": {
@@ -599,14 +864,18 @@ def run_completion(
                             contract.known_explicit_but_unsupported
                         ),
                         "explicit_exclusions": list(contract.explicit_exclusions),
+                        "targeted_evidence_search_terms": list(
+                            current_value_search_terms(contract, current_values)
+                        ),
                         "contract_sha256": contract.contract_sha256,
                         "version": contract.resource_version,
                     },
                     "evidence": evidence_items,
                     "local_adjudication": adjudication,
                     "external_model_instruction": (
-                        "Resolve only this field from the supplied evidence. Return a structured patch "
-                        "matching escalation_patch.schema.json. Abstain rather than inventing a value."
+                        "Resolve only this field from the supplied evidence and candidate row context. "
+                        "Audit the existing value as well as any proposed replacement. Return a structured "
+                        "patch matching escalation_patch.schema.json. Abstain rather than inventing a value."
                     ),
                 }
             )
@@ -629,8 +898,12 @@ def run_completion(
     write_jsonl(patch_path, accepted_patches)
     review_headers = [
         "accession",
+        "blocker_family",
         "field",
         "current_values",
+        "current_value_model_assessment",
+        "current_value_audit",
+        "current_value_evidence_refs",
         "model_decision",
         "proposed_value",
         "canonical_value",
@@ -653,6 +926,9 @@ def run_completion(
                 **row,
                 "current_values": ";".join(row.get("current_values") or []),
                 "evidence_refs": ";".join(row.get("evidence_refs") or []),
+                "current_value_evidence_refs": ";".join(
+                    row.get("current_value_evidence_refs") or []
+                ),
                 "deterministic_scope_supported": str(
                     bool(row.get("deterministic_scope_supported"))
                 ).lower(),
@@ -669,6 +945,8 @@ def run_completion(
         "field_fit_adjudicator_version": field_fit.VERSION,
         "accession": accession,
         "blocker_family": blocker_family,
+        "blocker_state": blocker_state,
+        "blocker_reason": blocker_reason,
         "blocker_fields": blocker_fields,
         "model": model,
         "candidate_sdrf": str(candidate_sdrf),
@@ -697,6 +975,8 @@ def run_completion(
         "version": VERSION,
         "accession": accession,
         "blocker_family": blocker_family,
+        "blocker_state": blocker_state,
+        "blocker_reason": blocker_reason,
         "blocker_fields": len(blocker_fields),
         "local_fields_attempted": len(decisions),
         "accepted_confident_patches": len(accepted_patches),
@@ -711,6 +991,17 @@ def run_completion(
             1
             for decision in decisions
             if decision.model_decision in {"ambiguous", "conflicting_evidence"}
+        ),
+        "existing_value_audit_items": sum(
+            1
+            for decision in decisions
+            if decision.current_value_audit != "no_substantive_current_value"
+        ),
+        "existing_value_conflicts": sum(
+            1
+            for decision in decisions
+            if decision.current_value_audit
+            == "current_value_conflicts_with_supplied_evidence"
         ),
         "outputs": provenance["outputs"],
         "provenance": str(provenance_path),
@@ -749,15 +1040,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--timeout-seconds", type=float, default=180.0)
     parser.add_argument("--responses-jsonl", type=Path)
     parser.add_argument("--window-chars", type=int, default=1200)
-    parser.add_argument("--max-publication-windows", type=int, default=4)
+    parser.add_argument("--max-publication-windows", type=int, default=8)
     parser.add_argument("--self-test", action="store_true")
     return parser.parse_args()
 
 
 def self_test() -> None:
-    assert current_values_compatible([], "HCD")
-    assert current_values_compatible(["HCD"], "HCD")
-    assert not current_values_compatible(["CID"], "HCD")
+    contract = field_fit.load_field_contract(
+        Path(__file__).resolve().parents[1] / "resources" / "sdrf_field_semantics_v1.json",
+        "comment[dissociation method]",
+    )
+    assert current_values_compatible(contract, [], "HCD")
+    assert current_values_compatible(contract, ["HCD"], "HCD")
+    assert current_values_compatible(contract, ["NT=HCD;AC=MS:1000422"], "HCD")
+    assert not current_values_compatible(contract, ["CID"], "HCD")
     assert find_text_windows(
         text="abc HCD def",
         terms=("HCD",),

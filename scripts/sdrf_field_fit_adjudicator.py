@@ -16,8 +16,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-VERSION = "pride-scp-sdrf-field-fit-adjudicator-v0.2.0"
-OUTPUT_SCHEMA_VERSION = "pride-scp-sdrf-field-fit-adjudication-v2"
+VERSION = "pride-scp-sdrf-field-fit-adjudicator-v0.3.0"
+OUTPUT_SCHEMA_VERSION = "pride-scp-sdrf-field-fit-adjudication-v3"
 DEFAULT_MODEL = "qwen3.6:27b"
 DEFAULT_OLLAMA_URL = "http://127.0.0.1:11434"
 
@@ -30,6 +30,12 @@ ALLOWED_DECISIONS = {
     "conflicting_evidence",
 }
 ALLOWED_SCOPES = {"all_rows", "subset", "unknown"}
+ALLOWED_CURRENT_VALUE_ASSESSMENTS = {
+    "supported",
+    "unsupported",
+    "conflicts",
+    "not_assessed",
+}
 
 
 @dataclass(frozen=True)
@@ -136,6 +142,8 @@ def field_fit_response_schema() -> dict[str, Any]:
             "proposed_value",
             "application_scope",
             "evidence_refs",
+            "current_value_assessment",
+            "current_value_evidence_refs",
             "rationale",
         ],
         "properties": {
@@ -143,6 +151,14 @@ def field_fit_response_schema() -> dict[str, Any]:
             "proposed_value": {"type": "string"},
             "application_scope": {"type": "string", "enum": sorted(ALLOWED_SCOPES)},
             "evidence_refs": {"type": "array", "items": {"type": "string"}},
+            "current_value_assessment": {
+                "type": "string",
+                "enum": sorted(ALLOWED_CURRENT_VALUE_ASSESSMENTS),
+            },
+            "current_value_evidence_refs": {
+                "type": "array",
+                "items": {"type": "string"},
+            },
             "rationale": {"type": "string"},
         },
     }
@@ -172,28 +188,33 @@ def build_prompt(
         "accession": accession,
         "target_field": contract.field,
         "field_semantics": contract.semantic_definition,
-        "accepted_values": list(contract.accepted_values),
-        "aliases": contract.aliases,
-        "known_explicit_but_unsupported": list(contract.known_explicit_but_unsupported),
         "explicit_exclusions": list(contract.explicit_exclusions),
         "current_distinct_values": current_values,
         "evidence": evidence_payload,
     }
     return (
         "You are a bounded scientific adjudicator for proteomics SDRF metadata.\n"
-        "Decide whether the supplied evidence describes the semantic concept represented by the "
-        "single target SDRF field.\n"
-        "Do not invent facts. Do not use general instrument knowledge to infer a fragmentation "
-        "method. Do not confuse biological cell/tissue dissociation with MS/MS ion dissociation.\n"
-        "Use only the supplied evidence. If evidence is missing, conflicting, truncated, or too "
-        "complex for a reliable judgment, abstain with insufficient_evidence, conflicting_evidence, "
+        "Stage A is semantic only: decide whether the supplied evidence explicitly describes the "
+        "concept represented by the single target SDRF field. The accepted SDRF vocabulary is "
+        "intentionally withheld from you. Do NOT downgrade a semantically valid explicit phrase "
+        "because it might not be in a controlled vocabulary. Vocabulary mapping is a separate "
+        "deterministic stage after your response.\n"
+        "If the evidence explicitly states a field-relevant concept, use decision=fits and copy the "
+        "most faithful explicit source phrase into proposed_value, even if it may be unusual. Do not "
+        "coerce it to a more familiar term.\n"
+        "Audit current_distinct_values separately. They are existing candidate annotations, not trusted "
+        "facts. Use current_value_assessment=supported only when supplied evidence supports them; "
+        "unsupported when supplied evidence does not substantiate them; conflicts when supplied evidence "
+        "supports a different value; and not_assessed when there is no substantive current value. Cite "
+        "current_value_evidence_refs separately.\n"
+        "Do not invent facts. Do not use general instrument knowledge to infer a fragmentation method. "
+        "Do not confuse biological cell/tissue dissociation with MS/MS ion dissociation.\n"
+        "Use only the supplied evidence. If evidence is missing, conflicting, truncated, or too complex "
+        "for a reliable semantic judgment, abstain with insufficient_evidence, conflicting_evidence, "
         "ambiguous, or context_limit.\n"
-        "If decision=fits, proposed_value must be explicitly supported by the cited evidence. "
-        "Do not coerce an unsupported explicit method into a different accepted vocabulary term.\n"
-        "application_scope is a semantic judgment only: all_rows means the supplied evidence explicitly "
-        "supports one study-wide value; subset means evidence only applies to some rows; unknown means "
-        "scope cannot be established. Deterministic policy will independently decide whether any edit "
-        "may be applied.\n"
+        "application_scope is a semantic judgment only: all_rows means supplied evidence explicitly "
+        "supports one study-wide value; subset means it applies only to some rows; unknown means scope "
+        "cannot be established. Deterministic policy independently decides whether any edit may be applied.\n"
         "Return JSON only, matching the required schema.\n\n"
         + json.dumps(task, ensure_ascii=False, indent=2, sort_keys=True)
     )
@@ -254,11 +275,22 @@ def normalize_model_response(response: dict[str, Any]) -> dict[str, Any]:
         application_scope = "unknown"
     refs_raw = response.get("evidence_refs") or []
     refs = [str(ref).strip() for ref in refs_raw if str(ref).strip()]
+    current_assessment = str(
+        response.get("current_value_assessment") or "not_assessed"
+    ).strip()
+    if current_assessment not in ALLOWED_CURRENT_VALUE_ASSESSMENTS:
+        current_assessment = "not_assessed"
+    current_refs_raw = response.get("current_value_evidence_refs") or []
+    current_refs = [
+        str(ref).strip() for ref in current_refs_raw if str(ref).strip()
+    ]
     return {
         "decision": decision,
         "proposed_value": normalize_text(str(response.get("proposed_value") or "")),
         "application_scope": application_scope,
         "evidence_refs": sorted(set(refs)),
+        "current_value_assessment": current_assessment,
+        "current_value_evidence_refs": sorted(set(current_refs)),
         "rationale": normalize_text(str(response.get("rationale") or "")),
     }
 
@@ -271,7 +303,8 @@ def apply_deterministic_policy(
 ) -> dict[str, Any]:
     normalized = normalize_model_response(model_response)
     cited = set(normalized["evidence_refs"])
-    invalid_refs = sorted(cited - allowed_evidence_refs)
+    current_cited = set(normalized["current_value_evidence_refs"])
+    invalid_refs = sorted((cited | current_cited) - allowed_evidence_refs)
     missing_refs = not cited
 
     if invalid_refs or missing_refs:

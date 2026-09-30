@@ -1,6 +1,6 @@
 {
   "schema_version": "pride-scp-sdrf-field-semantics-v1",
-  "version": "pride-scp-sdrf-field-semantics-v1.1.0",
+  "version": "pride-scp-sdrf-field-semantics-v1.2.0",
   "fields": {
     "characteristics[single cell isolation protocol]": {
       "semantic_definition": "Method used to isolate or collect an individual cell, oocyte, or cell-equivalent sample for single-cell proteomics. The value must describe the physical or instrumental isolation/collection method, not downstream lysis, digestion, labeling, chromatography, or mass-spectrometry fragmentation.",
@@ -35,22 +35,29 @@
         "instrument model alone"
       ],
       "evidence_search_terms": [
-        "single cell",
-        "single-cell",
-        "isolation",
-        "isolated",
-        "sorting",
-        "sorted",
+        "transvaginal puncture",
+        "microaspiration",
+        "patch-clamp aspiration",
+        "capillary microsampling",
+        "manual picking",
         "picked",
         "picking",
-        "puncture",
+        "FACS",
+        "fluorescence-activated cell sorting",
+        "cellenONE",
+        "laser capture microdissection",
+        "LCM",
+        "nanoPOTS",
+        "droplet microfluidics",
+        "acoustic droplet ejection",
+        "microfluidics",
         "aspiration",
-        "oocyte",
-        "cellenone",
-        "facs",
-        "microfluid",
-        "laser capture",
-        "nanopots"
+        "puncture",
+        "isolated",
+        "isolation",
+        "single-cell",
+        "single cell",
+        "oocyte"
       ]
     },
     "comment[dissociation method]": {
@@ -86,19 +93,33 @@
         "collision energy alone without an explicit fragmentation method"
       ],
       "evidence_search_terms": [
+        "higher-energy collisional dissociation",
+        "higher energy collisional dissociation",
+        "beam-type collision-induced dissociation",
+        "beam type collision induced dissociation",
+        "collision-induced dissociation",
+        "collision induced dissociation",
+        "electron-transfer/higher-energy collision dissociation",
+        "electron-transfer dissociation",
+        "electron transfer dissociation",
+        "electron capture dissociation",
+        "ultraviolet photodissociation",
         "HCD",
         "CID",
-        "ETD",
         "EThcD",
+        "ETD",
         "ECD",
         "UVPD",
-        "dissociation",
+        "normalized collision energy",
+        "NCE",
+        "collision energy",
         "fragmentation",
         "fragmented",
-        "collision-induced",
-        "collisional dissociation",
-        "higher-energy",
-        "beam-type"
+        "dissociation",
+        "MS/MS spectra",
+        "MS2",
+        "precursor ions",
+        "fragment ions"
       ]
     }
   }
