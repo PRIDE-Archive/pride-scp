@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""PRIDE-SCP SDRF annotation harness v2.1 decision/orchestration layer.
+"""PRIDE-SCP SDRF annotation harness v2.4 decision/orchestration layer.
 
-v2.1 deliberately does not replace the frozen scientific components.  It consumes their
+v2.4 deliberately does not replace the frozen scientific components.  It consumes their
 machine-readable artifacts, normalizes accession state, prevents repeated no-progress work,
 and emits the next deterministic queue:
 
@@ -48,10 +48,13 @@ from sdrf_evidence_acquisition_planner import (
     plan_acquisition_for_case,
 )
 from sdrf_evidence_registry import build_registry as build_evidence_registry
+from sdrf_publication_claims import AUDIT_FIELDS as PUBLICATION_CLAIM_AUDIT_FIELDS
+from sdrf_publication_claims import SOURCE_FIELDS as PUBLICATION_CLAIM_SOURCE_FIELDS
+from sdrf_publication_claims import build_publication_claim_rows
 from sdrf_publication_evidence import build_publication_source_rows
 from sdrf_publication_evidence import write_tsv as write_publication_source_tsv
 
-VERSION = "pride-scp-sdrf-annotation-harness-v2.3.1"
+VERSION = "pride-scp-sdrf-annotation-harness-v2.4.0"
 RUN_SPEC_VERSION = "pride-scp-sdrf-annotation-run-spec-v1"
 
 
@@ -181,6 +184,13 @@ def load_evidence(path: Path | None) -> list[EvidenceRecord]:
                 retrieval_method=row.get("retrieval_method", ""),
                 original_filename=row.get("original_filename", ""),
                 media_type=row.get("media_type", ""),
+                claim_value=row.get("claim_value", ""),
+                claim_status=row.get("claim_status", ""),
+                claim_rule_id=row.get("claim_rule_id", ""),
+                claim_text=row.get("claim_text", ""),
+                claim_source_start=row.get("claim_source_start", ""),
+                claim_source_end=row.get("claim_source_end", ""),
+                claim_extractor_version=row.get("claim_extractor_version", ""),
             )
         )
     return out
@@ -253,10 +263,12 @@ def verify_run_spec(spec_path: Path, spec: dict[str, Any]) -> dict[str, str]:
 EVIDENCE_REGISTRY_FIELDS = [
     "accession", "artifact_sha256", "declared_sha256", "sha_verified", "blocker_field",
     "source_kind", "source_provider", "source_locator", "source_identity", "publication_doi",
-    "publication_pmid", "publication_pmcid", "publication_identity_status", "retrieved_at", "retrieval_method",
-    "original_filename", "media_type", "local_path", "byte_size", "parent_artifact_sha256",
-    "derivation_operation", "trust_class", "independence_class", "is_independent",
-    "provenance_status", "candidate_hash_equal", "manifest_path",
+    "publication_pmid", "publication_pmcid", "publication_identity_status", "claim_value",
+    "claim_status", "claim_rule_id", "claim_text", "claim_source_start", "claim_source_end",
+    "claim_extractor_version", "retrieved_at", "retrieval_method", "original_filename",
+    "media_type", "local_path", "byte_size", "parent_artifact_sha256", "derivation_operation",
+    "trust_class", "independence_class", "is_independent", "provenance_status",
+    "candidate_hash_equal", "manifest_path",
 ]
 
 
@@ -325,6 +337,66 @@ def ingest_publication_manifests_and_replan(
         "registry_independent_records": registry_summary["independent_records"],
     }
     (output / "run_manifest.json").write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
+    return summary
+
+
+def extract_publication_claims_and_replan(
+    spec_path: Path, output: Path
+) -> dict[str, Any]:
+    """Extract exact blocker-scoped publication claims, register them, then replan."""
+    spec = load_json(spec_path)
+    base = spec_path.parent
+    inputs = spec.get("inputs") or {}
+    evidence_registry = resolve_path(base, inputs.get("evidence_registry"))
+    blocker_manifest = resolve_path(base, inputs.get("blocker_manifest"))
+    candidate_manifest = resolve_path(base, inputs.get("candidate_manifest"))
+    if evidence_registry is None or not evidence_registry.is_file():
+        raise FileNotFoundError(
+            f"configured inputs.evidence_registry missing: {evidence_registry}"
+        )
+    if blocker_manifest is None or not blocker_manifest.is_file():
+        raise FileNotFoundError(
+            f"configured inputs.blocker_manifest missing: {blocker_manifest}"
+        )
+
+    output.mkdir(parents=True, exist_ok=True)
+    claim_artifact_dir = evidence_registry.parent / "publication_claim_artifacts"
+    claim_rows, audit_rows, claim_summary = build_publication_claim_rows(
+        evidence_registry,
+        blocker_manifest,
+        claim_artifact_dir,
+    )
+    source_manifest = output / "publication_claim_source_manifest.tsv"
+    audit_manifest = output / "publication_claim_audit.tsv"
+    write_tsv(source_manifest, claim_rows, PUBLICATION_CLAIM_SOURCE_FIELDS)
+    write_tsv(audit_manifest, audit_rows, PUBLICATION_CLAIM_AUDIT_FIELDS)
+
+    manifests = [evidence_registry]
+    if claim_rows:
+        manifests.append(source_manifest)
+    rows, registry_summary = build_evidence_registry(manifests, candidate_manifest)
+    write_tsv(evidence_registry, rows, EVIDENCE_REGISTRY_FIELDS)
+    registry_summary_path = evidence_registry.with_name("evidence_registry_summary.json")
+    registry_summary_path.write_text(
+        json.dumps(registry_summary, indent=2) + "\n",
+        encoding="utf-8",
+    )
+
+    summary = plan(spec_path, output)
+    summary["publication_claim_extraction"] = {
+        **claim_summary,
+        "source_manifest": str(source_manifest),
+        "audit_manifest": str(audit_manifest),
+        "claim_artifact_dir": str(claim_artifact_dir),
+        "evidence_registry": str(evidence_registry),
+        "evidence_registry_summary": str(registry_summary_path),
+        "registry_records": registry_summary["records"],
+        "registry_independent_records": registry_summary["independent_records"],
+    }
+    (output / "run_manifest.json").write_text(
+        json.dumps(summary, indent=2) + "\n",
+        encoding="utf-8",
+    )
     return summary
 
 
@@ -720,6 +792,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--output", type=Path)
     p.add_argument("--ingest-source-manifest", type=Path, help="Provider source_manifest.tsv to ingest before automatically replanning")
     p.add_argument("--ingest-publication-manifest", action="append", type=Path, default=[], help="Cached publication manifest to register before automatically replanning; repeatable")
+    p.add_argument("--extract-publication-claims", action="store_true", help="Extract exact blocker-scoped claims from registered trusted publication full text, then replan")
     p.add_argument("--self-test", action="store_true")
     return p
 
@@ -731,8 +804,13 @@ def main() -> int:
         return 0
     if args.run_spec is None or args.output is None:
         raise SystemExit("--run-spec and --output are required unless --self-test")
-    if args.ingest_source_manifest is not None and args.ingest_publication_manifest:
-        raise SystemExit("choose provider ingestion or publication ingestion in one invocation")
+    ingestion_modes = int(args.ingest_source_manifest is not None) + int(
+        bool(args.ingest_publication_manifest)
+    ) + int(args.extract_publication_claims)
+    if ingestion_modes > 1:
+        raise SystemExit(
+            "choose exactly one of provider ingestion, publication ingestion, or publication claim extraction"
+        )
     if args.ingest_source_manifest is not None:
         summary = ingest_provider_manifest_and_replan(
             args.run_spec, args.ingest_source_manifest.resolve(), args.output
@@ -741,6 +819,8 @@ def main() -> int:
         summary = ingest_publication_manifests_and_replan(
             args.run_spec, [path.resolve() for path in args.ingest_publication_manifest], args.output
         )
+    elif args.extract_publication_claims:
+        summary = extract_publication_claims_and_replan(args.run_spec, args.output)
     else:
         summary = plan(args.run_spec, args.output)
     print(json.dumps(summary, indent=2))

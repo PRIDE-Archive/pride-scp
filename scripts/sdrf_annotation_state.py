@@ -15,7 +15,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
-VERSION = "pride-scp-sdrf-annotation-state-v2.2.1"
+VERSION = "pride-scp-sdrf-annotation-state-v2.2.2"
 
 TERMINAL_STATES = {
     "SUBMISSION_READY",
@@ -115,6 +115,13 @@ class EvidenceRecord:
     retrieval_method: str = ""
     original_filename: str = ""
     media_type: str = ""
+    claim_value: str = ""
+    claim_status: str = ""
+    claim_rule_id: str = ""
+    claim_text: str = ""
+    claim_source_start: str = ""
+    claim_source_end: str = ""
+    claim_extractor_version: str = ""
 
 
 @dataclass(frozen=True)

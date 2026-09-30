@@ -19,7 +19,7 @@ from typing import Any
 from sdrf_annotation_state import VERSION as STATE_VERSION
 from sdrf_annotation_state import sha256_file
 
-VERSION = "pride-scp-sdrf-evidence-registry-v2.3.0"
+VERSION = "pride-scp-sdrf-evidence-registry-v2.4.0"
 
 PATH_KEYS = ("local_path", "path", "source_path", "artifact_path", "file_path")
 ACCESSION_KEYS = ("accession", "project_accession", "pxd")
@@ -48,13 +48,21 @@ PUBLICATION_DOI_KEYS = ("publication_doi", "doi")
 PUBLICATION_PMID_KEYS = ("publication_pmid", "pmid")
 PUBLICATION_PMCID_KEYS = ("publication_pmcid", "pmcid")
 PUBLICATION_IDENTITY_STATUS_KEYS = ("publication_identity_status", "identity_status")
+CLAIM_VALUE_KEYS = ("claim_value", "normalized_claim_value")
+CLAIM_STATUS_KEYS = ("claim_status", "claim_state")
+CLAIM_RULE_ID_KEYS = ("claim_rule_id", "rule_id")
+CLAIM_TEXT_KEYS = ("claim_text", "supporting_text")
+CLAIM_SOURCE_START_KEYS = ("claim_source_start", "source_start")
+CLAIM_SOURCE_END_KEYS = ("claim_source_end", "source_end")
+CLAIM_EXTRACTOR_VERSION_KEYS = ("claim_extractor_version", "extractor_version")
 
 TRUSTED_EXTERNAL_CLASSES = {"trusted_independent"}
 TRUSTED_DEPOSITED_CLASSES = {"trusted_deposited", "trusted_local_deposited_sdrf"}
 TRUSTED_SUPPLEMENT_CLASSES = {"trusted_publication_supplement"}
 TRUSTED_CLASSES = TRUSTED_EXTERNAL_CLASSES | TRUSTED_DEPOSITED_CLASSES | TRUSTED_SUPPLEMENT_CLASSES
 
-# These operations preserve the scientific source identity; they do not themselves invent values.
+# These operations preserve source lineage. Claim extraction is allowed only for exact,
+# rule-backed source spans emitted by the deterministic publication claim extractor.
 SAFE_DERIVATIONS = {
     "copy",
     "materialize",
@@ -65,6 +73,8 @@ SAFE_DERIVATIONS = {
     "parse_table",
     "extract_table",
     "normalize_schema",
+    # Deterministic claim artifacts retain exact parent SHA and bounded source spans.
+    "extract_publication_claim",
 }
 
 
@@ -224,6 +234,13 @@ def build_registry(
             publication_pmid = first(row, PUBLICATION_PMID_KEYS)
             publication_pmcid = first(row, PUBLICATION_PMCID_KEYS)
             publication_identity_status = first(row, PUBLICATION_IDENTITY_STATUS_KEYS)
+            claim_value = first(row, CLAIM_VALUE_KEYS)
+            claim_status = first(row, CLAIM_STATUS_KEYS)
+            claim_rule_id = first(row, CLAIM_RULE_ID_KEYS)
+            claim_text = first(row, CLAIM_TEXT_KEYS)
+            claim_source_start = first(row, CLAIM_SOURCE_START_KEYS)
+            claim_source_end = first(row, CLAIM_SOURCE_END_KEYS)
+            claim_extractor_version = first(row, CLAIM_EXTRACTOR_VERSION_KEYS)
 
             key = (acc, artifact_sha, field_name)
             item = {
@@ -240,6 +257,13 @@ def build_registry(
                 "publication_pmid": publication_pmid,
                 "publication_pmcid": publication_pmcid,
                 "publication_identity_status": publication_identity_status,
+                "claim_value": claim_value,
+                "claim_status": claim_status,
+                "claim_rule_id": claim_rule_id,
+                "claim_text": claim_text,
+                "claim_source_start": claim_source_start,
+                "claim_source_end": claim_source_end,
+                "claim_extractor_version": claim_extractor_version,
                 "retrieved_at": retrieved_at,
                 "retrieval_method": retrieval_method,
                 "original_filename": original_filename,
@@ -389,10 +413,13 @@ def main() -> int:
     args.output.mkdir(parents=True, exist_ok=True)
     fields = [
         "accession", "artifact_sha256", "declared_sha256", "sha_verified", "blocker_field",
-        "source_kind", "source_provider", "source_locator", "retrieved_at", "retrieval_method",
-        "original_filename", "media_type", "local_path", "byte_size", "parent_artifact_sha256",
-        "derivation_operation", "trust_class", "independence_class", "is_independent",
-        "provenance_status", "candidate_hash_equal", "manifest_path",
+        "source_kind", "source_provider", "source_locator", "source_identity", "publication_doi",
+        "publication_pmid", "publication_pmcid", "publication_identity_status", "claim_value",
+        "claim_status", "claim_rule_id", "claim_text", "claim_source_start", "claim_source_end",
+        "claim_extractor_version", "retrieved_at", "retrieval_method", "original_filename",
+        "media_type", "local_path", "byte_size", "parent_artifact_sha256", "derivation_operation",
+        "trust_class", "independence_class", "is_independent", "provenance_status",
+        "candidate_hash_equal", "manifest_path",
     ]
     write_tsv(args.output / "evidence_registry.tsv", rows, fields)
     (args.output / "evidence_registry_summary.json").write_text(
