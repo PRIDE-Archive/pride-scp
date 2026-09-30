@@ -99,6 +99,11 @@ jobs:
         run: |
           set -euo pipefail
           docker run --rm --entrypoint pride-scp "$IMAGE" --help >/dev/null
+          docker run --rm --entrypoint pridepy "$IMAGE" --version
+          docker run --rm --entrypoint python "$IMAGE" -c \
+            'from pridepy.download.massive import MassiveProvider; assert MassiveProvider.matches("MSV000098940")'
+          docker run --rm --entrypoint python "$IMAGE" \
+            /opt/pride-scp/scripts/download_massive_pridepy.py --help >/dev/null
           docker run --rm --entrypoint python "$IMAGE" \
             /opt/pride-scp/scripts/sdrf_scientific_guard.py --self-test
           docker run --rm --entrypoint python "$IMAGE" \

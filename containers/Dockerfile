@@ -28,10 +28,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates
 COPY --from=uv-bin /uv /usr/local/bin/uv
 COPY python/requirements.lock /tmp/requirements.lock
 COPY python/requirements-bigbio.txt /tmp/requirements-bigbio.txt
+COPY python/requirements-pridepy.lock /tmp/requirements-pridepy.lock
 RUN uv python install "${PYTHON_VERSION}" \
  && uv venv --python "${PYTHON_VERSION}" /opt/pride-scp/venv \
  && uv pip install --python /opt/pride-scp/venv/bin/python --no-cache -r /tmp/requirements.lock \
  && uv pip install --python /opt/pride-scp/venv/bin/python --no-cache -r /tmp/requirements-bigbio.txt \
+ && uv pip install --python /opt/pride-scp/venv/bin/python --no-cache -r /tmp/requirements-pridepy.lock \
  && /opt/pride-scp/venv/bin/python -m compileall -q /opt/pride-scp/venv \
  && rm -rf /tmp/uv-cache
 RUN { \
@@ -39,7 +41,9 @@ RUN { \
       echo "uv_version=$(uv --version)"; \
       echo "python_package_lock_sha256=$(sha256sum /tmp/requirements.lock | awk '{print $1}')"; \
       echo "bigbio_requirements_sha256=$(sha256sum /tmp/requirements-bigbio.txt | awk '{print $1}')"; \
+      echo "pridepy_requirements_sha256=$(sha256sum /tmp/requirements-pridepy.lock | awk '{print $1}')"; \
       echo "sdrf_pipelines_version=$(/opt/pride-scp/venv/bin/python -c 'import importlib.metadata as m; print(m.version("sdrf-pipelines"))')"; \
+      echo "pridepy_version=$(/opt/pride-scp/venv/bin/python -c 'import importlib.metadata as m; print(m.version("pridepy"))')"; \
       uv pip freeze --python /opt/pride-scp/venv/bin/python | sort | sha256sum | awk '{print "python_environment_freeze_sha256=" $1}'; \
     } > /tmp/python-build-info.txt
 
@@ -133,7 +137,10 @@ RUN mkdir -p /opt/pride-scp /data /models /cache /results /scratch \
       cat /tmp/python-build-info.txt; \
       echo "runtime_ollama_version=$(ollama --version 2>&1 | head -1)"; \
     } > /opt/pride-scp/build-info.txt \
- && python -c 'import requests, pymupdf, pypdf, importlib.metadata as m; print("python runtime imports: OK; sdrf-pipelines=" + m.version("sdrf-pipelines"))' \
+ && python -c 'import requests, pymupdf, pypdf, importlib.metadata as m; print("python runtime imports: OK; sdrf-pipelines=" + m.version("sdrf-pipelines") + "; pridepy=" + m.version("pridepy"))' \
+ && pridepy --version \
+ && python -c 'from pridepy.download.massive import MassiveProvider; assert MassiveProvider.matches("MSV000098940")' \
+ && python /opt/pride-scp/scripts/download_massive_pridepy.py --help >/dev/null \
  && parse_sdrf --help >/dev/null \
  && python /opt/pride-scp/scripts/sdrf_bigbio_readiness.py --self-test \
  && pride-scp --version

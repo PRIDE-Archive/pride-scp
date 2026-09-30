@@ -132,6 +132,11 @@ jobs:
           sha256sum -c "${SIF_BASE}.sha256"
           apptainer inspect "$SIF_BASE" >/dev/null
           apptainer exec "$SIF_BASE" pride-scp --help >/dev/null
+          apptainer exec "$SIF_BASE" pridepy --version
+          apptainer exec "$SIF_BASE" python -c \
+            'from pridepy.download.massive import MassiveProvider; assert MassiveProvider.matches("MSV000098940")'
+          apptainer exec "$SIF_BASE" python \
+            /opt/pride-scp/scripts/download_massive_pridepy.py --help >/dev/null
           apptainer exec "$SIF_BASE" python \
             /opt/pride-scp/scripts/sdrf_scientific_guard.py --self-test
           apptainer exec "$SIF_BASE" python \
