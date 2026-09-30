@@ -2688,6 +2688,32 @@ fn explicit_facs_evidence(hay: &str) -> bool {
     has_method && has_context
 }
 
+fn explicit_nanopots_isolation_evidence(item: &EvidenceItem, hay: &str) -> bool {
+    if !hay.contains("nanopots") {
+        return false;
+    }
+
+    let label = item.source_label.to_ascii_lowercase();
+    let exact_isolation_field = label.contains("characteristics[single cell isolation protocol]")
+        || label.contains("single_cell_isolation_method")
+        || label.contains("single cell isolation method");
+    if exact_isolation_field {
+        return true;
+    }
+
+    [
+        "isolated by nanopots",
+        "isolation by nanopots",
+        "isolated using nanopots",
+        "isolated with nanopots",
+        "nanopots isolation",
+        "nanopots-based isolation",
+        "nanopots based isolation",
+    ]
+    .iter()
+    .any(|term| hay.contains(term))
+}
+
 fn infer_isolation_method_scaffold(evidence: &[EvidenceItem]) -> Option<(String, Vec<String>)> {
     let mut candidates: BTreeMap<String, (i32, Vec<String>)> = BTreeMap::new();
 
@@ -2714,7 +2740,7 @@ fn infer_isolation_method_scaffold(evidence: &[EvidenceItem]) -> Option<(String,
         {
             observed.push(("laser capture microdissection", 25));
         }
-        if hay.contains("nanopots") {
+        if explicit_nanopots_isolation_evidence(item, &hay) {
             observed.push(("nanoPOTS", 15));
         }
         if hay.contains("droplet microfluid") {
@@ -2761,6 +2787,14 @@ fn infer_isolation_method_scaffold(evidence: &[EvidenceItem]) -> Option<(String,
 
 fn infer_isolation_template_gap(evidence: &[EvidenceItem]) -> Option<TemplateCompatibilityGap> {
     let unsupported = [
+        (
+            "capillary-based micromanipulation",
+            &[
+                "capillary-based micromanipulation",
+                "capillary based micromanipulation",
+                "capillary micromanipulation",
+            ] as &[&str],
+        ),
         (
             "patch-clamp-guided microaspiration",
             &[
@@ -5582,7 +5616,7 @@ RULES:\n\
 3. If a TARGET field is not supported by its own evidence section, return exactly 'not available' (or relation_mode='uncertain').\n\
 4. Every concrete TARGET value must cite one or more E#### refs from that SAME field section.\n\
 5. relation_mode means acquisition cardinality, not biological row identity: one_cell_per_data_file, multiplexed_cells_per_data_file, mixed, or uncertain. Do not infer it merely from the phrase 'single-cell', and do not downgrade a concrete one-sample-per-file relation merely because organism, condition, sex, cell type, treatment, or replicate linkage is unresolved.\n\
-6. For single_cell_isolation_method, use only a method faithfully represented by the pinned template vocabulary (for example FACS, cellenONE, microfluidics, laser capture microdissection, manual picking, nanoPOTS, droplet microfluidics, or acoustic droplet ejection). If the evidence instead supports a method such as patch-clamp aspiration or capillary microsampling that the pinned vocabulary cannot represent faithfully, return 'not available'; Rust records the template-compatibility gap separately. Software such as MaxQuant is never an isolation method.\n\
+6. For single_cell_isolation_method, preserve the most specific source-faithful isolation method. Preferred template values include FACS, cellenONE, microfluidics, laser capture microdissection, manual picking, nanoPOTS, droplet microfluidics, and acoustic droplet ejection. If trusted evidence instead supports a real isolation method outside that preferred vocabulary (for example capillary-based micromanipulation, patch-clamp aspiration, or capillary microsampling), do not coerce it to a false preferred term: retain the source-faithful observation and let Rust classify it as an evidence-backed template extension or fail closed. Software such as MaxQuant is never an isolation method.\n\
 7. proteomics_data_acquisition_method describes MS acquisition (for example DDA, DIA, diaPASEF, PRM), not analysis/search software.\n\
 8. instrument is the mass spectrometer/instrument, not software.\n\
 9. Do not infer a per-cell identifier from filenames here. Rust constructs identifiers only when the row relationship is deterministically supported.\n\
@@ -12226,6 +12260,51 @@ mod tests {
             .template_gaps
             .iter()
             .all(|gap| gap.observed_value != "capillary microsampling"));
+    }
+
+    #[test]
+    fn explicit_capillary_based_micromanipulation_creates_template_gap() {
+        let item = EvidenceItem {
+            id: "E0001".into(),
+            source_kind: "manuscript_text".into(),
+            source_label: "methods isolation".into(),
+            text: "Single HeLa cells were isolated by capillary-based micromanipulation before nanoPOTS processing.".into(),
+        };
+        let design = StudyDesignScaffold {
+            relation_mode_hint: "one_cell_per_data_file".into(),
+            relation_confidence: "high".into(),
+            repository_file_mode: "raw_files_present".into(),
+            ..Default::default()
+        };
+        let scaffold = infer_deterministic_metadata_scaffold(&[item], &design);
+        assert!(scaffold
+            .template_gaps
+            .iter()
+            .any(|gap| gap.observed_value == "capillary-based micromanipulation"));
+    }
+
+    #[test]
+    fn structured_nanopots_isolation_value_remains_canonical() {
+        let item = EvidenceItem {
+            id: "E0001".into(),
+            source_kind: "existing_sdrf_structured".into(),
+            source_label: "characteristics[single cell isolation protocol]".into(),
+            text: "nanoPOTS".into(),
+        };
+        let design = StudyDesignScaffold {
+            relation_mode_hint: "one_cell_per_data_file".into(),
+            relation_confidence: "high".into(),
+            repository_file_mode: "raw_files_present".into(),
+            ..Default::default()
+        };
+        let scaffold = infer_deterministic_metadata_scaffold(&[item], &design);
+        assert_eq!(
+            scaffold
+                .values
+                .get("single_cell_isolation_method")
+                .map(String::as_str),
+            Some("nanoPOTS")
+        );
     }
 
     #[test]

@@ -7651,6 +7651,59 @@ fn canonical_workspace_claim_value(
     }
 }
 
+fn independent_isolation_extension_evidence_ref(
+    evidence: &DatasetEvidence,
+    evidence_ref: &str,
+) -> bool {
+    evidence
+        .evidence
+        .iter()
+        .find(|item| item.id == evidence_ref)
+        .is_some_and(|item| {
+            matches!(
+                item.source_kind.as_str(),
+                "publication_field_claim"
+                    | "publication_fulltext"
+                    | "manuscript_semantic_evidence"
+                    | "manuscript_text"
+            )
+        })
+}
+
+fn projectable_isolation_workspace_claim_value(
+    evidence: &DatasetEvidence,
+    state: &ScientificWorkspaceState,
+    claim: &ScientificClaim,
+) -> Option<(String, Vec<String>, bool)> {
+    match adjudicate_workspace_claim(evidence, state, claim) {
+        ClaimAdjudication::Canonical {
+            value,
+            evidence_refs,
+        }
+        | ClaimAdjudication::SupportedConcept {
+            value,
+            evidence_refs,
+        } => Some((value, evidence_refs, false)),
+        ClaimAdjudication::TemplateGap {
+            observed_value,
+            evidence_refs,
+            ..
+        } if claim.concept_type == "isolation_method"
+            && claim.status == "supported"
+            && matches!(claim.scope.as_str(), "branch" | "row")
+            && !observed_value.trim().is_empty()
+            && evidence_refs.iter().any(|evidence_ref| {
+                independent_isolation_extension_evidence_ref(evidence, evidence_ref)
+            }) =>
+        {
+            Some((observed_value, evidence_refs, true))
+        }
+        ClaimAdjudication::TemplateGap { .. }
+        | ClaimAdjudication::Unresolved { .. }
+        | ClaimAdjudication::Conflict { .. } => None,
+    }
+}
+
 fn branch_claims_require_project_mask(
     evidence: &DatasetEvidence,
     state: &ScientificWorkspaceState,
@@ -8845,11 +8898,18 @@ fn apply_branch_row_selector_isolation_projection(
                 && claim.branch_id == branch.id
                 && claim.concept_type == "isolation_method"
         }) {
-            let Some((value, refs)) = canonical_workspace_claim_value(evidence, state, claim)
+            let Some((value, refs, is_extension)) =
+                projectable_isolation_workspace_claim_value(evidence, state, claim)
             else {
                 continue;
             };
-            candidates.push((branch.id.clone(), selectors.clone(), value, refs));
+            candidates.push((
+                branch.id.clone(),
+                selectors.clone(),
+                value,
+                refs,
+                is_extension,
+            ));
         }
     }
     if candidates.is_empty() {
@@ -8871,7 +8931,7 @@ fn apply_branch_row_selector_isolation_projection(
 
         let matched = candidates
             .iter()
-            .filter(|(_, selectors, _, _)| {
+            .filter(|(_, selectors, _, _, _)| {
                 branch_row_matches_selectors(row, &header_index, selectors)
             })
             .collect::<Vec<_>>();
@@ -8880,7 +8940,7 @@ fn apply_branch_row_selector_isolation_projection(
         }
         let distinct_values = matched
             .iter()
-            .map(|(_, _, value, _)| value.trim().to_ascii_lowercase())
+            .map(|(_, _, value, _, _)| value.trim().to_ascii_lowercase())
             .collect::<BTreeSet<_>>();
         if distinct_values.len() != 1 {
             issues.push(ValidationIssue {
@@ -8899,35 +8959,49 @@ fn apply_branch_row_selector_isolation_projection(
         let value = matched[0].2.clone();
         let mut branch_ids = matched
             .iter()
-            .map(|(branch_id, _, _, _)| branch_id.clone())
+            .map(|(branch_id, _, _, _, _)| branch_id.clone())
             .collect::<Vec<_>>();
         branch_ids.sort();
         branch_ids.dedup();
         let mut refs = matched
             .iter()
-            .flat_map(|(_, _, _, refs)| refs.clone())
+            .flat_map(|(_, _, _, refs, _)| refs.clone())
             .collect::<Vec<_>>();
         refs.sort();
         refs.dedup();
+        let is_extension = matched
+            .iter()
+            .any(|(_, _, _, _, is_extension)| *is_extension);
         row[isolation_idx] = value.clone();
         issues.push(ValidationIssue {
             level: "warning".into(),
-            code: "scientific_agent_branch_row_selector_isolation_projected".into(),
+            code: if is_extension {
+                "scientific_agent_branch_row_selector_isolation_extension_projected".into()
+            } else {
+                "scientific_agent_branch_row_selector_isolation_projected".into()
+            },
             row: row_idx + 1,
             column: SC_ISOLATION_METHOD.into(),
-            message: format!(
-                "projected canonical isolation '{}' from source-grounded branch selector(s) {:?}; refs={:?}",
-                value, branch_ids, refs
-            ),
+            message: if is_extension {
+                format!(
+                    "projected evidence-backed warning-level isolation extension '{}' from source-grounded branch selector(s) {:?}; refs={:?}",
+                    value, branch_ids, refs
+                )
+            } else {
+                format!(
+                    "projected canonical isolation '{}' from source-grounded branch selector(s) {:?}; refs={:?}",
+                    value, branch_ids, refs
+                )
+            },
         });
     }
     issues
 }
 
-fn consensus_canonical_isolation_for_single_cell_regimes(
+fn consensus_projectable_isolation_for_single_cell_regimes(
     evidence: &DatasetEvidence,
     state: &ScientificWorkspaceState,
-) -> Option<(String, Vec<String>, Vec<String>)> {
+) -> Option<(String, Vec<String>, Vec<String>, bool)> {
     if state.harness_version != SCIENTIFIC_AGENT_FACTOR_ROW_ROLE_HARDENED_VERSION {
         return None;
     }
@@ -8958,6 +9032,7 @@ fn consensus_canonical_isolation_for_single_cell_regimes(
     let mut consensus_key: Option<String> = None;
     let mut consensus_value: Option<String> = None;
     let mut consensus_refs = BTreeSet::new();
+    let mut consensus_uses_extension = false;
 
     for regime_id in &single_cell_regimes {
         let isolation_claims = state
@@ -8976,16 +9051,9 @@ fn consensus_canonical_isolation_for_single_cell_regimes(
         let mut regime_key: Option<String> = None;
         let mut regime_value: Option<String> = None;
         for claim in isolation_claims {
-            let (value, refs) = match adjudicate_workspace_claim(evidence, state, claim) {
-                ClaimAdjudication::Canonical {
-                    value,
-                    evidence_refs,
-                } => (value, evidence_refs),
-                ClaimAdjudication::TemplateGap { .. }
-                | ClaimAdjudication::SupportedConcept { .. }
-                | ClaimAdjudication::Unresolved { .. }
-                | ClaimAdjudication::Conflict { .. } => return None,
-            };
+            let (value, refs, is_extension) =
+                projectable_isolation_workspace_claim_value(evidence, state, claim)?;
+            consensus_uses_extension |= is_extension;
             let key = value.trim().to_ascii_lowercase();
             if key.is_empty() {
                 return None;
@@ -9014,6 +9082,7 @@ fn consensus_canonical_isolation_for_single_cell_regimes(
         consensus_value?,
         consensus_refs.into_iter().collect(),
         single_cell_regimes.into_iter().collect(),
+        consensus_uses_extension,
     ))
 }
 
@@ -9041,8 +9110,8 @@ fn apply_consensus_single_cell_isolation_projection(
         return Vec::new();
     }
 
-    let Some((isolation_value, evidence_refs, regime_ids)) =
-        consensus_canonical_isolation_for_single_cell_regimes(evidence, state)
+    let Some((isolation_value, evidence_refs, regime_ids, is_extension)) =
+        consensus_projectable_isolation_for_single_cell_regimes(evidence, state)
     else {
         return Vec::new();
     };
@@ -9080,13 +9149,24 @@ fn apply_consensus_single_cell_isolation_projection(
 
     vec![ValidationIssue {
         level: "warning".into(),
-        code: "scientific_agent_consensus_single_cell_isolation_projected".into(),
+        code: if is_extension {
+            "scientific_agent_consensus_single_cell_isolation_extension_projected".into()
+        } else {
+            "scientific_agent_consensus_single_cell_isolation_projected".into()
+        },
         row: 0,
         column: SC_ISOLATION_METHOD.into(),
-        message: format!(
-            "projected canonical isolation '{}' to {} deterministically classified single-cell row(s) because all accepted single-cell regimes {:?} independently adjudicate to the same canonical isolation value; refs={:?}",
-            isolation_value, projected_rows, regime_ids, evidence_refs
-        ),
+        message: if is_extension {
+            format!(
+                "projected evidence-backed warning-level isolation extension '{}' to {} deterministically classified single-cell row(s) because all accepted single-cell regimes {:?} independently support the same source-faithful extension; refs={:?}",
+                isolation_value, projected_rows, regime_ids, evidence_refs
+            )
+        } else {
+            format!(
+                "projected canonical isolation '{}' to {} deterministically classified single-cell row(s) because all accepted single-cell regimes {:?} independently adjudicate to the same canonical isolation value; refs={:?}",
+                isolation_value, projected_rows, regime_ids, evidence_refs
+            )
+        },
     }]
 }
 
@@ -9276,21 +9356,42 @@ fn compile_workspace_with_trusted_partial_sdrf(
                 let Some(&idx) = header_index.get(header) else {
                     continue;
                 };
-                let Some((value, _)) = canonical_workspace_claim_value(evidence, state, claim)
-                else {
-                    continue;
+                let (value, is_extension) = if claim.concept_type == "isolation_method" {
+                    let Some((value, _, is_extension)) =
+                        projectable_isolation_workspace_claim_value(evidence, state, claim)
+                    else {
+                        continue;
+                    };
+                    (value, is_extension)
+                } else {
+                    let Some((value, _)) = canonical_workspace_claim_value(evidence, state, claim)
+                    else {
+                        continue;
+                    };
+                    (value, false)
                 };
                 if idx < row.len() {
                     row[idx] = value.clone();
                     issues.push(ValidationIssue {
                         level: "warning".into(),
-                        code: "scientific_agent_branch_value_applied".into(),
+                        code: if is_extension {
+                            "scientific_agent_branch_isolation_extension_applied".into()
+                        } else {
+                            "scientific_agent_branch_value_applied".into()
+                        },
                         row: 0,
                         column: header.into(),
-                        message: format!(
-                            "source-grounded branch '{}' applied {}='{}' to RAW {}",
-                            branch.id, field, value, raw
-                        ),
+                        message: if is_extension {
+                            format!(
+                                "source-grounded branch '{}' applied evidence-backed warning-level isolation extension {}='{}' to RAW {}",
+                                branch.id, field, value, raw
+                            )
+                        } else {
+                            format!(
+                                "source-grounded branch '{}' applied {}='{}' to RAW {}",
+                                branch.id, field, value, raw
+                            )
+                        },
                     });
                 }
             }
@@ -12451,6 +12552,108 @@ mod tests {
     }
 
     #[test]
+    fn v2_branch_row_selectors_project_evidence_backed_isolation_extension() {
+        let mut evidence = evidence_with(
+            vec![
+                EvidenceItem {
+                    id: "E0001".into(),
+                    source_kind: "manuscript_semantic_evidence".into(),
+                    source_label: "paper.txt".into(),
+                    text: "Single HeLa cells were isolated by capillary-based micromanipulation before nanoPOTS processing.".into(),
+                },
+                EvidenceItem {
+                    id: "E0002".into(),
+                    source_kind: "manuscript_semantic_evidence".into(),
+                    source_label: "paper.txt".into(),
+                    text: "Spinal cord neurons were isolated by laser capture microdissection.".into(),
+                },
+            ],
+            vec!["hela.raw", "neuron.raw", "control.raw"],
+        );
+        evidence.existing_sdrf_path = "/tmp/existing.sdrf.tsv".into();
+        let mut state = row_role_state_with_claims(vec![
+            branch_claim_with_ref("sample_type", "single cell", "R001", "E0001"),
+            branch_claim_with_ref("sample_type", "single cell", "R002", "E0002"),
+            branch_claim_with_ref(
+                "isolation_method",
+                "capillary-based micromanipulation",
+                "R001",
+                "E0001",
+            ),
+            branch_claim_with_ref(
+                "isolation_method",
+                "laser capture microdissection",
+                "R002",
+                "E0002",
+            ),
+        ]);
+        state.branches = vec![
+            selector_branch("R001", "E0001", "characteristics[cell line]", "HeLa"),
+            selector_branch(
+                "R002",
+                "E0002",
+                "characteristics[organism part]",
+                "spinal cord",
+            ),
+        ];
+        normalize_workspace_branches(&evidence, &mut state.branches);
+
+        let extension_claim = state
+            .claims
+            .iter()
+            .find(|claim| claim.branch_id == "R001" && claim.concept_type == "isolation_method")
+            .unwrap();
+        assert!(matches!(
+            adjudicate_workspace_claim(&evidence, &state, extension_claim),
+            ClaimAdjudication::TemplateGap { ref observed_value, .. }
+                if observed_value == "capillary-based micromanipulation"
+        ));
+
+        let headers = vec![
+            "characteristics[cell line]".into(),
+            "characteristics[organism part]".into(),
+            SC_SAMPLE_TYPE.into(),
+            SC_ISOLATION_METHOD.into(),
+        ];
+        let mut rows = vec![
+            vec![
+                "HeLa".into(),
+                "not applicable".into(),
+                "single cell".into(),
+                "not available".into(),
+            ],
+            vec![
+                "not applicable".into(),
+                "spinal cord".into(),
+                "single cell".into(),
+                "not available".into(),
+            ],
+            vec![
+                "not applicable".into(),
+                "not applicable".into(),
+                "bulk control".into(),
+                "not applicable".into(),
+            ],
+        ];
+
+        let issues = apply_branch_row_selector_isolation_projection(
+            &headers,
+            &mut rows,
+            &evidence,
+            &state,
+            &[],
+            false,
+        );
+
+        assert_eq!(rows[0][3], "capillary-based micromanipulation");
+        assert_eq!(rows[1][3], "laser capture microdissection");
+        assert_eq!(rows[2][3], "not applicable");
+        assert!(issues.iter().any(|issue| {
+            issue.code == "scientific_agent_branch_row_selector_isolation_extension_projected"
+        }));
+    }
+
+    #[test]
     fn v2_branch_row_selectors_leave_unmatched_and_concrete_rows_unchanged() {
         let mut evidence = evidence_with(
             vec![EvidenceItem {
@@ -12648,6 +12851,36 @@ mod tests {
     }
 
     #[test]
+    fn v2_project_scoped_isolation_template_gap_is_not_directly_projectable() {
+        let evidence = evidence_with(
+            vec![EvidenceItem {
+                id: "E0001".into(),
+                source_kind: "manuscript_semantic_evidence".into(),
+                source_label: "paper.txt".into(),
+                text: "Single cells were isolated by capillary-based micromanipulation.".into(),
+            }],
+            vec!["cell.raw"],
+        );
+        let state = row_role_state_with_claims(Vec::new());
+        let mut project_claim = claim(
+            "isolation_method",
+            "capillary-based micromanipulation",
+            "project",
+            "",
+        );
+        project_claim.evidence_refs = vec!["E0001".into()];
+
+        assert!(matches!(
+            adjudicate_workspace_claim(&evidence, &state, &project_claim),
+            ClaimAdjudication::TemplateGap { .. }
+        ));
+        assert!(
+            projectable_isolation_workspace_claim_value(&evidence, &state, &project_claim)
+                .is_none()
+        );
+    }
+
+    #[test]
     fn v2_consensus_isolation_projects_one_canonical_single_cell_regime() {
         let evidence = consensus_projection_evidence();
         let state = row_role_state_with_claims(vec![
@@ -12720,6 +12953,53 @@ mod tests {
 
         assert_eq!(rows[0][1], "FACS");
         assert_eq!(issues.len(), 1);
+    }
+
+    #[test]
+    fn v2_consensus_isolation_projects_evidence_backed_extension_when_all_regimes_agree() {
+        let evidence = evidence_with(
+            vec![EvidenceItem {
+                id: "E0001".into(),
+                source_kind: "manuscript_semantic_evidence".into(),
+                source_label: "paper.txt".into(),
+                text: "Single cells from both experimental regimes were isolated by capillary-based micromanipulation.".into(),
+            }],
+            vec!["cell_A.raw", "cell_B.raw"],
+        );
+        let state = row_role_state_with_claims(vec![
+            branch_claim_with_ref("sample_type", "single cell", "R001", "E0001"),
+            branch_claim_with_ref("sample_type", "single cell", "R002", "E0001"),
+            branch_claim_with_ref(
+                "isolation_method",
+                "capillary-based micromanipulation",
+                "R001",
+                "E0001",
+            ),
+            branch_claim_with_ref(
+                "isolation_method",
+                "capillary-based micromanipulation",
+                "R002",
+                "E0001",
+            ),
+        ]);
+        let headers = vec![SC_SAMPLE_TYPE.into(), SC_ISOLATION_METHOD.into()];
+        let mut rows = vec![vec!["single cell".into(), "not available".into()]];
+
+        let issues = apply_consensus_single_cell_isolation_projection(
+            &headers,
+            &mut rows,
+            &evidence,
+            &state,
+            "one_cell_per_data_file",
+            &[],
+            false,
+            false,
+        );
+
+        assert_eq!(rows[0][1], "capillary-based micromanipulation");
+        assert!(issues.iter().any(|issue| {
+            issue.code == "scientific_agent_consensus_single_cell_isolation_extension_projected"
+        }));
     }
 
     #[test]
