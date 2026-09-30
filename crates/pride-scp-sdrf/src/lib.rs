@@ -6336,6 +6336,22 @@ fn recover_missing_proposal_refs(
     issues
 }
 
+fn bind_existing_sdrf_relation_evidence_ref(
+    proposal: &mut SdrfProposal,
+    evidence: &DatasetEvidence,
+) -> bool {
+    let Some(item) = evidence.evidence.iter().find(|e| {
+        e.source_kind == "existing_sdrf_structured"
+            && e.source_label.contains("relationship_summary")
+    }) else {
+        return false;
+    };
+    proposal
+        .evidence_refs
+        .insert("relation_mode".into(), vec![item.id.clone()]);
+    true
+}
+
 fn repair_proposal_provenance(
     proposal: &mut SdrfProposal,
     evidence: &DatasetEvidence,
@@ -6617,14 +6633,7 @@ fn repair_proposal_provenance(
             if hint != "uncertain" && proposal.relation_mode != hint {
                 let before = proposal.relation_mode.clone();
                 proposal.relation_mode = hint.clone();
-                if let Some(item) = evidence.evidence.iter().find(|e| {
-                    e.source_kind == "existing_sdrf_structured"
-                        && e.source_label.contains("relationship_summary")
-                }) {
-                    proposal
-                        .evidence_refs
-                        .insert("relation_mode".into(), vec![item.id.clone()]);
-                }
+                bind_existing_sdrf_relation_evidence_ref(proposal, evidence);
                 issues.push(ValidationIssue {
                     level: "warning".into(),
                     code: "proposal_relation_overridden_by_existing_sdrf".into(),
@@ -9266,16 +9275,19 @@ async fn annotate_one(opts: &SdrfAnnotateOptions, accession: &str) -> Result<Res
             read_existing_sdrf_table(Path::new(&evidence.existing_sdrf_path))
         {
             let hint = existing_sdrf_relation_hint(&headers, &rows);
-            if hint != "uncertain" && proposal.relation_mode != hint {
-                let previous = proposal.relation_mode.clone();
-                proposal.relation_mode = hint.clone();
-                provenance_issues.push(ValidationIssue {
-                    level: "warning".into(),
-                    code: "relation_mode_determined_from_existing_sdrf".into(),
-                    row: 0,
-                    column: "relation_mode".into(),
-                    message: format!("deterministic existing-SDRF relationship evidence changed relation_mode from '{previous}' to '{hint}'"),
-                });
+            if hint != "uncertain" {
+                if proposal.relation_mode != hint {
+                    let previous = proposal.relation_mode.clone();
+                    proposal.relation_mode = hint.clone();
+                    provenance_issues.push(ValidationIssue {
+                        level: "warning".into(),
+                        code: "relation_mode_determined_from_existing_sdrf".into(),
+                        row: 0,
+                        column: "relation_mode".into(),
+                        message: format!("deterministic existing-SDRF relationship evidence changed relation_mode from '{previous}' to '{hint}'"),
+                    });
+                }
+                bind_existing_sdrf_relation_evidence_ref(&mut proposal, &evidence);
             }
         }
     }
@@ -13456,6 +13468,59 @@ mod tests {
         assert!(!issues
             .iter()
             .any(|x| x.code == "agent_relation_conflict_not_broadcast"));
+    }
+
+    #[test]
+    fn existing_sdrf_relation_override_rebinds_provenance_after_design_guard() {
+        let mut proposal = SdrfProposal {
+            relation_mode: "one_cell_per_data_file".into(),
+            evidence_refs: BTreeMap::from([("relation_mode".into(), vec!["E0001".into()])]),
+            ..SdrfProposal::default()
+        };
+        let assessment = DatasetDesignAssessment {
+            relation_assessment: RelationAssessment {
+                mode: "mixed".into(),
+                scope: "branch".into(),
+                evidence_refs: vec!["E0001".into()],
+                confidence: "high".into(),
+                reason: "branch heterogeneity".into(),
+                claim_origin: "model_explicit".into(),
+            },
+            ..DatasetDesignAssessment::default()
+        };
+
+        apply_design_assessment_guard(&mut proposal, &assessment, "one_cell_per_data_file");
+        assert_eq!(proposal.relation_mode, "uncertain");
+        assert!(!proposal.evidence_refs.contains_key("relation_mode"));
+
+        let evidence = DatasetEvidence {
+            accession: "PXD000001".into(),
+            project_json_path: String::new(),
+            files_json_path: String::new(),
+            existing_sdrf_path: "fixture.sdrf.tsv".into(),
+            raw_files: Vec::new(),
+            study_design: StudyDesignScaffold::default(),
+            metadata_scaffold: DeterministicMetadataScaffold::default(),
+            evidence: vec![EvidenceItem {
+                id: "E0002".into(),
+                source_kind: "existing_sdrf_structured".into(),
+                source_label: "existing_sdrf:relationship_summary".into(),
+                text: "deterministic relation hint=one_cell_per_data_file".into(),
+            }],
+            manuscript_sources: Vec::new(),
+            annotation_sources: Vec::new(),
+        };
+
+        proposal.relation_mode = "one_cell_per_data_file".into();
+        assert!(bind_existing_sdrf_relation_evidence_ref(
+            &mut proposal,
+            &evidence
+        ));
+        assert_eq!(
+            proposal.evidence_refs.get("relation_mode"),
+            Some(&vec!["E0002".into()])
+        );
+        validate_proposal_refs(&proposal, &evidence).unwrap();
     }
 
     #[test]
