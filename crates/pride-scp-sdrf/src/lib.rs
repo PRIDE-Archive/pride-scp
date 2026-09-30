@@ -8,9 +8,9 @@ use anyhow::{anyhow, bail, Context, Result};
 use csv::{ReaderBuilder, WriterBuilder};
 use regex::Regex;
 use reqwest::Client;
+use ring::digest::{digest, SHA256};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
-use ring::digest::{digest, SHA256};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -1655,7 +1655,8 @@ async fn download_provider_artifact(
 }
 
 fn provider_artifact_identity(path: &Path) -> Result<(String, u64)> {
-    let bytes = fs::read(path).with_context(|| format!("read provider artifact {}", path.display()))?;
+    let bytes =
+        fs::read(path).with_context(|| format!("read provider artifact {}", path.display()))?;
     let hash = digest(&SHA256, &bytes);
     let sha256 = hash
         .as_ref()
@@ -14583,7 +14584,8 @@ mod tests {
     }
     #[test]
     fn provider_artifact_identity_hashes_exact_materialized_bytes() {
-        let root = std::env::temp_dir().join(format!("pride-scp-provider-hash-{}", std::process::id()));
+        let root =
+            std::env::temp_dir().join(format!("pride-scp-provider-hash-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(&root).unwrap();
         let path = root.join("artifact.sdrf.tsv");
@@ -14618,5 +14620,4 @@ mod tests {
         assert_ne!(old, provider_artifact_identity(&a).unwrap());
         let _ = fs::remove_dir_all(root);
     }
-
 }

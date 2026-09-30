@@ -8845,7 +8845,8 @@ fn apply_branch_row_selector_isolation_projection(
                 && claim.branch_id == branch.id
                 && claim.concept_type == "isolation_method"
         }) {
-            let Some((value, refs)) = canonical_workspace_claim_value(evidence, state, claim) else {
+            let Some((value, refs)) = canonical_workspace_claim_value(evidence, state, claim)
+            else {
                 continue;
             };
             candidates.push((branch.id.clone(), selectors.clone(), value, refs));
@@ -8860,7 +8861,9 @@ fn apply_branch_row_selector_isolation_projection(
         if sample_type_idx >= row.len() || isolation_idx >= row.len() {
             continue;
         }
-        if !row[sample_type_idx].trim().eq_ignore_ascii_case("single cell")
+        if !row[sample_type_idx]
+            .trim()
+            .eq_ignore_ascii_case("single cell")
             || !row_value_is_unresolved(&row[isolation_idx])
         {
             continue;
@@ -12316,12 +12319,7 @@ mod tests {
         result
     }
 
-    fn selector_branch(
-        id: &str,
-        evidence_ref: &str,
-        field: &str,
-        value: &str,
-    ) -> AgentBranch {
+    fn selector_branch(id: &str, evidence_ref: &str, field: &str, value: &str) -> AgentBranch {
         AgentBranch {
             id: id.into(),
             label: id.into(),
@@ -12377,7 +12375,8 @@ mod tests {
                     id: "E0002".into(),
                     source_kind: "manuscript_semantic_evidence".into(),
                     source_label: "paper.txt".into(),
-                    text: "Spinal cord neurons were isolated by laser capture microdissection.".into(),
+                    text: "Spinal cord neurons were isolated by laser capture microdissection."
+                        .into(),
                 },
             ],
             vec!["hela.raw", "neuron.raw", "control.raw"],
@@ -13349,7 +13348,8 @@ mod tests {
                     id: "E0002".into(),
                     source_kind: "manuscript_semantic_evidence".into(),
                     source_label: "methods".into(),
-                    text: "Spinal cord neurons were isolated by laser capture microdissection.".into(),
+                    text: "Spinal cord neurons were isolated by laser capture microdissection."
+                        .into(),
                 },
             ],
             vec!["hela.raw", "neuron.raw"],
@@ -13410,7 +13410,12 @@ mod tests {
         let selector_values = branches
             .iter()
             .filter(|branch| branch.id.starts_with('R'))
-            .flat_map(|branch| branch.row_selectors.iter().map(|selector| selector.value.clone()))
+            .flat_map(|branch| {
+                branch
+                    .row_selectors
+                    .iter()
+                    .map(|selector| selector.value.clone())
+            })
             .collect::<BTreeSet<_>>();
         assert_eq!(
             selector_values,
