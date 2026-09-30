@@ -1,0 +1,105 @@
+{
+  "schema_version": "pride-scp-sdrf-field-semantics-v1",
+  "version": "pride-scp-sdrf-field-semantics-v1.1.0",
+  "fields": {
+    "characteristics[single cell isolation protocol]": {
+      "semantic_definition": "Method used to isolate or collect an individual cell, oocyte, or cell-equivalent sample for single-cell proteomics. The value must describe the physical or instrumental isolation/collection method, not downstream lysis, digestion, labeling, chromatography, or mass-spectrometry fragmentation.",
+      "accepted_values": [
+        "FACS",
+        "cellenONE",
+        "microfluidics",
+        "laser capture microdissection",
+        "manual picking",
+        "nanoPOTS",
+        "droplet microfluidics",
+        "acoustic droplet ejection"
+      ],
+      "aliases": {
+        "fluorescence-activated cell sorting": "FACS",
+        "fluorescence activated cell sorting": "FACS",
+        "laser capture microdissection (LCM)": "laser capture microdissection",
+        "LCM": "laser capture microdissection"
+      },
+      "known_explicit_but_unsupported": [
+        "transvaginal puncture",
+        "microaspiration",
+        "patch-clamp aspiration",
+        "capillary microsampling"
+      ],
+      "explicit_exclusions": [
+        "cell lysis",
+        "protein digestion",
+        "peptide labeling",
+        "chromatography",
+        "MS/MS dissociation or fragmentation",
+        "instrument model alone"
+      ],
+      "evidence_search_terms": [
+        "single cell",
+        "single-cell",
+        "isolation",
+        "isolated",
+        "sorting",
+        "sorted",
+        "picked",
+        "picking",
+        "puncture",
+        "aspiration",
+        "oocyte",
+        "cellenone",
+        "facs",
+        "microfluid",
+        "laser capture",
+        "nanopots"
+      ]
+    },
+    "comment[dissociation method]": {
+      "semantic_definition": "Mass-spectrometry tandem-MS ion dissociation/fragmentation method used to fragment precursor ions for MS/MS, such as HCD, CID, ETD, EThcD, ECD, or UVPD. This field does not describe biological tissue or cell dissociation, enzymatic removal of neighboring cells, sample lysis, or cell isolation.",
+      "accepted_values": [
+        "HCD",
+        "CID",
+        "ETD",
+        "EThcD",
+        "ECD",
+        "UVPD"
+      ],
+      "aliases": {
+        "higher-energy collisional dissociation": "HCD",
+        "higher energy collisional dissociation": "HCD",
+        "beam-type collision-induced dissociation": "HCD",
+        "beam type collision induced dissociation": "HCD",
+        "collision-induced dissociation": "CID",
+        "collision induced dissociation": "CID",
+        "electron-transfer dissociation": "ETD",
+        "electron transfer dissociation": "ETD",
+        "electron-transfer/higher-energy collision dissociation": "EThcD",
+        "electron capture dissociation": "ECD",
+        "ultraviolet photodissociation": "UVPD"
+      },
+      "known_explicit_but_unsupported": [],
+      "explicit_exclusions": [
+        "biological cell or tissue dissociation",
+        "hyaluronidase treatment",
+        "removal of cumulus cells",
+        "cell isolation or sorting",
+        "instrument model alone",
+        "collision energy alone without an explicit fragmentation method"
+      ],
+      "evidence_search_terms": [
+        "HCD",
+        "CID",
+        "ETD",
+        "EThcD",
+        "ECD",
+        "UVPD",
+        "dissociation",
+        "fragmentation",
+        "fragmented",
+        "collision-induced",
+        "collisional dissociation",
+        "higher-energy",
+        "beam-type"
+      ]
+    }
+  }
+}
