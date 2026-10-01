@@ -1018,7 +1018,7 @@ fn scientific_agent_schema(
             "status":{"type":"string","enum":["supported","hypothesis","rejected"]},
             "evidence_refs":{"type":"array","items":{"type":"string","pattern":"^E[0-9]{4}$"},"minItems":1,"maxItems":16},
             "linked_raw_files":{"type":"array","items":{"type":"string","maxLength":300},"maxItems":128,"description":"Only exact RAW basenames explicitly linked by trusted source evidence. Use [] when linkage is unresolved."},
-            "row_selectors":{"type":"array","maxItems":8,"description":"Optional source-grounded exact selectors for existing/structured SDRF rows when exact RAW linkage is unavailable. Selectors are conjunctive and may use only approved biological SDRF context columns; never use source name, assay name, row number, or data-file/filename semantics.","items":{"type":"object","properties":{"field":{"type":"string","enum":["characteristics[organism]","characteristics[organism part]","characteristics[cell type]","characteristics[cell line]","characteristics[sample type]","characteristics[disease]","characteristics[sex]","characteristics[cell identifier]","characteristics[biological replicate]"]},"value":{"type":"string","minLength":1,"maxLength":300}},"required":["field","value"],"additionalProperties":false}},
+            "row_selectors":{"type":"array","maxItems":8,"description":"Optional source-grounded exact selectors for existing/structured SDRF rows when exact RAW linkage is unavailable. Selectors on different fields are conjunctive; multiple exact values for the same field are disjunctive (OR). Selectors may use only approved biological SDRF context columns; never use source name, assay name, row number, or data-file/filename semantics.","items":{"type":"object","properties":{"field":{"type":"string","enum":["characteristics[organism]","characteristics[organism part]","characteristics[cell type]","characteristics[cell line]","characteristics[sample type]","characteristics[disease]","characteristics[sex]","characteristics[cell identifier]","characteristics[biological replicate]"]},"value":{"type":"string","minLength":1,"maxLength":300}},"required":["field","value"],"additionalProperties":false}},
             "linkage_status":{"type":"string","enum":["supported","partial","unresolved"],"description":"Use unresolved when the conceptual branch is supported but exact RAW linkage is absent."},
             "notes":{"type":"string","maxLength":700}
         },
@@ -1831,7 +1831,7 @@ STUDY-STRUCTURE CONTRACT:\n\
 - task:study_structure comes first. Establish source-grounded biological/experimental branches, acquisition cardinality, and scope before field repair. Use edit_study_structure to create the supported conceptual branches. Conceptual branches may be supported while linked_raw_files remains empty and linkage_status is unresolved; unresolved RAW linkage is NOT a reason to avoid creating the branch.\n\
 - HARD RULE: a field-level template_gap is NOT structural ambiguity and is NOT a reason for human_review when trusted evidence establishes the conceptual branch. The branch schema intentionally contains no isolation-method field; do not wait for downstream isolation vocabulary or other SDRF field canonicalization before calling edit_study_structure. Rust preserves downstream template gaps separately.\n\
 - linked_raw_files require trusted source evidence explicitly linking exact RAW basenames. Filename words are search hints/contradiction detectors, never biological identity.\n\
-- row_selectors are an optional fallback for existing/structured SDRF rows when exact RAW linkage is unavailable. Each selector must be an exact approved biological SDRF column/value pair explicitly supported by the cited branch evidence. Selectors are conjunctive. Never select by row number, source/assay name, RAW filename, or fuzzy/semantic similarity. Use row_selectors=[] when the branch cannot be addressed safely.\n\
+- row_selectors are an optional fallback for existing/structured SDRF rows when exact RAW linkage is unavailable. Each selector must be an exact approved biological SDRF column/value pair explicitly supported by the cited branch evidence. Selectors on different fields are conjunctive; multiple exact values for the same field are disjunctive (OR). Never select by row number, source/assay name, RAW filename, or fuzzy/semantic similarity. Use row_selectors=[] when the branch cannot be addressed safely.\n\
 - Never collapse multiple organisms, cell populations, isolation regimes, or acquisition regimes into one project observation.\n\n\
 HARD SAFETY CONTRACT:\n\
 1. Never use GT labels or hidden benchmark truth.\n\
@@ -2604,7 +2604,7 @@ EXPERIMENTAL REGIME NODES (R#):\n\
 - Represent distinct experimental roles, isolation/loading/sampling operations, or input/cell-count regimes.\n\
 - If trusted evidence distinguishes single-cell manual/hydrodynamic loading from low-number spray-voltage injection, they MUST be separate regime nodes even if both use HeLa and the same CE-MS/MS acquisition.\n\
 - A named source-defined isolation technology such as evDISCO/tDISCO or capillary microsampling is a valid regime description.\n\n\
-- row_selectors are OPTIONAL exact applicability selectors for existing/structured SDRF rows when exact RAW linkage is unavailable. Use only approved biological characteristics fields and exact values explicitly supported by the regime's cited E#### evidence. Multiple selectors are conjunctive. Never use row number, source name, assay name, RAW/data-file name, filename wording, or fuzzy/model-inferred semantics as a selector. Omit row_selectors when applicability cannot be stated exactly from trusted evidence.\n\n\
+- row_selectors are OPTIONAL exact applicability selectors for existing/structured SDRF rows when exact RAW linkage is unavailable. Use only approved biological characteristics fields and exact values explicitly supported by the regime's cited E#### evidence. Selectors on different fields are conjunctive; multiple exact values for the same field are disjunctive (OR). Never use row number, source name, assay name, RAW/data-file name, filename wording, or fuzzy/model-inferred semantics as a selector. Omit row_selectors when applicability cannot be stated exactly from trusted evidence.\n\n\
 ACQUISITION NODES (A#):\n\
 - Represent distinct mass-spectrometry acquisition/platform workflows when source-supported.\n\n\
 RELATIONS:\n\
@@ -6676,7 +6676,7 @@ fn canonical_branch_row_selector_field(value: &str) -> Option<&'static str> {
     }
 }
 
-fn source_text_contains_selector_value(text: &str, value: &str) -> bool {
+fn source_text_contains_exact_selector_value(text: &str, value: &str) -> bool {
     let hay = text.to_ascii_lowercase();
     let needle = value.trim().to_ascii_lowercase();
     if needle.is_empty() {
@@ -6705,6 +6705,25 @@ fn source_text_contains_selector_value(text: &str, value: &str) -> bool {
     })
 }
 
+fn source_text_contains_selector_value(text: &str, value: &str) -> bool {
+    let needle = value.trim().to_ascii_lowercase();
+    if needle.is_empty() {
+        return false;
+    }
+    if source_text_contains_exact_selector_value(text, &needle) {
+        return true;
+    }
+    if needle.ends_with('s')
+        || !needle
+            .chars()
+            .next_back()
+            .is_some_and(|ch| ch.is_ascii_alphabetic())
+    {
+        return false;
+    }
+    source_text_contains_exact_selector_value(text, &format!("{needle}s"))
+}
+
 fn branch_row_selector_is_source_grounded(
     evidence: &DatasetEvidence,
     evidence_refs: &[String],
@@ -6722,6 +6741,13 @@ fn branch_row_selector_is_source_grounded(
             .map(|item| source_text_contains_selector_value(&item.text, &needle))
             .unwrap_or(false)
     })
+}
+
+fn branch_row_selector_is_branch_identity_grounded(
+    branch: &AgentBranch,
+    selector: &AgentRowSelector,
+) -> bool {
+    source_text_contains_selector_value(&branch.label, &selector.value)
 }
 
 fn normalize_row_selectors(
@@ -6745,16 +6771,6 @@ fn normalize_row_selectors(
     normalized.sort();
     normalized.dedup();
 
-    let mut field_values: BTreeMap<&str, BTreeSet<String>> = BTreeMap::new();
-    for selector in &normalized {
-        field_values
-            .entry(selector.field.as_str())
-            .or_default()
-            .insert(selector.value.to_ascii_lowercase());
-    }
-    if field_values.values().any(|values| values.len() > 1) {
-        return Vec::new();
-    }
     normalized
 }
 
@@ -6951,6 +6967,8 @@ fn synthesize_source_grounded_branch_row_selectors(
                     }
                     exact_values.entry(low).or_insert_with(|| value.to_string());
                 }
+
+                let mut identity_grounded_selectors = Vec::new();
                 for value in exact_values.into_values() {
                     let selector = AgentRowSelector {
                         field: (*field).to_string(),
@@ -6960,9 +6978,11 @@ fn synthesize_source_grounded_branch_row_selectors(
                         evidence,
                         &branch.evidence_refs,
                         &selector,
-                    ) {
+                    ) || !branch_row_selector_is_branch_identity_grounded(branch, &selector)
+                    {
                         continue;
                     }
+
                     let matched = selector_matching_row_indices(
                         &rows,
                         &header_index,
@@ -6974,7 +6994,7 @@ fn synthesize_source_grounded_branch_row_selectors(
                     }
                     let key = matched.iter().copied().collect::<Vec<_>>();
                     let candidate = BranchRowSelectorCandidate {
-                        selectors: vec![selector],
+                        selectors: vec![selector.clone()],
                         rows: matched,
                     };
                     match candidates_by_rows.get(&key) {
@@ -6987,6 +7007,37 @@ fn synthesize_source_grounded_branch_row_selectors(
                             candidates_by_rows.insert(key, candidate);
                         }
                         Some(_) => {}
+                    }
+                    identity_grounded_selectors.push(selector);
+                }
+
+                identity_grounded_selectors.sort();
+                identity_grounded_selectors.dedup();
+                if identity_grounded_selectors.len() > 1 {
+                    let matched = selector_matching_row_indices(
+                        &rows,
+                        &header_index,
+                        &eligible_rows,
+                        &identity_grounded_selectors,
+                    );
+                    if !matched.is_empty() && matched.len() != eligible_rows.len() {
+                        let key = matched.iter().copied().collect::<Vec<_>>();
+                        let candidate = BranchRowSelectorCandidate {
+                            selectors: identity_grounded_selectors,
+                            rows: matched,
+                        };
+                        match candidates_by_rows.get(&key) {
+                            None => {
+                                candidates_by_rows.insert(key, candidate);
+                            }
+                            Some(existing)
+                                if candidate.selectors.as_slice()
+                                    < existing.selectors.as_slice() =>
+                            {
+                                candidates_by_rows.insert(key, candidate);
+                            }
+                            Some(_) => {}
+                        }
                     }
                 }
             }
@@ -7498,25 +7549,46 @@ fn adjudicate_claim(evidence: &DatasetEvidence, claim: &ScientificClaim) -> Clai
 
     match claim.concept_type.as_str() {
         "isolation_method" => {
-            // Scientific fidelity precedes validator convenience. If the cited
-            // evidence describes a real isolation method outside the pinned
-            // template vocabulary, record the gap instead of coercing it into
-            // the nearest allowed value.
+            // Scientific fidelity precedes validator convenience. Branch/row
+            // observations are value-specific: when one cited evidence window
+            // contains multiple isolation methods, never adjudicate a claim to
+            // an unrelated method simply because it appears in the same source.
+            let value_specific =
+                matches!(claim.scope.as_str(), "branch" | "row") && claim.status == "supported";
+
             if let Some(gap) = infer_isolation_template_gap(&subset) {
-                return ClaimAdjudication::TemplateGap {
-                    observed_value: gap.observed_value,
-                    evidence_refs: gap.evidence_refs,
-                    reason: gap.reason,
-                };
+                if !value_specific
+                    || isolation_canonicalization_is_observation_faithful(
+                        &claim.value,
+                        &gap.observed_value,
+                    )
+                {
+                    return ClaimAdjudication::TemplateGap {
+                        observed_value: gap.observed_value,
+                        evidence_refs: gap.evidence_refs,
+                        reason: gap.reason,
+                    };
+                }
             }
             if let Some((value, refs)) = infer_isolation_method_scaffold(&subset) {
-                return ClaimAdjudication::Canonical {
-                    value,
-                    evidence_refs: refs,
-                };
+                if !value_specific
+                    || isolation_canonicalization_is_observation_faithful(&claim.value, &value)
+                {
+                    return ClaimAdjudication::Canonical {
+                        value,
+                        evidence_refs: refs,
+                    };
+                }
             }
             ClaimAdjudication::Unresolved {
-                reason: "trusted isolation evidence does not deterministically map to one supported single-cell isolation vocabulary value".into(),
+                reason: if value_specific {
+                    format!(
+                        "trusted isolation evidence contains field-relevant method evidence but does not deterministically support the branch/row observation '{}'; keep the observation unresolved rather than borrow a different isolation method from shared evidence",
+                        claim.value.trim()
+                    )
+                } else {
+                    "trusted isolation evidence does not deterministically map to one supported single-cell isolation vocabulary value".into()
+                },
             }
         }
         "acquisition_mode" => {
@@ -7717,6 +7789,22 @@ fn harden_factor_isolation_project_baseline(
     });
 }
 
+fn isolation_observation_is_template_vocabulary_value(value: &str) -> bool {
+    matches!(
+        normalize_semantic_mapping_phrase(value).as_str(),
+        "manual picking"
+            | "facs"
+            | "fluorescence activated cell sorting"
+            | "cellenone"
+            | "laser capture microdissection"
+            | "lcm"
+            | "nanopots"
+            | "droplet microfluidics"
+            | "acoustic droplet ejection"
+            | "microfluidics"
+    )
+}
+
 fn adjudicate_hardened_factor_isolation_claim(
     evidence: &DatasetEvidence,
     claim: &ScientificClaim,
@@ -7740,6 +7828,39 @@ fn adjudicate_hardened_factor_isolation_claim(
                         claim.value.trim(), value
                     ),
                 }
+            }
+        }
+        ClaimAdjudication::Unresolved { reason } => {
+            let evidence_refs =
+                field_relevant_claim_refs(evidence, &claim.concept_type, &claim.evidence_refs);
+            let subset = evidence
+                .evidence
+                .iter()
+                .filter(|item| evidence_refs.contains(&item.id))
+                .cloned()
+                .collect::<Vec<_>>();
+            let unrelated_scaffold =
+                infer_isolation_method_scaffold(&subset).is_some_and(|(value, _)| {
+                    !isolation_canonicalization_is_observation_faithful(&claim.value, &value)
+                });
+
+            if claim.status == "supported"
+                && matches!(claim.scope.as_str(), "branch" | "row")
+                && !claim.value.trim().is_empty()
+                && !evidence_refs.is_empty()
+                && unrelated_scaffold
+                && !isolation_observation_is_template_vocabulary_value(&claim.value)
+            {
+                ClaimAdjudication::TemplateGap {
+                    observed_value: claim.value.trim().to_string(),
+                    evidence_refs,
+                    reason: format!(
+                        "hardened factor canonicalization preserved source-faithful non-template isolation observation '{}' because trusted evidence would otherwise map it to an unrelated allowed vocabulary value",
+                        claim.value.trim()
+                    ),
+                }
+            } else {
+                ClaimAdjudication::Unresolved { reason }
             }
         }
         other => other,
@@ -9158,14 +9279,29 @@ fn branch_row_matches_selectors(
     header_index: &HashMap<String, usize>,
     selectors: &[AgentRowSelector],
 ) -> bool {
-    !selectors.is_empty()
-        && selectors.iter().all(|selector| {
-            header_index
-                .get(&selector.field.to_ascii_lowercase())
-                .and_then(|idx| row.get(*idx))
-                .map(|value| value.trim().eq_ignore_ascii_case(selector.value.trim()))
-                .unwrap_or(false)
-        })
+    if selectors.is_empty() {
+        return false;
+    }
+
+    let mut values_by_field = BTreeMap::<String, Vec<&str>>::new();
+    for selector in selectors {
+        values_by_field
+            .entry(selector.field.to_ascii_lowercase())
+            .or_default()
+            .push(selector.value.trim());
+    }
+
+    values_by_field.into_iter().all(|(field, values)| {
+        header_index
+            .get(&field)
+            .and_then(|idx| row.get(*idx))
+            .map(|row_value| {
+                values
+                    .iter()
+                    .any(|value| row_value.trim().eq_ignore_ascii_case(value))
+            })
+            .unwrap_or(false)
+    })
 }
 
 fn apply_branch_row_selector_isolation_projection(
@@ -13104,6 +13240,57 @@ mod tests {
     }
 
     #[test]
+    fn v13_shared_isolation_evidence_is_adjudicated_against_branch_observation() {
+        let evidence = evidence_with(
+            vec![EvidenceItem {
+                id: "E0001".into(),
+                source_kind: "manuscript_semantic_evidence".into(),
+                source_label: "paper.txt".into(),
+                text: "HeLa cells were isolated by capillary-based micromanipulation. Individual motor neurons and interneurons were excised by laser capture microdissection."
+                    .into(),
+            }],
+            vec!["hela.raw", "neuron.raw"],
+        );
+        let state = ScientificWorkspaceState {
+            harness_version: SCIENTIFIC_AGENT_HARNESS_VERSION.into(),
+            ..Default::default()
+        };
+
+        let mut hela = branch_claim_with_ref(
+            "isolation_method",
+            "capillary-based micromanipulation",
+            "branch_hela",
+            "E0001",
+        );
+        hela.status = "supported".into();
+        let mut neuron = branch_claim_with_ref(
+            "isolation_method",
+            "laser capture microdissection",
+            "branch_neurons",
+            "E0001",
+        );
+        neuron.status = "supported".into();
+        let mut false_manual =
+            branch_claim_with_ref("isolation_method", "manual picking", "branch_hela", "E0001");
+        false_manual.status = "supported".into();
+
+        assert!(matches!(
+            adjudicate_workspace_claim(&evidence, &state, &hela),
+            ClaimAdjudication::TemplateGap { ref observed_value, .. }
+                if observed_value == "capillary-based micromanipulation"
+        ));
+        assert!(matches!(
+            adjudicate_workspace_claim(&evidence, &state, &neuron),
+            ClaimAdjudication::Canonical { ref value, .. }
+                if value == "laser capture microdissection"
+        ));
+        assert!(matches!(
+            adjudicate_workspace_claim(&evidence, &state, &false_manual),
+            ClaimAdjudication::Unresolved { .. }
+        ));
+    }
+
+    #[test]
     fn v13_synthesizes_unique_source_grounded_branch_partition_and_projects_isolation() {
         let root = std::env::temp_dir().join(format!(
             "pride-scp-v13-synthesized-branch-selectors-{}",
@@ -13174,7 +13361,7 @@ mod tests {
                 },
                 AgentBranch {
                     id: "branch_neurons".into(),
-                    label: "spinal neurons".into(),
+                    label: "spinal cord neurons".into(),
                     status: "supported".into(),
                     evidence_refs: vec!["E0002".into()],
                     linked_raw_files: Vec::new(),
@@ -13211,6 +13398,135 @@ mod tests {
                 field: "characteristics[organism part]".into(),
                 value: "spinal cord".into(),
             }]
+        );
+
+        let (headers, mut rows) = read_existing_sdrf_table(&path).unwrap();
+        let issues = apply_branch_row_selector_isolation_projection(
+            &headers,
+            &mut rows,
+            &evidence,
+            &state,
+            &[],
+            false,
+        );
+        let isolation_idx = header_first_index(&headers, SC_ISOLATION_METHOD).unwrap();
+        assert_eq!(rows[0][isolation_idx], "not applicable");
+        assert_eq!(rows[1][isolation_idx], "capillary-based micromanipulation");
+        assert_eq!(rows[2][isolation_idx], "capillary-based micromanipulation");
+        assert_eq!(rows[3][isolation_idx], "laser capture microdissection");
+        assert_eq!(rows[4][isolation_idx], "laser capture microdissection");
+        assert_eq!(issues.len(), 4);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn v13_synthesizes_shared_evidence_plural_cell_type_or_partition() {
+        let root = std::env::temp_dir().join(format!(
+            "pride-scp-v13-shared-evidence-or-selectors-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("existing.sdrf.tsv");
+        fs::write(
+            &path,
+            concat!(
+                "source name\tcharacteristics[organism part]\tcharacteristics[cell type]\tcharacteristics[cell line]\tcharacteristics[sample type]\tcharacteristics[single cell isolation protocol]\n",
+                "blank_1\tnot applicable\tnot applicable\tnot applicable\tempty\tnot applicable\n",
+                "hela_1\tnot applicable\tnot available\tHeLa\tsingle cell\tnot available\n",
+                "hela_2\tnot applicable\tnot available\tHeLa\tsingle cell\tnot available\n",
+                "neuron_1\tspinal cord\tmotor neuron\tnot applicable\tsingle cell\tnot available\n",
+                "neuron_2\tspinal cord\tinterneuron\tnot applicable\tsingle cell\tnot available\n"
+            ),
+        )
+        .unwrap();
+
+        let shared = "HeLa cells were isolated as described previously. Fresh frozen human spinal tissue was cryosectioned. Single cells were isolated by capillary-based micromanipulation or laser capture microdissection. Individual motor neurons and interneurons were excised by laser capture microdissection.";
+        let mut evidence = evidence_with(
+            vec![EvidenceItem {
+                id: "E0001".into(),
+                source_kind: "manuscript_semantic_evidence".into(),
+                source_label: "paper.txt".into(),
+                text: shared.into(),
+            }],
+            vec!["hela_1.raw", "hela_2.raw", "neuron_1.raw", "neuron_2.raw"],
+        );
+        evidence.existing_sdrf_path = path.display().to_string();
+
+        let mut hela_claim = branch_claim_with_ref(
+            "isolation_method",
+            "capillary-based micromanipulation",
+            "branch_hela",
+            "E0001",
+        );
+        hela_claim.status = "supported".into();
+        let mut neuron_claim = branch_claim_with_ref(
+            "isolation_method",
+            "laser capture microdissection",
+            "branch_neurons",
+            "E0001",
+        );
+        neuron_claim.status = "supported".into();
+
+        let mut state = ScientificWorkspaceState {
+            branches: vec![
+                AgentBranch {
+                    id: "branch_hela".into(),
+                    label: "HeLa cells isolated by capillary-based micromanipulation".into(),
+                    status: "supported".into(),
+                    evidence_refs: vec!["E0001".into()],
+                    linked_raw_files: Vec::new(),
+                    row_selectors: Vec::new(),
+                    linkage_status: "unresolved".into(),
+                    notes: String::new(),
+                },
+                AgentBranch {
+                    id: "branch_neurons".into(),
+                    label: "Human spinal neurons (motor neurons and interneurons) isolated by laser capture microdissection".into(),
+                    status: "supported".into(),
+                    evidence_refs: vec!["E0001".into()],
+                    linked_raw_files: Vec::new(),
+                    row_selectors: Vec::new(),
+                    linkage_status: "unresolved".into(),
+                    notes: String::new(),
+                },
+            ],
+            claims: vec![hela_claim, neuron_claim],
+            ..Default::default()
+        };
+
+        normalize_workspace_state(&evidence, &mut state, 1);
+
+        let hela = state
+            .branches
+            .iter()
+            .find(|branch| branch.id == "branch_hela")
+            .unwrap();
+        assert_eq!(
+            hela.row_selectors,
+            vec![AgentRowSelector {
+                field: "characteristics[cell line]".into(),
+                value: "HeLa".into(),
+            }]
+        );
+
+        let neurons = state
+            .branches
+            .iter()
+            .find(|branch| branch.id == "branch_neurons")
+            .unwrap();
+        assert_eq!(
+            neurons.row_selectors,
+            vec![
+                AgentRowSelector {
+                    field: "characteristics[cell type]".into(),
+                    value: "interneuron".into(),
+                },
+                AgentRowSelector {
+                    field: "characteristics[cell type]".into(),
+                    value: "motor neuron".into(),
+                },
+            ]
         );
 
         let (headers, mut rows) = read_existing_sdrf_table(&path).unwrap();
@@ -13273,7 +13589,7 @@ mod tests {
             branches: vec![
                 AgentBranch {
                     id: "branch_a".into(),
-                    label: "A".into(),
+                    label: "HeLa and spinal cord cells".into(),
                     status: "supported".into(),
                     evidence_refs: vec!["E0001".into()],
                     linked_raw_files: Vec::new(),
@@ -13283,7 +13599,7 @@ mod tests {
                 },
                 AgentBranch {
                     id: "branch_b".into(),
-                    label: "B".into(),
+                    label: "HeLa and spinal cord cells".into(),
                     status: "supported".into(),
                     evidence_refs: vec!["E0002".into()],
                     linked_raw_files: Vec::new(),
@@ -15265,6 +15581,33 @@ mod tests {
             }
             other => panic!("expected fail-closed template gap/unresolved outcome, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn v2_canonical_hardening_keeps_unsupported_template_term_unresolved() {
+        let evidence = evidence_with(
+            vec![EvidenceItem {
+                id: "E0001".into(),
+                source_kind: "manuscript_semantic_evidence".into(),
+                source_label: "single cell isolation method".into(),
+                text: "HeLa cells were isolated by capillary-based micromanipulation. Neurons were isolated by laser capture microdissection."
+                    .into(),
+            }],
+            vec!["run.raw"],
+        );
+        let mut claim = claim("isolation_method", "manual picking", "branch", "R001");
+        claim.status = "supported".into();
+        claim.evidence_refs = vec!["E0001".into()];
+        let state = ScientificWorkspaceState {
+            harness_version: SCIENTIFIC_AGENT_FACTOR_CANONICAL_HARDENED_VERSION.into(),
+            claims: vec![claim.clone()],
+            ..Default::default()
+        };
+
+        assert!(matches!(
+            adjudicate_workspace_claim(&evidence, &state, &claim),
+            ClaimAdjudication::Unresolved { .. }
+        ));
     }
 
     #[test]
