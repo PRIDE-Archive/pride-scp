@@ -718,6 +718,14 @@ struct FactorPhaseBAcceptance {
     model_calls: usize,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum StudyStructureEscalationBlocker {
+    ConceptualBranchExistenceUnresolved,
+    ConceptualBranchIdentityUnresolved,
+    ConflictingConceptualBranchEvidence,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "command", rename_all = "snake_case", deny_unknown_fields)]
 enum AgentCommand {
@@ -751,6 +759,12 @@ enum AgentCommand {
         open_question_resolutions: Vec<String>,
         notes: String,
     },
+    EscalateStudyStructure {
+        task_id: String,
+        blocker: StudyStructureEscalationBlocker,
+        evidence_refs: Vec<String>,
+        reason: String,
+    },
     Escalate {
         task_id: String,
         reason: String,
@@ -775,6 +789,7 @@ impl AgentCommand {
             | AgentCommand::SearchEvidence { task_id, .. }
             | AgentCommand::EditStudyStructure { task_id, .. }
             | AgentCommand::EditScientificObservation { task_id, .. }
+            | AgentCommand::EscalateStudyStructure { task_id, .. }
             | AgentCommand::Escalate { task_id, .. } => task_id,
         }
     }
@@ -1103,6 +1118,19 @@ fn scientific_agent_schema(
         "required":["command","task_id","observation_upserts","observation_retractions","open_question_additions","open_question_resolutions","notes"],
         "additionalProperties":false
     });
+    let study_structure_escalate_command = json!({
+        "type":"object",
+        "description":"Escalate task:study_structure only when trusted evidence leaves the conceptual branch model itself unresolved or directly conflicting. This command is NOT for unresolved exact RAW linkage, filename-to-branch mapping, row selectors, exact SDRF row projection, downstream validator errors, isolation-method vocabulary/canonicalization/template gaps, or inability to populate branch-specific SDRF fields. If conceptual branch identities are supported but linkage/projection is unresolved, use edit_study_structure with linked_raw_files=[] and linkage_status='unresolved' and leave row_selectors=[] when no safe source-grounded selector exists.",
+        "properties":{
+            "command":{"type":"string","enum":["escalate_study_structure"]},
+            "task_id":{"type":"string","enum":["task:study_structure"]},
+            "blocker":{"type":"string","enum":["conceptual_branch_existence_unresolved","conceptual_branch_identity_unresolved","conflicting_conceptual_branch_evidence"],"description":"The unresolved conceptual-structure blocker. No RAW-linkage, row-projection, validator, or downstream field blocker is valid here."},
+            "evidence_refs":{"type":"array","items":{"type":"string","pattern":"^E[0-9]{4}$"},"minItems":1,"maxItems":8,"uniqueItems":true,"description":"Trusted evidence refs that demonstrate the conceptual ambiguity or conflict."},
+            "reason":{"type":"string","maxLength":1000}
+        },
+        "required":["command","task_id","blocker","evidence_refs","reason"],
+        "additionalProperties":false
+    });
     let escalate_command = json!({
         "type":"object",
         "properties":{
@@ -1122,10 +1150,11 @@ fn scientific_agent_schema(
     }
     if study_structure_task {
         commands.push(study_structure_edit_command);
+        commands.push(study_structure_escalate_command);
     } else {
         commands.push(observation_edit_command);
+        commands.push(escalate_command);
     }
-    commands.push(escalate_command);
     json!({"oneOf": commands})
 }
 
@@ -1758,12 +1787,22 @@ fn scientific_agent_prompt(
     } else {
         "edit_scientific_observation: commit one or more source-faithful scientific observations for the active field task. A source explicitly naming or defining an isolation method/platform is sufficient as an observation even when deeper mechanical detail is absent; Rust decides canonical SDRF mapping/template-gap/unresolved."
     };
+    let escalation_command = if study_structure_active {
+        "escalate_study_structure"
+    } else {
+        "escalate"
+    };
+    let escalation_contract = if study_structure_active {
+        "escalate_study_structure: use only when the conceptual branch model itself remains unresolved or directly conflicting after trusted evidence review. Select one typed conceptual blocker and cite the evidence demonstrating that ambiguity/conflict. RAW linkage, filename mapping, row projection, validator errors, and downstream field canonicalization are not valid structural escalation blockers."
+    } else {
+        "escalate: use only after relevant focused evidence/context and reasonable trusted search are exhausted or the field-level judgment truly requires human review."
+    };
     let read_policy = match active {
         Some(task) if task.decision_required && task.search_blocked => format!(
-            "DECISION ONLY: prior evidence gathering produced no new source material. Both read_evidence and search_evidence are disabled. Commit a supported {edit_command} or escalate."
+            "DECISION ONLY: prior evidence gathering produced no new source material. Both read_evidence and search_evidence are disabled. Commit a supported {edit_command} or {escalation_command}."
         ),
         Some(task) if task.decision_required => format!(
-            "READ LOCK ACTIVE: Rust has already returned source context for this task. read_evidence is disabled for this turn. Use {edit_command} if the evidence supports a material finding, search_evidence if a genuinely different trusted source/query is still needed, or escalate only if the evidence is insufficient/ambiguous after reasonable trusted search."
+            "READ LOCK ACTIVE: Rust has already returned source context for this task. read_evidence is disabled for this turn. Use {edit_command} if the evidence supports a material finding, search_evidence if a genuinely different trusted source/query is still needed, or {escalation_command} only if its typed escalation contract is satisfied after reasonable trusted search."
         ),
         _ => {
             "GATHER AVAILABLE: You may read promising unread E#### refs or issue a targeted trusted search. After Rust returns context, the next turn enters a decision step before another read is allowed.".to_string()
@@ -1773,15 +1812,15 @@ fn scientific_agent_prompt(
         "You are the scientific workspace agent for PRIDE single-cell proteomics dataset {acc}.\n\n\
 Your environment behaves like a coding/research workspace. Rust owns persistent state, provenance, controlled-vocabulary canonicalization, task status, compilation, validation, trusted RAW linkage, and all safety gates. You inspect source evidence, build a study model, and record source-faithful scientific observations. Work ONE active task deeply before moving to another task.\n\n\
 SCIENTIFIC WORKSPACE AGENT CONTRACT (v1.3):\n\
-- Return exactly ONE executable top-level command for this turn: read_evidence, search_evidence, {edit_command}, or escalate. Do not narrate a future tool action inside notes; if you need to read E####, the command itself must be read_evidence.\n\
+- Return exactly ONE executable top-level command for this turn: read_evidence, search_evidence, {edit_command}, or {escalation_command}. Do not narrate a future tool action inside notes; if you need to read E####, the command itself must be read_evidence.\n\
 - Never request the same evidence ref twice. Rust records requested refs as read even when multiple refs resolve to the same materialized source window.\n\
-- After a successful read, Rust enters a decision step: do not keep reading by inertia. Commit a supported study/observation edit, search a genuinely different source/query, or escalate.\n\
+- After a successful read, Rust enters a decision step: do not keep reading by inertia. Commit a supported study/observation edit, search a genuinely different source/query, or use the task-specific escalation command.\n\
 CURRENT COMMAND POLICY: {read_policy}\n\
 - task_id must exactly equal the ACTIVE TASK id. Rust derives task status and chooses when compilation/validation is useful. You do NOT request compile/finish or mark validator-backed tasks resolved.\n\
 - read_evidence: use when an existing promising E#### excerpt is insufficient. Rust reads a larger bounded window from only registered trusted sources and returns it on the next turn.\n\
 - search_evidence: use only when focused candidates plus already-read context do not answer the task. It searches registered/trusted publication, supplement, structured-design, repository metadata, exact-RAW-name, KG, or conflict-evidence sources only; it is NOT arbitrary web browsing.\n\
 - {edit_contract}\n\
-- escalate: use only after relevant focused evidence/context and reasonable trusted search are exhausted or the judgment truly requires human review. For task:study_structure, human review is appropriate only when the conceptual structure itself cannot be established safely; downstream field canonicalization/template compatibility is a later task. Do not escalate merely because exact RAW linkage is unresolved, a downstream field is or may be template_gap, or because Rust still needs to canonicalize an observation.\n\n\
+- {escalation_contract}\n\n\
 SCIENTIFIC OBSERVATION -> RUST CANONICALIZATION CONTRACT:\n\
 - observation_upserts record what the source says the experiment actually did. observed_value is an evidence-faithful scientific description, NOT an SDRF controlled-vocabulary answer.\n\
 - For isolation_method, record the most specific source-faithful method description available. An explicit source-defined method/platform name such as 'evDISCO (ex vivo-digital microfluidic isolation of single cells for -Omics)' is sufficient as an observation even if the excerpt does not spell out every mechanical substep. When the source provides the physical operation, preserve it (for example, 'an individual intact cell was manually loaded into the separation capillary using hydrodynamic pressure'). Do not invent pseudo-vocabulary such as hydrodynamic_loading. Do not choose 'manual picking' merely because you think the validator wants it unless that exact phrase is what the source says. Rust independently maps the cited observation/evidence to a canonical SDRF value, template_gap, unresolved, or conflict.\n\
@@ -1804,7 +1843,7 @@ COMMAND CHOICE:\n\
 - If you need more context around an existing E#### candidate -> read_evidence.\n\
 - If the candidate set lacks the needed evidence -> search_evidence.\n\
 - If evidence is sufficient to change the active task state -> {edit_command}.\n\
-- If evidence is exhausted/ambiguous beyond safe automation -> escalate.\n\n\
+- If evidence is exhausted/ambiguous beyond safe automation -> {escalation_command}, but only when its typed blocker contract is satisfied.\n\n\
 TASK BOARD:\n{task_board}\n\n\
 ACTIVE TASK:\n{active_json}\n\n\
 FOCUSED EVIDENCE FOR ACTIVE TASK:\n{task_evidence}\n\n\
@@ -1819,6 +1858,8 @@ This is turn {turn}. Return ONLY one AgentCommand object matching the JSON schem
         acc = evidence.accession,
         edit_command = edit_command,
         edit_contract = edit_contract,
+        escalation_command = escalation_command,
+        escalation_contract = escalation_contract,
         task_board = task_board_block(workspace),
         active_json = active_json,
         task_evidence = task_evidence_block(evidence, active),
@@ -9582,7 +9623,7 @@ fn append_changed_adjudication_feedback(
     pending_feedback: &mut Vec<String>,
     last_signatures: &mut BTreeMap<(String, String, String), String>,
     records: &[ClaimAdjudicationRecord],
-    active_concept_type: Option<&str>,
+    active_task_concept: Option<&str>,
     turn: usize,
     phase: &str,
 ) {
@@ -9593,11 +9634,7 @@ fn append_changed_adjudication_feedback(
     last_signatures.retain(|identity, _| active.contains(identity));
 
     for record in records {
-        // Keep downstream field canonicalization feedback out of unrelated task
-        // prompts. In particular, study-structure synthesis must not be steered
-        // by a later field-level template gap. Leave the signature unrecorded
-        // so the feedback can surface when the matching field task is active.
-        if active_concept_type != Some(record.concept_type.as_str()) {
+        if active_task_concept.is_some_and(|concept| record.concept_type != concept) {
             continue;
         }
         let identity = claim_identity_parts(&record.concept_type, &record.scope, &record.branch_id);
@@ -9647,8 +9684,12 @@ fn command_matches_active_task(state: &ScientificWorkspaceState, command: &Agent
         return false;
     }
     match command {
-        AgentCommand::EditStudyStructure { .. } => active_task_is_study_structure(state),
-        AgentCommand::EditScientificObservation { .. } => !active_task_is_study_structure(state),
+        AgentCommand::EditStudyStructure { .. } | AgentCommand::EscalateStudyStructure { .. } => {
+            active_task_is_study_structure(state)
+        }
+        AgentCommand::EditScientificObservation { .. } | AgentCommand::Escalate { .. } => {
+            !active_task_is_study_structure(state)
+        }
         _ => true,
     }
 }
@@ -10038,7 +10079,7 @@ async fn run_one_scientific_agent(
                             &mut trace.harness_feedback,
                             &mut pending_harness_feedback,
                             format!(
-                                "turn {turn} read_evidence was rejected because the task is in a decision step after a prior read. Use the task-specific typed edit command, search_evidence with a genuinely different trusted query/source, or escalate."
+                                "turn {turn} read_evidence was rejected because the task is in a decision step after a prior read. Use the task-specific typed edit command, search_evidence with a genuinely different trusted query/source, or use the task-specific escalation command."
                             ),
                         );
                         trace.states.push(state.clone());
@@ -10054,7 +10095,7 @@ async fn run_one_scientific_agent(
                             &mut trace.harness_feedback,
                             &mut pending_harness_feedback,
                             format!(
-                                "turn {turn} read_evidence contained only invalid or already-read E#### refs. Rust has locked further reads for this task until you use the task-specific typed edit command, run a genuinely new trusted search_evidence query, or escalate."
+                                "turn {turn} read_evidence contained only invalid or already-read E#### refs. Rust has locked further reads for this task until you use the task-specific typed edit command, run a genuinely new trusted search_evidence query, or use the task-specific escalation command."
                             ),
                         );
                         trace.states.push(state.clone());
@@ -10160,7 +10201,7 @@ async fn run_one_scientific_agent(
                             &mut trace.harness_feedback,
                             &mut pending_harness_feedback,
                             format!(
-                                "turn {turn} search_evidence contained no executable normalized search query. Rust has closed further evidence gathering for this task; use the task-specific typed edit command with current evidence or escalate."
+                                "turn {turn} search_evidence contained no executable normalized search query. Rust has closed further evidence gathering for this task; use the task-specific typed edit command with current evidence or use the task-specific escalation command."
                             ),
                         );
                         trace.states.push(state.clone());
@@ -10229,6 +10270,60 @@ async fn run_one_scientific_agent(
                         &adjudications,
                         &trace.validation_history,
                     )?;
+                    continue;
+                }
+                AgentCommand::EscalateStudyStructure {
+                    task_id,
+                    evidence_refs,
+                    reason,
+                    ..
+                } => {
+                    let valid_refs = valid_evidence_refs(&evidence, evidence_refs);
+                    if valid_refs.len() != evidence_refs.len() {
+                        push_harness_feedback(
+                            &mut trace.harness_feedback,
+                            &mut pending_harness_feedback,
+                            format!(
+                                "turn {turn} structural escalation rejected because evidence_refs must be unique existing trusted E#### refs; use edit_study_structure when conceptual branches are supported, or cite valid evidence for a typed conceptual ambiguity/conflict"
+                            ),
+                        );
+                        trace.states.push(state.clone());
+                        continue;
+                    }
+                    record_non_edit_task_attempt(&mut state, task_id, reason);
+                    mark_active_task_human_review(&mut state, reason);
+                    let adjudications = record_adjudication_snapshot(
+                        &mut trace,
+                        &evidence,
+                        &state,
+                        turn,
+                        "post_structural_escalation",
+                    );
+                    trace.states.push(state.clone());
+                    fs::write(
+                        workspace_dir.join(format!("state.turn{turn:02}.json")),
+                        serde_json::to_string_pretty(&state)?,
+                    )?;
+                    fs::write(
+                        workspace_dir.join("state.json"),
+                        serde_json::to_string_pretty(&state)?,
+                    )?;
+                    write_workspace_notebook(
+                        &workspace_dir,
+                        &evidence,
+                        &state,
+                        &adjudications,
+                        &trace.validation_history,
+                    )?;
+                    if state.active_task_id.is_empty() {
+                        trace.terminal_status = "human_review".into();
+                        break;
+                    }
+                    push_harness_feedback(
+                        &mut trace.harness_feedback,
+                        &mut pending_harness_feedback,
+                        "previous structural task escalated to human review; Rust advanced to the next scientific task".into(),
+                    );
                     continue;
                 }
                 AgentCommand::Escalate { task_id, reason } => {
@@ -10388,7 +10483,7 @@ async fn run_one_scientific_agent(
                             &mut trace.harness_feedback,
                             &mut pending_harness_feedback,
                             format!(
-                                "turn {turn} edit produced the same deterministic SDRF fingerprint as the previous validated compile; Rust skipped a validator cycle. Read/search more evidence, refine the scientific observation/scope, or escalate."
+                                "turn {turn} edit produced the same deterministic SDRF fingerprint as the previous validated compile; Rust skipped a validator cycle. Read/search more evidence, refine the scientific observation/scope, or use the task-specific escalation command."
                             ),
                         );
                         fs::write(
@@ -11362,15 +11457,15 @@ mod tests {
     fn adjudication_feedback_is_scoped_to_active_field_task() {
         let record = ClaimAdjudicationRecord {
             concept_type: "isolation_method".into(),
-            scope: "project".into(),
+            scope: "unresolved".into(),
             branch_id: "rust:evidence_template_gap".into(),
-            model_status: "supported".into(),
+            model_status: "rust_evidence_bootstrap".into(),
             proposed_value: "capillary-based micromanipulation".into(),
             evidence_refs: vec!["E0001".into()],
             adjudication: ClaimAdjudication::TemplateGap {
                 observed_value: "capillary-based micromanipulation".into(),
                 evidence_refs: vec!["E0001".into()],
-                reason: "source-faithful isolation method is outside the pinned template".into(),
+                reason: "source-faithful method is outside the pinned vocabulary".into(),
             },
         };
         let mut trace_feedback = Vec::new();
@@ -11397,7 +11492,7 @@ mod tests {
             &[record],
             Some("isolation_method"),
             2,
-            "post-read",
+            "post-edit",
         );
         assert_eq!(trace_feedback.len(), 1);
         assert_eq!(pending.len(), 1);
@@ -11662,7 +11757,7 @@ mod tests {
                 "read_evidence",
                 "search_evidence",
                 "edit_study_structure",
-                "escalate",
+                "escalate_study_structure",
             ]
             .into_iter()
             .collect::<BTreeSet<_>>()
@@ -11685,6 +11780,40 @@ mod tests {
         assert_eq!(
             edit["properties"]["task_id"]["enum"][0],
             "task:study_structure"
+        );
+        let escalation = variants
+            .iter()
+            .find(|variant| {
+                variant["properties"]["command"]["enum"][0].as_str()
+                    == Some("escalate_study_structure")
+            })
+            .unwrap();
+        assert!(escalation["description"]
+            .as_str()
+            .unwrap()
+            .contains("NOT for unresolved exact RAW linkage"));
+        assert_eq!(
+            escalation["properties"]["task_id"]["enum"][0],
+            "task:study_structure"
+        );
+        assert_eq!(
+            escalation["properties"]["blocker"]["enum"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(Value::as_str)
+                .collect::<BTreeSet<_>>(),
+            [
+                "conceptual_branch_existence_unresolved",
+                "conceptual_branch_identity_unresolved",
+                "conflicting_conceptual_branch_evidence",
+            ]
+            .into_iter()
+            .collect::<BTreeSet<_>>()
+        );
+        assert_eq!(
+            escalation["properties"]["evidence_refs"]["minItems"].as_u64(),
+            Some(1)
         );
     }
 
@@ -11771,7 +11900,10 @@ mod tests {
             "a field-level template_gap is NOT structural ambiguity and is NOT a reason for human_review"
         ));
         assert!(prompt.contains(
-            "human review is appropriate only when the conceptual structure itself cannot be established safely"
+            "escalate_study_structure: use only when the conceptual branch model itself remains unresolved or directly conflicting"
+        ));
+        assert!(prompt.contains(
+            "RAW linkage, filename mapping, row projection, validator errors, and downstream field canonicalization are not valid structural escalation blockers"
         ));
     }
 
@@ -11796,6 +11928,7 @@ mod tests {
         );
         assert!(!commands.contains("edit_workspace"));
         assert!(!commands.contains("edit_study_structure"));
+        assert!(!commands.contains("escalate_study_structure"));
         let edit = variants
             .iter()
             .find(|variant| {
@@ -11824,9 +11957,13 @@ mod tests {
             .collect::<BTreeSet<_>>();
         assert_eq!(
             study_commands,
-            ["search_evidence", "edit_study_structure", "escalate"]
-                .into_iter()
-                .collect::<BTreeSet<_>>()
+            [
+                "search_evidence",
+                "edit_study_structure",
+                "escalate_study_structure",
+            ]
+            .into_iter()
+            .collect::<BTreeSet<_>>()
         );
         assert!(!study_commands.contains("read_evidence"));
 
@@ -11856,7 +11993,7 @@ mod tests {
             .collect::<BTreeSet<_>>();
         assert_eq!(
             study_commands,
-            ["edit_study_structure", "escalate"]
+            ["edit_study_structure", "escalate_study_structure"]
                 .into_iter()
                 .collect::<BTreeSet<_>>()
         );
@@ -11909,6 +12046,52 @@ mod tests {
         assert!(!command_matches_active_task(
             &field_state,
             &wrong_field_edit
+        ));
+    }
+
+    #[test]
+    fn v13_runtime_scopes_escalation_type_to_active_task() {
+        let study_state = ScientificWorkspaceState {
+            active_task_id: "task:study_structure".into(),
+            ..Default::default()
+        };
+        let structural_escalation = AgentCommand::EscalateStudyStructure {
+            task_id: "task:study_structure".into(),
+            blocker: StudyStructureEscalationBlocker::ConceptualBranchIdentityUnresolved,
+            evidence_refs: vec!["E0001".into()],
+            reason: "trusted evidence does not establish the conceptual branch identity".into(),
+        };
+        assert!(command_matches_active_task(
+            &study_state,
+            &structural_escalation
+        ));
+        let generic_escalation = AgentCommand::Escalate {
+            task_id: "task:study_structure".into(),
+            reason: "row linkage is unresolved".into(),
+        };
+        assert!(!command_matches_active_task(
+            &study_state,
+            &generic_escalation
+        ));
+
+        let field_state = ScientificWorkspaceState {
+            active_task_id: "task:single_cell_isolation_method".into(),
+            ..Default::default()
+        };
+        let field_escalation = AgentCommand::Escalate {
+            task_id: "task:single_cell_isolation_method".into(),
+            reason: "trusted field evidence remains conflicting".into(),
+        };
+        assert!(command_matches_active_task(&field_state, &field_escalation));
+        let wrong_structural_escalation = AgentCommand::EscalateStudyStructure {
+            task_id: "task:single_cell_isolation_method".into(),
+            blocker: StudyStructureEscalationBlocker::ConceptualBranchExistenceUnresolved,
+            evidence_refs: vec!["E0001".into()],
+            reason: "not applicable to a field task".into(),
+        };
+        assert!(!command_matches_active_task(
+            &field_state,
+            &wrong_structural_escalation
         ));
     }
 
