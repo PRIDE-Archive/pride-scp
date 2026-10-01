@@ -6766,6 +6766,254 @@ fn normalize_branch_row_selectors(evidence: &DatasetEvidence, branch: &mut Agent
     );
 }
 
+#[derive(Debug, Clone)]
+struct BranchRowSelectorCandidate {
+    selectors: Vec<AgentRowSelector>,
+    rows: BTreeSet<usize>,
+}
+
+fn approved_branch_row_selector_fields() -> &'static [&'static str] {
+    &[
+        "characteristics[organism]",
+        "characteristics[organism part]",
+        "characteristics[cell type]",
+        "characteristics[cell line]",
+        "characteristics[sample type]",
+        "characteristics[disease]",
+        "characteristics[sex]",
+        "characteristics[cell identifier]",
+        "characteristics[biological replicate]",
+    ]
+}
+
+fn selector_matching_row_indices(
+    rows: &[Vec<String>],
+    header_index: &HashMap<String, usize>,
+    eligible_rows: &BTreeSet<usize>,
+    selectors: &[AgentRowSelector],
+) -> BTreeSet<usize> {
+    eligible_rows
+        .iter()
+        .copied()
+        .filter(|row_idx| {
+            rows.get(*row_idx)
+                .map(|row| branch_row_matches_selectors(row, header_index, selectors))
+                .unwrap_or(false)
+        })
+        .collect()
+}
+
+fn collect_complete_branch_selector_partitions(
+    choices: &[(String, Vec<BranchRowSelectorCandidate>)],
+    target_rows: &BTreeSet<usize>,
+    index: usize,
+    used_rows: &mut BTreeSet<usize>,
+    selected: &mut Vec<BranchRowSelectorCandidate>,
+    solutions: &mut BTreeMap<Vec<(String, Vec<usize>)>, BTreeMap<String, Vec<AgentRowSelector>>>,
+) {
+    if solutions.len() > 1 {
+        return;
+    }
+    if index == choices.len() {
+        if used_rows != target_rows {
+            return;
+        }
+        let mut signature = Vec::new();
+        let mut selectors = BTreeMap::new();
+        for ((branch_id, _), candidate) in choices.iter().zip(selected.iter()) {
+            signature.push((branch_id.clone(), candidate.rows.iter().copied().collect()));
+            selectors.insert(branch_id.clone(), candidate.selectors.clone());
+        }
+        solutions.entry(signature).or_insert(selectors);
+        return;
+    }
+
+    for candidate in &choices[index].1 {
+        if !candidate.rows.is_disjoint(used_rows) {
+            continue;
+        }
+        let added = candidate.rows.iter().copied().collect::<Vec<_>>();
+        used_rows.extend(added.iter().copied());
+        selected.push(candidate.clone());
+        collect_complete_branch_selector_partitions(
+            choices,
+            target_rows,
+            index + 1,
+            used_rows,
+            selected,
+            solutions,
+        );
+        selected.pop();
+        for row_idx in added {
+            used_rows.remove(&row_idx);
+        }
+        if solutions.len() > 1 {
+            return;
+        }
+    }
+}
+
+fn synthesize_source_grounded_branch_row_selectors(
+    evidence: &DatasetEvidence,
+    branches: &[AgentBranch],
+    claims: &[ScientificClaim],
+) -> BTreeMap<String, Vec<AgentRowSelector>> {
+    if evidence.existing_sdrf_path.is_empty() {
+        return BTreeMap::new();
+    }
+    let Ok((headers, rows)) = read_existing_sdrf_table(Path::new(&evidence.existing_sdrf_path))
+    else {
+        return BTreeMap::new();
+    };
+    let header_index = headers
+        .iter()
+        .enumerate()
+        .map(|(index, header)| (header.to_ascii_lowercase(), index))
+        .collect::<HashMap<_, _>>();
+    let Some(&sample_type_idx) = header_index.get(&SC_SAMPLE_TYPE.to_ascii_lowercase()) else {
+        return BTreeMap::new();
+    };
+    let Some(&isolation_idx) = header_index.get(&SC_ISOLATION_METHOD.to_ascii_lowercase()) else {
+        return BTreeMap::new();
+    };
+
+    let eligible_rows = rows
+        .iter()
+        .enumerate()
+        .filter_map(|(row_idx, row)| {
+            let sample_type = row.get(sample_type_idx)?.trim();
+            let isolation = row.get(isolation_idx)?.trim();
+            (sample_type.eq_ignore_ascii_case("single cell") && row_value_is_unresolved(isolation))
+                .then_some(row_idx)
+        })
+        .collect::<BTreeSet<_>>();
+    if eligible_rows.is_empty() {
+        return BTreeMap::new();
+    }
+
+    let mut relevant_branches = branches
+        .iter()
+        .filter(|branch| {
+            branch.status == "supported"
+                && claims.iter().any(|claim| {
+                    claim.status == "supported"
+                        && claim.scope == "branch"
+                        && claim.branch_id == branch.id
+                        && claim.concept_type == "isolation_method"
+                })
+        })
+        .collect::<Vec<_>>();
+    relevant_branches.sort_by(|a, b| a.id.cmp(&b.id));
+    if relevant_branches.len() < 2 || relevant_branches.len() > 8 {
+        return BTreeMap::new();
+    }
+
+    let mut choices = Vec::new();
+    for branch in relevant_branches {
+        let mut candidates_by_rows: BTreeMap<Vec<usize>, BranchRowSelectorCandidate> =
+            BTreeMap::new();
+        let normalized_existing = normalize_row_selectors(
+            evidence,
+            &branch.evidence_refs,
+            branch.row_selectors.clone(),
+        );
+        if !normalized_existing.is_empty() {
+            let matched = selector_matching_row_indices(
+                &rows,
+                &header_index,
+                &eligible_rows,
+                &normalized_existing,
+            );
+            if !matched.is_empty() {
+                let key = matched.iter().copied().collect::<Vec<_>>();
+                candidates_by_rows.insert(
+                    key,
+                    BranchRowSelectorCandidate {
+                        selectors: normalized_existing,
+                        rows: matched,
+                    },
+                );
+            }
+        } else {
+            for field in approved_branch_row_selector_fields() {
+                let Some(&field_idx) = header_index.get(&field.to_ascii_lowercase()) else {
+                    continue;
+                };
+                let mut exact_values = BTreeMap::<String, String>::new();
+                for row_idx in &eligible_rows {
+                    let Some(value) = rows.get(*row_idx).and_then(|row| row.get(field_idx)) else {
+                        continue;
+                    };
+                    let value = value.trim();
+                    let low = value.to_ascii_lowercase();
+                    if value.is_empty() || canonical_reserved_alias(&low).is_some() {
+                        continue;
+                    }
+                    exact_values.entry(low).or_insert_with(|| value.to_string());
+                }
+                for value in exact_values.into_values() {
+                    let selector = AgentRowSelector {
+                        field: (*field).to_string(),
+                        value,
+                    };
+                    if !branch_row_selector_is_source_grounded(
+                        evidence,
+                        &branch.evidence_refs,
+                        &selector,
+                    ) {
+                        continue;
+                    }
+                    let matched = selector_matching_row_indices(
+                        &rows,
+                        &header_index,
+                        &eligible_rows,
+                        std::slice::from_ref(&selector),
+                    );
+                    if matched.is_empty() || matched.len() == eligible_rows.len() {
+                        continue;
+                    }
+                    let key = matched.iter().copied().collect::<Vec<_>>();
+                    let candidate = BranchRowSelectorCandidate {
+                        selectors: vec![selector],
+                        rows: matched,
+                    };
+                    match candidates_by_rows.get(&key) {
+                        None => {
+                            candidates_by_rows.insert(key, candidate);
+                        }
+                        Some(existing)
+                            if candidate.selectors.as_slice() < existing.selectors.as_slice() =>
+                        {
+                            candidates_by_rows.insert(key, candidate);
+                        }
+                        Some(_) => {}
+                    }
+                }
+            }
+        }
+        let candidates = candidates_by_rows.into_values().collect::<Vec<_>>();
+        if candidates.is_empty() {
+            return BTreeMap::new();
+        }
+        choices.push((branch.id.clone(), candidates));
+    }
+
+    let mut solutions = BTreeMap::new();
+    collect_complete_branch_selector_partitions(
+        &choices,
+        &eligible_rows,
+        0,
+        &mut BTreeSet::new(),
+        &mut Vec::new(),
+        &mut solutions,
+    );
+    if solutions.len() == 1 {
+        solutions.into_values().next().unwrap_or_default()
+    } else {
+        BTreeMap::new()
+    }
+}
+
 fn normalize_workspace_branches(evidence: &DatasetEvidence, branches: &mut Vec<AgentBranch>) {
     let raw_names = evidence
         .raw_files
@@ -6878,6 +7126,19 @@ fn normalize_workspace_state(
         &mut state.conflicts,
         turn,
     );
+
+    let synthesized_selectors =
+        synthesize_source_grounded_branch_row_selectors(evidence, &state.branches, &state.claims);
+    if !synthesized_selectors.is_empty() {
+        for branch in &mut state.branches {
+            if branch.row_selectors.is_empty() {
+                if let Some(selectors) = synthesized_selectors.get(&branch.id) {
+                    branch.row_selectors = selectors.clone();
+                    normalize_branch_row_selectors(evidence, branch);
+                }
+            }
+        }
+    }
 
     let old_conflicts = std::mem::take(&mut state.conflicts);
     for mut conflict in old_conflicts {
@@ -8915,7 +9176,9 @@ fn apply_branch_row_selector_isolation_projection(
     explicit_mappings: &[ExplicitRowMapping],
     trusted_partial_mapping_applied: bool,
 ) -> Vec<ValidationIssue> {
-    if state.harness_version != SCIENTIFIC_AGENT_FACTOR_ROW_ROLE_HARDENED_VERSION
+    let selector_projection_enabled = state.harness_version == SCIENTIFIC_AGENT_HARNESS_VERSION
+        || state.harness_version == SCIENTIFIC_AGENT_FACTOR_ROW_ROLE_HARDENED_VERSION;
+    if !selector_projection_enabled
         || (evidence.existing_sdrf_path.is_empty()
             && explicit_mappings.is_empty()
             && !trusted_partial_mapping_applied)
@@ -12838,6 +13101,214 @@ mod tests {
             ClaimAdjudication::Canonical { ref value, .. }
                 if value == "laser capture microdissection"
         ));
+    }
+
+    #[test]
+    fn v13_synthesizes_unique_source_grounded_branch_partition_and_projects_isolation() {
+        let root = std::env::temp_dir().join(format!(
+            "pride-scp-v13-synthesized-branch-selectors-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("existing.sdrf.tsv");
+        fs::write(
+            &path,
+            concat!(
+                "source name\tcharacteristics[organism part]\tcharacteristics[cell type]\tcharacteristics[cell line]\tcharacteristics[sample type]\tcharacteristics[single cell isolation protocol]\n",
+                "blank_1\tnot applicable\tnot applicable\tnot applicable\tempty\tnot applicable\n",
+                "hela_1\tnot applicable\tnot available\tHeLa\tsingle cell\tnot available\n",
+                "hela_2\tnot applicable\tnot available\tHeLa\tsingle cell\tnot available\n",
+                "neuron_1\tspinal cord\tmotor neuron\tnot applicable\tsingle cell\tnot available\n",
+                "neuron_2\tspinal cord\tinterneuron\tnot applicable\tsingle cell\tnot available\n"
+            ),
+        )
+        .unwrap();
+
+        let mut evidence = evidence_with(
+            vec![
+                EvidenceItem {
+                    id: "E0001".into(),
+                    source_kind: "manuscript_semantic_evidence".into(),
+                    source_label: "paper.txt".into(),
+                    text: "HeLa single cells were isolated by capillary-based micromanipulation."
+                        .into(),
+                },
+                EvidenceItem {
+                    id: "E0002".into(),
+                    source_kind: "manuscript_semantic_evidence".into(),
+                    source_label: "paper.txt".into(),
+                    text: "Motor neurons and interneurons from human spinal cord were excised by laser capture microdissection."
+                        .into(),
+                },
+            ],
+            vec!["hela_1.raw", "hela_2.raw", "neuron_1.raw", "neuron_2.raw"],
+        );
+        evidence.existing_sdrf_path = path.display().to_string();
+
+        let mut hela_claim = branch_claim_with_ref(
+            "isolation_method",
+            "capillary-based micromanipulation",
+            "branch_hela",
+            "E0001",
+        );
+        hela_claim.status = "supported".into();
+        let mut neuron_claim = branch_claim_with_ref(
+            "isolation_method",
+            "laser capture microdissection",
+            "branch_neurons",
+            "E0002",
+        );
+        neuron_claim.status = "supported".into();
+        let mut state = ScientificWorkspaceState {
+            branches: vec![
+                AgentBranch {
+                    id: "branch_hela".into(),
+                    label: "HeLa".into(),
+                    status: "supported".into(),
+                    evidence_refs: vec!["E0001".into()],
+                    linked_raw_files: Vec::new(),
+                    row_selectors: Vec::new(),
+                    linkage_status: "unresolved".into(),
+                    notes: String::new(),
+                },
+                AgentBranch {
+                    id: "branch_neurons".into(),
+                    label: "spinal neurons".into(),
+                    status: "supported".into(),
+                    evidence_refs: vec!["E0002".into()],
+                    linked_raw_files: Vec::new(),
+                    row_selectors: Vec::new(),
+                    linkage_status: "unresolved".into(),
+                    notes: String::new(),
+                },
+            ],
+            claims: vec![hela_claim, neuron_claim],
+            ..Default::default()
+        };
+        normalize_workspace_state(&evidence, &mut state, 1);
+        assert_eq!(state.harness_version, SCIENTIFIC_AGENT_HARNESS_VERSION);
+        let hela = state
+            .branches
+            .iter()
+            .find(|branch| branch.id == "branch_hela")
+            .unwrap();
+        assert_eq!(
+            hela.row_selectors,
+            vec![AgentRowSelector {
+                field: "characteristics[cell line]".into(),
+                value: "HeLa".into(),
+            }]
+        );
+        let neurons = state
+            .branches
+            .iter()
+            .find(|branch| branch.id == "branch_neurons")
+            .unwrap();
+        assert_eq!(
+            neurons.row_selectors,
+            vec![AgentRowSelector {
+                field: "characteristics[organism part]".into(),
+                value: "spinal cord".into(),
+            }]
+        );
+
+        let (headers, mut rows) = read_existing_sdrf_table(&path).unwrap();
+        let issues = apply_branch_row_selector_isolation_projection(
+            &headers,
+            &mut rows,
+            &evidence,
+            &state,
+            &[],
+            false,
+        );
+        let isolation_idx = header_first_index(&headers, SC_ISOLATION_METHOD).unwrap();
+        assert_eq!(rows[0][isolation_idx], "not applicable");
+        assert_eq!(rows[1][isolation_idx], "capillary-based micromanipulation");
+        assert_eq!(rows[2][isolation_idx], "capillary-based micromanipulation");
+        assert_eq!(rows[3][isolation_idx], "laser capture microdissection");
+        assert_eq!(rows[4][isolation_idx], "laser capture microdissection");
+        assert_eq!(issues.len(), 4);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn v13_selector_synthesis_fails_closed_on_ambiguous_complete_partitions() {
+        let root = std::env::temp_dir().join(format!(
+            "pride-scp-v13-ambiguous-synthesized-selectors-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("existing.sdrf.tsv");
+        fs::write(
+            &path,
+            concat!(
+                "source name\tcharacteristics[organism part]\tcharacteristics[cell line]\tcharacteristics[sample type]\tcharacteristics[single cell isolation protocol]\n",
+                "a\tnot applicable\tHeLa\tsingle cell\tnot available\n",
+                "b\tspinal cord\tnot applicable\tsingle cell\tnot available\n"
+            ),
+        )
+        .unwrap();
+        let shared = "Both HeLa cells and spinal cord cells were isolated by manual picking and laser capture microdissection.";
+        let mut evidence = evidence_with(
+            vec![
+                EvidenceItem {
+                    id: "E0001".into(),
+                    source_kind: "manuscript_semantic_evidence".into(),
+                    source_label: "paper.txt".into(),
+                    text: shared.into(),
+                },
+                EvidenceItem {
+                    id: "E0002".into(),
+                    source_kind: "manuscript_semantic_evidence".into(),
+                    source_label: "paper.txt".into(),
+                    text: shared.into(),
+                },
+            ],
+            vec!["a.raw", "b.raw"],
+        );
+        evidence.existing_sdrf_path = path.display().to_string();
+        let mut state = ScientificWorkspaceState {
+            branches: vec![
+                AgentBranch {
+                    id: "branch_a".into(),
+                    label: "A".into(),
+                    status: "supported".into(),
+                    evidence_refs: vec!["E0001".into()],
+                    linked_raw_files: Vec::new(),
+                    row_selectors: Vec::new(),
+                    linkage_status: "unresolved".into(),
+                    notes: String::new(),
+                },
+                AgentBranch {
+                    id: "branch_b".into(),
+                    label: "B".into(),
+                    status: "supported".into(),
+                    evidence_refs: vec!["E0002".into()],
+                    linked_raw_files: Vec::new(),
+                    row_selectors: Vec::new(),
+                    linkage_status: "unresolved".into(),
+                    notes: String::new(),
+                },
+            ],
+            claims: vec![
+                branch_claim_with_ref("isolation_method", "manual picking", "branch_a", "E0001"),
+                branch_claim_with_ref(
+                    "isolation_method",
+                    "laser capture microdissection",
+                    "branch_b",
+                    "E0002",
+                ),
+            ],
+            ..Default::default()
+        };
+        normalize_workspace_state(&evidence, &mut state, 1);
+        assert!(state
+            .branches
+            .iter()
+            .all(|branch| branch.row_selectors.is_empty()));
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
