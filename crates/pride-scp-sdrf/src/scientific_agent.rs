@@ -1076,7 +1076,7 @@ fn scientific_agent_schema(
     });
     let study_structure_edit_command = json!({
         "type":"object",
-        "description":"Commit source-supported conceptual study branches for task:study_structure. This command CAN create branches even when exact RAW linkage is unresolved.",
+        "description":"Commit source-supported conceptual study branches for task:study_structure. Structural branch creation is independent of downstream SDRF field canonicalization: this branch schema intentionally has no isolation-method field, and a later field-level template_gap or unresolved canonicalization result does not block creation of a source-supported branch. This command CAN create branches even when exact RAW linkage is unresolved.",
         "properties":{
             "command":{"type":"string","enum":["edit_study_structure"]},
             "task_id":{"type":"string","enum":["task:study_structure"]},
@@ -1260,7 +1260,7 @@ fn build_scientific_tasks(
             error_count: 1,
             representative_rows: Vec::new(),
             representative_messages: Vec::new(),
-            objective: "Establish a source-grounded study model before field repair: biological/experimental branches, acquisition cardinality, field scope, and only source-supported RAW linkage. Preserve unresolved linkage rather than infer biological identity from filenames.".into(),
+            objective: "Establish a source-grounded study model before field repair: biological/experimental branches, acquisition cardinality, field scope, and only source-supported RAW linkage. Preserve unresolved linkage rather than infer biological identity from filenames. Structural branch creation is independent of downstream SDRF field canonicalization: do not wait for isolation-method vocabulary resolution, and do not treat a field-level template_gap as structural ambiguity. Human review is only for conceptual study structure that cannot itself be established safely from trusted evidence.".into(),
             evidence_candidates: task_evidence_candidates(
                 evidence,
                 "study_structure",
@@ -1754,7 +1754,7 @@ fn scientific_agent_prompt(
         "edit_scientific_observation"
     };
     let edit_contract = if study_structure_active {
-        "edit_study_structure: commit one or more source-supported conceptual branches. This command CAN create branches. Exact RAW linkage is not required: when the branch is supported but the sources do not explicitly map exact RAW basenames, use linked_raw_files=[] and linkage_status='unresolved'."
+        "edit_study_structure: commit one or more source-supported conceptual branches. The branch schema intentionally contains no isolation-method field because conceptual structure is independent of downstream SDRF field canonicalization. Do NOT wait for isolation vocabulary resolution: a later template_gap or unresolved field canonicalization does not block creation of a source-supported branch. This command CAN create branches. Exact RAW linkage is not required: when the branch is supported but the sources do not explicitly map exact RAW basenames, use linked_raw_files=[] and linkage_status='unresolved'."
     } else {
         "edit_scientific_observation: commit one or more source-faithful scientific observations for the active field task. A source explicitly naming or defining an isolation method/platform is sufficient as an observation even when deeper mechanical detail is absent; Rust decides canonical SDRF mapping/template-gap/unresolved."
     };
@@ -1781,7 +1781,7 @@ CURRENT COMMAND POLICY: {read_policy}\n\
 - read_evidence: use when an existing promising E#### excerpt is insufficient. Rust reads a larger bounded window from only registered trusted sources and returns it on the next turn.\n\
 - search_evidence: use only when focused candidates plus already-read context do not answer the task. It searches registered/trusted publication, supplement, structured-design, repository metadata, exact-RAW-name, KG, or conflict-evidence sources only; it is NOT arbitrary web browsing.\n\
 - {edit_contract}\n\
-- escalate: use only after relevant focused evidence/context and reasonable trusted search are exhausted or the judgment truly requires human review. Do not escalate merely because exact RAW linkage is unresolved or because Rust still needs to canonicalize an observation.\n\n\
+- escalate: use only after relevant focused evidence/context and reasonable trusted search are exhausted or the judgment truly requires human review. For task:study_structure, human review is appropriate only when the conceptual structure itself cannot be established safely; downstream field canonicalization/template compatibility is a later task. Do not escalate merely because exact RAW linkage is unresolved, a downstream field is or may be template_gap, or because Rust still needs to canonicalize an observation.\n\n\
 SCIENTIFIC OBSERVATION -> RUST CANONICALIZATION CONTRACT:\n\
 - observation_upserts record what the source says the experiment actually did. observed_value is an evidence-faithful scientific description, NOT an SDRF controlled-vocabulary answer.\n\
 - For isolation_method, record the most specific source-faithful method description available. An explicit source-defined method/platform name such as 'evDISCO (ex vivo-digital microfluidic isolation of single cells for -Omics)' is sufficient as an observation even if the excerpt does not spell out every mechanical substep. When the source provides the physical operation, preserve it (for example, 'an individual intact cell was manually loaded into the separation capillary using hydrodynamic pressure'). Do not invent pseudo-vocabulary such as hydrodynamic_loading. Do not choose 'manual picking' merely because you think the validator wants it unless that exact phrase is what the source says. Rust independently maps the cited observation/evidence to a canonical SDRF value, template_gap, unresolved, or conflict.\n\
@@ -1789,7 +1789,8 @@ SCIENTIFIC OBSERVATION -> RUST CANONICALIZATION CONTRACT:\n\
 - Stable observation identity is (concept_type, scope, branch_id). Same evidence-compatible meaning merges. If you intentionally replace a genuinely different prior observation, set supersedes_observed_value exactly to the old observed_value.\n\
 - A branch existing does NOT automatically make every observation branch-scoped. Use project scope only when the trusted source supports one invariant value across all relevant study material and no heterogeneous branch evidence contradicts it. Use branch scope when the method/biology actually differs by branch. Rust masks unsafe project broadcasts whenever heterogeneous branch evidence exists.\n\n\
 STUDY-STRUCTURE CONTRACT:\n\
-- task:study_structure comes first. Establish source-grounded biological/experimental branches, acquisition cardinality, and scope before field repair. Use edit_study_structure to create the supported conceptual branches. Conceptual branches may be supported while linked_raw_files remains empty and linkage_status is unresolved; unresolved RAW linkage is NOT a reason to avoid creating the branch. A downstream field-level template_gap or unresolved canonicalization result is NOT a blocker to structural editing: if the trusted evidence establishes distinct conceptual branches, commit them with edit_study_structure and let Rust preserve any downstream template gap separately. Do NOT escalate task:study_structure merely because an isolation method is outside the pinned SDRF vocabulary.\n\
+- task:study_structure comes first. Establish source-grounded biological/experimental branches, acquisition cardinality, and scope before field repair. Use edit_study_structure to create the supported conceptual branches. Conceptual branches may be supported while linked_raw_files remains empty and linkage_status is unresolved; unresolved RAW linkage is NOT a reason to avoid creating the branch.\n\
+- HARD RULE: a field-level template_gap is NOT structural ambiguity and is NOT a reason for human_review when trusted evidence establishes the conceptual branch. The branch schema intentionally contains no isolation-method field; do not wait for downstream isolation vocabulary or other SDRF field canonicalization before calling edit_study_structure. Rust preserves downstream template gaps separately.\n\
 - linked_raw_files require trusted source evidence explicitly linking exact RAW basenames. Filename words are search hints/contradiction detectors, never biological identity.\n\
 - row_selectors are an optional fallback for existing/structured SDRF rows when exact RAW linkage is unavailable. Each selector must be an exact approved biological SDRF column/value pair explicitly supported by the cited branch evidence. Selectors are conjunctive. Never select by row number, source/assay name, RAW filename, or fuzzy/semantic similarity. Use row_selectors=[] when the branch cannot be addressed safely.\n\
 - Never collapse multiple organisms, cell populations, isolation regimes, or acquisition regimes into one project observation.\n\n\
@@ -11624,6 +11625,93 @@ mod tests {
             edit["properties"]["task_id"]["enum"][0],
             "task:study_structure"
         );
+    }
+
+    #[test]
+    fn v13_study_structure_contract_separates_structure_from_field_canonicalization() {
+        let schema = scientific_agent_schema(true, true, true);
+        let variants = schema["oneOf"].as_array().unwrap();
+        let edit = variants
+            .iter()
+            .find(|variant| {
+                variant["properties"]["command"]["enum"][0].as_str() == Some("edit_study_structure")
+            })
+            .unwrap();
+        let description = edit["description"].as_str().unwrap();
+        assert!(description.contains("independent of downstream SDRF field canonicalization"));
+        assert!(description.contains("intentionally has no isolation-method field"));
+        assert!(description.contains("template_gap"));
+        let branch_properties = edit["properties"]["branch_upserts"]["items"]["properties"]
+            .as_object()
+            .unwrap();
+        assert!(!branch_properties.contains_key("isolation_method"));
+        assert!(!branch_properties.contains_key("single_cell_isolation_method"));
+
+        let evidence = evidence_with(
+            vec![EvidenceItem {
+                id: "E0001".into(),
+                source_kind: "manuscript_semantic_evidence".into(),
+                source_label: "study structure".into(),
+                text: "trusted evidence establishes two conceptual branches".into(),
+            }],
+            vec!["runA.raw"],
+        );
+        let issues = vec![ValidationIssue {
+            level: "error".into(),
+            code: "single_cell_isolation_unresolved".into(),
+            row: 1,
+            column: SC_ISOLATION_METHOD.into(),
+            message: "missing isolation method".into(),
+        }];
+        let tasks = build_scientific_tasks(&evidence, &issues);
+        let study_task = tasks
+            .iter()
+            .find(|task| task.id == "task:study_structure")
+            .unwrap();
+        assert!(study_task
+            .objective
+            .contains("do not treat a field-level template_gap as structural ambiguity"));
+        assert!(study_task.objective.contains(
+            "Human review is only for conceptual study structure that cannot itself be established safely"
+        ));
+
+        let state = ScientificWorkspaceState {
+            tasks,
+            active_task_id: "task:study_structure".into(),
+            ..Default::default()
+        };
+        let opts = SdrfScientificAgentOptions {
+            snapshot_dir: PathBuf::new(),
+            annotations_dir: PathBuf::new(),
+            publication_manifest: None,
+            manuscript_text_paths: Vec::new(),
+            output_dir: PathBuf::new(),
+            accessions: Vec::new(),
+            accessions_file: None,
+            resolved_sdrf_dir: None,
+            explicit_row_mapping_manifest: None,
+            model: "test".into(),
+            ollama_url: "http://127.0.0.1:11434/api/generate".into(),
+            timeout_seconds: 1,
+            max_evidence_items: 8,
+            max_evidence_chars: 8000,
+            max_files_in_prompt: 8,
+            max_agent_turns: 4,
+            max_tool_actions: 4,
+            max_validator_cycles: 1,
+            force: false,
+            progress: false,
+        };
+        let prompt = scientific_agent_prompt(&opts, &evidence, &state, &[], &[], &[], 1);
+        assert!(
+            prompt.contains("The branch schema intentionally contains no isolation-method field")
+        );
+        assert!(prompt.contains(
+            "a field-level template_gap is NOT structural ambiguity and is NOT a reason for human_review"
+        ));
+        assert!(prompt.contains(
+            "human review is appropriate only when the conceptual structure itself cannot be established safely"
+        ));
     }
 
     #[test]
