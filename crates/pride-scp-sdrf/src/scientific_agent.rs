@@ -9582,6 +9582,7 @@ fn append_changed_adjudication_feedback(
     pending_feedback: &mut Vec<String>,
     last_signatures: &mut BTreeMap<(String, String, String), String>,
     records: &[ClaimAdjudicationRecord],
+    active_concept_type: Option<&str>,
     turn: usize,
     phase: &str,
 ) {
@@ -9592,6 +9593,13 @@ fn append_changed_adjudication_feedback(
     last_signatures.retain(|identity, _| active.contains(identity));
 
     for record in records {
+        // Keep downstream field canonicalization feedback out of unrelated task
+        // prompts. In particular, study-structure synthesis must not be steered
+        // by a later field-level template gap. Leave the signature unrecorded
+        // so the feedback can surface when the matching field task is active.
+        if active_concept_type != Some(record.concept_type.as_str()) {
+            continue;
+        }
         let identity = claim_identity_parts(&record.concept_type, &record.scope, &record.branch_id);
         let signature = adjudication_feedback_signature(record);
         if last_signatures
@@ -10089,6 +10097,7 @@ async fn run_one_scientific_agent(
                         &mut pending_harness_feedback,
                         &mut last_adjudication_signatures,
                         &adjudications,
+                        active_task(&state).map(|task| task.concept_type.as_str()),
                         turn,
                         "post-read",
                     );
@@ -10192,6 +10201,7 @@ async fn run_one_scientific_agent(
                         &mut pending_harness_feedback,
                         &mut last_adjudication_signatures,
                         &adjudications,
+                        active_task(&state).map(|task| task.concept_type.as_str()),
                         turn,
                         "post-search",
                     );
@@ -10297,6 +10307,7 @@ async fn run_one_scientific_agent(
                         &mut pending_harness_feedback,
                         &mut last_adjudication_signatures,
                         &post_edit_adjudications,
+                        active_task(&state).map(|task| task.concept_type.as_str()),
                         turn,
                         "post-edit",
                     );
@@ -10352,6 +10363,7 @@ async fn run_one_scientific_agent(
                         &mut pending_harness_feedback,
                         &mut last_adjudication_signatures,
                         &compiled_now.adjudications,
+                        active_task(&state).map(|task| task.concept_type.as_str()),
                         turn,
                         "compile-after-edit",
                     );
@@ -11329,6 +11341,7 @@ mod tests {
             &mut pending,
             &mut signatures,
             &[record.clone()],
+            Some("isolation_method"),
             1,
             "post-delta",
         );
@@ -11337,11 +11350,59 @@ mod tests {
             &mut pending,
             &mut signatures,
             &[record],
+            Some("isolation_method"),
             2,
             "post-search",
         );
         assert_eq!(trace_feedback.len(), 1);
         assert_eq!(pending.len(), 1);
+    }
+
+    #[test]
+    fn adjudication_feedback_is_scoped_to_active_field_task() {
+        let record = ClaimAdjudicationRecord {
+            concept_type: "isolation_method".into(),
+            scope: "project".into(),
+            branch_id: "rust:evidence_template_gap".into(),
+            model_status: "supported".into(),
+            proposed_value: "capillary-based micromanipulation".into(),
+            evidence_refs: vec!["E0001".into()],
+            adjudication: ClaimAdjudication::TemplateGap {
+                observed_value: "capillary-based micromanipulation".into(),
+                evidence_refs: vec!["E0001".into()],
+                reason: "source-faithful isolation method is outside the pinned template".into(),
+            },
+        };
+        let mut trace_feedback = Vec::new();
+        let mut pending = Vec::new();
+        let mut signatures = BTreeMap::new();
+
+        append_changed_adjudication_feedback(
+            &mut trace_feedback,
+            &mut pending,
+            &mut signatures,
+            &[record.clone()],
+            Some("study_structure"),
+            1,
+            "post-read",
+        );
+        assert!(trace_feedback.is_empty());
+        assert!(pending.is_empty());
+        assert!(signatures.is_empty());
+
+        append_changed_adjudication_feedback(
+            &mut trace_feedback,
+            &mut pending,
+            &mut signatures,
+            &[record],
+            Some("isolation_method"),
+            2,
+            "post-read",
+        );
+        assert_eq!(trace_feedback.len(), 1);
+        assert_eq!(pending.len(), 1);
+        assert_eq!(signatures.len(), 1);
+        assert!(pending[0].contains("template gap"));
     }
 
     #[test]
