@@ -1482,6 +1482,20 @@ fn active_task_is_study_structure(state: &ScientificWorkspaceState) -> bool {
 }
 
 fn ensure_active_task(state: &mut ScientificWorkspaceState) {
+    // Study structure is a prerequisite for all downstream scientific repair.
+    // If it has been escalated to human review, do not rotate into a field
+    // task: the conceptual graph has not been established safely enough for
+    // downstream repair to proceed. A later human-resolved state can clear
+    // this gate and re-enter the normal task board.
+    let study_structure_in_human_review = state
+        .tasks
+        .iter()
+        .any(|task| task.sdrf_field == "study_structure" && task.status == "human_review");
+    if study_structure_in_human_review {
+        state.active_task_id.clear();
+        return;
+    }
+
     let active_still_valid = state.tasks.iter().any(|task| {
         task.id == state.active_task_id && !task_is_terminal(task) && task.error_count > 0
     });
@@ -1775,7 +1789,7 @@ SCIENTIFIC OBSERVATION -> RUST CANONICALIZATION CONTRACT:\n\
 - Stable observation identity is (concept_type, scope, branch_id). Same evidence-compatible meaning merges. If you intentionally replace a genuinely different prior observation, set supersedes_observed_value exactly to the old observed_value.\n\
 - A branch existing does NOT automatically make every observation branch-scoped. Use project scope only when the trusted source supports one invariant value across all relevant study material and no heterogeneous branch evidence contradicts it. Use branch scope when the method/biology actually differs by branch. Rust masks unsafe project broadcasts whenever heterogeneous branch evidence exists.\n\n\
 STUDY-STRUCTURE CONTRACT:\n\
-- task:study_structure comes first. Establish source-grounded biological/experimental branches, acquisition cardinality, and scope before field repair. Use edit_study_structure to create the supported conceptual branches. Conceptual branches may be supported while linked_raw_files remains empty and linkage_status is unresolved; unresolved RAW linkage is NOT a reason to avoid creating the branch.\n\
+- task:study_structure comes first. Establish source-grounded biological/experimental branches, acquisition cardinality, and scope before field repair. Use edit_study_structure to create the supported conceptual branches. Conceptual branches may be supported while linked_raw_files remains empty and linkage_status is unresolved; unresolved RAW linkage is NOT a reason to avoid creating the branch. A downstream field-level template_gap or unresolved canonicalization result is NOT a blocker to structural editing: if the trusted evidence establishes distinct conceptual branches, commit them with edit_study_structure and let Rust preserve any downstream template gap separately. Do NOT escalate task:study_structure merely because an isolation method is outside the pinned SDRF vocabulary.\n\
 - linked_raw_files require trusted source evidence explicitly linking exact RAW basenames. Filename words are search hints/contradiction detectors, never biological identity.\n\
 - row_selectors are an optional fallback for existing/structured SDRF rows when exact RAW linkage is unavailable. Each selector must be an exact approved biological SDRF column/value pair explicitly supported by the cited branch evidence. Selectors are conjunctive. Never select by row number, source/assay name, RAW filename, or fuzzy/semantic similarity. Use row_selectors=[] when the branch cannot be addressed safely.\n\
 - Never collapse multiple organisms, cell populations, isolation regimes, or acquisition regimes into one project observation.\n\n\
@@ -11445,6 +11459,38 @@ mod tests {
         assert_eq!(result.outcome, "context_unavailable");
         assert_eq!(evidence.evidence.len(), 1);
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn study_structure_human_review_blocks_downstream_task_rotation() {
+        let mut state = ScientificWorkspaceState {
+            tasks: vec![
+                ScientificTask {
+                    id: "task:study_structure".into(),
+                    concept_type: "study_structure".into(),
+                    sdrf_field: "study_structure".into(),
+                    status: "investigating".into(),
+                    error_count: 1,
+                    ..Default::default()
+                },
+                ScientificTask {
+                    id: "task:single_cell_isolation_method".into(),
+                    concept_type: "isolation_method".into(),
+                    sdrf_field: "single_cell_isolation_method".into(),
+                    status: "open".into(),
+                    error_count: 9,
+                    ..Default::default()
+                },
+            ],
+            active_task_id: "task:study_structure".into(),
+            ..Default::default()
+        };
+
+        mark_active_task_human_review(&mut state, "conceptual structure requires human review");
+
+        assert!(state.active_task_id.is_empty());
+        assert_eq!(state.tasks[0].status, "human_review");
+        assert_eq!(state.tasks[1].status, "open");
     }
 
     #[test]
