@@ -6745,9 +6745,22 @@ fn branch_row_selector_is_source_grounded(
 
 fn branch_row_selector_is_branch_identity_grounded(
     branch: &AgentBranch,
+    claims: &[ScientificClaim],
     selector: &AgentRowSelector,
 ) -> bool {
-    source_text_contains_selector_value(&branch.label, &selector.value)
+    if source_text_contains_selector_value(&branch.label, &selector.value)
+        || source_text_contains_selector_value(&branch.notes, &selector.value)
+    {
+        return true;
+    }
+
+    claims.iter().any(|claim| {
+        claim.status == "supported"
+            && claim.scope == "branch"
+            && claim.branch_id == branch.id
+            && claim.concept_type == "isolation_method"
+            && source_text_contains_selector_value(&claim.reason, &selector.value)
+    })
 }
 
 fn normalize_row_selectors(
@@ -6978,8 +6991,9 @@ fn synthesize_source_grounded_branch_row_selectors(
                         evidence,
                         &branch.evidence_refs,
                         &selector,
-                    ) || !branch_row_selector_is_branch_identity_grounded(branch, &selector)
-                    {
+                    ) || !branch_row_selector_is_branch_identity_grounded(
+                        branch, claims, &selector,
+                    ) {
                         continue;
                     }
 
@@ -13460,13 +13474,17 @@ mod tests {
             "E0001",
         );
         hela_claim.status = "supported".into();
+        hela_claim.reason =
+            "Trusted evidence supports capillary-based micromanipulation for the HeLa cells."
+                .into();
         let mut neuron_claim = branch_claim_with_ref(
             "isolation_method",
-            "laser capture microdissection",
+            "laser capture microdissection (LCM)",
             "branch_neurons",
             "E0001",
         );
         neuron_claim.status = "supported".into();
+        neuron_claim.reason = "Trusted evidence explicitly states that individual motor neurons and interneurons were excised by laser capture microdissection (LCM).".into();
 
         let mut state = ScientificWorkspaceState {
             branches: vec![
@@ -13482,7 +13500,8 @@ mod tests {
                 },
                 AgentBranch {
                     id: "branch_neurons".into(),
-                    label: "Human spinal neurons (motor neurons and interneurons) isolated by laser capture microdissection".into(),
+                    label: "Human spinal neurons isolated by Laser Capture Microdissection (LCM)"
+                        .into(),
                     status: "supported".into(),
                     evidence_refs: vec!["E0001".into()],
                     linked_raw_files: Vec::new(),
