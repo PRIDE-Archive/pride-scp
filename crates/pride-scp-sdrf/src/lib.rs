@@ -7593,11 +7593,17 @@ fn draft_rows_with_explicit_mappings(
         .map(|(i, h)| (h.as_str(), i))
         .collect();
     let mut rows = Vec::new();
-    let one_per_file = proposal.relation_mode == "one_cell_per_data_file";
-    let mode = if one_per_file {
-        "generated_file_role_aware_one_row_per_raw_file"
-    } else if evidence.study_design.repository_file_mode == "generic_archives_only" {
+    // Repository archive/container files are not acquisition units. Even when
+    // publication evidence supports one cell per *actual* acquisition, a
+    // generic .rar/.zip/.7z/.tar wrapper cannot authorize one-row-per-file
+    // serialization until its contents are mapped to canonical acquisitions.
+    let generic_archive_only =
+        evidence.study_design.repository_file_mode == "generic_archives_only";
+    let one_per_file = proposal.relation_mode == "one_cell_per_data_file" && !generic_archive_only;
+    let mode = if generic_archive_only {
         "generated_archive_container_skeleton"
+    } else if one_per_file {
+        "generated_file_role_aware_one_row_per_raw_file"
     } else {
         "generated_skeleton_unresolved_mapping"
     };
@@ -12094,6 +12100,54 @@ mod tests {
         assert_eq!(design.repository_file_mode, "generic_archives_only");
         assert_eq!(design.generic_archive_files, 1);
         assert_eq!(design.direct_acquisition_files, 0);
+    }
+    #[test]
+    fn generic_archive_only_never_serializes_as_one_cell_per_repository_file() {
+        let evidence = DatasetEvidence {
+            accession: "PXDTEST".into(),
+            project_json_path: String::new(),
+            files_json_path: String::new(),
+            existing_sdrf_path: String::new(),
+            raw_files: vec![RawFile {
+                file_name: "CELLREPORTSraw.rar".into(),
+                file_uri: "ftp://example/CELLREPORTSraw.rar".into(),
+                category: "RAW".into(),
+            }],
+            study_design: StudyDesignScaffold {
+                relation_mode_hint: "one_cell_per_data_file".into(),
+                relation_confidence: "high".into(),
+                repository_file_mode: "generic_archives_only".into(),
+                generic_archive_files: 1,
+                generic_archive_file_names: vec!["CELLREPORTSraw.rar".into()],
+                ..Default::default()
+            },
+            metadata_scaffold: DeterministicMetadataScaffold::default(),
+            evidence: Vec::new(),
+            manuscript_sources: Vec::new(),
+            annotation_sources: Vec::new(),
+        };
+        let proposal = SdrfProposal {
+            relation_mode: "one_cell_per_data_file".into(),
+            single_cell_isolation_method: "manual picking".into(),
+            ..Default::default()
+        };
+
+        let (headers, rows, mode) = draft_rows(&proposal, &evidence).unwrap();
+        assert_eq!(mode, "generated_archive_container_skeleton");
+        assert_eq!(rows.len(), 1);
+
+        let idx = |name: &str| header_first_index(&headers, name).unwrap();
+        assert_eq!(rows[0][idx("source name")], "run_0001");
+        assert_eq!(rows[0][idx(SC_CELL_IDENTIFIER)], "not available");
+        assert_eq!(
+            rows[0][idx("comment[fraction identifier]")],
+            "not available"
+        );
+        assert_eq!(
+            rows[0][idx("comment[technical replicate]")],
+            "not available"
+        );
+        assert_eq!(rows[0][idx("comment[data file]")], "CELLREPORTSraw.rar");
     }
 
     #[test]

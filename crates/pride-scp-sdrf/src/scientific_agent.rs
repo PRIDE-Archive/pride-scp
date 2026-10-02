@@ -9647,17 +9647,21 @@ fn validate_scientific_workspace_rows(
     explicit_mappings: &[ExplicitRowMapping],
     trusted_partial_mapping_applied: bool,
 ) -> Vec<ValidationIssue> {
-    if unresolved_de_novo_multiplex_mapping(
-        evidence,
-        relation_mode,
-        explicit_mappings,
-        trusted_partial_mapping_applied,
-    ) {
-        // Preserve the mature SDRF-generator contract: when the acquisition is
-        // reporter-multiplexed but the source does not provide an exact
-        // sample/channel mapping, do not validate the one-row-per-RAW skeleton
-        // as though it were a finalized per-channel SDRF. Doing so creates a
-        // misleading row-error storm for one causal mapping gap.
+    let unresolved_generic_archive_mapping = evidence.existing_sdrf_path.is_empty()
+        && explicit_mappings.is_empty()
+        && evidence.study_design.repository_file_mode == "generic_archives_only";
+    if unresolved_generic_archive_mapping
+        || unresolved_de_novo_multiplex_mapping(
+            evidence,
+            relation_mode,
+            explicit_mappings,
+            trusted_partial_mapping_applied,
+        )
+    {
+        // Preserve the mature SDRF-generator contract: unresolved repository
+        // archive contents and unresolved reporter-multiplexed sample/channel
+        // mappings are causal mapping gaps. Do not validate either skeleton as
+        // though it were a finalized biological row mapping.
         validate_incomplete_mapping_scaffold(headers, rows, evidence, relation_mode, false)
     } else {
         validate_annotation_draft(headers, rows, evidence, false)
@@ -14439,6 +14443,53 @@ mod tests {
 
         assert_eq!(errors.len(), 1);
         assert_eq!(errors[0].code, "sample_to_channel_mapping_unresolved");
+        assert!(!issues.iter().any(|issue| {
+            matches!(
+                issue.code.as_str(),
+                "single_cell_isolation_unresolved"
+                    | "cell_identifier_invalid_or_unresolved"
+                    | "required_integer_invalid"
+            )
+        }));
+    }
+
+    #[test]
+    fn scientific_workspace_generic_archive_uses_mapping_level_validation() {
+        let mut evidence = evidence_with(Vec::new(), vec!["CELLREPORTSraw.rar"]);
+        evidence.study_design.relation_mode_hint = "one_cell_per_data_file".into();
+        evidence.study_design.relation_confidence = "high".into();
+        evidence.study_design.repository_file_mode = "generic_archives_only".into();
+        evidence.study_design.direct_acquisition_files = 0;
+        evidence.study_design.wrapped_acquisition_files = 0;
+        evidence.study_design.generic_archive_files = 1;
+        evidence.study_design.generic_archive_file_names = vec!["CELLREPORTSraw.rar".into()];
+
+        let proposal = SdrfProposal {
+            relation_mode: "one_cell_per_data_file".into(),
+            single_cell_isolation_method: "manual picking".into(),
+            ..Default::default()
+        };
+        let (headers, rows, mode) = draft_rows(&proposal, &evidence).unwrap();
+        assert_eq!(mode, "generated_archive_container_skeleton");
+
+        let issues = validate_scientific_workspace_rows(
+            &headers,
+            &rows,
+            &evidence,
+            "one_cell_per_data_file",
+            &[],
+            false,
+        );
+        let errors = issues
+            .iter()
+            .filter(|issue| issue.level == "error")
+            .collect::<Vec<_>>();
+
+        assert_eq!(errors.len(), 1);
+        assert_eq!(
+            errors[0].code,
+            "repository_archive_contents_mapping_unresolved"
+        );
         assert!(!issues.iter().any(|issue| {
             matches!(
                 issue.code.as_str(),
