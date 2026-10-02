@@ -27,6 +27,10 @@ NO_PROGRESS_STATUSES = {
     "source_exhausted",
     "unsupported_source",
     "provenance_invalid",
+    # PRIDE may expose only a community-curated SDRF for an accession.
+    # That artifact is deliberately untrusted for independent evidence and
+    # therefore represents no progress for the depositor_sdrf source class.
+    "found_untrusted_community_annotation",
 }
 
 
@@ -227,6 +231,25 @@ def self_test() -> None:
         strategy_version="catalog-v1",
     )
     assert plan_acquisition_for_case(attempts=[attempt], **kwargs) == []
+
+    community_only_attempt = AcquisitionAttempt(
+        stage_key=rows[0]["stage_key"],
+        accession="PXD900001",
+        source_class="deposited_sdrf",
+        status="found_untrusted_community_annotation",
+        evidence_set_sha256="e" * 64,
+        policy_version="p",
+        blocker_key="b" * 64,
+        strategy_version="catalog-v1",
+    )
+    assert (
+        plan_acquisition_for_case(
+            attempts=[community_only_attempt],
+            **kwargs,
+        )
+        == []
+    )
+
     kwargs["evidence_set_sha256"] = "f" * 64
     assert len(plan_acquisition_for_case(attempts=[attempt], **kwargs)) == 1
     print("sdrf_evidence_acquisition_planner self-test: PASS")
