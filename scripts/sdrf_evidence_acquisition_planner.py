@@ -33,13 +33,17 @@ NO_PROGRESS_STATUSES = {
     "found_untrusted_community_annotation",
 }
 
-# This provider result describes the state of the queried source class itself,
-# not merely the current evidence bundle. Registering the untrusted community
-# source may change evidence_set_sha256, but that must not immediately replay
-# the same depositor-SDRF acquisition. A changed blocker, policy, or source
-# strategy still permits a fresh attempt.
-SOURCE_STATE_NO_PROGRESS_STATUSES = {
+# These provider results complete the queried source class for the current
+# blocker/policy/strategy. Registering the result may change the evidence-set
+# identity, but that must not immediately replay the same source class.
+#
+# `found_new_provenance_gated_artifact` is progress, not a no-progress result:
+# downstream logic should evaluate the acquired artifact, while acquisition
+# advances to another eligible source class if more evidence is still needed.
+# A changed blocker, policy, or source strategy deliberately permits a retry.
+SOURCE_CLASS_COMPLETED_STATUSES = {
     "found_untrusted_community_annotation",
+    "found_new_provenance_gated_artifact",
 }
 
 
@@ -169,14 +173,14 @@ def plan_acquisition_for_case(
     for strategy in sorted(strategies, key=lambda x: (x.priority, x.source_class)):
         if not strategy_supports(strategy, blocker_family, blocker_fields):
             continue
-        source_state_exhausted = any(
+        source_class_completed = any(
             attempt.accession.upper() == accession.upper()
             and attempt.source_class == strategy.source_class
             and attempt.policy_version == policy_version
-            and attempt.status in SOURCE_STATE_NO_PROGRESS_STATUSES
+            and attempt.status in SOURCE_CLASS_COMPLETED_STATUSES
             for attempt in relevant_attempts
         )
-        if source_state_exhausted:
+        if source_class_completed:
             continue
         skey = acquisition_stage_key(
             accession=accession,
@@ -284,9 +288,45 @@ def self_test() -> None:
         == []
     )
 
-    # A policy change deliberately reopens the source-state decision.
+    # A successful depositor-SDRF acquisition also completes that source
+    # class. If evidence remains limited after registering the new artifact,
+    # planning should advance to the next eligible source instead of querying
+    # the same depositor source again.
+    successful_attempt = AcquisitionAttempt(
+        stage_key=rows[0]["stage_key"],
+        accession="PXD900001",
+        source_class="deposited_sdrf",
+        status="found_new_provenance_gated_artifact",
+        evidence_set_sha256="e" * 64,
+        policy_version="p",
+        blocker_key="b" * 64,
+        strategy_version="catalog-v1",
+    )
+    fallback = SourceStrategy(
+        source_class="sample_annotation_table",
+        priority=20,
+        families=("single_cell_isolation",),
+        fields=(),
+        provider="PRIDE_or_public_supplement",
+        acquisition_method="structured_sidecar_discovery",
+        expected_trust_class="trusted_independent",
+    )
+    kwargs["strategies"] = [strategy, fallback]
+    rows_after_success = plan_acquisition_for_case(
+        attempts=[successful_attempt],
+        **kwargs,
+    )
+    assert len(rows_after_success) == 1
+    assert rows_after_success[0]["source_class"] == "sample_annotation_table"
+
+    # A policy change deliberately reopens the completed source-class decision.
     kwargs["policy_version"] = "p2"
-    assert len(plan_acquisition_for_case(attempts=[community_only_attempt], **kwargs)) == 1
+    rows_after_policy_change = plan_acquisition_for_case(
+        attempts=[successful_attempt],
+        **kwargs,
+    )
+    assert len(rows_after_policy_change) == 1
+    assert rows_after_policy_change[0]["source_class"] == "deposited_sdrf"
     print("sdrf_evidence_acquisition_planner self-test: PASS")
 
 
