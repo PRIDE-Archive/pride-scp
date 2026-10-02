@@ -33,6 +33,15 @@ NO_PROGRESS_STATUSES = {
     "found_untrusted_community_annotation",
 }
 
+# This provider result describes the state of the queried source class itself,
+# not merely the current evidence bundle. Registering the untrusted community
+# source may change evidence_set_sha256, but that must not immediately replay
+# the same depositor-SDRF acquisition. A changed blocker, policy, or source
+# strategy still permits a fresh attempt.
+SOURCE_STATE_NO_PROGRESS_STATUSES = {
+    "found_untrusted_community_annotation",
+}
+
 
 @dataclass(frozen=True)
 class SourceStrategy:
@@ -160,6 +169,15 @@ def plan_acquisition_for_case(
     for strategy in sorted(strategies, key=lambda x: (x.priority, x.source_class)):
         if not strategy_supports(strategy, blocker_family, blocker_fields):
             continue
+        source_state_exhausted = any(
+            attempt.accession.upper() == accession.upper()
+            and attempt.source_class == strategy.source_class
+            and attempt.policy_version == policy_version
+            and attempt.status in SOURCE_STATE_NO_PROGRESS_STATUSES
+            for attempt in relevant_attempts
+        )
+        if source_state_exhausted:
+            continue
         skey = acquisition_stage_key(
             accession=accession,
             source_class=strategy.source_class,
@@ -250,8 +268,25 @@ def self_test() -> None:
         == []
     )
 
+    # Ordinary content-addressed no-progress work can be retried after the
+    # evidence identity changes.
     kwargs["evidence_set_sha256"] = "f" * 64
     assert len(plan_acquisition_for_case(attempts=[attempt], **kwargs)) == 1
+
+    # A community-only result is different: it describes the queried source
+    # class itself. Registering that untrusted source may change the evidence
+    # hash, but must not immediately replay the same depositor-SDRF lookup.
+    assert (
+        plan_acquisition_for_case(
+            attempts=[community_only_attempt],
+            **kwargs,
+        )
+        == []
+    )
+
+    # A policy change deliberately reopens the source-state decision.
+    kwargs["policy_version"] = "p2"
+    assert len(plan_acquisition_for_case(attempts=[community_only_attempt], **kwargs)) == 1
     print("sdrf_evidence_acquisition_planner self-test: PASS")
 
 
