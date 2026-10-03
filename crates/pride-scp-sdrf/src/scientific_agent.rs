@@ -8602,6 +8602,20 @@ fn enforce_deterministic_row_scaffold(
     if relation_mode != "one_cell_per_data_file" || !evidence.existing_sdrf_path.is_empty() {
         return issues;
     }
+    if evidence.study_design.repository_file_mode == "generic_archives_only" {
+        // A repository archive/container is not an acquisition unit. The
+        // de-novo archive skeleton has already preserved structural row fields
+        // as unresolved; do not re-populate them from the archive filename just
+        // because publication evidence supports one cell per actual acquisition.
+        issues.push(ValidationIssue {
+            level: "warning".into(),
+            code: "scientific_agent_generic_archive_row_scaffold_suppressed".into(),
+            row: 0,
+            column: "comment[data file]".into(),
+            message: "skipped one-cell-per-file structural row synthesis because the repository exposes only generic archive/container files; exact archive-contents mapping is required before assigning cell/fraction/technical-replicate identity".into(),
+        });
+        return issues;
+    }
     let header_index = headers
         .iter()
         .enumerate()
@@ -14469,8 +14483,36 @@ mod tests {
             single_cell_isolation_method: "manual picking".into(),
             ..Default::default()
         };
-        let (headers, rows, mode) = draft_rows(&proposal, &evidence).unwrap();
+        let (headers, mut rows, mode) = draft_rows(&proposal, &evidence).unwrap();
         assert_eq!(mode, "generated_archive_container_skeleton");
+
+        // Mirror the real compile_workspace sequence. The v1.3 harness uses
+        // row_role_hardened=false, which historically re-populated unresolved
+        // archive fields from the .rar filename after draft generation.
+        let scaffold_issues = enforce_deterministic_row_scaffold(
+            &headers,
+            &mut rows,
+            &evidence,
+            "one_cell_per_data_file",
+            false,
+        );
+        assert!(scaffold_issues.iter().any(|issue| {
+            issue.code == "scientific_agent_generic_archive_row_scaffold_suppressed"
+        }));
+
+        let idx = |name: &str| headers.iter().position(|h| h == name).unwrap();
+        assert_eq!(rows[0][idx("source name")], "run_0001");
+        assert_eq!(rows[0][idx("assay name")], "run_0001");
+        assert_eq!(rows[0][idx(SC_CELL_IDENTIFIER)], "not available");
+        assert_eq!(
+            rows[0][idx("comment[fraction identifier]")],
+            "not available"
+        );
+        assert_eq!(
+            rows[0][idx("comment[technical replicate]")],
+            "not available"
+        );
+        assert_eq!(rows[0][idx("comment[data file]")], "CELLREPORTSraw.rar");
 
         let issues = validate_scientific_workspace_rows(
             &headers,

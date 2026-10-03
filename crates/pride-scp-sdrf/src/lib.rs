@@ -7625,7 +7625,14 @@ fn draft_rows_with_explicit_mappings(
         } else {
             format!("run_{:04}", i + 1)
         };
-        let assay = stem.clone();
+        // A generic repository archive is a container, not a proven assay.
+        // Preserve its filename only in repository/file provenance fields until
+        // archive contents are mapped to canonical acquisitions.
+        let assay = if generic_archive_only {
+            source.clone()
+        } else {
+            stem.clone()
+        };
         let set = |row: &mut Vec<String>, name: &str, value: String| {
             if let Some(&j) = idx.get(name) {
                 row[j] = value;
@@ -12138,6 +12145,7 @@ mod tests {
 
         let idx = |name: &str| header_first_index(&headers, name).unwrap();
         assert_eq!(rows[0][idx("source name")], "run_0001");
+        assert_eq!(rows[0][idx("assay name")], "run_0001");
         assert_eq!(rows[0][idx(SC_CELL_IDENTIFIER)], "not available");
         assert_eq!(
             rows[0][idx("comment[fraction identifier]")],
