@@ -1,8 +1,9 @@
 use super::*;
 
-pub const SCIENTIFIC_AGENT_HARNESS_VERSION: &str = "pride-scp-scientific-workspace-agent-v1.4";
+pub const SCIENTIFIC_AGENT_HARNESS_VERSION: &str = "pride-scp-scientific-workspace-agent-v1.4.1";
 const SCIENTIFIC_AGENT_TASK_EVIDENCE_LIMIT: usize = 20;
 const SCIENTIFIC_AGENT_STUDY_STRUCTURE_EVIDENCE_CHECKPOINT: usize = 6;
+const SCIENTIFIC_AGENT_FIELD_NO_PROGRESS_EDIT_LIMIT: usize = 2;
 const SCIENTIFIC_AGENT_CONTEXT_READ_RADIUS: usize = 6000;
 #[derive(Debug, Clone)]
 pub struct SdrfScientificAgentOptions {
@@ -873,6 +874,10 @@ struct ScientificTask {
     search_blocked: bool,
     #[serde(default)]
     evidence_actions_since_edit: usize,
+    #[serde(default)]
+    material_edits: usize,
+    #[serde(default)]
+    consecutive_no_progress_edits: usize,
     attempts: usize,
     notes: String,
 }
@@ -1106,11 +1111,11 @@ fn scientific_agent_schema(
     });
     let study_structure_edit_command = json!({
         "type":"object",
-        "description":"Commit source-supported conceptual study branches for task:study_structure incrementally. Structural branch creation remains independent of downstream SDRF field canonicalization: this branch schema intentionally has no isolation-method field, and a later field-level template_gap or unresolved canonicalization does not block creation of a source-supported branch. Use structure_status=continue to persist safe partial structure and keep the task active for another bounded evidence cycle; use structure_status=complete when the conceptual branch model itself is sufficiently captured to advance. Exact RAW linkage, row projection, and downstream SDRF field canonicalization are not prerequisites for complete.",
+        "description":"Commit source-supported conceptual study branches for task:study_structure incrementally. Structural branch creation remains independent of downstream SDRF field canonicalization: this branch schema intentionally has no isolation-method field, and a later field-level template_gap or unresolved canonicalization does not block creation of a source-supported branch. The first material structure commit is persistence-only: Rust keeps task:study_structure active even if complete is requested, so the next structural decision can review the canonical persisted branch model. Later edits may use structure_status=continue to refine or structure_status=complete to advance. Exact RAW linkage, row projection, and downstream SDRF field canonicalization are not prerequisites for complete.",
         "properties":{
             "command":{"type":"string","enum":["edit_study_structure"]},
             "task_id":{"type":"string","enum":["task:study_structure"]},
-            "structure_status":{"type":"string","enum":["continue","complete"],"description":"continue persists a material source-grounded partial structure and keeps task:study_structure active; complete advances after the conceptual branch model itself is sufficiently captured. Unresolved exact RAW linkage is compatible with complete."},
+            "structure_status":{"type":"string","enum":["continue","complete"],"description":"The first material structure edit is always persisted as continue by Rust, even when complete is requested. After that canonical structure is visible, continue refines it and complete advances when every explicitly supported biological population/experimental arm is represented or retained as an unresolved conceptual question. Unresolved exact RAW linkage is compatible with complete."},
             "branch_upserts":{"type":"array","items":branch,"minItems":1,"maxItems":24},
             "open_question_additions":{"type":"array","items":{"type":"string","maxLength":500},"maxItems":24},
             "open_question_resolutions":{"type":"array","items":{"type":"string","maxLength":500},"maxItems":24},
@@ -1315,6 +1320,8 @@ fn build_scientific_tasks(
             decision_required: false,
             search_blocked: false,
             evidence_actions_since_edit: 0,
+            material_edits: 0,
+            consecutive_no_progress_edits: 0,
             attempts: 0,
             notes: String::new(),
         });
@@ -1349,6 +1356,8 @@ fn build_scientific_tasks(
                     decision_required: false,
                     search_blocked: false,
                     evidence_actions_since_edit: 0,
+                    material_edits: 0,
+                    consecutive_no_progress_edits: 0,
                     attempts: 0,
                     notes: String::new(),
                 })
@@ -1360,7 +1369,7 @@ fn build_scientific_tasks(
 fn task_is_terminal(task: &ScientificTask) -> bool {
     matches!(
         task.status.as_str(),
-        "resolved" | "human_review" | "repair_attempted" | "template_gap"
+        "resolved" | "human_review" | "repair_attempted" | "template_gap" | "evidence_exhausted"
     )
 }
 
@@ -1469,6 +1478,8 @@ fn load_readiness_tasks(
             decision_required: false,
             search_blocked: false,
             evidence_actions_since_edit: 0,
+            material_edits: 0,
+            consecutive_no_progress_edits: 0,
             attempts: 0,
             notes: String::new(),
         });
@@ -1665,7 +1676,7 @@ fn task_board_block(state: &ScientificWorkspaceState) -> String {
         .iter()
         .map(|task| {
             format!(
-                "- {} status={} source={} completion={} concept={} errors={} codes={:?} candidates={} reads={} decision_required={} search_blocked={} evidence_since_edit={} attempts={} objective={}",
+                "- {} status={} source={} completion={} concept={} errors={} codes={:?} candidates={} reads={} decision_required={} search_blocked={} evidence_since_edit={} material_edits={} no_progress_edits={} attempts={} objective={}",
                 task.id,
                 task.status,
                 task.task_source,
@@ -1678,6 +1689,8 @@ fn task_board_block(state: &ScientificWorkspaceState) -> String {
                 task.decision_required,
                 task.search_blocked,
                 task.evidence_actions_since_edit,
+                task.material_edits,
+                task.consecutive_no_progress_edits,
                 task.attempts,
                 task.objective
             )
@@ -1803,9 +1816,9 @@ fn scientific_agent_prompt(
         "edit_scientific_observation"
     };
     let edit_contract = if study_structure_active {
-        "edit_study_structure: commit one or more source-supported conceptual branches incrementally. Use structure_status='continue' to persist supported structure now while keeping task:study_structure active for another bounded evidence cycle. Use structure_status='complete' when the conceptual branch model itself is sufficiently captured to advance. The branch schema intentionally contains no isolation-method field because conceptual structure is independent of downstream SDRF field canonicalization. Exact RAW linkage is not required for either status: when the branch is supported but the sources do not explicitly map exact RAW basenames, use linked_raw_files=[] and linkage_status='unresolved'. Do NOT postpone a safe partial commit merely to chase linkage, donor, replicate, isolation-vocabulary, or row-projection details."
+        "edit_study_structure: commit one or more source-supported conceptual branches incrementally. FIRST COMMIT RULE: the first material structural edit is persistence-only; Rust will keep task:study_structure active even if you request structure_status='complete'. On the next structural decision, inspect the canonical persisted branch model and ensure every explicitly supported biological population or experimental arm is represented, or record an unresolved conceptual question when trusted evidence does not safely resolve it. Then use structure_status='continue' to refine or 'complete' to advance. The branch schema intentionally contains no isolation-method field because conceptual structure is independent of downstream SDRF field canonicalization. Exact RAW linkage is not required for either status: when the branch is supported but the sources do not explicitly map exact RAW basenames, use linked_raw_files=[] and linkage_status='unresolved'. Do NOT postpone a safe partial commit merely to chase linkage, donor, replicate, isolation-vocabulary, or row-projection details."
     } else {
-        "edit_scientific_observation: commit one or more source-faithful scientific observations for the active field task. A source explicitly naming or defining an isolation method/platform is sufficient as an observation even when deeper mechanical detail is absent; Rust decides canonical SDRF mapping/template-gap/unresolved."
+        "edit_scientific_observation: commit one or more source-faithful scientific observations for the active field task. A source explicitly naming or defining an isolation method/platform is sufficient as an observation even when deeper mechanical detail is absent; Rust decides canonical SDRF mapping/template-gap/unresolved. Do not repeatedly paraphrase the same source observation to chase a vocabulary match: Rust terminates a validator-backed field task fail-closed after two consecutive material edits leave the deterministic target-field values and validator error signature unchanged."
     };
     let escalation_command = if study_structure_active {
         "escalate_study_structure"
@@ -1840,11 +1853,13 @@ fn scientific_agent_prompt(
     format!(
         "You are the scientific workspace agent for PRIDE single-cell proteomics dataset {acc}.\n\n\
 Your environment behaves like a coding/research workspace. Rust owns persistent state, provenance, controlled-vocabulary canonicalization, task status, compilation, validation, trusted RAW linkage, and all safety gates. You inspect source evidence, build a study model, and record source-faithful scientific observations. Work ONE active task deeply before moving to another task.\n\n\
-SCIENTIFIC WORKSPACE AGENT CONTRACT (v1.4):\n\
+SCIENTIFIC WORKSPACE AGENT CONTRACT (v1.4.1):\n\
 - Return exactly ONE executable top-level command for this turn: read_evidence, search_evidence, {edit_command}, or {escalation_command}. Do not narrate a future tool action inside notes; if you need to read E####, the command itself must be read_evidence.\n\
 - Never request the same evidence ref twice. Rust records requested refs as read even when multiple refs resolve to the same materialized source window.\n\
 - After a successful read, Rust enters a decision step: do not keep reading by inertia. Commit a supported study/observation edit, search a genuinely different source/query, or use the task-specific escalation command.\n\
 CURRENT COMMAND POLICY: {read_policy}\n\
+- For task:study_structure, the first material structure commit is persistence-only and cannot finalize the task. On the next structural decision, inspect the canonical persisted branches and ensure every explicitly supported biological population or experimental arm is represented, or retain the unresolved conceptual question explicitly. A later complete edit may finalize immediately; another full evidence cycle is not required merely because a first commit occurred.\n\
+- FIELD NO-PROGRESS RULE: for validator-backed non-structure tasks, two consecutive material observation edits that leave the deterministic target SDRF field values and validator error signature unchanged terminate that field task fail-closed as evidence_exhausted. Preserve the source-faithful observation; do not keep paraphrasing it to chase a vocabulary match.\n\
 - task_id must exactly equal the ACTIVE TASK id. Rust derives task status and chooses when compilation/validation is useful. You do NOT request compile/finish or mark validator-backed tasks resolved.\n\
 - read_evidence: use when an existing promising E#### excerpt is insufficient. Rust reads a larger bounded window from only registered trusted sources and returns it on the next turn.\n\
 - search_evidence: use only when focused candidates plus already-read context do not answer the task. It searches registered/trusted publication, supplement, structured-design, repository metadata, exact-RAW-name, KG, or conflict-evidence sources only; it is NOT arbitrary web browsing.\n\
@@ -6723,6 +6738,86 @@ fn active_task_command_permissions(state: &ScientificWorkspaceState) -> (bool, b
     )
 }
 
+fn task_material_edits(state: &ScientificWorkspaceState, task_id: &str) -> usize {
+    state
+        .tasks
+        .iter()
+        .find(|task| task.id == task_id)
+        .map(|task| task.material_edits)
+        .unwrap_or(0)
+}
+
+fn field_task_outcome_fingerprint(compiled: &CompiledWorkspace, field: &str) -> String {
+    let header = field_existing_header(field).unwrap_or(field);
+    let values = compiled
+        .headers
+        .iter()
+        .position(|candidate| candidate == header)
+        .map(|idx| {
+            compiled
+                .rows
+                .iter()
+                .map(|row| row.get(idx).cloned().unwrap_or_default())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let validation = cluster_validator_repair_tasks(&compiled.issues)
+        .into_iter()
+        .find(|task| task.field == field)
+        .map(|task| {
+            json!({
+                "error_codes": task.error_codes,
+                "error_count": task.error_count,
+                "representative_rows": task.representative_rows,
+            })
+        })
+        .unwrap_or_else(|| json!({"error_codes": [], "error_count": 0, "representative_rows": []}));
+    serde_json::to_string(&json!({
+        "field": field,
+        "values": values,
+        "validation": validation,
+    }))
+    .unwrap_or_default()
+}
+
+fn record_field_edit_outcome(
+    state: &mut ScientificWorkspaceState,
+    task_id: &str,
+    unchanged: bool,
+) -> usize {
+    let Some(task) = state.tasks.iter_mut().find(|task| task.id == task_id) else {
+        return 0;
+    };
+    if task.concept_type == "study_structure" {
+        return 0;
+    }
+    if unchanged {
+        task.consecutive_no_progress_edits += 1;
+    } else {
+        task.consecutive_no_progress_edits = 0;
+    }
+    task.consecutive_no_progress_edits
+}
+
+fn mark_field_task_evidence_exhausted(
+    state: &mut ScientificWorkspaceState,
+    task_id: &str,
+    note: &str,
+) {
+    if let Some(task) = state.tasks.iter_mut().find(|task| task.id == task_id) {
+        task.status = "evidence_exhausted".into();
+        task.decision_required = false;
+        task.search_blocked = true;
+        if !note.trim().is_empty() {
+            task.notes = note.trim().to_string();
+        }
+    }
+    if state.active_task_id == task_id {
+        state.active_task_id.clear();
+    }
+    ensure_active_task(state);
+}
+
 fn canonical_branch_row_selector_field(value: &str) -> Option<&'static str> {
     match value.trim().to_ascii_lowercase().as_str() {
         "characteristics[organism]" => Some("characteristics[organism]"),
@@ -10228,8 +10323,12 @@ fn apply_edit_workspace_command(
     let publishable_edit = !branch_upserts.is_empty()
         || !observation_upserts.is_empty()
         || !observation_retractions.is_empty();
+    let first_structure_commit = task_id == "task:study_structure"
+        && publishable_edit
+        && task_material_edits(state, task_id) == 0;
     let structure_complete = task_id == "task:study_structure"
-        && structure_status == Some(StudyStructureEditStatus::Complete);
+        && structure_status == Some(StudyStructureEditStatus::Complete)
+        && !first_structure_commit;
     let delta = WorkspaceDelta {
         turn,
         task_id: task_id.to_string(),
@@ -10256,12 +10355,22 @@ fn apply_edit_workspace_command(
         notes: notes.to_string(),
     };
     let mut events = apply_workspace_delta(evidence, state, &delta, turn);
+    if publishable_edit {
+        if let Some(task) = state.tasks.iter_mut().find(|task| task.id == task_id) {
+            task.material_edits += 1;
+        }
+    }
+    if first_structure_commit && structure_status == Some(StudyStructureEditStatus::Complete) {
+        events.push(format!(
+            "turn {turn} Rust deferred the first requested task:study_structure completion: the source-grounded branches were persisted as an incremental commit so the next structural decision can review the canonical branch model before finalization"
+        ));
+    }
 
     if task_id == "task:study_structure" && publishable_edit {
         if let Some(task) = state.tasks.iter_mut().find(|task| task.id == task_id) {
             task.evidence_actions_since_edit = 0;
-            task.decision_required = false;
-            task.search_blocked = false;
+            task.decision_required = first_structure_commit;
+            task.search_blocked = first_structure_commit;
             if !notes.trim().is_empty() {
                 task.notes = notes.trim().to_string();
             }
@@ -10274,9 +10383,15 @@ fn apply_edit_workspace_command(
             ));
         } else {
             state.active_task_id = task_id.to_string();
-            events.push(format!(
-                "turn {turn} Rust persisted an incremental task:study_structure edit, reset the bounded evidence checkpoint, and kept conceptual structure active"
-            ));
+            if first_structure_commit {
+                events.push(format!(
+                    "turn {turn} Rust persisted the first task:study_structure edit and entered a canonical-structure review step: evidence gathering is temporarily closed so the next command must refine/finalize the persisted branches or use typed structural escalation"
+                ));
+            } else {
+                events.push(format!(
+                    "turn {turn} Rust persisted an incremental task:study_structure edit, reset the bounded evidence checkpoint, and kept conceptual structure active"
+                ));
+            }
         }
     }
     state.next_evidence_actions.clear();
@@ -10908,6 +11023,17 @@ async fn run_one_scientific_agent(
                     let edit = command
                         .workspace_edit_payload()
                         .expect("typed edit command must expose a workspace edit payload");
+                    let edited_field = state
+                        .tasks
+                        .iter()
+                        .find(|task| task.id == edit.task_id)
+                        .filter(|task| task.concept_type != "study_structure")
+                        .map(|task| task.sdrf_field.clone());
+                    let previous_field_outcome = edited_field.as_ref().and_then(|field| {
+                        compiled
+                            .as_ref()
+                            .map(|current| field_task_outcome_fingerprint(current, field))
+                    });
                     set_task_decision_required(&mut state, &edit.task_id, false);
                     set_task_search_blocked(&mut state, &edit.task_id, false);
                     let (reducer_events, publishable_edit) = apply_edit_workspace_command(
@@ -11013,6 +11139,49 @@ async fn run_one_scientific_agent(
                         &compiled_now.adjudications,
                     );
                     refresh_scientific_tasks(&evidence, &mut state, &compiled_now.issues);
+
+                    if let (Some(field), Some(previous)) =
+                        (edited_field.as_ref(), previous_field_outcome.as_ref())
+                    {
+                        let current = field_task_outcome_fingerprint(&compiled_now, field);
+                        let no_progress = record_field_edit_outcome(
+                            &mut state,
+                            &edit.task_id,
+                            previous == &current,
+                        );
+                        if no_progress >= SCIENTIFIC_AGENT_FIELD_NO_PROGRESS_EDIT_LIMIT {
+                            let note = format!(
+                                "two consecutive material edits left {} values and validator errors unchanged; source-faithful evidence was preserved and Rust closed this field task fail-closed instead of permitting further semantic paraphrase attempts",
+                                field
+                            );
+                            mark_field_task_evidence_exhausted(&mut state, &edit.task_id, &note);
+                            push_harness_feedback(
+                                &mut trace.harness_feedback,
+                                &mut pending_harness_feedback,
+                                format!(
+                                    "turn {turn} FIELD NO-PROGRESS GUARD: {note}. Do not retry the same field with another paraphrase."
+                                ),
+                            );
+                            let adjudications = compiled_now.adjudications.clone();
+                            compiled = Some(compiled_now);
+                            fs::write(
+                                workspace_dir.join("state.json"),
+                                serde_json::to_string_pretty(&state)?,
+                            )?;
+                            write_workspace_notebook(
+                                &workspace_dir,
+                                &evidence,
+                                &state,
+                                &adjudications,
+                                &trace.validation_history,
+                            )?;
+                            if state.active_task_id.is_empty() {
+                                trace.terminal_status = "evidence_exhausted".into();
+                                break;
+                            }
+                            continue;
+                        }
+                    }
 
                     if last_compile_fingerprint
                         .as_deref()
@@ -11163,7 +11332,7 @@ async fn run_one_scientific_agent(
         "branches": state.branches.clone(),
         "scientific_observations": state.claims.clone(),
         "observation_adjudications": final_adjudications.clone(),
-        // Backward-compatible aliases for existing audit tooling. v1.4 model
+        // Backward-compatible aliases for existing audit tooling. v1.4.1 model
         // commands and prompts use observation terminology exclusively.
         "claims": state.claims.clone(),
         "claim_adjudications": final_adjudications,
@@ -11230,7 +11399,7 @@ pub async fn run_scientific_sdrf_agent(
     }
     if !requested_mode.trim().is_empty() {
         bail!(
-            "unsupported PRIDE_SCP_SCIENTIFIC_AGENT_MODE='{}'; expected '{}', '{}', '{}', '{}', '{}', '{}', or '{}' or unset for the v1.4 workspace agent",
+            "unsupported PRIDE_SCP_SCIENTIFIC_AGENT_MODE='{}'; expected '{}', '{}', '{}', '{}', '{}', '{}', or '{}' or unset for the v1.4.1 workspace agent",
             requested_mode,
             SCIENTIFIC_AGENT_FACTOR_ROW_ROLE_HARDENED_MODE,
             SCIENTIFIC_AGENT_FACTOR_SEMANTIC_FIDELITY_HARDENED_MODE,
@@ -12223,7 +12392,7 @@ mod tests {
     }
 
     #[test]
-    fn study_structure_task_is_first_and_complete_edit_advances_after_material_edit() {
+    fn v141_first_complete_request_persists_then_second_complete_advances() {
         let evidence = evidence_with(
             vec![EvidenceItem {
                 id: "E0001".into(),
@@ -12249,7 +12418,7 @@ mod tests {
         ensure_active_task(&mut state);
         assert_eq!(state.active_task_id, "task:study_structure");
 
-        let (_events, publishable) = apply_edit_workspace_command(
+        let (first_events, first_publishable) = apply_edit_workspace_command(
             &evidence,
             &mut state,
             "task:study_structure",
@@ -12266,28 +12435,67 @@ mod tests {
             }],
             &[],
             &[],
+            &["Xenopus conceptual branch must be reviewed before final completion".into()],
             &[],
-            &[],
-            "source-grounded structure established",
+            "persist the first supported branch set",
             1,
         );
-        assert!(publishable);
-        refresh_scientific_tasks(&evidence, &mut state, &issues);
-        assert_eq!(
-            state
-                .tasks
-                .iter()
-                .find(|task| task.id == "task:study_structure")
-                .map(|task| task.status.as_str()),
-            Some("resolved")
+        assert!(first_publishable);
+        assert!(first_events
+            .iter()
+            .any(|event| event.contains("deferred the first requested")));
+        let structure = state
+            .tasks
+            .iter()
+            .find(|task| task.id == "task:study_structure")
+            .unwrap();
+        assert_eq!(structure.status, "investigating");
+        assert_eq!(structure.material_edits, 1);
+        assert!(structure.decision_required);
+        assert!(structure.search_blocked);
+        assert_eq!(state.active_task_id, "task:study_structure");
+
+        let (_second_events, second_publishable) = apply_edit_workspace_command(
+            &evidence,
+            &mut state,
+            "task:study_structure",
+            Some(StudyStructureEditStatus::Complete),
+            &[AgentBranch {
+                id: "xenopus".into(),
+                label: "Xenopus experimental system".into(),
+                status: "supported".into(),
+                evidence_refs: vec!["E0001".into()],
+                linked_raw_files: Vec::new(),
+                row_selectors: Vec::new(),
+                linkage_status: "unresolved".into(),
+                notes: "second supported conceptual branch".into(),
+            }],
+            &[],
+            &[],
+            &[],
+            &["Xenopus conceptual branch must be reviewed before final completion".into()],
+            "canonical structure reviewed and complete",
+            2,
         );
+        assert!(second_publishable);
+        refresh_scientific_tasks(&evidence, &mut state, &issues);
+        let structure = state
+            .tasks
+            .iter()
+            .find(|task| task.id == "task:study_structure")
+            .unwrap();
+        assert_eq!(structure.status, "resolved");
+        assert_eq!(structure.material_edits, 2);
         assert_eq!(state.active_task_id, "task:single_cell_isolation_method");
-        assert_eq!(state.branches.len(), 1);
-        assert!(state.branches[0].linked_raw_files.is_empty());
+        assert_eq!(state.branches.len(), 2);
+        assert!(state
+            .branches
+            .iter()
+            .all(|branch| branch.linked_raw_files.is_empty()));
     }
 
     #[test]
-    fn v14_structure_continue_edit_keeps_task_active_and_resets_checkpoint() {
+    fn v141_first_continue_persists_and_enters_review_lock() {
         let evidence = evidence_with(
             vec![EvidenceItem {
                 id: "E0001".into(),
@@ -12351,10 +12559,79 @@ mod tests {
             .unwrap();
         assert_eq!(task.status, "investigating");
         assert_eq!(task.evidence_actions_since_edit, 0);
-        assert!(!task.decision_required);
-        assert!(!task.search_blocked);
+        assert_eq!(task.material_edits, 1);
+        assert!(task.decision_required);
+        assert!(task.search_blocked);
+        assert_eq!(active_task_command_permissions(&state), (false, false));
         assert_eq!(state.active_task_id, "task:study_structure");
         assert_eq!(state.branches.len(), 1);
+    }
+
+    #[test]
+    fn v141_second_continue_reopens_bounded_evidence_cycle() {
+        let evidence = evidence_with(
+            vec![EvidenceItem {
+                id: "E0001".into(),
+                source_kind: "manuscript_semantic_evidence".into(),
+                source_label: "stage04_semantic".into(),
+                text: "HeLa cells and Xenopus oocytes were distinct experimental systems".into(),
+            }],
+            vec!["runA.raw"],
+        );
+        let issues = vec![ValidationIssue {
+            level: "error".into(),
+            code: "single_cell_isolation_unresolved".into(),
+            row: 1,
+            column: SC_ISOLATION_METHOD.into(),
+            message: "missing isolation method".into(),
+        }];
+        let mut state = ScientificWorkspaceState {
+            tasks: build_scientific_tasks(&evidence, &issues),
+            ..Default::default()
+        };
+        ensure_active_task(&mut state);
+
+        for (turn, id, label) in [
+            (1, "hela", "HeLa experimental system"),
+            (2, "xenopus", "Xenopus experimental system"),
+        ] {
+            let (_events, publishable) = apply_edit_workspace_command(
+                &evidence,
+                &mut state,
+                "task:study_structure",
+                Some(StudyStructureEditStatus::Continue),
+                &[AgentBranch {
+                    id: id.into(),
+                    label: label.into(),
+                    status: "supported".into(),
+                    evidence_refs: vec!["E0001".into()],
+                    linked_raw_files: Vec::new(),
+                    row_selectors: Vec::new(),
+                    linkage_status: "unresolved".into(),
+                    notes: "source-supported conceptual branch".into(),
+                }],
+                &[],
+                &[],
+                &[],
+                &[],
+                "refine canonical conceptual structure",
+                turn,
+            );
+            assert!(publishable);
+        }
+
+        let task = state
+            .tasks
+            .iter()
+            .find(|task| task.id == "task:study_structure")
+            .unwrap();
+        assert_eq!(task.material_edits, 2);
+        assert_eq!(task.evidence_actions_since_edit, 0);
+        assert!(!task.decision_required);
+        assert!(!task.search_blocked);
+        assert_eq!(active_task_command_permissions(&state), (true, true));
+        assert_eq!(state.active_task_id, "task:study_structure");
+        assert_eq!(state.branches.len(), 2);
     }
 
     #[test]
@@ -12455,6 +12732,109 @@ mod tests {
             .unwrap();
         assert_eq!(field.evidence_actions_since_edit, 0);
         assert!(!field.search_blocked);
+    }
+
+    #[test]
+    fn v141_field_outcome_fingerprint_ignores_claim_paraphrase_when_rows_and_errors_do_not_change()
+    {
+        let headers = vec![SC_ISOLATION_METHOD.to_string()];
+        let rows = vec![vec!["not available".into()]];
+        let issues = vec![ValidationIssue {
+            level: "error".into(),
+            code: "single_cell_isolation_unresolved".into(),
+            row: 1,
+            column: SC_ISOLATION_METHOD.into(),
+            message: "missing isolation method".into(),
+        }];
+        let first = CompiledWorkspace {
+            proposal: SdrfProposal {
+                single_cell_isolation_method: "mechanical dissection".into(),
+                ..Default::default()
+            },
+            headers: headers.clone(),
+            rows: rows.clone(),
+            generation_mode: "test".into(),
+            issues: issues.clone(),
+            deterministic_repairs: Vec::new(),
+            adjudications: Vec::new(),
+            fingerprint: "proposal-a".into(),
+        };
+        let second = CompiledWorkspace {
+            proposal: SdrfProposal {
+                single_cell_isolation_method: "manual dissection".into(),
+                ..Default::default()
+            },
+            headers,
+            rows,
+            generation_mode: "test".into(),
+            issues,
+            deterministic_repairs: Vec::new(),
+            adjudications: Vec::new(),
+            fingerprint: "proposal-b".into(),
+        };
+        assert_ne!(first.fingerprint, second.fingerprint);
+        assert_eq!(
+            field_task_outcome_fingerprint(&first, "single_cell_isolation_method"),
+            field_task_outcome_fingerprint(&second, "single_cell_isolation_method")
+        );
+    }
+
+    #[test]
+    fn v141_field_no_progress_guard_closes_after_two_unchanged_material_edits() {
+        let mut state = ScientificWorkspaceState {
+            tasks: vec![ScientificTask {
+                id: "task:single_cell_isolation_method".into(),
+                concept_type: "isolation_method".into(),
+                sdrf_field: "single_cell_isolation_method".into(),
+                status: "investigating".into(),
+                error_count: 176,
+                ..Default::default()
+            }],
+            active_task_id: "task:single_cell_isolation_method".into(),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            record_field_edit_outcome(&mut state, "task:single_cell_isolation_method", true),
+            1
+        );
+        assert_eq!(
+            record_field_edit_outcome(&mut state, "task:single_cell_isolation_method", true),
+            SCIENTIFIC_AGENT_FIELD_NO_PROGRESS_EDIT_LIMIT
+        );
+        mark_field_task_evidence_exhausted(
+            &mut state,
+            "task:single_cell_isolation_method",
+            "deterministic field outcome unchanged",
+        );
+        let task = &state.tasks[0];
+        assert_eq!(task.status, "evidence_exhausted");
+        assert_eq!(task.error_count, 176);
+        assert_eq!(task.consecutive_no_progress_edits, 2);
+        assert!(state.active_task_id.is_empty());
+    }
+
+    #[test]
+    fn v141_field_progress_resets_no_progress_counter() {
+        let mut state = ScientificWorkspaceState {
+            tasks: vec![ScientificTask {
+                id: "task:single_cell_isolation_method".into(),
+                concept_type: "isolation_method".into(),
+                sdrf_field: "single_cell_isolation_method".into(),
+                status: "investigating".into(),
+                error_count: 4,
+                consecutive_no_progress_edits: 1,
+                ..Default::default()
+            }],
+            active_task_id: "task:single_cell_isolation_method".into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            record_field_edit_outcome(&mut state, "task:single_cell_isolation_method", false),
+            0
+        );
+        assert_eq!(state.tasks[0].consecutive_no_progress_edits, 0);
+        assert_eq!(state.tasks[0].status, "investigating");
     }
 
     #[test]
