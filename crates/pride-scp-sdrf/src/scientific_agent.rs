@@ -1,6 +1,6 @@
 use super::*;
 
-pub const SCIENTIFIC_AGENT_HARNESS_VERSION: &str = "pride-scp-scientific-workspace-agent-v1.4.1";
+pub const SCIENTIFIC_AGENT_HARNESS_VERSION: &str = "pride-scp-scientific-workspace-agent-v1.4.2";
 const SCIENTIFIC_AGENT_TASK_EVIDENCE_LIMIT: usize = 20;
 const SCIENTIFIC_AGENT_STUDY_STRUCTURE_EVIDENCE_CHECKPOINT: usize = 6;
 const SCIENTIFIC_AGENT_FIELD_NO_PROGRESS_EDIT_LIMIT: usize = 2;
@@ -720,7 +720,7 @@ struct FactorPhaseBAcceptance {
     model_calls: usize,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 enum StudyStructureEscalationBlocker {
     ConceptualBranchExistenceUnresolved,
@@ -878,6 +878,8 @@ struct ScientificTask {
     material_edits: usize,
     #[serde(default)]
     consecutive_no_progress_edits: usize,
+    #[serde(default)]
+    structural_escalation_deferrals: usize,
     attempts: usize,
     notes: String,
 }
@@ -1141,11 +1143,11 @@ fn scientific_agent_schema(
     });
     let study_structure_escalate_command = json!({
         "type":"object",
-        "description":"Escalate task:study_structure only when trusted evidence leaves the conceptual branch model itself unresolved or directly conflicting. This command is NOT for unresolved exact RAW linkage, filename-to-branch mapping, row selectors, exact SDRF row projection, downstream validator errors, isolation-method vocabulary/canonicalization/template gaps, or inability to populate branch-specific SDRF fields. If conceptual branch identities are supported but linkage/projection is unresolved, use edit_study_structure with linked_raw_files=[] and linkage_status='unresolved' and leave row_selectors=[] when no safe source-grounded selector exists.",
+        "description":"Escalate task:study_structure only when no minimum source-grounded conceptual branch model can be safely stated, or when trusted evidence directly conflicts about that minimum model. This command is NOT for unresolved exact RAW linkage, filename-to-branch mapping, row selectors, exact SDRF row projection, sample/channel mapping, downstream validator errors, isolation-method vocabulary/canonicalization/template gaps, post-acquisition subgroup classifications, or uncertainty about whether a supported secondary classification should become a finer branch. If a minimum branch model is supported, persist it with unresolved linkage and record finer unresolved granularity as an open question instead of escalating the whole study.",
         "properties":{
             "command":{"type":"string","enum":["escalate_study_structure"]},
             "task_id":{"type":"string","enum":["task:study_structure"]},
-            "blocker":{"type":"string","enum":["conceptual_branch_existence_unresolved","conceptual_branch_identity_unresolved","conflicting_conceptual_branch_evidence"],"description":"The unresolved conceptual-structure blocker. No RAW-linkage, row-projection, validator, or downstream field blocker is valid here."},
+            "blocker":{"type":"string","enum":["conceptual_branch_existence_unresolved","conceptual_branch_identity_unresolved","conflicting_conceptual_branch_evidence"],"description":"The unresolved minimum conceptual-structure blocker. existence/identity blockers are valid only when no minimum source-grounded branch model can be stated; finer subgroup granularity and linkage/projection uncertainty are not valid whole-study blockers. conflicting_conceptual_branch_evidence is reserved for direct evidence conflict that may invalidate the minimum branch model."},
             "evidence_refs":{"type":"array","items":{"type":"string","pattern":"^E[0-9]{4}$"},"minItems":1,"maxItems":8,"uniqueItems":true,"description":"Trusted evidence refs that demonstrate the conceptual ambiguity or conflict."},
             "reason":{"type":"string","maxLength":1000}
         },
@@ -1310,7 +1312,7 @@ fn build_scientific_tasks(
             error_count: 1,
             representative_rows: Vec::new(),
             representative_messages: Vec::new(),
-            objective: "Establish a source-grounded study model before field repair: biological/experimental branches, acquisition cardinality, field scope, and only source-supported RAW linkage. Preserve unresolved linkage rather than infer biological identity from filenames. Structural branch creation is independent of downstream SDRF field canonicalization: do not wait for isolation-method vocabulary resolution, and do not treat a field-level template_gap as structural ambiguity. Human review is only for conceptual study structure that cannot itself be established safely from trusted evidence.".into(),
+            objective: "Establish a source-grounded study model before field repair: biological/experimental branches, acquisition cardinality, field scope, and only source-supported RAW linkage. Preserve unresolved linkage rather than infer biological identity from filenames. Always preserve the minimum safe conceptual branch model when trusted evidence supports one; unresolved exact linkage, row projection, sample/channel mapping, or finer secondary/post-acquisition subgroup granularity belongs in open questions and does not invalidate supported primary branches. Structural branch creation is independent of downstream SDRF field canonicalization: do not wait for isolation-method vocabulary resolution, and do not treat a field-level template_gap as structural ambiguity. Human review is only for conceptual study structure that cannot itself be established safely. This means no minimum source-grounded branch model can be stated without unsupported inference, or trusted evidence for that minimum model directly conflicts.".into(),
             evidence_candidates: task_evidence_candidates(
                 evidence,
                 "study_structure",
@@ -1322,6 +1324,7 @@ fn build_scientific_tasks(
             evidence_actions_since_edit: 0,
             material_edits: 0,
             consecutive_no_progress_edits: 0,
+            structural_escalation_deferrals: 0,
             attempts: 0,
             notes: String::new(),
         });
@@ -1358,6 +1361,7 @@ fn build_scientific_tasks(
                     evidence_actions_since_edit: 0,
                     material_edits: 0,
                     consecutive_no_progress_edits: 0,
+                    structural_escalation_deferrals: 0,
                     attempts: 0,
                     notes: String::new(),
                 })
@@ -1480,6 +1484,7 @@ fn load_readiness_tasks(
             evidence_actions_since_edit: 0,
             material_edits: 0,
             consecutive_no_progress_edits: 0,
+            structural_escalation_deferrals: 0,
             attempts: 0,
             notes: String::new(),
         });
@@ -1676,7 +1681,7 @@ fn task_board_block(state: &ScientificWorkspaceState) -> String {
         .iter()
         .map(|task| {
             format!(
-                "- {} status={} source={} completion={} concept={} errors={} codes={:?} candidates={} reads={} decision_required={} search_blocked={} evidence_since_edit={} material_edits={} no_progress_edits={} attempts={} objective={}",
+                "- {} status={} source={} completion={} concept={} errors={} codes={:?} candidates={} reads={} decision_required={} search_blocked={} evidence_since_edit={} material_edits={} no_progress_edits={} structure_escalation_deferrals={} attempts={} objective={}",
                 task.id,
                 task.status,
                 task.task_source,
@@ -1691,6 +1696,7 @@ fn task_board_block(state: &ScientificWorkspaceState) -> String {
                 task.evidence_actions_since_edit,
                 task.material_edits,
                 task.consecutive_no_progress_edits,
+                task.structural_escalation_deferrals,
                 task.attempts,
                 task.objective
             )
@@ -1826,7 +1832,7 @@ fn scientific_agent_prompt(
         "escalate"
     };
     let escalation_contract = if study_structure_active {
-        "escalate_study_structure: use only when the conceptual branch model itself remains unresolved or directly conflicting after trusted evidence review. Select one typed conceptual blocker and cite the evidence demonstrating that ambiguity/conflict. RAW linkage, filename mapping, row projection, validator errors, and downstream field canonicalization are not valid structural escalation blockers."
+        "escalate_study_structure: use only when the conceptual branch model itself remains unresolved or directly conflicting. In v1.4.2 this means use it only when NO MINIMUM source-grounded conceptual branch model can be safely stated, or when trusted evidence directly conflicts about that minimum model. RAW linkage, filename mapping, row projection, validator errors, and downstream field canonicalization are not valid structural escalation blockers. If primary branches are supported but exact RAW linkage, row projection, sample/channel mapping, or finer secondary/post-acquisition subgroup granularity remains unresolved, persist/complete the minimum branches and add the finer ambiguity as an open question instead of escalating. Rust will defer one premature non-conflict escalation before the first safe branch commit, and will preserve already-supported branches rather than discard them for secondary ambiguity."
     } else {
         "escalate: use only after relevant focused evidence/context and reasonable trusted search are exhausted or the field-level judgment truly requires human review."
     };
@@ -1853,12 +1859,12 @@ fn scientific_agent_prompt(
     format!(
         "You are the scientific workspace agent for PRIDE single-cell proteomics dataset {acc}.\n\n\
 Your environment behaves like a coding/research workspace. Rust owns persistent state, provenance, controlled-vocabulary canonicalization, task status, compilation, validation, trusted RAW linkage, and all safety gates. You inspect source evidence, build a study model, and record source-faithful scientific observations. Work ONE active task deeply before moving to another task.\n\n\
-SCIENTIFIC WORKSPACE AGENT CONTRACT (v1.4.1):\n\
+SCIENTIFIC WORKSPACE AGENT CONTRACT (v1.4.2):\n\
 - Return exactly ONE executable top-level command for this turn: read_evidence, search_evidence, {edit_command}, or {escalation_command}. Do not narrate a future tool action inside notes; if you need to read E####, the command itself must be read_evidence.\n\
 - Never request the same evidence ref twice. Rust records requested refs as read even when multiple refs resolve to the same materialized source window.\n\
 - After a successful read, Rust enters a decision step: do not keep reading by inertia. Commit a supported study/observation edit, search a genuinely different source/query, or use the task-specific escalation command.\n\
 CURRENT COMMAND POLICY: {read_policy}\n\
-- For task:study_structure, the first material structure commit is persistence-only and cannot finalize the task. On the next structural decision, inspect the canonical persisted branches and ensure every explicitly supported biological population or experimental arm is represented, or retain the unresolved conceptual question explicitly. A later complete edit may finalize immediately; another full evidence cycle is not required merely because a first commit occurred.\n\
+- For task:study_structure, preserve the MINIMUM SAFE conceptual branch model first. The first material structure commit is persistence-only and cannot finalize the task. On the next structural decision, inspect the canonical persisted branches and ensure every explicitly supported primary biological population or experimental arm is represented. Exact RAW linkage, row projection, sample/channel mapping, and uncertainty about finer secondary or post-acquisition subgroup granularity do not invalidate a safe primary branch model; record those finer uncertainties as open questions. A later complete edit may finalize immediately; another full evidence cycle is not required merely because a first commit occurred.\n\
 - FIELD NO-PROGRESS RULE: for validator-backed non-structure tasks, two consecutive material observation edits that leave the deterministic target SDRF field values and validator error signature unchanged terminate that field task fail-closed as evidence_exhausted. Preserve the source-faithful observation; do not keep paraphrasing it to chase a vocabulary match.\n\
 - task_id must exactly equal the ACTIVE TASK id. Rust derives task status and chooses when compilation/validation is useful. You do NOT request compile/finish or mark validator-backed tasks resolved.\n\
 - read_evidence: use when an existing promising E#### excerpt is insufficient. Rust reads a larger bounded window from only registered trusted sources and returns it on the next turn.\n\
@@ -1872,7 +1878,7 @@ SCIENTIFIC OBSERVATION -> RUST CANONICALIZATION CONTRACT:\n\
 - Stable observation identity is (concept_type, scope, branch_id). Same evidence-compatible meaning merges. If you intentionally replace a genuinely different prior observation, set supersedes_observed_value exactly to the old observed_value.\n\
 - A branch existing does NOT automatically make every observation branch-scoped. Use project scope only when the trusted source supports one invariant value across all relevant study material and no heterogeneous branch evidence contradicts it. Use branch scope when the method/biology actually differs by branch. Rust masks unsafe project broadcasts whenever heterogeneous branch evidence exists.\n\n\
 STUDY-STRUCTURE CONTRACT:\n\
-- task:study_structure comes first. Establish source-grounded biological/experimental branches, acquisition cardinality, and scope before field repair. Commit supported conceptual structure incrementally: structure_status='continue' persists a safe partial structure and opens another bounded evidence cycle; structure_status='complete' advances when the conceptual branch model itself is sufficiently captured. Conceptual branches may be supported while linked_raw_files remains empty and linkage_status is unresolved; unresolved RAW linkage is NOT a reason to avoid creating or completing the conceptual branch model.\n\
+- task:study_structure comes first. Establish source-grounded biological/experimental branches, acquisition cardinality, and scope before field repair. Commit supported conceptual structure incrementally: structure_status='continue' persists a safe partial structure and opens another bounded evidence cycle; structure_status='complete' advances when the MINIMUM SAFE conceptual branch model itself is sufficiently captured. A supported primary branch model remains valid even when finer subgroup granularity is unresolved. Conceptual branches may be supported while linked_raw_files remains empty and linkage_status is unresolved; unresolved RAW linkage is NOT a reason to avoid creating or completing the conceptual branch model.\n\
 - Rust enforces a bounded evidence checkpoint for task:study_structure. After six evidence commands since the last material structure edit, another search is blocked. If the final search surfaced unread evidence, one final read may remain available; after that you MUST either commit source-supported structure with edit_study_structure or use typed structural escalation. A material structure_status='continue' edit resets this checkpoint.\n\
 - HARD RULE: a field-level template_gap is NOT structural ambiguity and is NOT a reason for human_review when trusted evidence establishes the conceptual branch. The branch schema intentionally contains no isolation-method field; do not wait for downstream isolation vocabulary or other SDRF field canonicalization before calling edit_study_structure. Rust preserves downstream template gaps separately.\n\
 - linked_raw_files require trusted source evidence explicitly linking exact RAW basenames. Filename words are search hints/contradiction detectors, never biological identity.\n\
@@ -6747,6 +6753,98 @@ fn task_material_edits(state: &ScientificWorkspaceState, task_id: &str) -> usize
         .unwrap_or(0)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StudyStructureEscalationDisposition {
+    DeferBeforeFirstCommit,
+    CompleteMinimumSafeStructure,
+    HumanReview,
+}
+
+fn study_structure_escalation_disposition(
+    state: &ScientificWorkspaceState,
+    task_id: &str,
+    blocker: StudyStructureEscalationBlocker,
+) -> StudyStructureEscalationDisposition {
+    if blocker == StudyStructureEscalationBlocker::ConflictingConceptualBranchEvidence {
+        return StudyStructureEscalationDisposition::HumanReview;
+    }
+    if state
+        .branches
+        .iter()
+        .any(|branch| branch.status == "supported")
+    {
+        return StudyStructureEscalationDisposition::CompleteMinimumSafeStructure;
+    }
+    let Some(task) = state.tasks.iter().find(|task| task.id == task_id) else {
+        return StudyStructureEscalationDisposition::HumanReview;
+    };
+    if task.concept_type == "study_structure"
+        && task.material_edits == 0
+        && task.structural_escalation_deferrals == 0
+    {
+        StudyStructureEscalationDisposition::DeferBeforeFirstCommit
+    } else {
+        StudyStructureEscalationDisposition::HumanReview
+    }
+}
+
+fn defer_first_study_structure_escalation(
+    state: &mut ScientificWorkspaceState,
+    task_id: &str,
+    note: &str,
+) {
+    if let Some(task) = state.tasks.iter_mut().find(|task| task.id == task_id) {
+        task.attempts += 1;
+        task.structural_escalation_deferrals += 1;
+        task.status = "investigating".into();
+        task.decision_required = true;
+        task.search_blocked = true;
+        if !note.trim().is_empty() {
+            task.notes = note.trim().to_string();
+        }
+    }
+    state.active_task_id = task_id.to_string();
+}
+
+fn minimum_safe_structure_open_question(reason: &str) -> String {
+    let detail = reason.trim().chars().take(420).collect::<String>();
+    if detail.is_empty() {
+        "Secondary study-structure granularity remains unresolved after preserving the minimum source-grounded branch model.".into()
+    } else {
+        format!(
+            "Secondary study-structure granularity remains unresolved after preserving the minimum source-grounded branch model: {detail}"
+        )
+    }
+}
+
+fn complete_minimum_safe_study_structure(
+    state: &mut ScientificWorkspaceState,
+    task_id: &str,
+    reason: &str,
+) {
+    let question = minimum_safe_structure_open_question(reason);
+    if !state
+        .open_questions
+        .iter()
+        .any(|existing| existing == &question)
+    {
+        state.open_questions.push(question);
+        state.open_questions.sort();
+        state.open_questions.dedup();
+    }
+    if let Some(task) = state.tasks.iter_mut().find(|task| task.id == task_id) {
+        task.attempts += 1;
+        task.status = "resolved".into();
+        task.decision_required = false;
+        task.search_blocked = false;
+        if !reason.trim().is_empty() {
+            task.notes = reason.trim().to_string();
+        }
+    }
+    state.active_task_id.clear();
+    ensure_active_task(state);
+}
+
 fn field_task_outcome_fingerprint(compiled: &CompiledWorkspace, field: &str) -> String {
     let header = field_existing_header(field).unwrap_or(field);
     let values = compiled
@@ -10369,6 +10467,7 @@ fn apply_edit_workspace_command(
     if task_id == "task:study_structure" && publishable_edit {
         if let Some(task) = state.tasks.iter_mut().find(|task| task.id == task_id) {
             task.evidence_actions_since_edit = 0;
+            task.structural_escalation_deferrals = 0;
             task.decision_required = first_structure_commit;
             task.search_blocked = first_structure_commit;
             if !notes.trim().is_empty() {
@@ -10929,9 +11028,9 @@ async fn run_one_scientific_agent(
                 }
                 AgentCommand::EscalateStudyStructure {
                     task_id,
+                    blocker,
                     evidence_refs,
                     reason,
-                    ..
                 } => {
                     let valid_refs = valid_evidence_refs(&evidence, evidence_refs);
                     if valid_refs.len() != evidence_refs.len() {
@@ -10945,8 +11044,32 @@ async fn run_one_scientific_agent(
                         trace.states.push(state.clone());
                         continue;
                     }
-                    record_non_edit_task_attempt(&mut state, task_id, reason);
-                    mark_active_task_human_review(&mut state, reason);
+                    match study_structure_escalation_disposition(&state, task_id, *blocker) {
+                        StudyStructureEscalationDisposition::DeferBeforeFirstCommit => {
+                            defer_first_study_structure_escalation(&mut state, task_id, reason);
+                            push_harness_feedback(
+                                &mut trace.harness_feedback,
+                                &mut pending_harness_feedback,
+                                format!(
+                                    "turn {turn} STRUCTURE ESCALATION DEFERRED: before escalating conceptual existence/identity, persist any source-supported minimum conceptual branches with edit_study_structure. Exact RAW linkage, row projection, sample/channel mapping, and uncertain finer subgroup granularity are not blockers. If no minimum safe branch model can be stated after reviewing this instruction, reissue the typed escalation; a repeated unresolved escalation may then enter human review."
+                                ),
+                            );
+                        }
+                        StudyStructureEscalationDisposition::CompleteMinimumSafeStructure => {
+                            complete_minimum_safe_study_structure(&mut state, task_id, reason);
+                            push_harness_feedback(
+                                &mut trace.harness_feedback,
+                                &mut pending_harness_feedback,
+                                format!(
+                                    "turn {turn} MINIMUM-SAFE STRUCTURE PRESERVED: supported conceptual branches already exist, so a non-conflict structural escalation cannot discard them. Rust recorded the finer unresolved granularity as an open question, marked task:study_structure complete, and advanced while leaving exact linkage/projection unresolved."
+                                ),
+                            );
+                        }
+                        StudyStructureEscalationDisposition::HumanReview => {
+                            record_non_edit_task_attempt(&mut state, task_id, reason);
+                            mark_active_task_human_review(&mut state, reason);
+                        }
+                    }
                     let adjudications = record_adjudication_snapshot(
                         &mut trace,
                         &evidence,
@@ -10970,15 +11093,16 @@ async fn run_one_scientific_agent(
                         &adjudications,
                         &trace.validation_history,
                     )?;
-                    if state.active_task_id.is_empty() {
+                    if state
+                        .tasks
+                        .iter()
+                        .find(|task| task.id.as_str() == task_id.as_str())
+                        .is_some_and(|task| task.status == "human_review")
+                        && state.active_task_id.is_empty()
+                    {
                         trace.terminal_status = "human_review".into();
                         break;
                     }
-                    push_harness_feedback(
-                        &mut trace.harness_feedback,
-                        &mut pending_harness_feedback,
-                        "previous structural task escalated to human review; Rust advanced to the next scientific task".into(),
-                    );
                     continue;
                 }
                 AgentCommand::Escalate { task_id, reason } => {
@@ -11332,7 +11456,7 @@ async fn run_one_scientific_agent(
         "branches": state.branches.clone(),
         "scientific_observations": state.claims.clone(),
         "observation_adjudications": final_adjudications.clone(),
-        // Backward-compatible aliases for existing audit tooling. v1.4.1 model
+        // Backward-compatible aliases for existing audit tooling. v1.4.2 model
         // commands and prompts use observation terminology exclusively.
         "claims": state.claims.clone(),
         "claim_adjudications": final_adjudications,
@@ -11399,7 +11523,7 @@ pub async fn run_scientific_sdrf_agent(
     }
     if !requested_mode.trim().is_empty() {
         bail!(
-            "unsupported PRIDE_SCP_SCIENTIFIC_AGENT_MODE='{}'; expected '{}', '{}', '{}', '{}', '{}', '{}', or '{}' or unset for the v1.4.1 workspace agent",
+            "unsupported PRIDE_SCP_SCIENTIFIC_AGENT_MODE='{}'; expected '{}', '{}', '{}', '{}', '{}', '{}', or '{}' or unset for the v1.4.2 workspace agent",
             requested_mode,
             SCIENTIFIC_AGENT_FACTOR_ROW_ROLE_HARDENED_MODE,
             SCIENTIFIC_AGENT_FACTOR_SEMANTIC_FIDELITY_HARDENED_MODE,
@@ -13004,6 +13128,209 @@ mod tests {
         assert!(prompt.contains(
             "RAW linkage, filename mapping, row projection, validator errors, and downstream field canonicalization are not valid structural escalation blockers"
         ));
+    }
+
+    #[test]
+    fn v142_nonconflict_precommit_escalation_is_deferred_once() {
+        let mut state = ScientificWorkspaceState {
+            tasks: vec![ScientificTask {
+                id: "task:study_structure".into(),
+                concept_type: "study_structure".into(),
+                sdrf_field: "study_structure".into(),
+                status: "investigating".into(),
+                ..Default::default()
+            }],
+            active_task_id: "task:study_structure".into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            study_structure_escalation_disposition(
+                &state,
+                "task:study_structure",
+                StudyStructureEscalationBlocker::ConceptualBranchIdentityUnresolved,
+            ),
+            StudyStructureEscalationDisposition::DeferBeforeFirstCommit
+        );
+        defer_first_study_structure_escalation(
+            &mut state,
+            "task:study_structure",
+            "secondary granularity is unclear",
+        );
+        let task = &state.tasks[0];
+        assert_eq!(task.status, "investigating");
+        assert_eq!(task.structural_escalation_deferrals, 1);
+        assert!(task.decision_required);
+        assert!(task.search_blocked);
+        assert_eq!(state.active_task_id, "task:study_structure");
+    }
+
+    #[test]
+    fn v142_repeated_precommit_nonconflict_escalation_can_reach_human_review() {
+        let state = ScientificWorkspaceState {
+            tasks: vec![ScientificTask {
+                id: "task:study_structure".into(),
+                concept_type: "study_structure".into(),
+                sdrf_field: "study_structure".into(),
+                status: "investigating".into(),
+                structural_escalation_deferrals: 1,
+                ..Default::default()
+            }],
+            active_task_id: "task:study_structure".into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            study_structure_escalation_disposition(
+                &state,
+                "task:study_structure",
+                StudyStructureEscalationBlocker::ConceptualBranchExistenceUnresolved,
+            ),
+            StudyStructureEscalationDisposition::HumanReview
+        );
+    }
+
+    #[test]
+    fn v142_conflicting_structure_evidence_still_escalates_immediately() {
+        let state = ScientificWorkspaceState {
+            tasks: vec![ScientificTask {
+                id: "task:study_structure".into(),
+                concept_type: "study_structure".into(),
+                sdrf_field: "study_structure".into(),
+                status: "investigating".into(),
+                ..Default::default()
+            }],
+            active_task_id: "task:study_structure".into(),
+            branches: vec![AgentBranch {
+                id: "branch_a".into(),
+                label: "Branch A".into(),
+                status: "supported".into(),
+                evidence_refs: vec!["E0001".into()],
+                linkage_status: "unresolved".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        assert_eq!(
+            study_structure_escalation_disposition(
+                &state,
+                "task:study_structure",
+                StudyStructureEscalationBlocker::ConflictingConceptualBranchEvidence,
+            ),
+            StudyStructureEscalationDisposition::HumanReview
+        );
+    }
+
+    #[test]
+    fn v142_supported_minimum_structure_converts_secondary_escalation_to_open_question() {
+        let mut state = ScientificWorkspaceState {
+            tasks: vec![ScientificTask {
+                id: "task:study_structure".into(),
+                concept_type: "study_structure".into(),
+                sdrf_field: "study_structure".into(),
+                status: "investigating".into(),
+                material_edits: 1,
+                ..Default::default()
+            }],
+            active_task_id: "task:study_structure".into(),
+            branches: vec![AgentBranch {
+                id: "branch_primary".into(),
+                label: "Primary source-grounded arm".into(),
+                status: "supported".into(),
+                evidence_refs: vec!["E0001".into()],
+                linkage_status: "unresolved".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        assert_eq!(
+            study_structure_escalation_disposition(
+                &state,
+                "task:study_structure",
+                StudyStructureEscalationBlocker::ConceptualBranchIdentityUnresolved,
+            ),
+            StudyStructureEscalationDisposition::CompleteMinimumSafeStructure
+        );
+        complete_minimum_safe_study_structure(
+            &mut state,
+            "task:study_structure",
+            "finer post-acquisition subgroups cannot be projected safely",
+        );
+        assert_eq!(state.tasks[0].status, "resolved");
+        assert_eq!(state.branches.len(), 1);
+        assert_eq!(state.branches[0].id, "branch_primary");
+        assert_eq!(state.open_questions.len(), 1);
+        assert!(state.open_questions[0].contains("finer post-acquisition subgroups"));
+        assert!(state.active_task_id.is_empty());
+    }
+
+    #[test]
+    fn v142_first_material_structure_edit_resets_precommit_escalation_deferral() {
+        let evidence = evidence_with(
+            vec![EvidenceItem {
+                id: "E0001".into(),
+                source_kind: "manuscript_semantic_evidence".into(),
+                source_label: "minimum structure".into(),
+                text: "two source-grounded primary experimental arms".into(),
+            }],
+            vec!["runA.raw"],
+        );
+        let mut state = ScientificWorkspaceState {
+            tasks: vec![ScientificTask {
+                id: "task:study_structure".into(),
+                concept_type: "study_structure".into(),
+                sdrf_field: "study_structure".into(),
+                status: "investigating".into(),
+                structural_escalation_deferrals: 1,
+                ..Default::default()
+            }],
+            active_task_id: "task:study_structure".into(),
+            ..Default::default()
+        };
+        let (_events, publishable) = apply_edit_workspace_command(
+            &evidence,
+            &mut state,
+            "task:study_structure",
+            Some(StudyStructureEditStatus::Continue),
+            &[AgentBranch {
+                id: "branch_a".into(),
+                label: "Primary arm A".into(),
+                status: "supported".into(),
+                evidence_refs: vec!["E0001".into()],
+                linkage_status: "unresolved".into(),
+                ..Default::default()
+            }],
+            &[],
+            &[],
+            &[],
+            &[],
+            "persist minimum safe structure",
+            3,
+        );
+        assert!(publishable);
+        let task = state
+            .tasks
+            .iter()
+            .find(|task| task.id == "task:study_structure")
+            .unwrap();
+        assert_eq!(task.structural_escalation_deferrals, 0);
+        assert_eq!(task.material_edits, 1);
+    }
+
+    #[test]
+    fn v142_structure_escalation_schema_encodes_minimum_safe_principle() {
+        let schema = scientific_agent_schema(false, false, true);
+        let escalation = schema["oneOf"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|variant| {
+                variant["properties"]["command"]["enum"][0].as_str()
+                    == Some("escalate_study_structure")
+            })
+            .unwrap();
+        let description = escalation["description"].as_str().unwrap();
+        assert!(description.contains("no minimum source-grounded conceptual branch model"));
+        assert!(description.contains("post-acquisition subgroup classifications"));
+        assert!(description.contains("open question"));
     }
 
     #[test]
