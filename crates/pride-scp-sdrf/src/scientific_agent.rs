@@ -1,6 +1,6 @@
 use super::*;
 
-pub const SCIENTIFIC_AGENT_HARNESS_VERSION: &str = "pride-scp-scientific-workspace-agent-v1.4.3";
+pub const SCIENTIFIC_AGENT_HARNESS_VERSION: &str = "pride-scp-scientific-workspace-agent-v1.4.4";
 const SCIENTIFIC_AGENT_TASK_EVIDENCE_LIMIT: usize = 20;
 const SCIENTIFIC_AGENT_STUDY_STRUCTURE_EVIDENCE_CHECKPOINT: usize = 6;
 const SCIENTIFIC_AGENT_FIELD_NO_PROGRESS_EDIT_LIMIT: usize = 2;
@@ -1143,11 +1143,11 @@ fn scientific_agent_schema(
     });
     let study_structure_escalate_command = json!({
         "type":"object",
-        "description":"Escalate task:study_structure only when no minimum source-grounded conceptual branch model can be safely stated, or when trusted evidence directly conflicts about that minimum model. This command is NOT for unresolved exact RAW linkage, filename-to-branch mapping, generic archive/container contents, QC/control-to-branch mapping, row selectors, exact SDRF row projection, sample/channel mapping, downstream validator errors, isolation-method vocabulary/canonicalization/template gaps, post-acquisition subgroup classifications, or uncertainty about whether a supported secondary classification should become a finer branch. If trusted sources directly contradict one another about the biological subject or primary experimental design, use blocker=conflicting_conceptual_branch_evidence. Otherwise, if a minimum branch model is supported, persist it with unresolved linkage and record finer unresolved granularity as an open question instead of escalating the whole study. A repeated non-conflict precommit escalation is closed fail-closed as evidence_exhausted rather than human_review.",
+        "description":"Escalate task:study_structure only when no minimum source-grounded conceptual branch model can be safely stated, or when trusted evidence directly conflicts about that minimum model. This command is NOT for unresolved exact RAW linkage, filename-to-branch mapping, generic archive/container contents, QC/control-to-branch mapping, row selectors, exact SDRF row projection, sample/channel mapping, downstream validator errors, isolation-method vocabulary/canonicalization/template gaps, post-acquisition subgroup classifications, or uncertainty about whether a supported secondary classification should become a finer branch. If trusted sources directly contradict one another about the biological subject or primary experimental design, use blocker=conflicting_conceptual_branch_evidence and cite evidence from at least two independent trusted semantic source domains; multiple windows from one publication and RAW/file inventory do not qualify as independent conceptual sources. Otherwise, if a minimum branch model is supported, persist it with unresolved linkage and record finer unresolved granularity as an open question instead of escalating the whole study. A repeated non-conflict precommit escalation is closed fail-closed as evidence_exhausted rather than human_review.",
         "properties":{
             "command":{"type":"string","enum":["escalate_study_structure"]},
             "task_id":{"type":"string","enum":["task:study_structure"]},
-            "blocker":{"type":"string","enum":["conceptual_branch_existence_unresolved","conceptual_branch_identity_unresolved","conflicting_conceptual_branch_evidence"],"description":"The unresolved minimum conceptual-structure blocker. existence/identity blockers are valid only when no minimum source-grounded branch model can be stated; finer subgroup granularity, exact RAW/archive/container/QC/control mapping, and linkage/projection uncertainty are not valid whole-study blockers. conflicting_conceptual_branch_evidence is reserved for direct contradiction between trusted evidence sources about the biological subject or primary experimental design."},
+            "blocker":{"type":"string","enum":["conceptual_branch_existence_unresolved","conceptual_branch_identity_unresolved","conflicting_conceptual_branch_evidence"],"description":"The unresolved minimum conceptual-structure blocker. existence/identity blockers are valid only when no minimum source-grounded branch model can be stated; finer subgroup granularity, exact RAW/archive/container/QC/control mapping, and linkage/projection uncertainty are not valid whole-study blockers. conflicting_conceptual_branch_evidence is reserved for direct contradiction between at least two independent trusted semantic source domains about the biological subject or primary experimental design; multiple excerpts from one publication, RAW/file inventory, archive contents, and QC/control filename ambiguity do not qualify."},
             "evidence_refs":{"type":"array","items":{"type":"string","pattern":"^E[0-9]{4}$"},"minItems":1,"maxItems":8,"uniqueItems":true,"description":"Trusted evidence refs that demonstrate the conceptual ambiguity or conflict."},
             "reason":{"type":"string","maxLength":1000}
         },
@@ -1312,7 +1312,7 @@ fn build_scientific_tasks(
             error_count: 1,
             representative_rows: Vec::new(),
             representative_messages: Vec::new(),
-            objective: "Establish a source-grounded study model before field repair: biological/experimental branches, acquisition cardinality, field scope, and only source-supported RAW linkage. Preserve unresolved linkage rather than infer biological identity from filenames. Always preserve the minimum safe conceptual branch model when trusted evidence supports one; unresolved exact linkage, row projection, sample/channel mapping, or finer secondary/post-acquisition subgroup granularity belongs in open questions and does not invalidate supported primary branches. Structural branch creation is independent of downstream SDRF field canonicalization: do not wait for isolation-method vocabulary resolution, and do not treat a field-level template_gap as structural ambiguity. Human review is only for conceptual study structure that cannot itself be established safely. Under v1.4.3, direct trusted-source conflict is the automatic human-review path; a non-conflict inability to state a minimum model closes fail-closed as evidence_exhausted after one bounded deferral. This means no minimum source-grounded branch model can be stated without unsupported inference, or trusted evidence for that minimum model directly conflicts.".into(),
+            objective: "Establish a source-grounded study model before field repair: biological/experimental branches, acquisition cardinality, field scope, and only source-supported RAW linkage. Preserve unresolved linkage rather than infer biological identity from filenames. Always preserve the minimum safe conceptual branch model when trusted evidence supports one; unresolved exact linkage, row projection, sample/channel mapping, or finer secondary/post-acquisition subgroup granularity belongs in open questions and does not invalidate supported primary branches. Structural branch creation is independent of downstream SDRF field canonicalization: do not wait for isolation-method vocabulary resolution, and do not treat a field-level template_gap as structural ambiguity. Human review is only for conceptual study structure that cannot itself be established safely. Under v1.4.4, only a direct conceptual conflict verified across at least two independent trusted semantic source domains is the automatic human-review path; multiple windows from one publication and RAW/file inventory do not qualify. A non-conflict inability to state a minimum model closes fail-closed as evidence_exhausted after one bounded deferral. This means no minimum source-grounded branch model can be stated without unsupported inference, or trusted evidence for that minimum model directly conflicts.".into(),
             evidence_candidates: task_evidence_candidates(
                 evidence,
                 "study_structure",
@@ -1833,7 +1833,7 @@ fn scientific_agent_prompt(
         "escalate"
     };
     let escalation_contract = if study_structure_active {
-        "escalate_study_structure: use only when the conceptual branch model itself remains unresolved or directly conflicting. In v1.4.3 this means use it only when NO MINIMUM source-grounded conceptual branch model can be safely stated, or when trusted evidence directly conflicts about that minimum model. RAW linkage, filename mapping, row projection, validator errors, and downstream field canonicalization are not valid structural escalation blockers. Generic archive/container contents and QC/control-to-branch mapping are also not valid structural escalation blockers. If trusted evidence sources directly contradict one another about the biological subject or primary experimental design, use blocker=conflicting_conceptual_branch_evidence. Otherwise, if primary branches are supported but exact RAW/archive/QC/control linkage, row projection, sample/channel mapping, or finer secondary/post-acquisition subgroup granularity remains unresolved, persist/complete the minimum branches and add the finer ambiguity as an open question instead of escalating. Rust will defer one premature non-conflict escalation before the first safe branch commit; a repeated non-conflict precommit escalation closes task:study_structure fail-closed as evidence_exhausted, not human_review, while explicit conflicting_conceptual_branch_evidence remains the human-review path."
+        "escalate_study_structure: use only when the conceptual branch model itself remains unresolved or directly conflicting. In v1.4.4 this means use it only when NO MINIMUM source-grounded conceptual branch model can be safely stated, or when trusted evidence from independent semantic source domains directly conflicts about that minimum model. RAW linkage, filename mapping, row projection, validator errors, and downstream field canonicalization are not valid structural escalation blockers. Generic archive/container contents and QC/control-to-branch mapping are also not valid structural escalation blockers. If trusted evidence sources from at least two independent semantic source domains directly contradict one another about the biological subject or primary experimental design, use blocker=conflicting_conceptual_branch_evidence and cite both domains. Multiple excerpts/windows from one publication, RAW/file inventory, archive contents, and QC/control filename ambiguity do not qualify as independent conceptual conflicts. Otherwise, if primary branches are supported but exact RAW/archive/QC/control linkage, row projection, sample/channel mapping, or finer secondary/post-acquisition subgroup granularity remains unresolved, persist/complete the minimum branches and add the finer ambiguity as an open question instead of escalating. Rust will defer one premature non-conflict escalation before the first safe branch commit; a repeated non-conflict precommit escalation closes task:study_structure fail-closed as evidence_exhausted, not human_review, while only independently source-verified conflicting_conceptual_branch_evidence remains the immediate human-review path."
     } else {
         "escalate: use only after relevant focused evidence/context and reasonable trusted search are exhausted or the field-level judgment truly requires human review."
     };
@@ -1860,7 +1860,7 @@ fn scientific_agent_prompt(
     format!(
         "You are the scientific workspace agent for PRIDE single-cell proteomics dataset {acc}.\n\n\
 Your environment behaves like a coding/research workspace. Rust owns persistent state, provenance, controlled-vocabulary canonicalization, task status, compilation, validation, trusted RAW linkage, and all safety gates. You inspect source evidence, build a study model, and record source-faithful scientific observations. Work ONE active task deeply before moving to another task.\n\n\
-SCIENTIFIC WORKSPACE AGENT CONTRACT (v1.4.3):\n\
+SCIENTIFIC WORKSPACE AGENT CONTRACT (v1.4.4):\n\
 - Return exactly ONE executable top-level command for this turn: read_evidence, search_evidence, {edit_command}, or {escalation_command}. Do not narrate a future tool action inside notes; if you need to read E####, the command itself must be read_evidence.\n\
 - Never request the same evidence ref twice. Rust records requested refs as read even when multiple refs resolve to the same materialized source window.\n\
 - After a successful read, Rust enters a decision step: do not keep reading by inertia. Commit a supported study/observation edit, search a genuinely different source/query, or use the task-specific escalation command.\n\
@@ -6762,12 +6762,88 @@ enum StudyStructureEscalationDisposition {
     HumanReview,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum StudyStructureConflictEvidenceDomain {
+    ProjectMetadata,
+    Publication,
+    CuratedAnnotation,
+}
+
+fn study_structure_conflict_evidence_domain(
+    evidence: &DatasetEvidence,
+    item: &EvidenceItem,
+) -> Option<StudyStructureConflictEvidenceDomain> {
+    let kind = item.source_kind.trim().to_ascii_lowercase();
+    let label = item.source_label.trim();
+
+    if (!evidence.files_json_path.trim().is_empty() && label == evidence.files_json_path)
+        || kind.contains("repository_file")
+        || kind.contains("raw_file")
+        || kind.contains("file_inventory")
+    {
+        return None;
+    }
+
+    if (!evidence.project_json_path.trim().is_empty() && label == evidence.project_json_path)
+        || kind == "pride_project"
+        || kind.contains("project_metadata")
+        || kind.contains("repository_metadata")
+    {
+        return Some(StudyStructureConflictEvidenceDomain::ProjectMetadata);
+    }
+    if evidence
+        .manuscript_sources
+        .iter()
+        .any(|path| path.as_str() == label)
+        || kind.contains("manuscript")
+        || kind.contains("publication")
+    {
+        return Some(StudyStructureConflictEvidenceDomain::Publication);
+    }
+    if evidence
+        .annotation_sources
+        .iter()
+        .any(|path| path.as_str() == label)
+        || kind.contains("curated_annotation")
+        || kind.contains("trusted_annotation")
+    {
+        return Some(StudyStructureConflictEvidenceDomain::CuratedAnnotation);
+    }
+
+    // agent_read_context inherits its semantic domain from the exact registered
+    // source path in source_label. If that path is neither project metadata, a
+    // manuscript, nor a curated annotation, it cannot independently validate a
+    // conceptual study-identity conflict. In particular, repository file lists
+    // and RAW filenames are intentionally not qualifying semantic domains.
+    None
+}
+
+fn conflicting_structure_evidence_spans_independent_semantic_domains(
+    evidence: &DatasetEvidence,
+    evidence_refs: &[String],
+) -> bool {
+    let domains = evidence_refs
+        .iter()
+        .filter_map(|evidence_ref| {
+            evidence
+                .evidence
+                .iter()
+                .find(|item| item.id.eq_ignore_ascii_case(evidence_ref))
+        })
+        .filter_map(|item| study_structure_conflict_evidence_domain(evidence, item))
+        .collect::<BTreeSet<_>>();
+    domains.len() >= 2
+}
+
 fn study_structure_escalation_disposition(
     state: &ScientificWorkspaceState,
     task_id: &str,
     blocker: StudyStructureEscalationBlocker,
+    verified_independent_source_conflict: bool,
 ) -> StudyStructureEscalationDisposition {
-    if blocker == StudyStructureEscalationBlocker::ConflictingConceptualBranchEvidence {
+    if blocker == StudyStructureEscalationBlocker::ConflictingConceptualBranchEvidence
+        && verified_independent_source_conflict
+    {
         return StudyStructureEscalationDisposition::HumanReview;
     }
     if state
@@ -11070,15 +11146,36 @@ async fn run_one_scientific_agent(
                         trace.states.push(state.clone());
                         continue;
                     }
-                    match study_structure_escalation_disposition(&state, task_id, *blocker) {
+                    let verified_independent_source_conflict = *blocker
+                        == StudyStructureEscalationBlocker::ConflictingConceptualBranchEvidence
+                        && conflicting_structure_evidence_spans_independent_semantic_domains(
+                            &evidence,
+                            evidence_refs,
+                        );
+                    let unverified_conflict_blocker = *blocker
+                        == StudyStructureEscalationBlocker::ConflictingConceptualBranchEvidence
+                        && !verified_independent_source_conflict;
+                    match study_structure_escalation_disposition(
+                        &state,
+                        task_id,
+                        *blocker,
+                        verified_independent_source_conflict,
+                    ) {
                         StudyStructureEscalationDisposition::DeferBeforeFirstCommit => {
                             defer_first_study_structure_escalation(&mut state, task_id, reason);
+                            let feedback = if unverified_conflict_blocker {
+                                format!(
+                                    "turn {turn} CONFLICT BLOCKER NOT VERIFIED: conflicting_conceptual_branch_evidence requires cited trusted evidence from at least two independent semantic source domains (for example PRIDE project metadata versus a linked publication) that disagree about the biological subject or primary experimental design. Multiple excerpts/windows from one publication, RAW/file inventory, generic archive contents, QC/control filename ambiguity, or missing exact linkage do not validate a conceptual source conflict. Persist any source-supported minimum branches with unresolved linkage, or use a non-conflict existence/identity blocker if no minimum model can safely be stated."
+                                )
+                            } else {
+                                format!(
+                                    "turn {turn} STRUCTURE ESCALATION DEFERRED: before escalating conceptual existence/identity, persist any source-supported minimum conceptual branches with edit_study_structure. Exact RAW/archive/container linkage, QC/control-to-branch mapping, row projection, sample/channel mapping, and uncertain finer subgroup granularity are not blockers. If trusted evidence sources directly contradict one another about the biological subject or primary experimental design, reissue with blocker=conflicting_conceptual_branch_evidence and cite independent semantic source domains. Otherwise persist the minimum safe branches. A repeated non-conflict escalation will terminate task:study_structure fail-closed as evidence_exhausted, not human_review."
+                                )
+                            };
                             push_harness_feedback(
                                 &mut trace.harness_feedback,
                                 &mut pending_harness_feedback,
-                                format!(
-                                    "turn {turn} STRUCTURE ESCALATION DEFERRED: before escalating conceptual existence/identity, persist any source-supported minimum conceptual branches with edit_study_structure. Exact RAW/archive/container linkage, QC/control-to-branch mapping, row projection, sample/channel mapping, and uncertain finer subgroup granularity are not blockers. If trusted evidence sources directly contradict one another about the biological subject or primary experimental design, reissue with blocker=conflicting_conceptual_branch_evidence. Otherwise persist the minimum safe branches. A repeated non-conflict escalation will terminate task:study_structure fail-closed as evidence_exhausted, not human_review."
-                                ),
+                                feedback,
                             );
                         }
                         StudyStructureEscalationDisposition::CompleteMinimumSafeStructure => {
@@ -11093,12 +11190,19 @@ async fn run_one_scientific_agent(
                         }
                         StudyStructureEscalationDisposition::EvidenceExhausted => {
                             mark_study_structure_evidence_exhausted(&mut state, task_id, reason);
+                            let feedback = if unverified_conflict_blocker {
+                                format!(
+                                    "turn {turn} UNVERIFIED CONFLICT ESCALATION CLOSED: task:study_structure is evidence_exhausted, not human_review. The conflict blocker did not cite at least two independent trusted semantic source domains; RAW/file inventory, archive/QC/control ambiguity, or multiple windows from one publication cannot create whole-study human review. Downstream field repair is blocked until conceptual structure is externally resolved or refreshed."
+                                )
+                            } else {
+                                format!(
+                                    "turn {turn} REPEATED NON-CONFLICT STRUCTURE ESCALATION CLOSED: task:study_structure is evidence_exhausted rather than human_review. Existence/identity escalation cannot substitute for unresolved RAW/archive/container/QC/control mapping or finer subgroup granularity. Downstream field repair is blocked until conceptual structure is externally resolved or refreshed."
+                                )
+                            };
                             push_harness_feedback(
                                 &mut trace.harness_feedback,
                                 &mut pending_harness_feedback,
-                                format!(
-                                    "turn {turn} REPEATED NON-CONFLICT STRUCTURE ESCALATION CLOSED: task:study_structure is evidence_exhausted rather than human_review. Existence/identity escalation cannot substitute for unresolved RAW/archive/container/QC/control mapping or finer subgroup granularity. Downstream field repair is blocked until conceptual structure is externally resolved or refreshed."
-                                ),
+                                feedback,
                             );
                         }
                         StudyStructureEscalationDisposition::HumanReview => {
@@ -11495,7 +11599,7 @@ async fn run_one_scientific_agent(
         "branches": state.branches.clone(),
         "scientific_observations": state.claims.clone(),
         "observation_adjudications": final_adjudications.clone(),
-        // Backward-compatible aliases for existing audit tooling. v1.4.3 model
+        // Backward-compatible aliases for existing audit tooling. v1.4.4 model
         // commands and prompts use observation terminology exclusively.
         "claims": state.claims.clone(),
         "claim_adjudications": final_adjudications,
@@ -11562,7 +11666,7 @@ pub async fn run_scientific_sdrf_agent(
     }
     if !requested_mode.trim().is_empty() {
         bail!(
-            "unsupported PRIDE_SCP_SCIENTIFIC_AGENT_MODE='{}'; expected '{}', '{}', '{}', '{}', '{}', '{}', or '{}' or unset for the v1.4.3 workspace agent",
+            "unsupported PRIDE_SCP_SCIENTIFIC_AGENT_MODE='{}'; expected '{}', '{}', '{}', '{}', '{}', '{}', or '{}' or unset for the v1.4.4 workspace agent",
             requested_mode,
             SCIENTIFIC_AGENT_FACTOR_ROW_ROLE_HARDENED_MODE,
             SCIENTIFIC_AGENT_FACTOR_SEMANTIC_FIDELITY_HARDENED_MODE,
@@ -13232,6 +13336,7 @@ mod tests {
                 &state,
                 "task:study_structure",
                 StudyStructureEscalationBlocker::ConceptualBranchIdentityUnresolved,
+                false,
             ),
             StudyStructureEscalationDisposition::DeferBeforeFirstCommit
         );
@@ -13267,8 +13372,102 @@ mod tests {
                 &state,
                 "task:study_structure",
                 StudyStructureEscalationBlocker::ConceptualBranchExistenceUnresolved,
+                false,
             ),
             StudyStructureEscalationDisposition::EvidenceExhausted
+        );
+    }
+
+    #[test]
+    fn v144_conflict_blocker_rejects_same_publication_as_independent_conflict() {
+        let evidence = evidence_with(
+            vec![
+                EvidenceItem {
+                    id: "E0001".into(),
+                    source_kind: "manuscript_semantic_evidence".into(),
+                    source_label: "linked publication excerpt".into(),
+                    text: "Group 1 and Group 2 are the primary experimental arms.".into(),
+                },
+                EvidenceItem {
+                    id: "E0002".into(),
+                    source_kind: "manuscript_semantic_evidence".into(),
+                    source_label: "another linked publication excerpt".into(),
+                    text: "QC files and technical controls are also described.".into(),
+                },
+            ],
+            vec!["runA.raw"],
+        );
+        let refs = vec!["E0001".into(), "E0002".into()];
+        assert!(
+            !conflicting_structure_evidence_spans_independent_semantic_domains(&evidence, &refs)
+        );
+
+        let state = ScientificWorkspaceState {
+            tasks: vec![ScientificTask {
+                id: "task:study_structure".into(),
+                concept_type: "study_structure".into(),
+                sdrf_field: "study_structure".into(),
+                status: "investigating".into(),
+                ..Default::default()
+            }],
+            active_task_id: "task:study_structure".into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            study_structure_escalation_disposition(
+                &state,
+                "task:study_structure",
+                StudyStructureEscalationBlocker::ConflictingConceptualBranchEvidence,
+                false,
+            ),
+            StudyStructureEscalationDisposition::DeferBeforeFirstCommit
+        );
+    }
+
+    #[test]
+    fn v144_project_vs_publication_conflict_can_human_review() {
+        let mut evidence = evidence_with(
+            vec![
+                EvidenceItem {
+                    id: "E0001".into(),
+                    source_kind: "pride_project".into(),
+                    source_label: "project description".into(),
+                    text: "Human HeLa single-cell proteomics.".into(),
+                },
+                EvidenceItem {
+                    id: "E0002".into(),
+                    source_kind: "agent_read_context".into(),
+                    source_label: "/trusted/linked-publication.txt".into(),
+                    text: "Arabidopsis bulk proteomics.".into(),
+                },
+            ],
+            vec!["HeLa_001.raw"],
+        );
+        evidence.manuscript_sources = vec!["/trusted/linked-publication.txt".into()];
+        let refs = vec!["E0001".into(), "E0002".into()];
+        assert!(
+            conflicting_structure_evidence_spans_independent_semantic_domains(&evidence, &refs)
+        );
+
+        let state = ScientificWorkspaceState {
+            tasks: vec![ScientificTask {
+                id: "task:study_structure".into(),
+                concept_type: "study_structure".into(),
+                sdrf_field: "study_structure".into(),
+                status: "investigating".into(),
+                ..Default::default()
+            }],
+            active_task_id: "task:study_structure".into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            study_structure_escalation_disposition(
+                &state,
+                "task:study_structure",
+                StudyStructureEscalationBlocker::ConflictingConceptualBranchEvidence,
+                true,
+            ),
+            StudyStructureEscalationDisposition::HumanReview
         );
     }
 
@@ -13298,6 +13497,7 @@ mod tests {
                 &state,
                 "task:study_structure",
                 StudyStructureEscalationBlocker::ConflictingConceptualBranchEvidence,
+                true,
             ),
             StudyStructureEscalationDisposition::HumanReview
         );
@@ -13330,6 +13530,7 @@ mod tests {
                 &state,
                 "task:study_structure",
                 StudyStructureEscalationBlocker::ConceptualBranchIdentityUnresolved,
+                false,
             ),
             StudyStructureEscalationDisposition::CompleteMinimumSafeStructure
         );
@@ -13416,6 +13617,8 @@ mod tests {
         assert!(description.contains("post-acquisition subgroup classifications"));
         assert!(description.contains("generic archive/container contents"));
         assert!(description.contains("conflicting_conceptual_branch_evidence"));
+        assert!(description.contains("independent trusted semantic source domains"));
+        assert!(description.contains("RAW/file inventory"));
         assert!(description.contains("evidence_exhausted rather than human_review"));
         assert!(description.contains("open question"));
     }
