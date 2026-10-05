@@ -168,3 +168,35 @@ Structured mapping now:
 The Cellosaurus resolver no longer changes bytes merely by adding an empty accession column.
 Composite cell-line identities are routed through structured mapping evidence first; an exact
 Cellosaurus lookup is retried only after row-specific identity is available.
+
+## Structured multiplex analysis bundles (2026-10-05)
+
+Repository deposits may contain authoritative row/channel mappings as a relational analysis bundle
+rather than one flat spreadsheet. `scripts/sdrf_structured_multiplex_bundle.py` provides a bounded,
+non-generative schema adapter for bundles that explicitly contain all of the following relations:
+
+- `file_sample_mapping.txt`: deposited file name -> plate/sample;
+- `plate_layout_mapping.txt`: plate -> sort/label/sample layout tables;
+- `*_InputFiles.txt`: analysis File ID -> deposited file name; and
+- `*_Proteins.txt`: explicit observed `(File ID, reporter channel)` abundance headers.
+
+For every observed File-ID/reporter pair, the adapter follows those source relations to one unique
+sample-layout well and sort-layout population. It does not use RAW filename numbering, lexical file
+order, matrix column order, expected plex cardinality, or accession-specific rules. A mapping root
+with malformed or ambiguous relations emits no partial mappings. Repeated analysis roots for the
+same RAW/reporter are collapsed only when their plate/sample/well/population signatures agree.
+Carrier, booster, blank, reference and empty wells remain set-level evidence and are not emitted as
+biological SDRF rows.
+
+The generalized evidence graph treats likely mapping/analysis ZIPs as a separate bounded acquisition
+class because such provenance bundles can be substantially larger than ordinary supplementary tables.
+Selection by archive name is acquisition triage only; an archive contributes row evidence only after
+the relational schema above is proven. The resulting `structured_bundle_row_mappings.tsv` is then
+consumed by the existing structured row/channel resolver and immediate validator gate.
+
+During explicit multiplex expansion, a project-level chemistry value such as `TMT`, `TMTpro` or a
+plex-level TMT designation may be specialized to an exact source-backed reporter channel. A concrete
+reporter channel remains protected from overwrite. When the candidate row already independently
+establishes `characteristics[sample type] = single cell`, a unique source-backed plate/sample/well
+identity may also populate `characteristics[cell identifier]`; this projection is never applied to
+bulk, QC or unresolved sample types.
