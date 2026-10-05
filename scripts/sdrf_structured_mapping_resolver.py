@@ -398,10 +398,27 @@ def dedupe_records(records: list[dict[str, str]]) -> list[dict[str, str]]:
         out.append(rec)
     return out
 
+def generic_isobaric_label(value: str) -> bool:
+    """Return whether *value* describes chemistry, not one reporter channel.
+
+    A project-level value such as ``TMTpro`` or ``TMTpro18`` is useful chemistry
+    context but is not a row identity.  Exact structured reporter evidence may
+    therefore specialize it during multiplex expansion.  Specific channel labels
+    such as ``TMT127N`` remain concrete and protected.
+    """
+    token = re.sub(r"[^a-z0-9]+", "", norm_text(value))
+    if not token:
+        return False
+    if token in {"tmt", "tmtpro", "tandemmasstag", "itraq", "isobaric", "isobariclabel"}:
+        return True
+    return bool(re.fullmatch(r"tmt(?:pro)?(?:6|8|10|11|16|18)(?:plex)?", token))
+
+
 def can_expand(base: dict[str, str], records: list[dict[str, str]]) -> bool:
     if len(records) < 2:
         return False
-    if is_concrete(base.get("comment[label]", "")):
+    base_label = base.get("comment[label]", "")
+    if is_concrete(base_label) and not generic_isobaric_label(base_label):
         return False
     labels = [rec.get("comment[label]", "") for rec in records]
     if not all(is_concrete(x) for x in labels):
@@ -458,6 +475,22 @@ def apply_record(
                     "source_path": rec.get("source_path", ""),
                     "source_sha256": rec.get("source_sha256", ""),
                     "explicit_multiplex_identity_split": "true",
+                })
+                continue
+            if (
+                allow_expansion_identity_replace
+                and field == "comment[label]"
+                and generic_isobaric_label(current)
+                and is_concrete(value)
+            ):
+                row[field] = value
+                edges.append({
+                    "field": field,
+                    "old": current,
+                    "new": value,
+                    "source_path": rec.get("source_path", ""),
+                    "source_sha256": rec.get("source_sha256", ""),
+                    "explicit_multiplex_label_specialization": "true",
                 })
                 continue
             if not safe_composite_narrowing(field, current, value):
@@ -524,7 +557,10 @@ def resolve(candidate: Path, output: Path, report: Path, roots: list[Path], acce
             expanded_rows = []
             expanded_edges: list[dict[str, Any]] = []
             ok = True
-            for rec in sorted(explicit_records, key=lambda r: norm_text(r.get("comment[label]", ""))):
+            ordered_records = sorted(
+                explicit_records, key=lambda r: norm_text(r.get("comment[label]", ""))
+            )
+            for rec in ordered_records:
                 new_row, edges, err = apply_record(
                     group[0], rec, headers, allow_expansion_identity_replace=True
                 )
@@ -535,6 +571,30 @@ def resolve(candidate: Path, output: Path, report: Path, roots: list[Path], acce
                 expanded_rows.append(new_row)
                 expanded_edges.extend(edges)
             if ok and len(expanded_rows) == len(explicit_records):
+                # When the candidate already establishes single-cell semantics and
+                # the structured bundle supplies a unique explicit source/well
+                # identity, that exact identity is also a safe cell identifier.
+                # Do not perform this projection for bulk/QC/unknown rows.
+                sample_type_field = "characteristics[sample type]"
+                cell_id_field = "characteristics[cell identifier]"
+                if cell_id_field in headers:
+                    for expanded, rec in zip(expanded_rows, ordered_records):
+                        if norm_text(expanded.get(sample_type_field, "")) != "single cell":
+                            continue
+                        if is_concrete(expanded.get(cell_id_field, "")):
+                            continue
+                        source_identity = rec.get("source name", "")
+                        if not is_concrete(source_identity):
+                            continue
+                        expanded[cell_id_field] = source_identity
+                        expanded_edges.append({
+                            "field": cell_id_field,
+                            "old": "",
+                            "new": source_identity,
+                            "source_path": rec.get("source_path", ""),
+                            "source_sha256": rec.get("source_sha256", ""),
+                            "explicit_single_cell_source_identity_projection": "true",
+                        })
                 output_rows.extend(expanded_rows)
                 expansions.append({"data_file": group[0].get("comment[data file]", ""), "rows_before": 1, "rows_after": len(expanded_rows), "labels": [x.get("comment[label]", "") for x in expanded_rows]})
                 for edge in expanded_edges:
@@ -731,6 +791,44 @@ def self_test() -> None:
         assert r5["multiplex_expansion_count"] == 1
         rows5 = list(csv.DictReader(out5.open(), delimiter="\t"))
         assert {x["source name"] for x in rows5} == {"cell-A", "cell-B"}
+
+        # A project-level generic isobaric chemistry label is not one reporter
+        # identity. Exact structured channel evidence may safely specialize it
+        # during multiplex expansion, while specific concrete labels remain
+        # protected from overwrite.
+        src5b = root / "multiplex_generic_label.tsv"
+        ev5b = root / "multiplex_generic_label_evidence.tsv"
+        out5b = root / "multiplex_generic_label_out.tsv"
+        rep5b = root / "multiplex_generic_label_report.json"
+        src5b.write_text(
+            "source name\tcharacteristics[sample type]\tcharacteristics[cell identifier]\tcomment[data file]\tcomment[label]\n"
+            "run_0001\tsingle cell\tnot available\tm.raw\tTMTpro\n"
+        )
+        ev5b.write_text(
+            "raw_file\treporter_channel\tsource_name\n"
+            "m.raw\tTMT127N\tcell-A\n"
+            "m.raw\tTMT128N\tcell-B\n"
+        )
+        r5b = resolve(src5b, out5b, rep5b, [ev5b], "")
+        assert r5b["multiplex_expansion_count"] == 1
+        rows5b = list(csv.DictReader(out5b.open(), delimiter="\t"))
+        assert {x["comment[label]"] for x in rows5b} == {"TMT127N", "TMT128N"}
+        assert {x["characteristics[cell identifier]"] for x in rows5b} == {"cell-A", "cell-B"}
+        assert any(
+            x.get("explicit_multiplex_label_specialization") == "true"
+            for x in r5b["applied_edges"]
+        )
+
+        src5c = root / "multiplex_specific_label.tsv"
+        out5c = root / "multiplex_specific_label_out.tsv"
+        rep5c = root / "multiplex_specific_label_report.json"
+        src5c.write_text(
+            "source name\tcomment[data file]\tcomment[label]\n"
+            "run_0001\tm.raw\tTMT127N\n"
+        )
+        r5c = resolve(src5c, out5c, rep5c, [ev5b], "")
+        assert r5c["multiplex_expansion_count"] == 0
+        assert out5c.read_bytes() == src5c.read_bytes()
 
         # Composite project-level identity must not be treated as row-scoped
         # structured mapping evidence.

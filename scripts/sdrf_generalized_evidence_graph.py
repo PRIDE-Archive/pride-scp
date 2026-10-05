@@ -32,6 +32,12 @@ if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
 from sdrf_external_artifact_acquisition import acquire_external_artifacts  # noqa: E402
+from sdrf_structured_multiplex_bundle import (  # noqa: E402
+    BundleMappingRecord,
+    flatten_mapping_records,
+    parse_bundle as parse_structured_multiplex_bundle,
+    write_mapping_tsv as write_structured_bundle_mapping_tsv,
+)
 
 from sdrf_multiplex_evidence_graph import (  # noqa: E402
     DesignContract,
@@ -63,6 +69,9 @@ VERSION = "pride-scp-sdrf-generalized-evidence-graph-v0.1"
 RAW_EXT_RE = re.compile(r"(?i)\.(?:raw|d|wiff|wiff2|mzml|mzxml)$")
 RAW_TOKEN_RE = re.compile(r"(?i)([^\s\t,;|]+\.(?:raw|d|wiff|wiff2|mzml|mzxml))")
 PXD_RE = re.compile(r"\bPXD\d{6,}\b", re.I)
+MAPPING_ARCHIVE_HINT_RE = re.compile(
+    r"(?i)(?:mapping|layout|design|metadata|analysis|source|code|sceptre|single[-_ .]?cell|scp)"
+)
 
 # These are reusable scientific/format concepts, not dataset identifiers.
 ACQ_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
@@ -821,6 +830,23 @@ def _write_dataclasses(path: Path, objects: Iterable[Any], fields: list[str]) ->
     write_tsv(path, (asdict(x) for x in objects), fields)
 
 
+def mapping_archive_priority(row: Any) -> tuple[int, str]:
+    """Select bounded repository archives likely to contain mapping/design assets.
+
+    Archive selection is filename/category triage only.  No biological inference is
+    made from the name; an archive contributes mapping evidence only if the schema
+    adapter later proves explicit RAW/channel/well relations.
+    """
+    name = str(getattr(row, "name", "") or "")
+    category = str(getattr(row, "category", "") or "")
+    suffix = Path(name).suffix.lower()
+    if suffix != ".zip" or category.upper() == "RAW":
+        return 0, "not_mapping_archive"
+    if MAPPING_ARCHIVE_HINT_RE.search(Path(name).name):
+        return 5, "mapping_or_analysis_archive_name"
+    return 0, "archive_without_mapping_hint"
+
+
 def run(args: argparse.Namespace) -> int:
     accessions = read_accessions(args.accessions_file)
     wanted = set(accessions)
@@ -876,6 +902,72 @@ def run(args: argparse.Namespace) -> int:
             if path:
                 parser, ev = parse_artifact(acc, path); structured.extend(ev)
             artifact_rows.append({"accession":acc,"file_name":row.name,"priority":pri,"reason":reason,"acquire_status":acq,"local_path":str(path or ""),"parser":parser,"structural_hits":len(ev)})
+
+    # Large repository analysis archives are handled separately from ordinary
+    # structured artifacts.  The normal artifact budget intentionally stays
+    # small; mapping archives may be larger but at most a bounded number are
+    # acquired per accession and they contribute only through explicit schema
+    # joins validated by sdrf_structured_multiplex_bundle.
+    bundle_mapping_rows: list[BundleMappingRecord] = []
+    bundle_archive_reports: list[dict[str, Any]] = []
+    for acc in accessions:
+        candidates: list[tuple[int, Any, str]] = []
+        for row in repo_rows(args.snapshot, acc):
+            pri, reason = mapping_archive_priority(row)
+            if pri > 0:
+                candidates.append((pri, row, reason))
+        candidates.sort(key=lambda item: (-item[0], item[1].name.lower()))
+        for pri, row, reason in candidates[: args.max_mapping_archives_per_accession]:
+            path, acq = acquire(
+                row,
+                out / "structured_mapping_archives" / acc,
+                args.max_mapping_archive_bytes,
+                reuse_roots,
+            )
+            mapping_count = 0
+            parser = ""
+            parse_issues: list[str] = []
+            mapping_conflicts: list[str] = []
+            if path is not None:
+                try:
+                    raw_bundle, parse_issues, report = parse_structured_multiplex_bundle(
+                        path, accession=acc, pride_raw_names=raw_files(args.snapshot, acc)
+                    )
+                    flat, mapping_conflicts = flatten_mapping_records(
+                        raw_bundle, accession=acc, archive_path=path
+                    )
+                    bundle_mapping_rows.extend(flat)
+                    mapping_count = len(flat)
+                    parser = "structured_multiplex_bundle"
+                    report.update({
+                        "repository_file": row.name,
+                        "acquire_status": acq,
+                        "mapping_rows": mapping_count,
+                        "mapping_conflicts": mapping_conflicts,
+                    })
+                    bundle_archive_reports.append(report)
+                except (OSError, ValueError, zipfile.BadZipFile) as exc:
+                    parser = f"structured_multiplex_bundle_error:{type(exc).__name__}"
+                    parse_issues = [str(exc)]
+            artifact_rows.append({
+                "accession": acc,
+                "file_name": row.name,
+                "priority": pri,
+                "reason": reason,
+                "acquire_status": acq,
+                "local_path": str(path or ""),
+                "parser": parser,
+                "structural_hits": mapping_count,
+            })
+
+    # The structured mapping resolver recursively scans the generalized graph
+    # root, so this flat TSV becomes ordinary source evidence for the existing
+    # validator-gated one-to-many multiplex expansion path.
+    bundle_mapping_path = out / "structured_bundle_row_mappings.tsv"
+    write_structured_bundle_mapping_tsv(bundle_mapping_path, bundle_mapping_rows)
+    (out / "structured_bundle_archive_reports.json").write_text(
+        json.dumps(bundle_archive_reports, indent=2) + "\n", encoding="utf-8"
+    )
 
     # Generic external analysis repository acquisition/join resolution.
     ext_inventory: list[ExternalFetch] = []
@@ -952,6 +1044,11 @@ def run(args: argparse.Namespace) -> int:
         "external_structured_evidence_rows": len(external_structured),
         "external_structured_parsers": dict(sorted(Counter(x.parser for x in ext_inventory if x.parser).items())),
         "join_evidence_rows": len(joins),
+        "structured_bundle_mapping_rows": len(bundle_mapping_rows),
+        "structured_bundle_archives": len(bundle_archive_reports),
+        "structured_bundle_archive_conflicts": sum(
+            len(report.get("mapping_conflicts") or []) for report in bundle_archive_reports
+        ),
         "relation_assessments": len(relations),
         "runtime_accession_specific_rules": False,
         "gt_metadata_used": False,
@@ -963,6 +1060,8 @@ def run(args: argparse.Namespace) -> int:
             "relations": str(out/"relation_assessments.tsv"),
             "branch_resolution": str(out/"branch_resolution.tsv"),
             "accession_summary": str(out/"accession_summary.tsv"),
+            "structured_bundle_mappings": str(bundle_mapping_path),
+            "structured_bundle_archive_reports": str(out/"structured_bundle_archive_reports.json"),
         },
     }
     (out/"generalized_evidence_graph_summary.json").write_text(json.dumps(summary, indent=2)+"\n")
@@ -1019,6 +1118,12 @@ def self_test() -> None:
         dump("PXD900011", [f"r{i}.raw" for i in range(10)] + ["extra1.raw","extra2.raw"])
         rels = assess_relations(root,["PXD900010","PXD900011"])
         assert rels and rels[0].relation_class == "probable_predecessor_expanded_redeposit", rels
+
+    from types import SimpleNamespace
+    pri, why = mapping_archive_priority(SimpleNamespace(name="SCeptre_FINAL.zip", category="OTHER"))
+    assert pri == 5 and why == "mapping_or_analysis_archive_name"
+    pri2, _ = mapping_archive_priority(SimpleNamespace(name="random_backup.zip", category="OTHER"))
+    assert pri2 == 0
     print("sdrf_generalized_evidence_graph self-test: PASS")
 
 
@@ -1033,6 +1138,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--reuse-external-root", type=Path, action="append", default=[])
     p.add_argument("--max-artifacts-per-accession", type=int, default=12)
     p.add_argument("--max-artifact-bytes", type=int, default=100*1024*1024)
+    p.add_argument("--max-mapping-archives-per-accession", type=int, default=1)
+    p.add_argument("--max-mapping-archive-bytes", type=int, default=1200*1024*1024)
     p.add_argument("--fetch-external-analysis", action="store_true")
     p.add_argument("--max-external-files", type=int, default=24)
     p.add_argument("--max-external-bytes", type=int, default=25*1024*1024)
