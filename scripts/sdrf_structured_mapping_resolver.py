@@ -414,8 +414,33 @@ def generic_isobaric_label(value: str) -> bool:
     return bool(re.fullmatch(r"tmt(?:pro)?(?:6|8|10|11|16|18)(?:plex)?", token))
 
 
+def multiplex_expansion_records(records: list[dict[str, str]]) -> list[dict[str, str]]:
+    """Return only records that can define explicit reporter-level rows.
+
+    Generic chemistry/context records such as ``TMT``/``TMTpro`` are useful for
+    ordinary structured mapping, but they are not reporter identities.  Mixing them
+    into an otherwise explicit reporter set can create a spurious conflict late in
+    expansion and roll back the whole RAW.  Keep those records available to the
+    normal resolver path, but exclude them from the one-RAW -> many-row split.
+    """
+    out: list[dict[str, str]] = []
+    for rec in records:
+        label = rec.get("comment[label]", "")
+        if not is_concrete(label) or generic_isobaric_label(label):
+            continue
+        if not any(is_concrete(rec.get(field, "")) for field in BIOLOGICAL_FIELDS):
+            continue
+        out.append(rec)
+    return out
+
+
 def can_expand(base: dict[str, str], records: list[dict[str, str]]) -> bool:
     if len(records) < 2:
+        return False
+    # Multiplex row expansion is a single-cell operation.  Explicit reporter
+    # mappings from bulk/QC/reference regimes remain valid graph evidence but must
+    # not be reinterpreted as one-cell-per-channel SDRF rows.
+    if norm_key(base.get("characteristics[sample type]", "")) != "singlecell":
         return False
     base_label = base.get("comment[label]", "")
     if is_concrete(base_label) and not generic_isobaric_label(base_label):
@@ -425,8 +450,7 @@ def can_expand(base: dict[str, str], records: list[dict[str, str]]) -> bool:
         return False
     if len({norm_text(x) for x in labels}) != len(labels):
         return False
-    # A reporter label alone is not enough to define a biological/sample row.
-    return all(any(is_concrete(rec.get(field, "")) for field in BIOLOGICAL_FIELDS) for rec in records)
+    return True
 
 
 
@@ -552,13 +576,16 @@ def resolve(candidate: Path, output: Path, report: Path, roots: list[Path], acce
 
     for raw_key, group in candidate_by_raw.items():
         explicit_records = dedupe_records(by_raw.get(raw_key, []))
-        # Safe explicit multiplex expansion only for one-row-per-RAW candidates.
-        if len(group) == 1 and can_expand(group[0], explicit_records):
+        expansion_records = multiplex_expansion_records(explicit_records)
+        # Safe explicit multiplex expansion only for one-row-per-RAW single-cell
+        # candidates and explicit reporter-level evidence.  Generic chemistry/context
+        # records remain available to the ordinary mapping path below.
+        if len(group) == 1 and can_expand(group[0], expansion_records):
             expanded_rows = []
             expanded_edges: list[dict[str, Any]] = []
             ok = True
             ordered_records = sorted(
-                explicit_records, key=lambda r: norm_text(r.get("comment[label]", ""))
+                expansion_records, key=lambda r: norm_text(r.get("comment[label]", ""))
             )
             for rec in ordered_records:
                 new_row, edges, err = apply_record(
@@ -570,7 +597,7 @@ def resolve(candidate: Path, output: Path, report: Path, roots: list[Path], acce
                     break
                 expanded_rows.append(new_row)
                 expanded_edges.extend(edges)
-            if ok and len(expanded_rows) == len(explicit_records):
+            if ok and len(expanded_rows) == len(expansion_records):
                 # When the candidate already establishes single-cell semantics and
                 # the structured bundle supplies a unique explicit source/well
                 # identity, that exact identity is also a safe cell identifier.
@@ -746,8 +773,8 @@ def self_test() -> None:
         # biological identities are both explicitly present.
         src2 = root / "candidate2.tsv"
         src2.write_text(
-            "source name\tcharacteristics[cell identifier]\tcomment[data file]\tcomment[label]\n"
-            "not available\tnot available\tm.raw\tnot available\n",
+            "source name\tcharacteristics[sample type]\tcharacteristics[cell identifier]\tcomment[data file]\tcomment[label]\n"
+            "not available\tsingle cell\tnot available\tm.raw\tnot available\n",
             encoding="utf-8",
         )
         evidence.write_text(
@@ -781,7 +808,7 @@ def self_test() -> None:
         ev5 = root / "multiplex_source_evidence.tsv"
         out5 = root / "multiplex_source_out.tsv"
         rep5 = root / "multiplex_source_report.json"
-        src5.write_text("source name\tcomment[data file]\nrun_0001\tm.raw\n")
+        src5.write_text("source name\tcharacteristics[sample type]\tcomment[data file]\nrun_0001\tsingle cell\tm.raw\n")
         ev5.write_text(
             "raw_file\tlabel\tsource name\tcell identifier\n"
             "m.raw\tTMT126\tcell-A\tA\n"
