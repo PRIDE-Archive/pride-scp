@@ -95,6 +95,18 @@ FIELD_ALIASES: dict[str, tuple[str, ...]] = {
     "characteristics[organism part]": ("characteristics[organism part]", "organism part", "organism_part", "tissue"),
     "characteristics[sample type]": ("characteristics[sample type]", "sample type", "sample_type"),
     "characteristics[individual]": ("characteristics[individual]", "individual", "donor identifier", "donor_identifier", "subject identifier", "subject_identifier"),
+    "comment[technical replicate]": (
+        "comment[technical replicate]", "technical replicate", "technical_replicate", "tech replicate", "tech_replicate",
+    ),
+    "comment[proteomics data acquisition method]": (
+        "comment[proteomics data acquisition method]", "proteomics data acquisition method",
+        "proteomics_data_acquisition_method", "acquisition method", "acquisition_method",
+        "acquisition mode", "acquisition_mode",
+    ),
+    "comment[instrument]": ("comment[instrument]", "instrument", "instrument model", "instrument_model"),
+    "comment[fraction identifier]": (
+        "comment[fraction identifier]", "fraction identifier", "fraction_identifier", "fraction",
+    ),
     "comment[label]": (
         "comment[label]", "label", "channel", "channel name", "channel_name", "channelname",
         "reporter channel", "reporter_channel", "reporter channel name", "reporter_channel_name",
@@ -141,6 +153,13 @@ BUNDLE_METADATA_KEYS = {
     norm_key("mapping_key"): "_bundle_mapping_key",
 }
 NON_SINGLE_CELL_POPULATION_KEYS = {"bulk", "bulkcontrol"}
+EXACT_REPORTER_SPECIALIZATION_FIELDS = (
+    "comment[technical replicate]",
+    "characteristics[biological replicate]",
+    "comment[proteomics data acquisition method]",
+    "comment[instrument]",
+    "comment[fraction identifier]",
+)
 
 
 def is_concrete(value: str) -> bool:
@@ -379,6 +398,31 @@ def collect_records(roots: list[Path], target_accession: str = "") -> list[dict[
     return out
 
 
+def canonical_reporter_token(value: str) -> str:
+    """Return a conservative reporter-channel key from plain or ontology labels."""
+    text = str(value or "")
+    match = re.search(
+        r"\btmt(?:pro)?\s*[-_]?\s*((?:12[6-9]|13[0-5])(?:n|c)?)\b",
+        text,
+        re.I,
+    )
+    if match:
+        return f"tmt{match.group(1).lower()}"
+    match = re.search(r"\bitraq\s*[-_]?\s*(11[3-9]|12[0-1])\b", text, re.I)
+    if match:
+        return f"itraq{match.group(1)}"
+    return ""
+
+
+def identity_field_values_equivalent(field: str, left: str, right: str) -> bool:
+    if field == "comment[label]":
+        left_reporter = canonical_reporter_token(left)
+        right_reporter = canonical_reporter_token(right)
+        if left_reporter and right_reporter:
+            return left_reporter == right_reporter
+    return norm_text(left) == norm_text(right)
+
+
 def identity_match_score(candidate: dict[str, str], rec: dict[str, str]) -> int | None:
     if norm_file(candidate.get("comment[data file]", "")) != norm_file(rec.get("raw_file", "")):
         return None
@@ -389,7 +433,7 @@ def identity_match_score(candidate: dict[str, str], rec: dict[str, str]) -> int 
             continue
         cv = candidate.get(field, "")
         if is_concrete(cv):
-            if norm_text(cv) != norm_text(rv):
+            if not identity_field_values_equivalent(field, cv, rv):
                 return None
             score += 2
     return score
@@ -457,8 +501,29 @@ def is_bundle_mapping_record(rec: dict[str, str]) -> bool:
     return Path(rec.get("source_path", "")).name == BUNDLE_MAPPING_BASENAME
 
 
-def bundle_record_set_allows_single_cell_expansion(records: list[dict[str, str]]) -> bool:
-    """Fail closed on explicit author evidence that a mapped reporter set is non-single-cell."""
+def exact_reporter_corroboration_records(
+    record: dict[str, str],
+    pool: list[dict[str, str]],
+) -> list[dict[str, str]]:
+    """Find non-bundle records that independently match one RAW/reporter identity."""
+    reporter = canonical_reporter_token(record.get("comment[label]", ""))
+    if not reporter:
+        return []
+    out: list[dict[str, str]] = []
+    for candidate in pool:
+        if is_bundle_mapping_record(candidate):
+            continue
+        other = canonical_reporter_token(candidate.get("comment[label]", ""))
+        if other and other == reporter:
+            out.append(candidate)
+    return out
+
+
+def bundle_record_set_allows_single_cell_expansion(
+    records: list[dict[str, str]],
+    pool: list[dict[str, str]],
+) -> bool:
+    """Gate bundle expansion on exact provenance and, for BULK roots, independent row evidence."""
     if not records or not all(is_bundle_mapping_record(rec) for rec in records):
         return True
 
@@ -471,11 +536,25 @@ def bundle_record_set_allows_single_cell_expansion(records: list[dict[str, str]]
     populations = [rec.get("_bundle_source_population", "") for rec in records]
     if not all(is_concrete(value) for value in populations):
         return False
-    if any(norm_key(value) in NON_SINGLE_CELL_POPULATION_KEYS for value in populations):
-        return False
+    population_keys = {norm_key(value) for value in populations}
+
+    # BULK is not treated as a single-cell claim by itself. It may materialize
+    # reporter rows only when every exact bundle reporter is independently
+    # corroborated by structured RAW+reporter evidence that explicitly says
+    # the reporter row is single cell. This preserves the historical fail-closed
+    # BULK veto when corroboration is absent or incomplete.
+    if population_keys & NON_SINGLE_CELL_POPULATION_KEYS:
+        if not population_keys <= NON_SINGLE_CELL_POPULATION_KEYS:
+            return False
+        for rec in records:
+            corroboration = exact_reporter_corroboration_records(rec, pool)
+            sample_type, _ = unique_value(corroboration, "characteristics[sample type]")
+            if norm_key(sample_type) != "singlecell":
+                return False
+        return True
 
     # If the bundle itself carries sample type, any explicit non-single-cell value
-    # vetoes expansion.  Missing sample type is allowed because the exact bundle
+    # vetoes expansion. Missing sample type is allowed because the exact bundle
     # schema may encode biology through source_population instead.
     sample_types = [
         rec.get("characteristics[sample type]", "")
@@ -521,7 +600,11 @@ def multiplex_expansion_records(records: list[dict[str, str]]) -> list[dict[str,
     ]
 
 
-def can_expand(base: dict[str, str], records: list[dict[str, str]]) -> bool:
+def can_expand(
+    base: dict[str, str],
+    records: list[dict[str, str]],
+    pool: list[dict[str, str]],
+) -> bool:
     if len(records) < 2:
         return False
     # Multiplex row expansion is a single-cell operation.  Explicit reporter
@@ -529,7 +612,7 @@ def can_expand(base: dict[str, str], records: list[dict[str, str]]) -> bool:
     # not be reinterpreted as one-cell-per-channel SDRF rows.
     if norm_key(base.get("characteristics[sample type]", "")) != "singlecell":
         return False
-    if not bundle_record_set_allows_single_cell_expansion(records):
+    if not bundle_record_set_allows_single_cell_expansion(records, pool):
         return False
     base_label = base.get("comment[label]", "")
     if is_concrete(base_label) and not generic_isobaric_label(base_label):
@@ -542,6 +625,35 @@ def can_expand(base: dict[str, str], records: list[dict[str, str]]) -> bool:
     return True
 
 
+
+
+def apply_exact_reporter_specializations(
+    row: dict[str, str],
+    corroboration: list[dict[str, str]],
+    headers: list[str],
+) -> tuple[dict[str, str], list[dict[str, str]]]:
+    """Apply unique exact RAW+reporter metadata over the generic pre-expansion row."""
+    out = dict(row)
+    edges: list[dict[str, str]] = []
+    for field in EXACT_REPORTER_SPECIALIZATION_FIELDS:
+        if field not in headers:
+            continue
+        value, source = unique_value(corroboration, field)
+        if not value or source is None:
+            continue
+        current = out.get(field, "")
+        if is_concrete(current) and field_values_equivalent(field, current, value):
+            continue
+        out[field] = value
+        edges.append({
+            "field": field,
+            "old": current,
+            "new": value,
+            "source_path": source.get("source_path", ""),
+            "source_sha256": source.get("source_sha256", ""),
+            "exact_raw_reporter_specialization": "true",
+        })
+    return out, edges
 
 
 def safe_composite_narrowing(field: str, current: str, value: str) -> bool:
@@ -669,7 +781,7 @@ def resolve(candidate: Path, output: Path, report: Path, roots: list[Path], acce
         # Safe explicit multiplex expansion only for one-row-per-RAW single-cell
         # candidates and explicit reporter-level evidence.  Generic chemistry/context
         # records remain available to the ordinary mapping path below.
-        if len(group) == 1 and can_expand(group[0], expansion_records):
+        if len(group) == 1 and can_expand(group[0], expansion_records, explicit_records):
             expanded_rows = []
             expanded_edges: list[dict[str, Any]] = []
             ok = True
@@ -684,6 +796,13 @@ def resolve(candidate: Path, output: Path, report: Path, roots: list[Path], acce
                     ok = False
                     conflicts.append({"data_file": group[0].get("comment[data file]", ""), "status": "multiplex_expansion_conflict", "detail": err, "source_path": rec.get("source_path", "")})
                     break
+
+                corroboration = exact_reporter_corroboration_records(rec, explicit_records)
+                new_row, reporter_edges = apply_exact_reporter_specializations(
+                    new_row, corroboration, headers
+                )
+                edges.extend(reporter_edges)
+
                 expanded_rows.append(new_row)
                 expanded_edges.extend(edges)
             if ok and len(expanded_rows) == len(expansion_records):
