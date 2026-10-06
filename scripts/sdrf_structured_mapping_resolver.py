@@ -38,6 +38,31 @@ def norm_key(value: str) -> str:
     return re.sub(r"[^a-z0-9]+", "", norm_text(value))
 
 
+def canonical_organism_name(value: str) -> str:
+    """Return a conservative scientific-name key for organism display labels.
+
+    SDRF sources may serialize the same organism as ``Homo sapiens`` or as the
+    ontology display form ``Homo sapiens (human)``. Treat these as equivalent
+    only when the normalized scientific binomial is exactly identical.
+    """
+    text = norm_text(value)
+    match = re.fullmatch(
+        r"([a-z][a-z0-9._-]*\s+[a-z][a-z0-9._-]*)(?:\s+\([^)]+\))?",
+        text,
+    )
+    return match.group(1) if match else ""
+
+
+def field_values_equivalent(field: str, left: str, right: str) -> bool:
+    if norm_text(left) == norm_text(right):
+        return True
+    if field != "characteristics[organism]":
+        return False
+    left_name = canonical_organism_name(left)
+    right_name = canonical_organism_name(right)
+    return bool(left_name and right_name and left_name == right_name)
+
+
 def norm_file(value: str) -> str:
     value = str(value or "").strip().replace("\\", "/")
     value = value.rsplit("/", 1)[-1]
@@ -109,6 +134,14 @@ ALIAS_TO_FIELD = {
 RAW_KEYS = {norm_key(x) for x in RAW_ALIASES}
 ACCESSION_KEYS = {norm_key(x) for x in ("accession", "project_accession", "project accession", "pxd")}
 
+BUNDLE_MAPPING_BASENAME = "structured_bundle_row_mappings.tsv"
+BUNDLE_METADATA_KEYS = {
+    norm_key("source_population"): "_bundle_source_population",
+    norm_key("mapping_confidence"): "_bundle_mapping_confidence",
+    norm_key("mapping_key"): "_bundle_mapping_key",
+}
+NON_SINGLE_CELL_POPULATION_KEYS = {"bulk", "bulkcontrol"}
+
 
 def is_concrete(value: str) -> bool:
     return norm_text(value) not in PLACEHOLDERS
@@ -155,6 +188,12 @@ def canonical_record(row: dict[str, Any], source: Path) -> dict[str, str] | None
             if prev and norm_text(prev) != norm_text(sval):
                 return None
             fields[field] = sval
+        metadata_field = BUNDLE_METADATA_KEYS.get(nk)
+        if metadata_field and sval:
+            prev = fields.get(metadata_field)
+            if prev and norm_text(prev) != norm_text(sval):
+                return None
+            fields[metadata_field] = sval
     if not raw or not fields:
         return None
     payload = {"raw_file": raw, "source_path": str(source)}
@@ -414,14 +453,48 @@ def generic_isobaric_label(value: str) -> bool:
     return bool(re.fullmatch(r"tmt(?:pro)?(?:6|8|10|11|16|18)(?:plex)?", token))
 
 
+def is_bundle_mapping_record(rec: dict[str, str]) -> bool:
+    return Path(rec.get("source_path", "")).name == BUNDLE_MAPPING_BASENAME
+
+
+def bundle_record_set_allows_single_cell_expansion(records: list[dict[str, str]]) -> bool:
+    """Fail closed on explicit author evidence that a mapped reporter set is non-single-cell."""
+    if not records or not all(is_bundle_mapping_record(rec) for rec in records):
+        return True
+
+    # Bundle expansion is accepted only for exact, high-confidence schema joins.
+    if any(norm_key(rec.get("_bundle_mapping_confidence", "")) != "high" for rec in records):
+        return False
+    if any(norm_key(rec.get("_bundle_mapping_key", "")) != "exactrawnamechannelwell" for rec in records):
+        return False
+
+    populations = [rec.get("_bundle_source_population", "") for rec in records]
+    if not all(is_concrete(value) for value in populations):
+        return False
+    if any(norm_key(value) in NON_SINGLE_CELL_POPULATION_KEYS for value in populations):
+        return False
+
+    # If the bundle itself carries sample type, any explicit non-single-cell value
+    # vetoes expansion.  Missing sample type is allowed because the exact bundle
+    # schema may encode biology through source_population instead.
+    sample_types = [
+        rec.get("characteristics[sample type]", "")
+        for rec in records
+        if is_concrete(rec.get("characteristics[sample type]", ""))
+    ]
+    if any(norm_key(value) != "singlecell" for value in sample_types):
+        return False
+    return True
+
+
 def multiplex_expansion_records(records: list[dict[str, str]]) -> list[dict[str, str]]:
     """Return only records that can define explicit reporter-level rows.
 
     Generic chemistry/context records such as ``TMT``/``TMTpro`` are useful for
-    ordinary structured mapping, but they are not reporter identities.  Mixing them
-    into an otherwise explicit reporter set can create a spurious conflict late in
-    expansion and roll back the whole RAW.  Keep those records available to the
-    normal resolver path, but exclude them from the one-RAW -> many-row split.
+    ordinary structured mapping, but they are not reporter identities.  When the
+    dedicated structured-bundle adapter has emitted exact reporter mappings for a
+    RAW, those records are authoritative for the expansion set and contextual
+    community/report rows must not be mixed into it.
     """
     out: list[dict[str, str]] = []
     for rec in records:
@@ -431,7 +504,9 @@ def multiplex_expansion_records(records: list[dict[str, str]]) -> list[dict[str,
         if not any(is_concrete(rec.get(field, "")) for field in BIOLOGICAL_FIELDS):
             continue
         out.append(rec)
-    return out
+
+    bundle = [rec for rec in out if is_bundle_mapping_record(rec)]
+    return bundle if bundle else out
 
 
 def can_expand(base: dict[str, str], records: list[dict[str, str]]) -> bool:
@@ -441,6 +516,8 @@ def can_expand(base: dict[str, str], records: list[dict[str, str]]) -> bool:
     # mappings from bulk/QC/reference regimes remain valid graph evidence but must
     # not be reinterpreted as one-cell-per-channel SDRF rows.
     if norm_key(base.get("characteristics[sample type]", "")) != "singlecell":
+        return False
+    if not bundle_record_set_allows_single_cell_expansion(records):
         return False
     base_label = base.get("comment[label]", "")
     if is_concrete(base_label) and not generic_isobaric_label(base_label):
@@ -489,7 +566,7 @@ def apply_record(
         if not row_specific_value(field, value):
             continue
         current = row.get(field, "")
-        if is_concrete(current) and norm_text(current) != norm_text(value):
+        if is_concrete(current) and not field_values_equivalent(field, current, value):
             if allow_expansion_identity_replace and field in {"source name", "assay name"}:
                 row[field] = value
                 edges.append({
@@ -639,7 +716,7 @@ def resolve(candidate: Path, output: Path, report: Path, roots: list[Path], acce
                 if not value or source is None:
                     continue
                 if is_concrete(current):
-                    if norm_text(current) == norm_text(value):
+                    if field_values_equivalent(field, current, value):
                         continue
                     if not safe_composite_narrowing(field, current, value):
                         continue
