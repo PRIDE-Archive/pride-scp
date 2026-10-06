@@ -253,9 +253,9 @@ def test_organism_display_alias_does_not_block_explicit_reporter_expansion(tmp_p
     )
     mapping = tmp_path / "mapping.tsv"
     mapping.write_text(
-        "accession\traw_file\treporter_channel\tsource_name\torganism\n"
-        "PXD900001\tA.raw\tTMT127N\tcell-A\tHomo sapiens\n"
-        "PXD900001\tA.raw\tTMT128N\tcell-B\tHomo sapiens\n"
+        "accession\traw_file\treporter_channel\tsource_name\torganism\tsample_type\n"
+        "PXD900001\tA.raw\tTMT127N\tcell-A\tHomo sapiens\tsingle cell\n"
+        "PXD900001\tA.raw\tTMT128N\tcell-B\tHomo sapiens\tsingle cell\n"
     )
     output = tmp_path / "resolved.tsv"
     report = tmp_path / "resolver.json"
@@ -278,9 +278,9 @@ def test_different_organism_still_blocks_explicit_reporter_expansion(tmp_path: P
     )
     mapping = tmp_path / "mapping.tsv"
     mapping.write_text(
-        "accession\traw_file\treporter_channel\tsource_name\torganism\n"
-        "PXD900001\tA.raw\tTMT127N\tcell-A\tMus musculus\n"
-        "PXD900001\tA.raw\tTMT128N\tcell-B\tMus musculus\n"
+        "accession\traw_file\treporter_channel\tsource_name\torganism\tsample_type\n"
+        "PXD900001\tA.raw\tTMT127N\tcell-A\tMus musculus\tsingle cell\n"
+        "PXD900001\tA.raw\tTMT128N\tcell-B\tMus musculus\tsingle cell\n"
     )
     output = tmp_path / "resolved.tsv"
     report = tmp_path / "resolver.json"
@@ -293,4 +293,27 @@ def test_different_organism_still_blocks_explicit_reporter_expansion(tmp_path: P
         "characteristics[organism]" in conflict["detail"]
         for conflict in result["conflicts"]
     )
+    assert output.read_bytes() == candidate.read_bytes()
+
+
+def test_nonbundle_bulk_control_reporters_do_not_attempt_single_cell_expansion(tmp_path: Path) -> None:
+    candidate = tmp_path / "candidate.tsv"
+    candidate.write_text(
+        "source name\tcharacteristics[sample type]\tcomment[data file]\tcomment[label]\n"
+        "run_B\tsingle cell\tB.raw\tTMTpro\n"
+    )
+    context = tmp_path / "PXD900001_community_annotated.sdrf.tsv"
+    context.write_text(
+        "source name\tcharacteristics[sample type]\tcomment[data file]\tcomment[label]\n"
+        "bulk_A\tbulk control\tB.raw\tTMT127N\n"
+        "bulk_B\tbulk control\tB.raw\tTMT128N\n"
+    )
+
+    output = tmp_path / "resolved.tsv"
+    report = tmp_path / "resolver.json"
+    result = resolve(candidate, output, report, [context], "PXD900001")
+
+    assert result["changed"] is False
+    assert result["multiplex_expansion_count"] == 0
+    assert result["conflicts"] == []
     assert output.read_bytes() == candidate.read_bytes()

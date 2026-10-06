@@ -506,7 +506,19 @@ def multiplex_expansion_records(records: list[dict[str, str]]) -> list[dict[str,
         out.append(rec)
 
     bundle = [rec for rec in out if is_bundle_mapping_record(rec)]
-    return bundle if bundle else out
+    if bundle:
+        return bundle
+
+    # Outside the dedicated author bundle, a reporter record may define a
+    # biological single-cell row only when that record itself explicitly says
+    # it is single cell.  This prevents carrier/reference/bulk-control context
+    # rows from being reinterpreted as biological reporter identities merely
+    # because the base candidate row was mislabeled single cell.
+    return [
+        rec
+        for rec in out
+        if norm_key(rec.get("characteristics[sample type]", "")) == "singlecell"
+    ]
 
 
 def can_expand(base: dict[str, str], records: list[dict[str, str]]) -> bool:
@@ -855,9 +867,9 @@ def self_test() -> None:
             encoding="utf-8",
         )
         evidence.write_text(
-            "raw_file\treporter_channel\tcell_identifier\tsource_name\n"
-            "m.raw\tTMT126\tcell-A\tcell-A\n"
-            "m.raw\tTMT127N\tcell-B\tcell-B\n",
+            "raw_file\treporter_channel\tcell_identifier\tsource_name\tsample_type\n"
+            "m.raw\tTMT126\tcell-A\tcell-A\tsingle cell\n"
+            "m.raw\tTMT127N\tcell-B\tcell-B\tsingle cell\n",
             encoding="utf-8",
         )
         result = resolve(src2, out, rep, [evidence])
@@ -887,9 +899,9 @@ def self_test() -> None:
         rep5 = root / "multiplex_source_report.json"
         src5.write_text("source name\tcharacteristics[sample type]\tcomment[data file]\nrun_0001\tsingle cell\tm.raw\n")
         ev5.write_text(
-            "raw_file\tlabel\tsource name\tcell identifier\n"
-            "m.raw\tTMT126\tcell-A\tA\n"
-            "m.raw\tTMT127N\tcell-B\tB\n"
+            "raw_file\tlabel\tsource name\tcell identifier\tsample type\n"
+            "m.raw\tTMT126\tcell-A\tA\tsingle cell\n"
+            "m.raw\tTMT127N\tcell-B\tB\tsingle cell\n"
         )
         r5 = resolve(src5, out5, rep5, [ev5], "")
         assert r5["multiplex_expansion_count"] == 1
@@ -909,9 +921,9 @@ def self_test() -> None:
             "run_0001\tsingle cell\tnot available\tm.raw\tTMTpro\n"
         )
         ev5b.write_text(
-            "raw_file\treporter_channel\tsource_name\n"
-            "m.raw\tTMT127N\tcell-A\n"
-            "m.raw\tTMT128N\tcell-B\n"
+            "raw_file\treporter_channel\tsource_name\tsample_type\n"
+            "m.raw\tTMT127N\tcell-A\tsingle cell\n"
+            "m.raw\tTMT128N\tcell-B\tsingle cell\n"
         )
         r5b = resolve(src5b, out5b, rep5b, [ev5b], "")
         assert r5b["multiplex_expansion_count"] == 1
