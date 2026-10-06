@@ -442,3 +442,180 @@ def test_single_cell_bundle_exact_reporter_evidence_specializes_validator_fields
     )
     assert all(r["comment[instrument]"] == "Orbitrap" for r in rows)
     assert all(r["comment[fraction identifier]"] == "1" for r in rows)
+
+
+def test_complete_community_bulk_control_projection_replaces_wrong_single_cell_semantics(
+    tmp_path: Path,
+) -> None:
+    candidate = tmp_path / "candidate.tsv"
+    candidate.write_text(
+        "source name\tassay name\tcharacteristics[sample type]\t"
+        "characteristics[single cell isolation protocol]\tcharacteristics[cell identifier]\t"
+        "characteristics[cells per well]\tcharacteristics[biological replicate]\t"
+        "comment[technical replicate]\tcomment[proteomics data acquisition method]\t"
+        "comment[instrument]\tcomment[fraction identifier]\tcomment[data file]\tcomment[label]\n"
+        "run_0205\tB\tsingle cell\tFACS\trun_0205\t1\tnot available\t"
+        "not available\tNT=data-dependent acquisition;AC=PRIDE:0000627\t"
+        "not available\tnot available\tB.raw\tTMTpro\n"
+    )
+    community = tmp_path / "structured_artifacts" / "PXD900001" / "PXD900001_community_annotated.sdrf.tsv"
+    community.parent.mkdir(parents=True, exist_ok=True)
+    community.write_text(
+        "source name\tassay name\tcharacteristics[sample type]\t"
+        "characteristics[single cell isolation protocol]\tcharacteristics[cell identifier]\t"
+        "characteristics[cells per well]\tcharacteristics[biological replicate]\t"
+        "comment[technical replicate]\tcomment[proteomics data acquisition method]\t"
+        "comment[instrument]\tcomment[fraction identifier]\tcomment[data file]\tcomment[label]\n"
+        "MS3_bulk_BLAST_rep1\trun 265\tbulk control\tFACS\tnot applicable\t20000\tpooled\t"
+        "1\tdata-dependent acquisition\tNT=Orbitrap Fusion;AC=MS:1002416\t1\tB.raw\t"
+        "NT=TMT127N;AC=PRIDE:0000519\n"
+        "MS3_bulk_LSC_rep2\trun 265\tbulk control\tFACS\tnot applicable\t20000\tpooled\t"
+        "2\tdata-dependent acquisition\tNT=Orbitrap Fusion;AC=MS:1002416\t1\tB.raw\t"
+        "NT=TMT130C;AC=PRIDE:0000527\n"
+        "MS3_bulk_PROG_rep3\trun 265\tbulk control\tFACS\tnot applicable\t20000\tpooled\t"
+        "3\tdata-dependent acquisition\tNT=Orbitrap Fusion;AC=MS:1002416\t1\tB.raw\t"
+        "NT=TMT133N;AC=PRIDE:0000632\n"
+    )
+
+    output = tmp_path / "resolved.tsv"
+    report = tmp_path / "resolver.json"
+    result = resolve(candidate, output, report, [community], "PXD900001")
+
+    assert result["changed"] is True
+    assert result["multiplex_expansion_count"] == 1
+    assert result["conflicts"] == []
+    assert result["multiplex_expansions"][0]["projection_mode"] == (
+        "community_full_row_multiplex_projection"
+    )
+
+    rows = list(csv.DictReader(output.open(), delimiter="\t"))
+    assert len(rows) == 3
+    assert [r["source name"] for r in rows] == [
+        "MS3_bulk_BLAST_rep1",
+        "MS3_bulk_LSC_rep2",
+        "MS3_bulk_PROG_rep3",
+    ]
+    assert all(r["assay name"] == "run 265" for r in rows)
+    assert all(r["characteristics[sample type]"] == "bulk control" for r in rows)
+    assert all(r["characteristics[single cell isolation protocol]"] == "FACS" for r in rows)
+    assert all(r["characteristics[cell identifier]"] == "not applicable" for r in rows)
+    assert all(r["characteristics[cells per well]"] == "20000" for r in rows)
+    assert all(r["characteristics[biological replicate]"] == "pooled" for r in rows)
+    assert [r["comment[technical replicate]"] for r in rows] == ["1", "2", "3"]
+    assert all(
+        r["comment[proteomics data acquisition method]"] == "data-dependent acquisition"
+        for r in rows
+    )
+    assert all(
+        r["comment[instrument]"] == "NT=Orbitrap Fusion;AC=MS:1002416"
+        for r in rows
+    )
+    assert all(r["comment[fraction identifier]"] == "1" for r in rows)
+    assert [r["comment[label]"] for r in rows] == [
+        "NT=TMT127N;AC=PRIDE:0000519",
+        "NT=TMT130C;AC=PRIDE:0000527",
+        "NT=TMT133N;AC=PRIDE:0000632",
+    ]
+    assert all(
+        edge.get("mode") == "community_full_row_multiplex_projection"
+        for edge in result["applied_edges"]
+    )
+
+
+def test_community_bulk_control_projection_fails_closed_when_required_metadata_is_partial(
+    tmp_path: Path,
+) -> None:
+    candidate = tmp_path / "candidate.tsv"
+    candidate.write_text(
+        "source name\tassay name\tcharacteristics[sample type]\t"
+        "characteristics[cell identifier]\tcharacteristics[cells per well]\t"
+        "characteristics[biological replicate]\tcomment[technical replicate]\t"
+        "comment[proteomics data acquisition method]\tcomment[instrument]\t"
+        "comment[fraction identifier]\tcomment[data file]\tcomment[label]\n"
+        "run_B\tB\tsingle cell\trun_B\t1\tnot available\tnot available\t"
+        "not available\tnot available\tnot available\tB.raw\tTMTpro\n"
+    )
+    community = tmp_path / "structured_artifacts" / "PXD900001" / "PXD900001_community_annotated.sdrf.tsv"
+    community.parent.mkdir(parents=True, exist_ok=True)
+    community.write_text(
+        "source name\tassay name\tcharacteristics[sample type]\t"
+        "characteristics[cell identifier]\tcharacteristics[cells per well]\t"
+        "characteristics[biological replicate]\tcomment[technical replicate]\t"
+        "comment[proteomics data acquisition method]\tcomment[instrument]\t"
+        "comment[fraction identifier]\tcomment[data file]\tcomment[label]\n"
+        "bulk_A\trun 1\tbulk control\tnot applicable\t20000\tpooled\t1\t"
+        "data-dependent acquisition\tOrbitrap\t1\tB.raw\tTMT127N\n"
+        "bulk_B\trun 1\tbulk control\tnot applicable\t20000\tpooled\t2\t"
+        "data-dependent acquisition\tOrbitrap\tnot available\tB.raw\tTMT128N\n"
+    )
+
+    output = tmp_path / "resolved.tsv"
+    report = tmp_path / "resolver.json"
+    result = resolve(candidate, output, report, [community], "PXD900001")
+
+    assert result["changed"] is False
+    assert result["multiplex_expansion_count"] == 0
+    assert result["conflicts"] == []
+    assert output.read_bytes() == candidate.read_bytes()
+
+
+def test_community_bulk_control_projection_fails_closed_on_duplicate_reporter_identity(
+    tmp_path: Path,
+) -> None:
+    candidate = tmp_path / "candidate.tsv"
+    candidate.write_text(
+        "source name\tcharacteristics[sample type]\tcharacteristics[biological replicate]\t"
+        "comment[technical replicate]\tcomment[proteomics data acquisition method]\t"
+        "comment[instrument]\tcomment[fraction identifier]\tcomment[data file]\tcomment[label]\n"
+        "run_B\tsingle cell\tnot available\tnot available\tnot available\t"
+        "not available\tnot available\tB.raw\tTMTpro\n"
+    )
+    community = tmp_path / "structured_artifacts" / "PXD900001" / "PXD900001_community_annotated.sdrf.tsv"
+    community.parent.mkdir(parents=True, exist_ok=True)
+    community.write_text(
+        "source name\tcharacteristics[sample type]\tcharacteristics[biological replicate]\t"
+        "comment[technical replicate]\tcomment[proteomics data acquisition method]\t"
+        "comment[instrument]\tcomment[fraction identifier]\tcomment[data file]\tcomment[label]\n"
+        "bulk_A\tbulk control\tpooled\t1\tdata-dependent acquisition\tOrbitrap\t1\tB.raw\tTMT127N\n"
+        "bulk_B\tbulk control\tpooled\t2\tdata-dependent acquisition\tOrbitrap\t1\tB.raw\t"
+        "NT=TMT127N;AC=PRIDE:0000519\n"
+    )
+
+    output = tmp_path / "resolved.tsv"
+    report = tmp_path / "resolver.json"
+    result = resolve(candidate, output, report, [community], "PXD900001")
+
+    assert result["changed"] is False
+    assert result["multiplex_expansion_count"] == 0
+    assert result["conflicts"] == []
+    assert output.read_bytes() == candidate.read_bytes()
+
+
+def test_complete_community_rows_outside_structured_artifacts_are_not_projection_authority(
+    tmp_path: Path,
+) -> None:
+    candidate = tmp_path / "candidate.tsv"
+    candidate.write_text(
+        "source name\tcharacteristics[sample type]\tcharacteristics[biological replicate]\t"
+        "comment[technical replicate]\tcomment[proteomics data acquisition method]\t"
+        "comment[instrument]\tcomment[fraction identifier]\tcomment[data file]\tcomment[label]\n"
+        "run_B\tsingle cell\tnot available\tnot available\tnot available\t"
+        "not available\tnot available\tB.raw\tTMTpro\n"
+    )
+    community = tmp_path / "PXD900001_community_annotated.sdrf.tsv"
+    community.write_text(
+        "source name\tcharacteristics[sample type]\tcharacteristics[biological replicate]\t"
+        "comment[technical replicate]\tcomment[proteomics data acquisition method]\t"
+        "comment[instrument]\tcomment[fraction identifier]\tcomment[data file]\tcomment[label]\n"
+        "bulk_A\tbulk control\tpooled\t1\tdata-dependent acquisition\tOrbitrap\t1\tB.raw\tTMT127N\n"
+        "bulk_B\tbulk control\tpooled\t2\tdata-dependent acquisition\tOrbitrap\t1\tB.raw\tTMT128N\n"
+    )
+
+    output = tmp_path / "resolved.tsv"
+    report = tmp_path / "resolver.json"
+    result = resolve(candidate, output, report, [community], "PXD900001")
+
+    assert result["changed"] is False
+    assert result["multiplex_expansion_count"] == 0
+    assert result["conflicts"] == []
+    assert output.read_bytes() == candidate.read_bytes()
