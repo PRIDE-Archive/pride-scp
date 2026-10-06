@@ -148,18 +148,20 @@ def test_generic_chemistry_context_does_not_poison_explicit_reporter_expansion(t
 
     mapping = tmp_path / "structured_bundle_row_mappings.tsv"
     mapping.write_text(
-        "accession\traw_file\treporter_channel\tsource_name\tplate\tmultiplex_sample\tplate_well\n"
-        "PXD900001\tA.raw\tTMT127N\tPlate1_S1_A1\tPlate1\t1\tA1\n"
-        "PXD900001\tA.raw\tTMT128N\tPlate1_S1_A2\tPlate1\t1\tA2\n"
+        "accession\traw_file\treporter_channel\tsource_name\tplate\tmultiplex_sample\tplate_well\t"
+        "source_population\tmapping_confidence\tmapping_key\n"
+        "PXD900001\tA.raw\tTMT127N\tPlate1_S1_A1\tPlate1\t1\tA1\tBLAST\thigh\texact_raw_name_channel_well\n"
+        "PXD900001\tA.raw\tTMT128N\tPlate1_S1_A2\tPlate1\t1\tA2\tPROG\thigh\texact_raw_name_channel_well\n"
     )
 
-    # Mirrors the contextual community SDRF record that triggered the real
-    # Regression: RAW-scoped context with a generic chemistry label,
-    # not one reporter identity.
+    # Contextual community rows may carry both generic chemistry and explicit
+    # control-channel identities.  Once the dedicated bundle has an exact
+    # reporter mapping, these rows remain context and must not enter expansion.
     context = tmp_path / "PXD900001_community_annotated.sdrf.tsv"
     context.write_text(
-        "source name\tcharacteristics[organism]\tcomment[data file]\tcomment[label]\n"
-        "run_A\tHomo sapiens\tA.raw\tTMTpro\n"
+        "source name\tcharacteristics[sample type]\tcharacteristics[organism]\tcomment[data file]\tcomment[label]\n"
+        "run_A\tsingle cell\tHomo sapiens\tA.raw\tTMTpro\n"
+        "carrier_A\tcarrier\tHomo sapiens\tA.raw\tTMT126\n"
     )
 
     output = tmp_path / "resolved.tsv"
@@ -193,4 +195,102 @@ def test_bulk_candidate_is_not_multiplex_expanded_from_reporter_mapping(tmp_path
 
     assert result["multiplex_expansion_count"] == 0
     assert result["changed"] is False
+    assert output.read_bytes() == candidate.read_bytes()
+
+
+def test_explicit_bundle_bulk_population_vetoes_mislabeled_single_cell_candidate(tmp_path: Path) -> None:
+    candidate = tmp_path / "candidate.tsv"
+    candidate.write_text(
+        "source name\tcharacteristics[sample type]\tcomment[data file]\tcomment[label]\n"
+        "run_B\tsingle cell\tB.raw\tTMTpro\n"
+    )
+    mapping = tmp_path / "structured_bundle_row_mappings.tsv"
+    mapping.write_text(
+        "accession\traw_file\treporter_channel\tsource_name\tsource_population\t"
+        "mapping_confidence\tmapping_key\n"
+        "PXD900001\tB.raw\tTMT127N\tBulk_S1_A1\tBULK\thigh\texact_raw_name_channel_well\n"
+        "PXD900001\tB.raw\tTMT128N\tBulk_S1_A2\tBULK\thigh\texact_raw_name_channel_well\n"
+    )
+
+    output = tmp_path / "resolved.tsv"
+    report = tmp_path / "resolver.json"
+    result = resolve(candidate, output, report, [mapping], "PXD900001")
+
+    assert result["multiplex_expansion_count"] == 0
+    assert result["changed"] is False
+    assert output.read_bytes() == candidate.read_bytes()
+
+
+def test_bundle_expansion_fails_closed_without_source_population_provenance(tmp_path: Path) -> None:
+    candidate = tmp_path / "candidate.tsv"
+    candidate.write_text(
+        "source name\tcharacteristics[sample type]\tcomment[data file]\tcomment[label]\n"
+        "run_C\tsingle cell\tC.raw\tTMTpro\n"
+    )
+    mapping = tmp_path / "structured_bundle_row_mappings.tsv"
+    mapping.write_text(
+        "accession\traw_file\treporter_channel\tsource_name\tsource_population\t"
+        "mapping_confidence\tmapping_key\n"
+        "PXD900001\tC.raw\tTMT127N\tCell_S1_A1\t\thigh\texact_raw_name_channel_well\n"
+        "PXD900001\tC.raw\tTMT128N\tCell_S1_A2\t\thigh\texact_raw_name_channel_well\n"
+    )
+
+    output = tmp_path / "resolved.tsv"
+    report = tmp_path / "resolver.json"
+    result = resolve(candidate, output, report, [mapping], "PXD900001")
+
+    assert result["multiplex_expansion_count"] == 0
+    assert result["changed"] is False
+    assert output.read_bytes() == candidate.read_bytes()
+
+
+def test_organism_display_alias_does_not_block_explicit_reporter_expansion(tmp_path: Path) -> None:
+    candidate = tmp_path / "candidate.tsv"
+    candidate.write_text(
+        "source name\tcharacteristics[sample type]\tcharacteristics[organism]\t"
+        "comment[data file]\tcomment[label]\n"
+        "run_A\tsingle cell\tHomo sapiens (human)\tA.raw\tTMTpro\n"
+    )
+    mapping = tmp_path / "mapping.tsv"
+    mapping.write_text(
+        "accession\traw_file\treporter_channel\tsource_name\torganism\n"
+        "PXD900001\tA.raw\tTMT127N\tcell-A\tHomo sapiens\n"
+        "PXD900001\tA.raw\tTMT128N\tcell-B\tHomo sapiens\n"
+    )
+    output = tmp_path / "resolved.tsv"
+    report = tmp_path / "resolver.json"
+    result = resolve(candidate, output, report, [mapping], "PXD900001")
+
+    assert result["changed"] is True
+    assert result["multiplex_expansion_count"] == 1
+    assert result["conflicts"] == []
+    rows = list(csv.DictReader(output.open(), delimiter="\t"))
+    assert {r["comment[label]"] for r in rows} == {"TMT127N", "TMT128N"}
+    assert all(r["characteristics[organism]"] == "Homo sapiens (human)" for r in rows)
+
+
+def test_different_organism_still_blocks_explicit_reporter_expansion(tmp_path: Path) -> None:
+    candidate = tmp_path / "candidate.tsv"
+    candidate.write_text(
+        "source name\tcharacteristics[sample type]\tcharacteristics[organism]\t"
+        "comment[data file]\tcomment[label]\n"
+        "run_A\tsingle cell\tHomo sapiens (human)\tA.raw\tTMTpro\n"
+    )
+    mapping = tmp_path / "mapping.tsv"
+    mapping.write_text(
+        "accession\traw_file\treporter_channel\tsource_name\torganism\n"
+        "PXD900001\tA.raw\tTMT127N\tcell-A\tMus musculus\n"
+        "PXD900001\tA.raw\tTMT128N\tcell-B\tMus musculus\n"
+    )
+    output = tmp_path / "resolved.tsv"
+    report = tmp_path / "resolver.json"
+    result = resolve(candidate, output, report, [mapping], "PXD900001")
+
+    assert result["changed"] is False
+    assert result["multiplex_expansion_count"] == 0
+    assert result["conflicts"]
+    assert all(
+        "characteristics[organism]" in conflict["detail"]
+        for conflict in result["conflicts"]
+    )
     assert output.read_bytes() == candidate.read_bytes()
