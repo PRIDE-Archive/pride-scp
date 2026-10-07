@@ -94,6 +94,13 @@ FIELD_ALIASES: dict[str, tuple[str, ...]] = {
     "characteristics[organism]": ("characteristics[organism]", "organism", "species"),
     "characteristics[organism part]": ("characteristics[organism part]", "organism part", "organism_part", "tissue"),
     "characteristics[sample type]": ("characteristics[sample type]", "sample type", "sample_type"),
+    "characteristics[single cell isolation protocol]": (
+        "characteristics[single cell isolation protocol]", "single cell isolation protocol",
+        "single_cell_isolation_protocol", "isolation protocol", "isolation_protocol",
+    ),
+    "characteristics[cells per well]": (
+        "characteristics[cells per well]", "cells per well", "cells_per_well",
+    ),
     "characteristics[individual]": ("characteristics[individual]", "individual", "donor identifier", "donor_identifier", "subject identifier", "subject_identifier"),
     "comment[technical replicate]": (
         "comment[technical replicate]", "technical replicate", "technical_replicate", "tech replicate", "tech_replicate",
@@ -161,9 +168,51 @@ EXACT_REPORTER_SPECIALIZATION_FIELDS = (
     "comment[fraction identifier]",
 )
 
+COMMUNITY_SDRF_SUFFIX = "_community_annotated.sdrf.tsv"
+COMMUNITY_PROJECTION_CORE_FIELDS = (
+    "source name",
+    "characteristics[sample type]",
+    "comment[label]",
+    *EXACT_REPORTER_SPECIALIZATION_FIELDS,
+)
+COMMUNITY_PROJECTION_IDENTITY_FIELDS = (
+    "assay name",
+    "characteristics[single cell isolation protocol]",
+    "characteristics[cell identifier]",
+    "characteristics[cells per well]",
+)
+COMMUNITY_EXPLICIT_NOT_APPLICABLE_FIELDS = {
+    "characteristics[single cell isolation protocol]",
+    "characteristics[cell identifier]",
+    "characteristics[cells per well]",
+}
+
 
 def is_concrete(value: str) -> bool:
     return norm_text(value) not in PLACEHOLDERS
+
+
+def is_trusted_community_sdrf_source(path: Path | str) -> bool:
+    source = Path(path)
+    parts = {part.casefold() for part in source.parts}
+    return (
+        source.name.casefold().endswith(COMMUNITY_SDRF_SUFFIX)
+        and "structured_artifacts" in parts
+    )
+
+
+def community_explicit_value(field: str, value: str) -> bool:
+    """Return whether a trusted community row explicitly defines *field*.
+
+    ``not applicable`` is a meaningful row semantic for selected structural
+    fields and must be distinguishable from missing/unknown evidence.
+    """
+    key = norm_text(value)
+    if not key or key in {"not available", "unknown", "na", "n/a", "none"}:
+        return False
+    if key == "not applicable":
+        return field in COMMUNITY_EXPLICIT_NOT_APPLICABLE_FIELDS
+    return True
 
 
 def row_specific_value(field: str, value: str) -> bool:
@@ -202,7 +251,17 @@ def canonical_record(row: dict[str, Any], source: Path) -> dict[str, str] | None
         if nk in ACCESSION_KEYS and not accession_value and re.fullmatch(r"PXD\d{6,}", sval, re.I):
             accession_value = sval.upper()
         field = ALIAS_TO_FIELD.get(nk)
-        if field and row_specific_value(field, sval):
+        field_is_explicit = bool(
+            field
+            and (
+                row_specific_value(field, sval)
+                or (
+                    is_trusted_community_sdrf_source(source)
+                    and community_explicit_value(field, sval)
+                )
+            )
+        )
+        if field_is_explicit:
             prev = fields.get(field)
             if prev and norm_text(prev) != norm_text(sval):
                 return None
@@ -600,6 +659,118 @@ def multiplex_expansion_records(records: list[dict[str, str]]) -> list[dict[str,
     ]
 
 
+def is_community_sdrf_record(rec: dict[str, str]) -> bool:
+    return is_trusted_community_sdrf_source(rec.get("source_path", ""))
+
+
+def community_multiplex_expansion_records(
+    records: list[dict[str, str]],
+) -> list[dict[str, str]]:
+    """Return trusted non-bundle community rows with explicit reporters."""
+    out: list[dict[str, str]] = []
+    for rec in records:
+        if not is_community_sdrf_record(rec):
+            continue
+        label = rec.get("comment[label]", "")
+        if not canonical_reporter_token(label) or generic_isobaric_label(label):
+            continue
+        out.append(rec)
+    return out
+
+
+def can_expand_community_row_semantics(
+    base: dict[str, str],
+    records: list[dict[str, str]],
+    pool: list[dict[str, str]],
+) -> bool:
+    """Gate full-row projection from a trusted community SDRF.
+
+    This path is intentionally distinct from single-cell reporter expansion. It
+    is used only when a one-row generic candidate conflicts with a complete,
+    internally unique, explicitly non-single-cell community multiplex mapping.
+    """
+    if len(records) < 2 or any(is_bundle_mapping_record(rec) for rec in pool):
+        return False
+    base_label = base.get("comment[label]", "")
+    if is_concrete(base_label) and not generic_isobaric_label(base_label):
+        return False
+    if not all(is_community_sdrf_record(rec) for rec in records):
+        return False
+
+    sources = {rec.get("source_path", "") for rec in records}
+    hashes = {rec.get("source_sha256", "") for rec in records}
+    if len(sources) != 1 or len(hashes) != 1 or "" in sources or "" in hashes:
+        return False
+
+    reporters = [canonical_reporter_token(rec.get("comment[label]", "")) for rec in records]
+    if not all(reporters) or len(set(reporters)) != len(reporters):
+        return False
+
+    source_names = [rec.get("source name", "") for rec in records]
+    if not all(is_concrete(value) for value in source_names):
+        return False
+    if len({norm_text(value) for value in source_names}) != len(source_names):
+        return False
+
+    sample_types = [rec.get("characteristics[sample type]", "") for rec in records]
+    if not all(is_concrete(value) for value in sample_types):
+        return False
+    sample_type_keys = {norm_key(value) for value in sample_types}
+    if len(sample_type_keys) != 1 or "singlecell" in sample_type_keys:
+        return False
+
+    for rec in records:
+        for field in COMMUNITY_PROJECTION_CORE_FIELDS:
+            if not is_concrete(rec.get(field, "")):
+                return False
+
+    # Any concrete structural identity already present on the base row must be
+    # explicitly resolved by every community row so wrong single-cell semantics
+    # cannot leak through an otherwise-valid projection.
+    for field in COMMUNITY_PROJECTION_IDENTITY_FIELDS:
+        if not is_concrete(base.get(field, "")):
+            continue
+        if not all(community_explicit_value(field, rec.get(field, "")) for rec in records):
+            return False
+    return True
+
+
+def apply_community_row_semantics(
+    base: dict[str, str],
+    rec: dict[str, str],
+    headers: list[str],
+) -> tuple[dict[str, str], list[dict[str, str]]]:
+    """Replace generic candidate semantics with one trusted community row."""
+    row = dict(base)
+    edges: list[dict[str, str]] = []
+    authoritative = set(COMMUNITY_PROJECTION_CORE_FIELDS) | set(
+        COMMUNITY_PROJECTION_IDENTITY_FIELDS
+    )
+    # Exact community rows may also refine established biological fields when
+    # those fields are already represented by the resolver schema.
+    authoritative.update(BIOLOGICAL_FIELDS)
+
+    for field in headers:
+        if field == "comment[data file]" or field not in authoritative:
+            continue
+        value = rec.get(field, "")
+        if not community_explicit_value(field, value):
+            continue
+        current = row.get(field, "")
+        if norm_text(current) == norm_text(value):
+            continue
+        row[field] = value
+        edges.append({
+            "field": field,
+            "old": current,
+            "new": value,
+            "source_path": rec.get("source_path", ""),
+            "source_sha256": rec.get("source_sha256", ""),
+            "community_full_row_projection": "true",
+        })
+    return row, edges
+
+
 def can_expand(
     base: dict[str, str],
     records: list[dict[str, str]],
@@ -835,6 +1006,40 @@ def resolve(candidate: Path, output: Path, report: Path, roots: list[Path], acce
                 for edge in expanded_edges:
                     applied.append({"data_file": group[0].get("comment[data file]", ""), **edge, "mode": "explicit_multiplex_expansion"})
                 continue
+
+        community_records = community_multiplex_expansion_records(explicit_records)
+        if (
+            len(group) == 1
+            and can_expand_community_row_semantics(
+                group[0], community_records, explicit_records
+            )
+        ):
+            ordered_records = sorted(
+                community_records,
+                key=lambda rec: canonical_reporter_token(rec.get("comment[label]", "")),
+            )
+            expanded_rows: list[dict[str, str]] = []
+            expanded_edges: list[dict[str, Any]] = []
+            for rec in ordered_records:
+                new_row, edges = apply_community_row_semantics(group[0], rec, headers)
+                expanded_rows.append(new_row)
+                expanded_edges.extend(edges)
+
+            output_rows.extend(expanded_rows)
+            expansions.append({
+                "data_file": group[0].get("comment[data file]", ""),
+                "rows_before": 1,
+                "rows_after": len(expanded_rows),
+                "labels": [x.get("comment[label]", "") for x in expanded_rows],
+                "projection_mode": "community_full_row_multiplex_projection",
+            })
+            for edge in expanded_edges:
+                applied.append({
+                    "data_file": group[0].get("comment[data file]", ""),
+                    **edge,
+                    "mode": "community_full_row_multiplex_projection",
+                })
+            continue
 
         for row in group:
             matches = mapping_candidates(row, by_raw)
