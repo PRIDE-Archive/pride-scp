@@ -6835,8 +6835,8 @@ fn conflicting_structure_evidence_spans_independent_semantic_domains(
     domains.len() >= 2
 }
 
-fn study_structure_conflict_subject_markers(item: &EvidenceItem) -> BTreeSet<&'static str> {
-    let text = item.text.to_ascii_lowercase();
+fn study_structure_conflict_subject_markers_from_text(text: &str) -> BTreeSet<&'static str> {
+    let text = text.to_ascii_lowercase();
     let mut subjects = BTreeSet::new();
 
     let contains_any = |needles: &[&str]| needles.iter().any(|needle| text.contains(needle));
@@ -6883,6 +6883,47 @@ fn study_structure_conflict_subject_markers(item: &EvidenceItem) -> BTreeSet<&'s
     subjects
 }
 
+fn study_structure_conflict_subject_markers(
+    evidence: &DatasetEvidence,
+    item: &EvidenceItem,
+    domain: StudyStructureConflictEvidenceDomain,
+) -> BTreeSet<&'static str> {
+    let mut subjects = study_structure_conflict_subject_markers_from_text(&item.text);
+
+    // Project descriptions are often intentionally concise and may omit the
+    // organism even when trusted structured project metadata establishes it.
+    // For conflict verification only, a cited ProjectMetadata source may inherit
+    // the deterministic organism scaffold when that scaffold is itself backed
+    // by project-metadata evidence. This preserves the trust boundary while
+    // avoiding false negatives caused solely by excerpt/window placement.
+    if domain == StudyStructureConflictEvidenceDomain::ProjectMetadata {
+        let project_backed_organism = evidence
+            .metadata_scaffold
+            .evidence_refs
+            .get("organism")
+            .into_iter()
+            .flatten()
+            .filter_map(|evidence_ref| {
+                evidence
+                    .evidence
+                    .iter()
+                    .find(|candidate| candidate.id.eq_ignore_ascii_case(evidence_ref))
+            })
+            .any(|candidate| {
+                study_structure_conflict_evidence_domain(evidence, candidate)
+                    == Some(StudyStructureConflictEvidenceDomain::ProjectMetadata)
+            });
+
+        if project_backed_organism {
+            if let Some(organism) = evidence.metadata_scaffold.values.get("organism") {
+                subjects.extend(study_structure_conflict_subject_markers_from_text(organism));
+            }
+        }
+    }
+
+    subjects
+}
+
 fn conflicting_structure_evidence_has_explicit_subject_mismatch(
     evidence: &DatasetEvidence,
     evidence_refs: &[String],
@@ -6896,8 +6937,12 @@ fn conflicting_structure_evidence_has_explicit_subject_mismatch(
                 .find(|item| item.id.eq_ignore_ascii_case(evidence_ref))
         })
         .filter_map(|item| {
-            study_structure_conflict_evidence_domain(evidence, item)
-                .map(|domain| (domain, study_structure_conflict_subject_markers(item)))
+            study_structure_conflict_evidence_domain(evidence, item).map(|domain| {
+                (
+                    domain,
+                    study_structure_conflict_subject_markers(evidence, item, domain),
+                )
+            })
         })
         .collect::<Vec<_>>();
 
@@ -13566,6 +13611,95 @@ mod tests {
             ),
             StudyStructureEscalationDisposition::HumanReview
         );
+    }
+
+    #[test]
+    fn project_scaffold_organism_can_verify_cross_domain_conflict() {
+        let mut evidence = evidence_with(
+            vec![
+                EvidenceItem {
+                    id: "E0001".into(),
+                    source_kind: "pride_project".into(),
+                    source_label: "project description".into(),
+                    text: "Targeted single-cell proteomics with TMT and SureQuant.".into(),
+                },
+                EvidenceItem {
+                    id: "E0002".into(),
+                    source_kind: "pride_project".into(),
+                    source_label: "project:organisms".into(),
+                    text: "Homo sapiens (human)".into(),
+                },
+                EvidenceItem {
+                    id: "E0003".into(),
+                    source_kind: "agent_read_context".into(),
+                    source_label: "/trusted/linked-publication.txt".into(),
+                    text: "Arabidopsis thaliana leaf oxidative stress response profiling.".into(),
+                },
+            ],
+            vec!["runA.raw"],
+        );
+        evidence.manuscript_sources = vec!["/trusted/linked-publication.txt".into()];
+        evidence
+            .metadata_scaffold
+            .values
+            .insert("organism".into(), "Homo sapiens (human)".into());
+        evidence
+            .metadata_scaffold
+            .evidence_refs
+            .insert("organism".into(), vec!["E0002".into()]);
+
+        // The cited project-description excerpt intentionally omits the organism.
+        // Conflict verification must still use the deterministic, project-backed
+        // organism scaffold rather than depend on bounded excerpt placement.
+        let refs = vec!["E0001".into(), "E0003".into()];
+        assert!(
+            conflicting_structure_evidence_spans_independent_semantic_domains(&evidence, &refs)
+        );
+        assert!(conflicting_structure_evidence_has_explicit_subject_mismatch(&evidence, &refs));
+        assert!(conflicting_structure_evidence_is_hard_cross_domain_mismatch(&evidence, &refs));
+    }
+
+    #[test]
+    fn non_project_organism_scaffold_cannot_create_project_conflict() {
+        let mut evidence = evidence_with(
+            vec![
+                EvidenceItem {
+                    id: "E0001".into(),
+                    source_kind: "pride_project".into(),
+                    source_label: "project description".into(),
+                    text: "Targeted single-cell proteomics with TMT and SureQuant.".into(),
+                },
+                EvidenceItem {
+                    id: "E0002".into(),
+                    source_kind: "repository_file_inventory".into(),
+                    source_label: "files.json".into(),
+                    text: "Homo sapiens (human)".into(),
+                },
+                EvidenceItem {
+                    id: "E0003".into(),
+                    source_kind: "agent_read_context".into(),
+                    source_label: "/trusted/linked-publication.txt".into(),
+                    text: "Arabidopsis thaliana leaf oxidative stress response profiling.".into(),
+                },
+            ],
+            vec!["runA.raw"],
+        );
+        evidence.manuscript_sources = vec!["/trusted/linked-publication.txt".into()];
+        evidence
+            .metadata_scaffold
+            .values
+            .insert("organism".into(), "Homo sapiens (human)".into());
+        evidence
+            .metadata_scaffold
+            .evidence_refs
+            .insert("organism".into(), vec!["E0002".into()]);
+
+        let refs = vec!["E0001".into(), "E0003".into()];
+        assert!(
+            conflicting_structure_evidence_spans_independent_semantic_domains(&evidence, &refs)
+        );
+        assert!(!conflicting_structure_evidence_has_explicit_subject_mismatch(&evidence, &refs));
+        assert!(!conflicting_structure_evidence_is_hard_cross_domain_mismatch(&evidence, &refs));
     }
 
     #[test]
