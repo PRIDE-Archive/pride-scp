@@ -6976,6 +6976,26 @@ fn conflicting_structure_evidence_is_hard_cross_domain_mismatch(
         && conflicting_structure_evidence_has_explicit_subject_mismatch(evidence, evidence_refs)
 }
 
+fn study_structure_completion_has_verified_hard_conflict(
+    evidence: &DatasetEvidence,
+    state: &ScientificWorkspaceState,
+    task_id: &str,
+    structure_status: Option<StudyStructureEditStatus>,
+) -> bool {
+    if task_id != "task:study_structure"
+        || structure_status != Some(StudyStructureEditStatus::Complete)
+    {
+        return false;
+    }
+    let evidence_reads = state
+        .tasks
+        .iter()
+        .find(|task| task.id == task_id)
+        .map(|task| task.evidence_reads.as_slice())
+        .unwrap_or_default();
+    conflicting_structure_evidence_is_hard_cross_domain_mismatch(evidence, evidence_reads)
+}
+
 fn study_structure_escalation_disposition(
     state: &ScientificWorkspaceState,
     task_id: &str,
@@ -11431,6 +11451,48 @@ async fn run_one_scientific_agent(
                     let edit = command
                         .workspace_edit_payload()
                         .expect("typed edit command must expose a workspace edit payload");
+                    if study_structure_completion_has_verified_hard_conflict(
+                        &evidence,
+                        &state,
+                        &edit.task_id,
+                        edit.structure_status,
+                    ) {
+                        let note = "Deterministic study-structure completion guard verified a hard cross-domain biological-subject conflict in evidence already read for this task. Completion is blocked fail-closed; human review is required before downstream scientific repair.";
+                        record_non_edit_task_attempt(&mut state, &edit.task_id, note);
+                        mark_active_task_human_review(&mut state, note);
+                        push_harness_feedback(
+                            &mut trace.harness_feedback,
+                            &mut pending_harness_feedback,
+                            format!(
+                                "turn {turn} VERIFIED CONFLICT BLOCKED STRUCTURE COMPLETION: task:study_structure cannot resolve because its read evidence contains a deterministically hard cross-domain biological-subject mismatch; Rust terminated the structural task as human_review rather than relying on the agent to issue escalate_study_structure"
+                            ),
+                        );
+                        let adjudications = record_adjudication_snapshot(
+                            &mut trace,
+                            &evidence,
+                            &state,
+                            turn,
+                            "post_structure_completion_conflict_guard",
+                        );
+                        trace.states.push(state.clone());
+                        fs::write(
+                            workspace_dir.join(format!("state.turn{turn:02}.json")),
+                            serde_json::to_string_pretty(&state)?,
+                        )?;
+                        fs::write(
+                            workspace_dir.join("state.json"),
+                            serde_json::to_string_pretty(&state)?,
+                        )?;
+                        write_workspace_notebook(
+                            &workspace_dir,
+                            &evidence,
+                            &state,
+                            &adjudications,
+                            &trace.validation_history,
+                        )?;
+                        trace.terminal_status = "human_review".into();
+                        break;
+                    }
                     let edited_field = state
                         .tasks
                         .iter()
@@ -13657,6 +13719,168 @@ mod tests {
         );
         assert!(conflicting_structure_evidence_has_explicit_subject_mismatch(&evidence, &refs));
         assert!(conflicting_structure_evidence_is_hard_cross_domain_mismatch(&evidence, &refs));
+    }
+
+    #[test]
+    fn structure_completion_guard_blocks_verified_conflict_in_read_evidence() {
+        let mut evidence = evidence_with(
+            vec![
+                EvidenceItem {
+                    id: "E0001".into(),
+                    source_kind: "pride_project".into(),
+                    source_label: "project description".into(),
+                    text: "Targeted single-cell proteomics with TMT and SureQuant.".into(),
+                },
+                EvidenceItem {
+                    id: "E0002".into(),
+                    source_kind: "pride_project".into(),
+                    source_label: "project:organisms".into(),
+                    text: "Homo sapiens (human)".into(),
+                },
+                EvidenceItem {
+                    id: "E0003".into(),
+                    source_kind: "agent_read_context".into(),
+                    source_label: "/trusted/linked-publication.txt".into(),
+                    text: "Arabidopsis thaliana leaf oxidative stress response profiling.".into(),
+                },
+            ],
+            vec!["runA.raw"],
+        );
+        evidence.manuscript_sources = vec!["/trusted/linked-publication.txt".into()];
+        evidence
+            .metadata_scaffold
+            .values
+            .insert("organism".into(), "Homo sapiens (human)".into());
+        evidence
+            .metadata_scaffold
+            .evidence_refs
+            .insert("organism".into(), vec!["E0002".into()]);
+
+        let state = ScientificWorkspaceState {
+            tasks: vec![ScientificTask {
+                id: "task:study_structure".into(),
+                concept_type: "study_structure".into(),
+                sdrf_field: "study_structure".into(),
+                status: "investigating".into(),
+                evidence_reads: vec!["E0001".into(), "E0003".into()],
+                ..Default::default()
+            }],
+            active_task_id: "task:study_structure".into(),
+            ..Default::default()
+        };
+
+        assert!(study_structure_completion_has_verified_hard_conflict(
+            &evidence,
+            &state,
+            "task:study_structure",
+            Some(StudyStructureEditStatus::Complete),
+        ));
+        assert!(!study_structure_completion_has_verified_hard_conflict(
+            &evidence,
+            &state,
+            "task:study_structure",
+            Some(StudyStructureEditStatus::Continue),
+        ));
+    }
+
+    #[test]
+    fn structure_completion_guard_ignores_unread_conflict_candidates() {
+        let mut evidence = evidence_with(
+            vec![
+                EvidenceItem {
+                    id: "E0001".into(),
+                    source_kind: "pride_project".into(),
+                    source_label: "project description".into(),
+                    text: "Targeted single-cell proteomics with TMT and SureQuant.".into(),
+                },
+                EvidenceItem {
+                    id: "E0002".into(),
+                    source_kind: "pride_project".into(),
+                    source_label: "project:organisms".into(),
+                    text: "Homo sapiens (human)".into(),
+                },
+                EvidenceItem {
+                    id: "E0003".into(),
+                    source_kind: "agent_read_context".into(),
+                    source_label: "/trusted/linked-publication.txt".into(),
+                    text: "Arabidopsis thaliana leaf oxidative stress response profiling.".into(),
+                },
+            ],
+            vec!["runA.raw"],
+        );
+        evidence.manuscript_sources = vec!["/trusted/linked-publication.txt".into()];
+        evidence
+            .metadata_scaffold
+            .values
+            .insert("organism".into(), "Homo sapiens (human)".into());
+        evidence
+            .metadata_scaffold
+            .evidence_refs
+            .insert("organism".into(), vec!["E0002".into()]);
+
+        let state = ScientificWorkspaceState {
+            tasks: vec![ScientificTask {
+                id: "task:study_structure".into(),
+                concept_type: "study_structure".into(),
+                sdrf_field: "study_structure".into(),
+                status: "investigating".into(),
+                evidence_candidates: vec!["E0001".into(), "E0003".into()],
+                evidence_reads: vec!["E0001".into()],
+                ..Default::default()
+            }],
+            active_task_id: "task:study_structure".into(),
+            ..Default::default()
+        };
+
+        assert!(!study_structure_completion_has_verified_hard_conflict(
+            &evidence,
+            &state,
+            "task:study_structure",
+            Some(StudyStructureEditStatus::Complete),
+        ));
+    }
+
+    #[test]
+    fn structure_completion_guard_allows_same_subject_modality_difference() {
+        let evidence = evidence_with(
+            vec![
+                EvidenceItem {
+                    id: "E0001".into(),
+                    source_kind: "pride_project".into(),
+                    source_label: "project description".into(),
+                    text: "Bovine single-oocyte profiling with intact-cell mass spectrometry."
+                        .into(),
+                },
+                EvidenceItem {
+                    id: "E0002".into(),
+                    source_kind: "manuscript_text".into(),
+                    source_label: "linked publication".into(),
+                    text:
+                        "Bovine oocytes and follicular cells were also profiled by bulk LC-MS/MS."
+                            .into(),
+                },
+            ],
+            vec!["runA.raw"],
+        );
+        let state = ScientificWorkspaceState {
+            tasks: vec![ScientificTask {
+                id: "task:study_structure".into(),
+                concept_type: "study_structure".into(),
+                sdrf_field: "study_structure".into(),
+                status: "investigating".into(),
+                evidence_reads: vec!["E0001".into(), "E0002".into()],
+                ..Default::default()
+            }],
+            active_task_id: "task:study_structure".into(),
+            ..Default::default()
+        };
+
+        assert!(!study_structure_completion_has_verified_hard_conflict(
+            &evidence,
+            &state,
+            "task:study_structure",
+            Some(StudyStructureEditStatus::Complete),
+        ));
     }
 
     #[test]
