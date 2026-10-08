@@ -10424,7 +10424,11 @@ fn compile_workspace_with_trusted_partial_sdrf(
     issues.extend(row_scaffold_issues);
 
     let mut trusted_partial_mapping_applied = false;
-    if state.harness_version == SCIENTIFIC_AGENT_FACTOR_ROW_ROLE_HARDENED_VERSION
+    // Both the legacy factor-row-role harness and v1.4.5 can use the same
+    // explicit, strict-repository-subset trusted partial. No input still
+    // means no fusion and leaves the mapping blocker unresolved.
+    if (state.harness_version == SCIENTIFIC_AGENT_FACTOR_ROW_ROLE_HARDENED_VERSION
+        || state.harness_version == SCIENTIFIC_AGENT_HARNESS_VERSION)
         && proposal.relation_mode == "multiplexed_cells_per_data_file"
         && evidence.existing_sdrf_path.is_empty()
         && explicit_mappings.is_empty()
@@ -14794,6 +14798,112 @@ mod tests {
             "deposited-only RAWs must fail the strict repository-subset gate"
         );
 
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn v145_compiler_fuses_trusted_partial_and_retains_it_after_recompile() {
+        let root = std::env::temp_dir().join(format!(
+            "pride-scp-v145-compiler-fusion-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let partial = root.join("PXDTEST.sdrf.tsv");
+        fs::write(
+            &partial,
+            concat!(
+                "source name\tassay name\ttechnology type\tcomment[data file]\tcomment[label]\n",
+                "cell_A\tassay_A\tproteomic profiling by mass spectrometry\tplex_1.raw\tTMT127N\n",
+                "cell_B\tassay_B\tproteomic profiling by mass spectrometry\tplex_1.raw\tTMT128N\n",
+            ),
+        )
+        .unwrap();
+
+        let mut evidence = evidence_with(
+            vec![EvidenceItem {
+                id: "E0001".into(),
+                source_kind: "repository".into(),
+                source_label: "study design".into(),
+                text: "multiplex reporter evidence".into(),
+            }],
+            vec!["plex_1.raw", "qc_1.raw"],
+        );
+        evidence.study_design.relation_mode_hint = "multiplexed_cells_per_data_file".into();
+        evidence.study_design.multiplex_mapping_status =
+            "chemistry_detected_channel_mapping_unresolved".into();
+
+        let mut state = ScientificWorkspaceState {
+            harness_version: SCIENTIFIC_AGENT_HARNESS_VERSION.into(),
+            accession: evidence.accession.clone(),
+            relation: AgentRelation {
+                mode: "multiplexed_cells_per_data_file".into(),
+                scope: "project".into(),
+                evidence_refs: vec!["E0001".into()],
+                confidence: "high".into(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let check_fused =
+            |compiled: &CompiledWorkspace| {
+                assert_eq!(
+                    compiled.generation_mode,
+                    "generated_trusted_partial_sdrf_fusion"
+                );
+                assert!(compiled
+                    .issues
+                    .iter()
+                    .any(|issue| issue.code
+                        == "scientific_agent_trusted_partial_sdrf_mapping_applied"));
+                assert!(!compiled
+                    .issues
+                    .iter()
+                    .any(|issue| issue.code == "sample_to_channel_mapping_unresolved"));
+                assert_eq!(compiled.rows.len(), 3);
+                let data_idx = compiled
+                    .headers
+                    .iter()
+                    .position(|h| h == "comment[data file]")
+                    .unwrap();
+                let label_idx = compiled
+                    .headers
+                    .iter()
+                    .position(|h| h == "comment[label]")
+                    .unwrap();
+                let labels = compiled
+                    .rows
+                    .iter()
+                    .filter(|row| row[data_idx] == "plex_1.raw")
+                    .map(|row| row[label_idx].as_str())
+                    .collect::<Vec<_>>();
+                assert_eq!(labels, vec!["TMT127N", "TMT128N"]);
+                assert!(compiled.rows.iter().any(|row| row[data_idx] == "qc_1.raw"));
+            };
+
+        let baseline =
+            compile_workspace_with_trusted_partial_sdrf(&evidence, &state, &[], Some(&partial))
+                .unwrap();
+        check_fused(&baseline);
+
+        // Explicitly exercise the subsequent compile path after agent state change.
+        state.turn = 1;
+        let after_edit =
+            compile_workspace_with_trusted_partial_sdrf(&evidence, &state, &[], Some(&partial))
+                .unwrap();
+        check_fused(&after_edit);
+
+        let no_partial =
+            compile_workspace_with_trusted_partial_sdrf(&evidence, &state, &[], None).unwrap();
+        assert!(no_partial
+            .issues
+            .iter()
+            .any(|issue| issue.code == "sample_to_channel_mapping_unresolved"));
+        assert!(!no_partial
+            .issues
+            .iter()
+            .any(|issue| issue.code == "scientific_agent_trusted_partial_sdrf_mapping_applied"));
         let _ = fs::remove_dir_all(root);
     }
 
