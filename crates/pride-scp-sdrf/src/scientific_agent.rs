@@ -10087,6 +10087,123 @@ fn consensus_projectable_isolation_for_single_cell_regimes(
     ))
 }
 
+fn projectable_project_isolation_baseline_for_single_cell_rows(
+    evidence: &DatasetEvidence,
+    state: &ScientificWorkspaceState,
+) -> Option<(String, Vec<String>)> {
+    if state.harness_version != SCIENTIFIC_AGENT_HARNESS_VERSION {
+        return None;
+    }
+
+    if state.claims.iter().any(|claim| {
+        claim.concept_type == "isolation_method" && matches!(claim.scope.as_str(), "branch" | "row")
+    }) {
+        return None;
+    }
+
+    let project_claims = state
+        .claims
+        .iter()
+        .filter(|claim| claim.concept_type == "isolation_method" && claim.scope == "project")
+        .collect::<Vec<_>>();
+    if project_claims.len() != 1 {
+        return None;
+    }
+
+    let claim = project_claims[0];
+    match adjudicate_workspace_claim(evidence, state, claim) {
+        ClaimAdjudication::Canonical {
+            value,
+            evidence_refs,
+        }
+        | ClaimAdjudication::SupportedConcept {
+            value,
+            evidence_refs,
+        } if !value.trim().is_empty() => Some((value, evidence_refs)),
+        ClaimAdjudication::Canonical { .. }
+        | ClaimAdjudication::SupportedConcept { .. }
+        | ClaimAdjudication::TemplateGap { .. }
+        | ClaimAdjudication::Unresolved { .. }
+        | ClaimAdjudication::Conflict { .. } => None,
+    }
+}
+
+fn apply_project_single_cell_isolation_baseline_projection(
+    headers: &[String],
+    rows: &mut [Vec<String>],
+    evidence: &DatasetEvidence,
+    state: &ScientificWorkspaceState,
+    relation_mode: &str,
+    explicit_mappings: &[ExplicitRowMapping],
+    has_unresolved_raw_roles: bool,
+    trusted_partial_mapping_applied: bool,
+) -> Vec<ValidationIssue> {
+    if state.harness_version != SCIENTIFIC_AGENT_HARNESS_VERSION
+        || relation_mode != "one_cell_per_data_file"
+        || evidence.study_design.relation_mode_hint != "one_cell_per_data_file"
+        || !study_design_has_assertive_relation_hint(&evidence.study_design)
+        || !evidence.existing_sdrf_path.is_empty()
+        || !explicit_mappings.is_empty()
+        || has_unresolved_raw_roles
+        || unresolved_de_novo_multiplex_mapping(
+            evidence,
+            relation_mode,
+            explicit_mappings,
+            trusted_partial_mapping_applied,
+        )
+    {
+        return Vec::new();
+    }
+
+    let Some((isolation_value, evidence_refs)) =
+        projectable_project_isolation_baseline_for_single_cell_rows(evidence, state)
+    else {
+        return Vec::new();
+    };
+
+    let header_index = headers
+        .iter()
+        .enumerate()
+        .map(|(index, header)| (header.as_str(), index))
+        .collect::<HashMap<_, _>>();
+    let Some(&sample_type_idx) = header_index.get(SC_SAMPLE_TYPE) else {
+        return Vec::new();
+    };
+    let Some(&isolation_idx) = header_index.get(SC_ISOLATION_METHOD) else {
+        return Vec::new();
+    };
+
+    let mut projected_rows = 0usize;
+    for row in rows {
+        if sample_type_idx >= row.len() || isolation_idx >= row.len() {
+            continue;
+        }
+        if row[sample_type_idx]
+            .trim()
+            .eq_ignore_ascii_case("single cell")
+            && row_value_is_unresolved(&row[isolation_idx])
+        {
+            row[isolation_idx] = isolation_value.clone();
+            projected_rows += 1;
+        }
+    }
+
+    if projected_rows == 0 {
+        return Vec::new();
+    }
+
+    vec![ValidationIssue {
+        level: "warning".into(),
+        code: "scientific_agent_project_single_cell_isolation_baseline_projected".into(),
+        row: 0,
+        column: SC_ISOLATION_METHOD.into(),
+        message: format!(
+            "projected canonical project-scoped isolation '{}' to {} deterministically classified single-cell row(s) because exactly one publishable project isolation claim exists, no branch/row isolation claims are present, and the relation is one_cell_per_data_file; refs={:?}",
+            isolation_value, projected_rows, evidence_refs
+        ),
+    }]
+}
+
 fn apply_consensus_single_cell_isolation_projection(
     headers: &[String],
     rows: &mut [Vec<String>],
@@ -10409,6 +10526,17 @@ fn compile_workspace_with_trusted_partial_sdrf(
         evidence,
         state,
         explicit_mappings,
+        trusted_partial_mapping_applied,
+    ));
+
+    issues.extend(apply_project_single_cell_isolation_baseline_projection(
+        &headers,
+        &mut rows,
+        evidence,
+        state,
+        &proposal.relation_mode,
+        explicit_mappings,
+        has_unresolved_raw_roles,
         trusted_partial_mapping_applied,
     ));
 
@@ -15048,6 +15176,14 @@ mod tests {
         )
     }
 
+    fn current_state_with_claims(claims: Vec<ScientificClaim>) -> ScientificWorkspaceState {
+        ScientificWorkspaceState {
+            harness_version: SCIENTIFIC_AGENT_HARNESS_VERSION.into(),
+            claims,
+            ..Default::default()
+        }
+    }
+
     fn row_role_state_with_claims(claims: Vec<ScientificClaim>) -> ScientificWorkspaceState {
         ScientificWorkspaceState {
             harness_version: SCIENTIFIC_AGENT_FACTOR_ROW_ROLE_HARDENED_VERSION.into(),
@@ -15888,6 +16024,163 @@ mod tests {
         assert!(!issues
             .iter()
             .any(|issue| issue.code == "sample_to_channel_mapping_unresolved"));
+    }
+
+    #[test]
+    fn v145_project_isolation_baseline_projects_only_single_cell_rows() {
+        let evidence = evidence_with(
+            vec![EvidenceItem {
+                id: "E0001".into(),
+                source_kind: "manuscript_semantic_evidence".into(),
+                source_label: "paper.txt".into(),
+                text: "Individual single cells were isolated by manual picking.".into(),
+            }],
+            vec!["cell.raw", "bulk.raw"],
+        );
+        let state = current_state_with_claims(vec![claim(
+            "isolation_method",
+            "manual picking",
+            "project",
+            "",
+        )]);
+        let headers = vec![SC_SAMPLE_TYPE.into(), SC_ISOLATION_METHOD.into()];
+        let mut rows = vec![
+            vec!["single cell".into(), "not available".into()],
+            vec!["bulk control".into(), "not applicable".into()],
+        ];
+
+        let issues = apply_project_single_cell_isolation_baseline_projection(
+            &headers,
+            &mut rows,
+            &evidence,
+            &state,
+            "one_cell_per_data_file",
+            &[],
+            false,
+            false,
+        );
+
+        assert_eq!(rows[0][1], "manual picking");
+        assert_eq!(rows[1][1], "not applicable");
+        assert!(issues.iter().any(|issue| {
+            issue.code == "scientific_agent_project_single_cell_isolation_baseline_projected"
+        }));
+    }
+
+    #[test]
+    fn v145_project_isolation_baseline_is_blocked_by_any_branch_override() {
+        let evidence = evidence_with(
+            vec![EvidenceItem {
+                id: "E0001".into(),
+                source_kind: "manuscript_semantic_evidence".into(),
+                source_label: "paper.txt".into(),
+                text: "Individual single cells were isolated by manual picking.".into(),
+            }],
+            vec!["cell.raw"],
+        );
+        let state = current_state_with_claims(vec![
+            claim("isolation_method", "manual picking", "project", ""),
+            branch_claim_with_ref("isolation_method", "manual picking", "R001", "E0001"),
+        ]);
+        let headers = vec![SC_SAMPLE_TYPE.into(), SC_ISOLATION_METHOD.into()];
+        let mut rows = vec![vec!["single cell".into(), "not available".into()]];
+
+        let issues = apply_project_single_cell_isolation_baseline_projection(
+            &headers,
+            &mut rows,
+            &evidence,
+            &state,
+            "one_cell_per_data_file",
+            &[],
+            false,
+            false,
+        );
+
+        assert_eq!(rows[0][1], "not available");
+        assert!(issues.is_empty());
+    }
+
+    #[test]
+    fn v145_project_isolation_baseline_fails_closed_for_template_gap() {
+        let evidence = evidence_with(
+            vec![EvidenceItem {
+                id: "E0001".into(),
+                source_kind: "manuscript_semantic_evidence".into(),
+                source_label: "paper.txt".into(),
+                text: "Single cells were isolated by capillary-based micromanipulation.".into(),
+            }],
+            vec!["cell.raw"],
+        );
+        let state = current_state_with_claims(vec![claim(
+            "isolation_method",
+            "capillary-based micromanipulation",
+            "project",
+            "",
+        )]);
+        let headers = vec![SC_SAMPLE_TYPE.into(), SC_ISOLATION_METHOD.into()];
+        let mut rows = vec![vec!["single cell".into(), "not available".into()]];
+
+        let issues = apply_project_single_cell_isolation_baseline_projection(
+            &headers,
+            &mut rows,
+            &evidence,
+            &state,
+            "one_cell_per_data_file",
+            &[],
+            false,
+            false,
+        );
+
+        assert_eq!(rows[0][1], "not available");
+        assert!(issues.is_empty());
+    }
+
+    #[test]
+    fn v145_project_isolation_baseline_requires_one_cell_relation_and_clean_mapping_state() {
+        let evidence = evidence_with(
+            vec![EvidenceItem {
+                id: "E0001".into(),
+                source_kind: "manuscript_semantic_evidence".into(),
+                source_label: "paper.txt".into(),
+                text: "Individual single cells were isolated by manual picking.".into(),
+            }],
+            vec!["cell.raw"],
+        );
+        let state = current_state_with_claims(vec![claim(
+            "isolation_method",
+            "manual picking",
+            "project",
+            "",
+        )]);
+        let headers = vec![SC_SAMPLE_TYPE.into(), SC_ISOLATION_METHOD.into()];
+
+        let mut uncertain_rows = vec![vec!["single cell".into(), "not available".into()]];
+        let uncertain_issues = apply_project_single_cell_isolation_baseline_projection(
+            &headers,
+            &mut uncertain_rows,
+            &evidence,
+            &state,
+            "uncertain",
+            &[],
+            false,
+            false,
+        );
+        assert_eq!(uncertain_rows[0][1], "not available");
+        assert!(uncertain_issues.is_empty());
+
+        let mut unresolved_role_rows = vec![vec!["single cell".into(), "not available".into()]];
+        let unresolved_role_issues = apply_project_single_cell_isolation_baseline_projection(
+            &headers,
+            &mut unresolved_role_rows,
+            &evidence,
+            &state,
+            "one_cell_per_data_file",
+            &[],
+            true,
+            false,
+        );
+        assert_eq!(unresolved_role_rows[0][1], "not available");
+        assert!(unresolved_role_issues.is_empty());
     }
 
     #[test]
