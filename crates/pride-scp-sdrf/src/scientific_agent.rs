@@ -5885,14 +5885,8 @@ async fn run_one_factor_row_role_hardened(
         ..Default::default()
     };
 
-    let trusted_partial_sdrf = opts
-        .resolved_sdrf_dir
-        .as_ref()
-        .map(|dir| dir.join(format!("{accession}.sdrf.tsv")))
-        .filter(|path| {
-            evidence.existing_sdrf_path.is_empty()
-                && existing_sdrf_is_strict_repository_subset(path, &evidence.raw_files)
-        });
+    let trusted_partial_sdrf =
+        trusted_partial_sdrf_candidate(opts.resolved_sdrf_dir.as_deref(), accession, &evidence);
     let compiled = compile_workspace_with_trusted_partial_sdrf(
         &evidence,
         &state,
@@ -10330,6 +10324,19 @@ fn compiled_workspace_fingerprint(
     .unwrap_or_default()
 }
 
+fn trusted_partial_sdrf_candidate(
+    resolved_sdrf_dir: Option<&Path>,
+    accession: &str,
+    evidence: &DatasetEvidence,
+) -> Option<PathBuf> {
+    resolved_sdrf_dir
+        .map(|dir| dir.join(format!("{accession}.sdrf.tsv")))
+        .filter(|path| {
+            evidence.existing_sdrf_path.is_empty()
+                && existing_sdrf_is_strict_repository_subset(path, &evidence.raw_files)
+        })
+}
+
 fn compile_workspace(
     evidence: &DatasetEvidence,
     state: &ScientificWorkspaceState,
@@ -10982,6 +10989,8 @@ async fn run_one_scientific_agent(
     } else {
         Vec::new()
     };
+    let trusted_partial_sdrf =
+        trusted_partial_sdrf_candidate(opts.resolved_sdrf_dir.as_deref(), accession, &evidence);
     let (workspace_dir, draft_path, review_path, audit_path, evidence_path) =
         workspace_paths(&opts.output_dir, accession);
     let directories: [&Path; 5] = [
@@ -11048,7 +11057,12 @@ async fn run_one_scientific_agent(
     // before asking the model to reason. The first agent turn therefore sees
     // the actual unresolved scientific tasks instead of inventing a parallel
     // replacement for already-working row structure.
-    let baseline = compile_workspace(&evidence, &state, &explicit_mappings)?;
+    let baseline = compile_workspace_with_trusted_partial_sdrf(
+        &evidence,
+        &state,
+        &explicit_mappings,
+        trusted_partial_sdrf.as_deref(),
+    )?;
     fs::write(
         workspace_dir.join("adjudications.json"),
         serde_json::to_string_pretty(&baseline.adjudications)?,
@@ -11707,7 +11721,12 @@ async fn run_one_scientific_agent(
                         continue;
                     }
 
-                    let compiled_now = compile_workspace(&evidence, &state, &explicit_mappings)?;
+                    let compiled_now = compile_workspace_with_trusted_partial_sdrf(
+                        &evidence,
+                        &state,
+                        &explicit_mappings,
+                        trusted_partial_sdrf.as_deref(),
+                    )?;
                     fs::write(
                         workspace_dir.join("adjudications.json"),
                         serde_json::to_string_pretty(&compiled_now.adjudications)?,
@@ -14725,6 +14744,57 @@ mod tests {
         assert_eq!(rows[0][3], "1");
         assert_eq!(rows[0][4], "1");
         assert_eq!(rows[0][5], "1");
+    }
+
+    #[test]
+    fn v145_trusted_partial_candidate_requires_explicit_dir_and_strict_repository_subset() {
+        let root = std::env::temp_dir().join(format!(
+            "pride-scp-v145-trusted-partial-candidate-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+
+        let accession = "PXD999999";
+        let partial = root.join(format!("{accession}.sdrf.tsv"));
+        fs::write(
+            &partial,
+            concat!("source name\tcomment[data file]\n", "cell_A\tplex_1.raw\n"),
+        )
+        .unwrap();
+
+        let mut evidence = evidence_with(Vec::new(), vec!["plex_1.raw", "qc_1.raw"]);
+
+        let selected = trusted_partial_sdrf_candidate(Some(root.as_path()), accession, &evidence);
+        assert_eq!(selected.as_deref(), Some(partial.as_path()));
+
+        assert!(
+            trusted_partial_sdrf_candidate(None, accession, &evidence).is_none(),
+            "trusted partial must require an explicit resolved SDRF directory"
+        );
+
+        evidence.existing_sdrf_path = "authoritative_existing.sdrf.tsv".into();
+        assert!(
+            trusted_partial_sdrf_candidate(Some(root.as_path()), accession, &evidence).is_none(),
+            "authoritative existing SDRF must retain precedence"
+        );
+
+        evidence.existing_sdrf_path.clear();
+        fs::write(
+            &partial,
+            concat!(
+                "source name\tcomment[data file]\n",
+                "cell_A\tplex_1.raw\n",
+                "cell_B\textra.raw\n"
+            ),
+        )
+        .unwrap();
+        assert!(
+            trusted_partial_sdrf_candidate(Some(root.as_path()), accession, &evidence).is_none(),
+            "deposited-only RAWs must fail the strict repository-subset gate"
+        );
+
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
