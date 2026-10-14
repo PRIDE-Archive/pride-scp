@@ -2401,9 +2401,39 @@ fn raw_file_role_counts(raw_files: &[RawFile]) -> BTreeMap<String, usize> {
     counts
 }
 
+// Structured SDRF channel columns are not affirmative multiplex evidence when every
+// recorded value is a null/negative placeholder. Keep the evidence item itself for
+// provenance; exclude it only from positive reporter-relation classification.
+fn is_placeholder_only_channel_evidence(item: &EvidenceItem) -> bool {
+    if item.source_kind != "existing_sdrf_structured" {
+        return false;
+    }
+    let text = item.text.trim().to_ascii_lowercase();
+    let Some((column, values)) = text.split_once(" values:") else {
+        return false;
+    };
+    if !matches!(
+        column.trim(),
+        "comment[carrier channel]" | "comment[reference channel]"
+    ) {
+        return false;
+    }
+    let values = values.trim();
+    !values.is_empty()
+        && values.split(|c| matches!(c, '|' | ',' | ';')).all(|value| {
+            matches!(
+                value.trim().trim_matches(&['\'', '"'][..]),
+                "not applicable" | "not available" | "n/a" | "na" | "none" | "null"
+            )
+        })
+}
+
 fn evidence_refs_containing(evidence: &[EvidenceItem], terms: &[&str]) -> Vec<String> {
     let mut refs = Vec::new();
     for item in evidence {
+        if is_placeholder_only_channel_evidence(item) {
+            continue;
+        }
         let hay = format!("{} {}", item.source_label, item.text).to_ascii_lowercase();
         if terms.iter().any(|term| hay.contains(term)) {
             refs.push(item.id.clone());
@@ -2493,6 +2523,9 @@ fn relation_scope_evidence(
     let mut plexdia = BTreeSet::new();
 
     for item in evidence {
+        if is_placeholder_only_channel_evidence(item) {
+            continue;
+        }
         let text = item.text.to_ascii_lowercase();
         if text.contains("plexdia") || text.contains("plex dia") {
             plexdia.insert(item.id.clone());
@@ -11997,6 +12030,97 @@ mod tests {
         assert_eq!(design.wrapped_acquisition_files, 1);
         assert_eq!(design.generic_archive_files, 0);
         assert!(design.relation_evidence_refs.contains(&"E0001".to_string()));
+    }
+
+    #[test]
+    fn structured_nonisobaric_channel_placeholders_never_imply_multiplex() {
+        let raw = vec![RawFile {
+            file_name: "E6V11_01.raw".into(),
+            file_uri: String::new(),
+            category: "RAW".into(),
+        }];
+        let evidence = vec![
+            EvidenceItem {
+                id: "E0015".into(),
+                source_kind: "existing_sdrf_structured".into(),
+                source_label: "existing_sdrf:characteristics[sample type]".into(),
+                text: "characteristics[sample type] values: single cell".into(),
+            },
+            EvidenceItem {
+                id: "E0019".into(),
+                source_kind: "existing_sdrf_structured".into(),
+                source_label: "existing_sdrf:comment[carrier channel]".into(),
+                text: "comment[carrier channel] values: not applicable".into(),
+            },
+            EvidenceItem {
+                id: "E0020".into(),
+                source_kind: "existing_sdrf_structured".into(),
+                source_label: "existing_sdrf:comment[reference channel]".into(),
+                text: "comment[reference channel] values: not available | not applicable".into(),
+            },
+            EvidenceItem {
+                id: "E0053".into(),
+                source_kind: "pride_project".into(),
+                source_label: "project:projectDescription".into(),
+                text: "Label-free CE-MS analysis of proteins from single cells".into(),
+            },
+        ];
+        let design = infer_study_design_scaffold(&raw, &evidence);
+        assert_eq!(design.relation_mode_hint, "one_cell_per_data_file");
+        assert!(design.multiplex_evidence_refs.is_empty());
+        assert!(design.multiplex_chemistry_hint.is_empty());
+        assert!(!design.relation_evidence_refs.contains(&"E0019".to_string()));
+        assert!(!design.relation_evidence_refs.contains(&"E0020".to_string()));
+    }
+
+    #[test]
+    fn placeholder_channels_do_not_suppress_genuine_tmt_reporter_design() {
+        let raw = vec![RawFile {
+            file_name: "TMT_single_cells.raw".into(),
+            file_uri: String::new(),
+            category: "RAW".into(),
+        }];
+        let evidence = vec![
+            EvidenceItem {
+                id: "E0019".into(),
+                source_kind: "existing_sdrf_structured".into(),
+                source_label: "existing_sdrf:comment[carrier channel]".into(),
+                text: "comment[carrier channel] values: not applicable".into(),
+            },
+            EvidenceItem {
+                id: "E_TRUE".into(),
+                source_kind: "manuscript_text".into(),
+                source_label: "methods".into(),
+                text: "Single-cell proteomics samples were labeled with TMTpro; the carrier channel was 131.".into(),
+            },
+        ];
+        let design = infer_study_design_scaffold(&raw, &evidence);
+        assert_eq!(design.relation_mode_hint, "multiplexed_cells_per_data_file");
+        assert!(design
+            .multiplex_evidence_refs
+            .contains(&"E_TRUE".to_string()));
+        assert!(!design
+            .multiplex_evidence_refs
+            .contains(&"E0019".to_string()));
+        assert_eq!(design.multiplex_chemistry_hint, "TMTpro");
+    }
+
+    #[test]
+    fn channel_placeholder_filter_does_not_discard_real_channel_values() {
+        let mut item = EvidenceItem {
+            id: "E".into(),
+            source_kind: "existing_sdrf_structured".into(),
+            source_label: "existing_sdrf:comment[carrier channel]".into(),
+            text: "comment[carrier channel] values: not applicable".into(),
+        };
+        assert!(is_placeholder_only_channel_evidence(&item));
+        item.text = "comment[carrier channel] values: TMT131".into();
+        assert!(!is_placeholder_only_channel_evidence(&item));
+        item.text = "comment[carrier channel] values: not applicable | TMT131".into();
+        assert!(!is_placeholder_only_channel_evidence(&item));
+        item.source_kind = "manuscript_text".into();
+        item.text = "comment[carrier channel] values: not applicable".into();
+        assert!(!is_placeholder_only_channel_evidence(&item));
     }
 
     #[test]
