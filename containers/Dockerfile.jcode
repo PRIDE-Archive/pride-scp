@@ -1,0 +1,33 @@
+# Extend the existing PRIDE-SCP runtime, which already contains Ollama,
+# Python 3.12, parse_sdrf 0.1.6, and the deterministic Rust/Python tools.
+# This image adds a checksum-locked JCode release. It does not include
+# model weights or private/accession-level scientific evidence.
+ARG BASE_IMAGE=pride-scp-jcode-base:ci
+FROM ${BASE_IMAGE}
+
+ARG JCODE_VERSION=0.99.0
+ARG JCODE_LINUX_X86_64_SHA256=d595e38bf8629730487da7f2c3eed79b9935d442ceb6af4cc89ff49ed7013cf7
+
+USER root
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends curl \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN mkdir -p /tmp/jcode-release \
+    && curl --fail --location --silent --show-error --retry 4 \
+       "https://github.com/1jehuang/jcode/releases/download/v${JCODE_VERSION}/jcode-linux-x86_64.tar.gz" \
+       -o /tmp/jcode-release.tar.gz \
+    && echo "${JCODE_LINUX_X86_64_SHA256}  /tmp/jcode-release.tar.gz" | sha256sum -c - \
+    && tar -xzf /tmp/jcode-release.tar.gz -C /tmp/jcode-release \
+    && JCODE_FILE="$(find /tmp/jcode-release -type f -name jcode -print -quit)" \
+    && test -n "${JCODE_FILE}" \
+    && install -m 0755 "${JCODE_FILE}" /usr/local/bin/jcode \
+    && jcode --version \
+    && rm -rf /tmp/jcode-release /tmp/jcode-release.tar.gz
+
+ENV OLLAMA_NO_CLOUD=1 \
+    OLLAMA_HOST=127.0.0.1:11434 \
+    JCODE_AUTO_UPDATE=0
+
+LABEL org.opencontainers.image.title="PRIDE-SCP JCode runtime" \
+      org.opencontainers.image.description="Existing PRIDE-SCP science tools + Ollama + SHA-pinned JCode agent"
