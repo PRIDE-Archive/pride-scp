@@ -1,0 +1,84 @@
+name: PRIDE-SCP JCode image
+
+on:
+  workflow_dispatch:
+    inputs:
+      publish_image:
+        description: 'Push the tested image to GHCR (requires packages:write)'
+        type: boolean
+        default: false
+      cpu_model_smoke:
+        description: 'Try a small Ollama/JCode inference smoke on CPU (not a scientific test)'
+        type: boolean
+        default: false
+  pull_request:
+    paths:
+      - 'containers/Dockerfile'
+      - 'containers/Dockerfile.jcode'
+      - '.github/workflows/pride-scp-jcode-image.yml'
+      - 'scripts/ci/smoke_jcode_image.sh'
+      - 'python/requirements*'
+      - 'Cargo.lock'
+
+permissions:
+  contents: read
+
+jobs:
+  docker-build-and-smoke:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 100
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Docker availability and disk
+        run: |
+          docker version
+          df -h .
+      - name: Build existing PRIDE-SCP image (includes Ollama)
+        run: |
+          docker build --pull --file containers/Dockerfile --target runtime \
+            --build-arg VCS_REF="${GITHUB_SHA}" \
+            --tag pride-scp-jcode-base:ci .
+      - name: Extend with SHA-locked JCode
+        run: |
+          docker build --file containers/Dockerfile.jcode \
+            --build-arg BASE_IMAGE=pride-scp-jcode-base:ci \
+            --tag pride-scp-jcode:ci .
+      - name: Smoke JCode Ollama and validator
+        run: bash scripts/ci/smoke_jcode_image.sh pride-scp-jcode:ci
+      - name: Optional CPU model and JCode response smoke
+        if: github.event_name == 'workflow_dispatch' && inputs.cpu_model_smoke
+        run: |
+          docker run -d --name pride-scp-jcode-ollama-smoke \
+            --entrypoint /bin/bash pride-scp-jcode:ci -c 'ollama serve'
+          trap 'docker rm -f pride-scp-jcode-ollama-smoke >/dev/null 2>&1 || true' EXIT
+          for attempt in $(seq 1 30); do
+            if docker exec pride-scp-jcode-ollama-smoke ollama list >/dev/null 2>&1; then
+              break
+            fi
+            sleep 2
+          done
+          docker exec pride-scp-jcode-ollama-smoke ollama pull qwen3:0.6b
+          docker exec pride-scp-jcode-ollama-smoke \
+            /bin/bash -c 'timeout 180 jcode --provider ollama --model qwen3:0.6b run "Reply with exactly JCODE_OLLAMA_SMOKE_OK."' \
+            | tee /tmp/pride-scp-jcode-smoke.log
+          grep -F JCODE_OLLAMA_SMOKE_OK /tmp/pride-scp-jcode-smoke.log
+      - name: Login to GHCR (explicit opt-in only)
+        if: github.event_name == 'workflow_dispatch' && inputs.publish_image
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Publish pinned revision to GHCR (explicit opt-in only)
+        if: github.event_name == 'workflow_dispatch' && inputs.publish_image
+        env:
+          GITHUB_REPOSITORY: ${{ github.repository }}
+        run: |
+          IMAGE="ghcr.io/${GITHUB_REPOSITORY,,}-jcode:sha-${GITHUB_SHA:0:12}"
+          docker tag pride-scp-jcode:ci "$IMAGE"
+          docker push "$IMAGE"
+          echo "JCODE_IMAGE=$IMAGE" >> "$GITHUB_STEP_SUMMARY"
+          echo "Model weights and scientific evidence are NOT part of the image." >> "$GITHUB_STEP_SUMMARY"
