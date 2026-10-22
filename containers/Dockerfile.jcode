@@ -13,18 +13,20 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends curl \
     && rm -rf /var/lib/apt/lists/*
 
-RUN mkdir -p /tmp/jcode-release \
+# Upstream JCode launcher and companion must remain together.
+# The launcher sets LD_LIBRARY_PATH for bundled OpenSSL libraries.
+RUN mkdir -p /opt/jcode \
     && curl --fail --location --silent --show-error --retry 4 \
        "https://github.com/1jehuang/jcode/releases/download/v${JCODE_VERSION}/jcode-linux-x86_64.tar.gz" \
        -o /tmp/jcode-release.tar.gz \
     && echo "${JCODE_LINUX_X86_64_SHA256}  /tmp/jcode-release.tar.gz" | sha256sum -c - \
-    && tar -xzf /tmp/jcode-release.tar.gz -C /tmp/jcode-release \
-    && JCODE_FILE="$(find /tmp/jcode-release -type f -name jcode -print -quit)" \
-    && test -n "${JCODE_FILE}" \
-    && install -m 0755 "${JCODE_FILE}" /usr/local/bin/jcode \
+    && tar -tzf /tmp/jcode-release.tar.gz \
+    && tar -xzf /tmp/jcode-release.tar.gz -C /opt/jcode \
+    && test -x /opt/jcode/jcode-linux-x86_64 \
+    && test -x /opt/jcode/jcode-linux-x86_64.bin \
+    && ln -s /opt/jcode/jcode-linux-x86_64 /usr/local/bin/jcode \
     && jcode --version \
-    && rm -rf /tmp/jcode-release /tmp/jcode-release.tar.gz
-
+    && rm -f /tmp/jcode-release.tar.gz
 ENV OLLAMA_NO_CLOUD=1 \
     OLLAMA_HOST=127.0.0.1:11434 \
     JCODE_AUTO_UPDATE=0
